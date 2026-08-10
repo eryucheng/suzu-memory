@@ -1,0 +1,12 @@
+{
+  "name": "@suzu-memory/console",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

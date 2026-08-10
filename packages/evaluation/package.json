@@ -1,0 +1,34 @@
+{
+  "name": "@suzu-memory/evaluation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "bin": {
+    "suzu-memory-eval": "./src/cli.mjs",
+    "suzu-memory-zh4o-system": "./src/zh4o-system-cli.mjs",
+    "suzu-memory-zh4o-source": "./src/zh4o-source-cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@suzu-memory/analysis": "0.1.0",
+    "@suzu-memory/runtime": "0.1.0",
+    "@suzu-memory/usage-ledger": "0.1.0",
+    "@suzu-memory/core": "0.1.0",
+    "@suzu-memory/config": "0.1.0",
+    "@suzu-memory/embedding-indexer": "0.1.0",
+    "@suzu-memory/extraction": "0.1.0",
+    "@suzu-memory/ingestion": "0.1.0",
+    "@suzu-memory/providers": "0.1.0",
+    "@suzu-memory/retriever": "0.1.0",
+    "@suzu-memory/service": "0.1.0"
+  },
+  "files": [
+    "src/**/*",
+    "fixtures/**/*",
+    "resources/**/*",
+    "README.md"
+  ]
+}

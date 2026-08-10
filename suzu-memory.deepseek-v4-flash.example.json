@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "dataRoot": "./data",
+  "agentId": "companion-demo",
+  "defaults": {
+    "memoryOwner": "Companion",
+    "userName": "User",
+    "primaryUserId": "user",
+    "companionId": "companion-demo",
+    "relationshipLabel": "relationship",
+    "defaultWorldId": "relationship",
+    "defaultWorldFrame": "relational",
+    "ingestion": {
+      "maximumEventCharacters": 12000,
+      "maximumBatchCharacters": 48000,
+      "leaseSeconds": 1800
+    },
+    "retrieval": {}
+  },
+  "providers": {
+    "generation": {
+      "type": "openai-compatible",
+      "name": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com",
+      "endpoint": "beta/chat/completions",
+      "model": "deepseek-v4-flash",
+      "structuredOutputMode": "strict-tool",
+      "apiKeyEnv": "SUZU_MEMORY_GENERATION_API_KEY",
+      "timeoutMs": 180000,
+      "maxOutputTokens": 16384,
+      "maximumTransportAttempts": 3,
+      "transportRetryDelayMs": 1000,
+      "extraBody": {
+        "thinking": {
+          "type": "disabled"
+        }
+      }
+    },
+    "embedding": {
+      "type": "openai-compatible",
+      "name": "DashScope",
+      "baseUrl": "https://ws-kbp30p5clsm7p1ml.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "endpoint": "embeddings",
+      "model": "text-embedding-v4",
+      "apiKeyEnv": "SUZU_MEMORY_EMBEDDING_API_KEY",
+      "dimensions": 1024,
+      "timeoutMs": 30000,
+      "extraBody": {
+        "encoding_format": "float"
+      }
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 37779,
+    "apiKeyEnv": "SUZU_MEMORY_API_KEY"
+  }
+}

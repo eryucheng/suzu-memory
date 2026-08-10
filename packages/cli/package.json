@@ -1,0 +1,19 @@
+{
+  "name": "@suzu-memory/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "bin": {
+    "suzu-memory": "./bin/suzu-memory.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@suzu-memory/config": "0.1.0",
+    "@suzu-memory/service": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

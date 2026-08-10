@@ -1,0 +1,23 @@
+{
+  "name": "@suzu-memory/service",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@suzu-memory/analysis": "0.1.0",
+    "@suzu-memory/core": "0.1.0",
+    "@suzu-memory/embedding-indexer": "0.1.0",
+    "@suzu-memory/ingestion": "0.1.0",
+    "@suzu-memory/maintenance": "0.1.0",
+    "@suzu-memory/retriever": "0.1.0",
+    "@suzu-memory/runtime": "0.1.0",
+    "@suzu-memory/structurer": "0.1.0",
+    "@suzu-memory/visualization": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "suzu-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local-first long-term memory system for persistent AI companions.",
+  "license": "Apache-2.0",
+  "author": "儿玉诚也",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test": "npm run test --workspaces --if-present",
+    "test:core": "npm test --workspace=@suzu-memory/core",
+    "test:retrieval": "npm test --workspace=@suzu-memory/retriever",
+    "test:evaluation": "npm test --workspace=@suzu-memory/evaluation"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

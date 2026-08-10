@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "reward-credit-holdout-manifest-v1",
+  "fixtureVersion": "suzu-reward-credit-holdout-v1-rc1",
+  "suite": "holdout-v1",
+  "frozenAt": "2026-08-03T16:22:39.721Z",
+  "purpose": "frozen-synthetic-fixture-integrity",
+  "synthetic": true,
+  "developmentSetSeen": false,
+  "crossModelValidated": false,
+  "automaticStateMutationAllowed": false,
+  "expected": {
+    "cases": 84,
+    "categories": 14,
+    "casesPerCategory": 6
+  },
+  "inputHashes": {
+    "fixtureSha256": "71108f95e5c809f17dfbe44211261dc16758eb3b5416ba9f5e939389c4ca59f2",
+    "outcomePromptSha256": "88df647bc348d53288c5cf6899cbf9d09eb5d7543da64b121e777e8353f1615a",
+    "targetPromptSha256": "e6ed1c70381841dafd47c39ba17eab83932926913bf75f9ba74d0bdbef465b56",
+    "creditPromptSha256": "26acc940694ec3fa629c4ebe64c0481396ffc11dd63f7d9e9321c3a4f5b86380"
+  }
+}

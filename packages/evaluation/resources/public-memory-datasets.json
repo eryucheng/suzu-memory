@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "vendoringPolicy": "download-on-demand",
+  "datasets": [
+    {
+      "id": "rhelm",
+      "purpose": ["retrieval", "synthetic-demo", "multi-hop", "temporal", "misleading", "cross-source"],
+      "homepage": "https://microsoft.github.io/RHELM/",
+      "dataset": "https://huggingface.co/datasets/microsoft/RHELM",
+      "datasetRevision": "7b3139992fb377b8375857bb4786cb1c19e577da",
+      "treeSha256": "8d45862445414d3d14ecfadeca653cb8ed78ebca5e3d386940f263b6af05e208",
+      "license": "CC-BY-4.0",
+      "bundle": false
+    },
+    {
+      "id": "personamem",
+      "purpose": ["evolving-profile", "preference-update", "personalization"],
+      "homepage": "https://github.com/bowen-upenn/PersonaMem",
+      "license": "verify-dataset-card-before-redistribution",
+      "bundle": false
+    }
+  ]
+}

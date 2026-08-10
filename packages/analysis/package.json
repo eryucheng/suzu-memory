@@ -1,0 +1,25 @@
+{
+  "name": "@suzu-memory/analysis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./state-analysis-cli": "./src/state-analysis-cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@suzu-memory/runtime": "0.1.0",
+    "@suzu-memory/usage-ledger": "0.1.0",
+    "@suzu-memory/core": "0.1.0",
+    "@suzu-memory/extraction": "0.1.0",
+    "@suzu-memory/providers": "0.1.0"
+  },
+  "files": [
+    "src/**/*",
+    "resources/**/*",
+    "README.md"
+  ]
+}

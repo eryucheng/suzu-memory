@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "dataRoot": "./data",
+  "agentId": "companion-demo",
+  "defaults": {
+    "memoryOwner": "Companion",
+    "userName": "User",
+    "primaryUserId": "user",
+    "companionId": "companion-demo",
+    "relationshipLabel": "关系",
+    "defaultWorldId": "relationship",
+    "defaultWorldFrame": "relational",
+    "ingestion": {
+      "maximumEventCharacters": 12000,
+      "maximumBatchCharacters": 48000,
+      "leaseSeconds": 1800
+    },
+    "retrieval": {}
+  },
+  "providers": {
+    "generation": {
+      "type": "openai-compatible",
+      "name": "Memory analysis model",
+      "baseUrl": "https://api.example.com/v1",
+      "model": "your-chat-model",
+      "apiKeyEnv": "SUZU_MEMORY_GENERATION_API_KEY",
+      "timeoutMs": 180000,
+      "maxOutputTokens": 8192,
+      "maximumTransportAttempts": 3,
+      "transportRetryDelayMs": 500
+    },
+    "intervention": {
+      "type": "openai-compatible",
+      "name": "Memory intervention model",
+      "baseUrl": "https://api.example.com/v1",
+      "model": "your-small-chat-model",
+      "apiKeyEnv": "SUZU_MEMORY_INTERVENTION_API_KEY",
+      "timeoutMs": 30000,
+      "maxOutputTokens": 512,
+      "maximumTransportAttempts": 3,
+      "transportRetryDelayMs": 500
+    },
+    "embedding": {
+      "type": "openai-compatible",
+      "name": "Memory embedding model",
+      "baseUrl": "https://api.example.com/v1",
+      "endpoint": "embeddings",
+      "model": "your-embedding-model",
+      "apiKeyEnv": "SUZU_MEMORY_EMBEDDING_API_KEY",
+      "dimensions": 0,
+      "timeoutMs": 30000
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 37779,
+    "apiKeyEnv": "SUZU_MEMORY_API_KEY",
+    "maxBodyBytes": 1048576
+  }
+}

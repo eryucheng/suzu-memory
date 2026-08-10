@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Suzu Memory · 记忆审核台</title>
+    <link rel="icon" href="/console/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/console/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <a class="brand" href="/console/" aria-label="Suzu Memory 记忆审核台">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span><strong>Suzu Memory</strong><small>记忆审核台</small></span>
+        </a>
+        <nav class="rail-nav" aria-label="审核台导航">
+          <button class="nav-item active" data-view="reviews"><span>审核队列</span><b id="nav-review-count">0</b></button>
+          <button class="nav-item" data-view="pipeline"><span>处理状态</span><b id="nav-pipeline-count">0</b></button>
+          <button class="nav-item" data-view="storage"><span>备份健康</span><b id="nav-storage-state">—</b></button>
+        </nav>
+        <div class="rail-foot">
+          <span class="connection-dot" id="connection-dot"></span>
+          <div><small>当前作用域</small><strong id="agent-id">正在连接</strong></div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">HUMAN-IN-THE-LOOP MEMORY</p>
+            <h1 id="view-title">审核队列</h1>
+            <p class="subtitle" id="view-subtitle">在候选进入正式长期记忆前，核对内容、证据和状态变化。</p>
+          </div>
+          <div class="top-actions">
+            <button class="button secondary" id="connection-button">连接设置</button>
+            <button class="button secondary" id="refresh-button">刷新</button>
+            <button class="button primary" id="backup-button">创建备份</button>
+          </div>
+        </header>
+
+        <section class="metric-grid" id="metric-grid" aria-label="审核概况"></section>
+
+        <section class="view active" id="view-reviews">
+          <div class="review-layout">
+            <section class="panel queue-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>记忆候选</h2>
+                  <p id="queue-caption">等待人工判断的高层记忆</p>
+                </div>
+                <div class="filters">
+                  <select id="state-filter" aria-label="审核状态">
+                    <option value="pending">待审</option>
+                    <option value="accepted">已接受</option>
+                    <option value="dismissed">已驳回</option>
+                    <option value="revoked">已撤销</option>
+                  </select>
+                  <select id="type-filter" aria-label="候选类型">
+                    <option value="">全部类型</option>
+                    <option value="ingestion">记忆升级</option>
+                    <option value="reported-state">人物状态</option>
+                    <option value="structure">主题与事件簇</option>
+                    <option value="relation">因果关系</option>
+                    <option value="maintenance-failure">维护失败</option>
+                  </select>
+                </div>
+              </div>
+              <div class="queue" id="review-list"></div>
+            </section>
+
+            <aside class="panel detail-panel" id="review-detail">
+              <div class="empty-detail">
+                <span class="empty-orbit" aria-hidden="true"></span>
+                <h2>选择一条候选</h2>
+                <p>这里会显示准备写入的内容、直接证据和它对现有记忆的影响。</p>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-pipeline">
+          <div class="health-grid">
+            <section class="panel health-card wide">
+              <div class="panel-head"><div><h2>卡住的输入事件</h2><p>有错误但仍等待处理的原始事件</p></div></div>
+              <div id="blocked-events" class="health-list"></div>
+            </section>
+            <section class="panel health-card">
+              <div class="panel-head"><div><h2>运行中的批次</h2><p>过期租约可以安全恢复</p></div></div>
+              <div id="active-batches" class="health-list"></div>
+            </section>
+            <section class="panel health-card">
+              <div class="panel-head"><div><h2>最近失败批次</h2><p>保留失败原因供审计</p></div></div>
+              <div id="failed-batches" class="health-list"></div>
+            </section>
+            <section class="panel health-card wide">
+              <div class="panel-head"><div><h2>维护任务</h2><p>Embedding 与语义整理任务状态</p></div></div>
+              <div id="maintenance-tasks" class="health-list compact"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-storage">
+          <div class="health-grid storage-grid">
+            <section class="panel storage-card" id="active-database"></section>
+            <section class="panel storage-card" id="latest-backup"></section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="connection-dialog">
+      <form method="dialog" class="dialog-card" id="connection-form">
+        <div class="dialog-head"><div><p class="eyebrow">CONNECTION</p><h2>连接设置</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
+        <label>API Key <span>仅保存到当前浏览器标签页</span><input id="api-key" type="password" autocomplete="off" placeholder="本地无鉴权时可留空"></label>
+        <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button primary" value="default" id="save-connection">保存并重连</button></div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <script type="module" src="/console/app.js"></script>
+  </body>
+</html>
