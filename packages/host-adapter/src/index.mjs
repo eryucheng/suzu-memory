@@ -328,6 +328,21 @@ function pendingCoreEventIds(windows) {
     .filter(Boolean)))];
 }
 
+function pendingArchiveWindow(window) {
+  const coreEvents = (window?.coreEvents || []).filter((event) => (
+    clean(event?.status) === "pending"
+  ));
+  if (!coreEvents.length) return null;
+  return {
+    ...window,
+    coreEvents,
+    coreCharacters: coreEvents.reduce(
+      (total, event) => total + eventTextLength(event),
+      0,
+    ),
+  };
+}
+
 function packCharacters(windows) {
   return (windows || []).flatMap((window) => window.coreEvents || [])
     .reduce((total, event) => total + eventTextLength(event), 0);
@@ -612,7 +627,13 @@ export class ChatHostMemoryAdapter {
         maximumContinuationGuidanceMessages,
         maximumContinuationGuidanceCharacters,
       });
-      const pendingWindows = windows.filter((window) => pendingCoreEventIds([window]).length);
+      // The archive plan deliberately sees prior archived turns so it can
+      // preserve boundary context.  The ingestion claim, however, is only
+      // allowed to own pending rows.  Keep archived turns in contextual
+      // fields, but never emit them as core event ids for this processing
+      // request; otherwise companionArchiveWindows rightfully rejects an
+      // archive window that references rows the claim could not acquire.
+      const pendingWindows = windows.map(pendingArchiveWindow).filter(Boolean);
       const packs = packConversationArchiveWindows(pendingWindows, {
         maximumEvents,
         maximumContentCharacters,

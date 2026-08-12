@@ -658,6 +658,56 @@ test("real host session maintenance applies the shared archive planner before se
   assert.equal(windows.length, 2);
 });
 
+test("a later host turn can be archived after earlier turns are already archived", async () => {
+  const dataRoot = temporaryDirectory();
+  const service = createMemoryService({
+    dataRoot,
+    agentId: IDENTITY.spaceId,
+    defaults: {
+      primaryUserId: IDENTITY.primaryUserId,
+      userName: IDENTITY.primaryUserName,
+      companionId: IDENTITY.companionId,
+      memoryOwner: IDENTITY.companionName,
+    },
+  });
+  service.initialize();
+  const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "codex", identity: IDENTITY });
+  await adapter.afterReply({
+    sessionId: "continued-real-session",
+    turnId: "turn-1",
+    userMessage: { text: "第一轮已经归档。", occurredAt: "2026-08-05T01:00:00.000Z" },
+    assistantMessage: { text: "第一轮回复。", occurredAt: "2026-08-05T01:00:01.000Z" },
+  });
+  const first = await adapter.onIdle({
+    sessionId: "continued-real-session",
+    lane: "embedding",
+    memoriesOverride: [],
+  });
+  assert.equal(first.status, "completed");
+
+  await adapter.afterReply({
+    sessionId: "continued-real-session",
+    turnId: "turn-2",
+    userMessage: { text: "第二轮应该不会被第一轮阻塞。", occurredAt: "2026-08-05T01:02:00.000Z" },
+    assistantMessage: { text: "第二轮回复。", occurredAt: "2026-08-05T01:02:01.000Z" },
+  });
+  const second = await adapter.onIdle({
+    sessionId: "continued-real-session",
+    lane: "embedding",
+    memoriesOverride: [],
+  });
+  assert.equal(second.status, "completed");
+  assert.equal(second.input[0].batches.length, 1);
+  const pending = service.listInputEvents({
+    statuses: ["pending"], hostId: "codex", sessionId: "continued-real-session",
+  });
+  const archived = service.listInputEvents({
+    statuses: ["archived"], hostId: "codex", sessionId: "continued-real-session",
+  });
+  assert.equal(pending.total, 0);
+  assert.equal(archived.total, 4);
+});
+
 test("a fresh adapter discovers persisted pending host sessions after restart", async () => {
   const dataRoot = temporaryDirectory();
   const service = createMemoryService({

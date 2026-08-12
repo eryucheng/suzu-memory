@@ -5,8 +5,10 @@ import { processPendingStateAnalysisRequests } from "@suzu-memory/analysis";
 import {
   databaseInfo,
   ensureCompanionRelationshipStructure,
+  materializePendingMemoryStructureProposals,
   MemoryRepository,
   openMemoryDatabase,
+  rebuildAssociationGraph,
   resolveMemoryIngestionReview,
   resolveMemoryRelationProposal,
   resolveMemoryStructureProposal,
@@ -297,6 +299,10 @@ export class MemoryService {
         worldId: this.defaults.defaultWorldId,
         worldFrame: this.defaults.defaultWorldFrame,
       });
+      const pendingStructureMaterialization = materializePendingMemoryStructureProposals(
+        repository,
+        { agentId: this.agentId },
+      );
       const memories = repository.listMemories(this.agentId, {
         statuses: [],
         limit: 1,
@@ -308,6 +314,11 @@ export class MemoryService {
         databasePath: this.paths.databasePath,
         usageLedgerPath: this.paths.usageLedgerPath,
         memoryCount: memories.total,
+        pendingStructureMaterialization: {
+          materialized: pendingStructureMaterialization.materialized.length,
+          alreadyMaterialized: pendingStructureMaterialization.skipped.length,
+          failed: pendingStructureMaterialization.failed,
+        },
         identityStructure: {
           userEntityId: identityStructure.user.id,
           companionEntityId: identityStructure.companion.id,
@@ -473,6 +484,96 @@ export class MemoryService {
           : "Input batch lease expired before completion.",
       },
     ));
+  }
+
+  recoverRunningMaintenance({
+    force = false,
+    now = new Date(),
+  } = {}) {
+    const recoveredAt = validDate(now, "maintenance recovery now").toISOString();
+    return this.withRepository((repository) => ({
+      tasks: repository.recoverRunningMaintenanceTasks(this.agentId, {
+        force: Boolean(force),
+        recoveredAt,
+      }),
+      consolidations: repository.recoverRunningConsolidationRuns(this.agentId, {
+        force: Boolean(force),
+        recoveredAt,
+      }),
+    }));
+  }
+
+  async retryLongTermExtractionFailure(taskId, {
+    actor = "human",
+    reason = "",
+    generator = this.providers.generator,
+    now = new Date(),
+  } = {}) {
+    const normalizedTaskId = clean(taskId);
+    if (!normalizedTaskId) throw new Error("Retrying long-term extraction requires a review task id.");
+    if (typeof generator !== "function") {
+      throw new Error("Long-term extraction retry requires a generation provider.");
+    }
+    const executionTime = validDate(now, "long-term extraction retry now");
+    const task = this.withRepository((repository) => {
+      const current = repository.getMaintenanceTask(this.agentId, normalizedTaskId);
+      if (!current || current.task_type !== "long-term-extraction"
+        || current.status !== "failed" || current.review_state !== "pending") {
+        throw new Error("Long-term extraction failure is not awaiting human retry.");
+      }
+      const eventIds = [...new Set(
+        (Array.isArray(current.payload?.eventIds) ? current.payload.eventIds : [])
+          .map(clean)
+          .filter(Boolean),
+      )];
+      if (!eventIds.length) {
+        throw new Error("Long-term extraction failure has no recoverable source events.");
+      }
+      repository.requeueArchivedInputEventsForHumanRetry({
+        agentId: this.agentId,
+        eventIds,
+        retryTaskId: current.id,
+        reason: clean(reason),
+        retriedAt: executionTime.toISOString(),
+      });
+      return current;
+    });
+    let result = null;
+    let latestError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        result = await this.processPendingEvents({
+          candidateEventIds: task.payload.eventIds,
+          generator,
+          now: executionTime,
+        });
+        break;
+      } catch (error) {
+        latestError = error;
+      }
+    }
+    if (!result) throw latestError || new Error("Long-term extraction retry did not produce a result.");
+    if (result.status !== "processed" || result.generationDiagnostics?.degraded) {
+      return {
+        status: "retry-degraded",
+        result,
+        reviewTask: this.withRepository((repository) => (
+          repository.getMaintenanceTask(this.agentId, normalizedTaskId)
+        ), { readOnly: true }),
+      };
+    }
+    return this.withRepository((repository) => ({
+      status: "retried",
+      result,
+      reviewTask: repository.reviewMaintenanceTaskFailure({
+        agentId: this.agentId,
+        taskId: normalizedTaskId,
+        action: "accept",
+        reviewedBy: clean(actor) || "human",
+        note: clean(reason) || "Human requested a successful long-term extraction retry.",
+        reviewedAt: executionTime.toISOString(),
+      }),
+    }));
   }
 
   processPendingEvents({
@@ -1258,6 +1359,14 @@ export class MemoryService {
       generator,
       maximumRuns,
       usageLedgerPath: this.paths.usageLedgerPath,
+    }));
+  }
+
+  rebuildAssociationGraph(options = {}) {
+    return this.withRepository((repository) => rebuildAssociationGraph({
+      repository,
+      agentId: this.agentId,
+      options,
     }));
   }
 

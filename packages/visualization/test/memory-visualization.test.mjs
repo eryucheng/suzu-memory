@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   MemoryRepository,
+  ensureCompanionRelationshipStructure,
   openMemoryDatabase,
 } from "@suzu-memory/core";
 import {
@@ -210,5 +211,81 @@ test("renders formal big neurons, state nodes, overlapping memberships, and all 
   });
   assert.equal(relationVisualFamily("causes"), "causal");
   assert.equal(relationVisualFamily("future-real-relation"), "associative");
+  database.close();
+});
+
+test("connects user, Agent, and relationship big neurons from all recorded actor roles", () => {
+  const database = openMemoryDatabase(":memory:");
+  const repository = new MemoryRepository(database);
+  ensureCompanionRelationshipStructure({
+    repository,
+    agentId: "agent-test",
+    primaryUserId: "user-primary",
+    primaryUserName: "我",
+    companionId: "agent-test",
+    companionName: "Agent",
+  });
+  repository.upsertMemory({
+    id: "user-memory",
+    agentId: "agent-test",
+    kind: "fact",
+    layer: "semantic",
+    title: "我的工作",
+    content: "用户的工作信息。",
+    subjectRole: "user",
+    subjectKey: "user-primary",
+  });
+  repository.upsertMemory({
+    id: "agent-memory",
+    agentId: "agent-test",
+    kind: "fact",
+    layer: "semantic",
+    title: "Agent 的偏好",
+    content: "Agent 的偏好信息。",
+    subjectRole: "agent",
+    subjectKey: "agent-test",
+  });
+  repository.upsertMemory({
+    id: "shared-memory",
+    agentId: "agent-test",
+    kind: "event",
+    layer: "episodic",
+    title: "共同经历",
+    content: "双方共同经历的一件事。",
+    subjectRole: "user",
+    subjectKey: "user-primary",
+  });
+  repository.upsertMemoryRole({
+    memoryId: "shared-memory",
+    agentId: "agent-test",
+    role: "participant",
+    actorRole: "agent",
+    actorKey: "agent-test",
+  });
+  repository.upsertMemory({
+    id: "relationship-memory",
+    agentId: "agent-test",
+    kind: "event",
+    layer: "episodic",
+    title: "关系里的一件事",
+    content: "这是一条直接归属共同关系的记忆。",
+    subjectRole: "shared",
+    subjectKey: "relationship",
+  });
+
+  const snapshot = createBrainSnapshot({ repository, agentId: "agent-test" });
+  const topologyEdges = new Set(snapshot.edges.map((edge) => (
+    `${edge.source}\u001f${edge.target}\u001f${edge.relation}`
+  )));
+  assert.equal(topologyEdges.has("user-memory\u001ftopology:user\u001fabout_subject"), true);
+  assert.equal(topologyEdges.has("agent-memory\u001ftopology:agent\u001fabout_subject"), true);
+  assert.equal(topologyEdges.has("shared-memory\u001ftopology:user\u001fabout_subject"), true);
+  assert.equal(topologyEdges.has("shared-memory\u001ftopology:agent\u001fabout_subject"), true);
+  assert.equal(topologyEdges.has("shared-memory\u001ftopology:relationship\u001fbelongs_to_relationship"), true);
+  assert.equal(topologyEdges.has("relationship-memory\u001ftopology:relationship\u001fbelongs_to_relationship"), true);
+  const roots = new Map(snapshot.nodes.map((node) => [node.id, node]));
+  assert.equal(roots.get("topology:user").visualTier, "major");
+  assert.equal(roots.get("topology:agent").visualTier, "major");
+  assert.equal(roots.get("topology:relationship").visualTier, "major");
   database.close();
 });

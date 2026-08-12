@@ -3495,7 +3495,7 @@ test("rejects ambiguous episode time and event time on semantic topics", () => {
   database.close();
 });
 
-test("keeps structural proposals pending until an explicit acceptance", () => {
+test("materializes structural proposals as pending nodes until an explicit acceptance", () => {
   const database = openMemoryDatabase(":memory:");
   const repository = new MemoryRepository(database);
   for (const [id, content, eventStart] of [
@@ -3558,7 +3558,15 @@ test("keeps structural proposals pending until an explicit acceptance", () => {
   assert.equal(repository.listStructureProposals("agent-test", {
     reviewStates: ["pending"],
   }).length, 1);
-  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 0);
+  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 1);
+  const provisional = repository.getMemory(proposal.result_memory_id);
+  assert.equal(provisional.kind, "episode");
+  assert.equal(provisional.evidence_mode, "inferred");
+  assert.equal(provisional.metadata.structureReviewState, "pending");
+  assert.equal(repository.listEpisodeMembers({
+    agentId: "agent-test",
+    episodeId: provisional.id,
+  }).every((member) => member.membership.metadata.structureReviewState === "pending"), true);
 
   const accepted = resolveMemoryStructureProposal(repository, {
     agentId: "agent-test",
@@ -3573,6 +3581,11 @@ test("keeps structural proposals pending until an explicit acceptance", () => {
   assert.equal(accepted.proposal.result_memory_id, accepted.memory.id);
   assert.equal(accepted.proposal.resolved_by, "human:test");
   assert.equal(accepted.proposal.resolution_note, "确认属于同一次出行。");
+  assert.equal(accepted.memory.metadata.structureReviewState, "accepted");
+  assert.equal(repository.listEpisodeMembers({
+    agentId: "agent-test",
+    episodeId: accepted.memory.id,
+  }).every((member) => member.membership.metadata.structureReviewState === "accepted"), true);
   assert.deepEqual(
     repository.listMemoryRoles(accepted.memory.id).map((role) => role.role).sort(),
     ["participant", "subject"],
@@ -3585,7 +3598,7 @@ test("keeps structural proposals pending until an explicit acceptance", () => {
   database.close();
 });
 
-test("audits dismissed proposals and rolls back a failed structural acceptance", () => {
+test("audits dismissed structural proposals and rolls back their provisional nodes", () => {
   const database = openMemoryDatabase(":memory:");
   const repository = new MemoryRepository(database);
   for (const [id, agentId] of [
@@ -3631,33 +3644,26 @@ test("audits dismissed proposals and rolls back a failed structural acceptance",
     eventDate: "2026-07-11",
     memberIds: ["rollback-a", "rollback-b"],
   });
-  const originalLink = repository.linkMemoryToEpisode.bind(repository);
-  let links = 0;
-  repository.linkMemoryToEpisode = (input) => {
-    links += 1;
-    if (links === 2) throw new Error("simulated membership failure");
-    return originalLink(input);
-  };
-  assert.throws(() => resolveMemoryStructureProposal(repository, {
+  const provisional = repository.getMemory(rollback.result_memory_id);
+  assert.equal(provisional.status, "active");
+  assert.equal(repository.listEpisodeMembers({
+    agentId: "agent-test",
+    episodeId: provisional.id,
+  }).length, 2);
+  const rollbackResult = resolveMemoryStructureProposal(repository, {
     agentId: "agent-test",
     proposalId: rollback.id,
-    action: "accept",
-  }), /simulated membership failure/u);
-  repository.linkMemoryToEpisode = originalLink;
-  assert.equal(repository.getStructureProposal("agent-test", rollback.id).review_state, "pending");
-  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 0);
-
-  repository.setMemoryDeleted({
-    agentId: "agent-test",
-    memoryId: "rollback-b",
-    deleted: true,
+    action: "dismiss",
   });
-  assert.throws(() => resolveMemoryStructureProposal(repository, {
+  assert.equal(rollbackResult.proposal.review_state, "dismissed");
+  assert.equal(repository.getMemory(provisional.id).status, "deleted");
+  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 0);
+  assert.equal(repository.findEdge({
     agentId: "agent-test",
-    proposalId: rollback.id,
-    action: "accept",
-  }), /Deleted memories/u);
-  assert.equal(repository.getStructureProposal("agent-test", rollback.id).review_state, "pending");
+    fromMemoryId: "rollback-a",
+    toMemoryId: provisional.id,
+    relation: "part_of_episode",
+  }), null);
   database.close();
 });
 
@@ -3729,6 +3735,11 @@ test("attaches new members to existing big neurons without rewriting them", () =
     agentId: "agent-test",
     episodeId: episode.id,
   }).length, 3);
+  assert.equal(repository.listEpisodeMembers({
+    agentId: "agent-test",
+    episodeId: episode.id,
+  }).filter((member) => ["attach-early", "attach-late"].includes(member.id))
+    .every((member) => member.membership.metadata.structureReviewState === "accepted"), true);
 
   const topicProposal = proposeMemoryStructure(repository, {
     agentId: "agent-test",
@@ -3748,6 +3759,10 @@ test("attaches new members to existing big neurons without rewriting them", () =
     agentId: "agent-test",
     topicId: topic.id,
   }).length, 2);
+  assert.equal(repository.listTopicMembers({
+    agentId: "agent-test",
+    topicId: topic.id,
+  }).find((member) => member.id === "attach-late").membership.metadata.structureReviewState, "accepted");
   assert.throws(() => proposeMemoryStructure(repository, {
     agentId: "agent-test",
     operation: "attach",

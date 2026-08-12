@@ -1870,6 +1870,83 @@ export class MemoryRepository {
     });
   }
 
+  requeueArchivedInputEventsForHumanRetry({
+    agentId,
+    eventIds = [],
+    retryTaskId = "",
+    reason = "",
+    retriedAt = nowIso(),
+  } = {}) {
+    const normalizedAgentId = clean(agentId);
+    const normalizedEventIds = cleanStringList(eventIds);
+    const normalizedTaskId = clean(retryTaskId);
+    const timestamp = new Date(clean(retriedAt));
+    if (!normalizedAgentId || !normalizedEventIds.length || !normalizedTaskId
+      || !Number.isFinite(timestamp.getTime())) {
+      throw new Error("Requeueing archived input events requires Agent, event ids, review task, and valid time.");
+    }
+    return this.transaction(() => {
+      const placeholders = normalizedEventIds.map(() => "?").join(", ");
+      const events = this.database.prepare(`
+        SELECT * FROM memory_input_events
+        WHERE agent_id = ? AND id IN (${placeholders})
+        ORDER BY occurred_at ASC, external_id ASC
+      `).all(normalizedAgentId, ...normalizedEventIds).map(normalizeInputEvent);
+      if (events.length !== normalizedEventIds.length) {
+        throw new Error("Every retry input event must exist for this Agent.");
+      }
+      if (events.some((event) => event.lifecycle !== "active" || event.status !== "archived")) {
+        throw new Error("Only active archived input events can be retried from human review.");
+      }
+      const retriedIso = timestamp.toISOString();
+      for (const event of events) {
+        const metadata = event.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata)
+          ? event.metadata
+          : {};
+        const processing = metadata.suzuMemoryProcessing
+          && typeof metadata.suzuMemoryProcessing === "object"
+          && !Array.isArray(metadata.suzuMemoryProcessing)
+          ? metadata.suzuMemoryProcessing
+          : {};
+        const {
+          attemptCount: _attemptCount,
+          maximumAttempts: _maximumAttempts,
+          lastFailure: _lastFailure,
+          failureHistory: _failureHistory,
+          ...retryableProcessing
+        } = processing;
+        const humanRetries = Array.isArray(processing.humanRetries)
+          ? processing.humanRetries.slice(-9)
+          : [];
+        humanRetries.push({
+          taskId: normalizedTaskId,
+          retriedAt: retriedIso,
+          reason: clean(reason),
+        });
+        this.database.prepare(`
+          UPDATE memory_input_events
+          SET status = 'pending', batch_id = '', last_error = '',
+              processing_disposition = 'pending', metadata_json = ?, updated_at = ?
+          WHERE agent_id = ? AND id = ? AND status = 'archived' AND lifecycle = 'active'
+        `).run(
+          canonicalJson({
+            ...metadata,
+            suzuMemoryProcessing: {
+              ...retryableProcessing,
+              attemptCount: 0,
+              humanRetries,
+              retryRequestedBy: normalizedTaskId,
+            },
+          }, {}),
+          retriedIso,
+          normalizedAgentId,
+          event.id,
+        );
+      }
+      return normalizedEventIds.map((id) => this.getInputEvent(normalizedAgentId, id));
+    });
+  }
+
   listInputBatches(agentId, { limit = 100, offset = 0 } = {}) {
     const normalizedAgentId = clean(agentId);
     if (!normalizedAgentId) throw new Error("listInputBatches requires agentId.");
@@ -2167,6 +2244,90 @@ export class MemoryRepository {
     });
   }
 
+  recoverRunningMaintenanceTasks(agentId, {
+    force = false,
+    recoveredAt = nowIso(),
+  } = {}) {
+    const normalizedAgentId = clean(agentId);
+    const timestamp = new Date(clean(recoveredAt));
+    if (!normalizedAgentId || !Number.isFinite(timestamp.getTime())) {
+      throw new Error("Recovering maintenance tasks requires Agent and valid time.");
+    }
+    const recoveredIso = timestamp.toISOString();
+    return this.transaction(() => {
+      const candidates = this.database.prepare(`
+        SELECT *
+        FROM memory_maintenance_tasks
+        WHERE agent_id = ? AND status = 'running'
+          AND (? = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+        ORDER BY created_at ASC, id ASC
+      `).all(normalizedAgentId, force ? 1 : 0, recoveredIso).map(normalizeMaintenanceTask);
+      const requeued = [];
+      const failed = [];
+      for (const task of candidates) {
+        const requiresHumanReview = task.task_type !== "memory-embedding";
+        const history = [
+          ...(Array.isArray(task.failureHistory) ? task.failureHistory : []),
+          {
+            attempt: task.attempt_count,
+            failedAt: recoveredIso,
+            error: force
+              ? "Maintenance task was interrupted by a local application restart."
+              : "Maintenance task lease expired before completion.",
+            details: {
+              stage: "maintenance-recovery",
+              reason: force ? "desktop-restart" : "lease-expired",
+              leaseOwner: clean(task.lease_owner),
+              leaseExpiredAt: clean(task.lease_expires_at),
+            },
+          },
+        ];
+        if (task.attempt_count < task.max_attempts) {
+          const update = this.database.prepare(`
+            UPDATE memory_maintenance_tasks
+            SET status = 'pending', available_at = ?, lease_owner = '', lease_expires_at = NULL,
+                error_message = '', failure_history_json = ?, review_state = 'not-required',
+                reviewed_by = '', review_note = '', reviewed_at = NULL,
+                completed_at = NULL, updated_at = ?
+            WHERE agent_id = ? AND id = ? AND status = 'running'
+          `).run(
+            recoveredIso,
+            canonicalJson(history, []),
+            recoveredIso,
+            normalizedAgentId,
+            task.id,
+          );
+          if (Number(update.changes || 0) === 1) {
+            requeued.push(this.getMaintenanceTask(normalizedAgentId, task.id));
+          }
+          continue;
+        }
+        const update = this.database.prepare(`
+          UPDATE memory_maintenance_tasks
+          SET status = 'failed', lease_owner = '', lease_expires_at = NULL,
+              error_message = ?, failure_history_json = ?, review_state = ?,
+              reviewed_by = '', review_note = '', reviewed_at = NULL,
+              completed_at = ?, updated_at = ?
+          WHERE agent_id = ? AND id = ? AND status = 'running'
+        `).run(
+          force
+            ? "Maintenance task was interrupted by a local application restart after its final attempt."
+            : "Maintenance task lease expired after maximum attempts.",
+          canonicalJson(history, []),
+          requiresHumanReview ? "pending" : "not-required",
+          recoveredIso,
+          recoveredIso,
+          normalizedAgentId,
+          task.id,
+        );
+        if (Number(update.changes || 0) === 1) {
+          failed.push(this.getMaintenanceTask(normalizedAgentId, task.id));
+        }
+      }
+      return { requeued: requeued.length, failed: failed.length, tasks: [...requeued, ...failed] };
+    });
+  }
+
   finishMaintenanceTask({
     agentId,
     taskId,
@@ -2226,6 +2387,7 @@ export class MemoryRepository {
       throw new Error("Maintenance task changed or its lease is owned by another worker.");
     }
     const shouldRetry = Boolean(retry) && current.attempt_count < current.max_attempts;
+    const requiresHumanReview = !shouldRetry && current.task_type !== "memory-embedding";
     const failedIso = timestamp.toISOString();
     const availableAt = new Date(
       timestamp.getTime() + Math.max(0, Math.trunc(Number(retryDelaySeconds) || 0)) * 1000,
@@ -2250,10 +2412,8 @@ export class MemoryRepository {
       UPDATE memory_maintenance_tasks
       SET status = ?, available_at = ?, lease_owner = '', lease_expires_at = NULL,
           error_message = ?, result_json = ?, failure_history_json = ?,
-          review_state = CASE WHEN ? = 1 THEN 'pending' ELSE review_state END,
-          reviewed_by = CASE WHEN ? = 1 THEN '' ELSE reviewed_by END,
-          review_note = CASE WHEN ? = 1 THEN '' ELSE review_note END,
-          reviewed_at = CASE WHEN ? = 1 THEN NULL ELSE reviewed_at END,
+          review_state = CASE WHEN ? = 1 THEN 'pending' ELSE 'not-required' END,
+          reviewed_by = '', review_note = '', reviewed_at = NULL,
           completed_at = ?, updated_at = ?
       WHERE agent_id = ? AND id = ? AND status = 'running' AND lease_owner = ?
     `).run(
@@ -2262,10 +2422,7 @@ export class MemoryRepository {
       clean(errorMessage),
       canonicalJson(partialResult, {}),
       canonicalJson(history, []),
-      shouldRetry ? 0 : 1,
-      shouldRetry ? 0 : 1,
-      shouldRetry ? 0 : 1,
-      shouldRetry ? 0 : 1,
+      requiresHumanReview ? 1 : 0,
       shouldRetry ? null : failedIso,
       failedIso,
       normalizedAgentId,
@@ -2995,6 +3152,96 @@ export class MemoryRepository {
       throw new Error("Structure proposal changed while it was being resolved.");
     }
     return this.getStructureProposal(normalizedAgentId, proposal.id);
+  }
+
+  setPendingStructureProposalResult({
+    agentId,
+    proposalId,
+    resultMemoryId,
+  }) {
+    const normalizedAgentId = clean(agentId);
+    const normalizedProposalId = clean(proposalId);
+    const normalizedMemoryId = clean(resultMemoryId);
+    const proposal = this.getStructureProposal(normalizedAgentId, normalizedProposalId);
+    if (!proposal) throw new Error("Structure proposal does not exist for this Agent.");
+    if (proposal.review_state !== "pending") {
+      throw new Error(`Only a pending structure proposal can receive a provisional result; it is ${proposal.review_state}.`);
+    }
+    const memory = this.getMemory(normalizedMemoryId);
+    if (!memory || memory.agent_id !== normalizedAgentId || memory.kind !== proposal.kind) {
+      throw new Error("Provisional structure proposal result requires a matching memory.");
+    }
+    if (proposal.result_memory_id) {
+      if (proposal.result_memory_id !== memory.id) {
+        throw new Error("Structure proposal already points to another result memory.");
+      }
+      return proposal;
+    }
+    const timestamp = nowIso();
+    const updated = this.database.prepare(`
+      UPDATE memory_structure_proposals
+      SET result_memory_id = ?, updated_at = ?
+      WHERE agent_id = ? AND id = ? AND review_state = 'pending' AND result_memory_id IS NULL
+    `).run(memory.id, timestamp, normalizedAgentId, proposal.id);
+    if (Number(updated.changes || 0) !== 1) {
+      throw new Error("Structure proposal changed while its provisional result was being recorded.");
+    }
+    return this.getStructureProposal(normalizedAgentId, proposal.id);
+  }
+
+  removeStructureProposalMemberships({ agentId, proposalId }) {
+    const normalizedAgentId = clean(agentId);
+    const normalizedProposalId = clean(proposalId);
+    if (!normalizedAgentId || !normalizedProposalId) {
+      throw new Error("Removing proposal memberships requires Agent and proposal id.");
+    }
+    return Number(this.database.prepare(`
+      DELETE FROM memory_edges
+      WHERE agent_id = ?
+        AND relation IN ('part_of_episode', 'supports_topic')
+        AND json_extract(metadata_json, '$.structureProposalId') = ?
+    `).run(normalizedAgentId, normalizedProposalId).changes || 0);
+  }
+
+  updateStructureProposalMembershipReviewState({
+    agentId,
+    proposalId,
+    reviewState,
+    reviewedBy = "",
+    reviewedAt = nowIso(),
+  }) {
+    const normalizedAgentId = clean(agentId);
+    const normalizedProposalId = clean(proposalId);
+    const normalizedReviewState = clean(reviewState);
+    const timestamp = new Date(clean(reviewedAt));
+    if (!normalizedAgentId || !normalizedProposalId || !["pending", "accepted"].includes(normalizedReviewState)
+      || !Number.isFinite(timestamp.getTime())) {
+      throw new Error("Updating structure proposal memberships requires Agent, proposal, review state, and valid time.");
+    }
+    const edges = this.database.prepare(`
+      SELECT id, metadata_json
+      FROM memory_edges
+      WHERE agent_id = ?
+        AND relation IN ('part_of_episode', 'supports_topic')
+        AND json_extract(metadata_json, '$.structureProposalId') = ?
+    `).all(normalizedAgentId, normalizedProposalId);
+    const update = this.database.prepare(`
+      UPDATE memory_edges
+      SET metadata_json = ?
+      WHERE agent_id = ? AND id = ?
+    `);
+    for (const edge of edges) {
+      const metadata = parseJson(edge.metadata_json, {});
+      update.run(canonicalJson({
+        ...metadata,
+        structureReviewState: normalizedReviewState,
+        ...(normalizedReviewState === "accepted" ? {
+          structureReviewedBy: clean(reviewedBy) || "human",
+          structureReviewedAt: timestamp.toISOString(),
+        } : {}),
+      }, {}), normalizedAgentId, edge.id);
+    }
+    return edges.length;
   }
 
   recordRelationProposal({
@@ -5397,6 +5644,90 @@ export class MemoryRepository {
       }
     });
     return { failed };
+  }
+
+  recoverRunningConsolidationRuns(agentId, {
+    force = false,
+    recoveredAt = nowIso(),
+  } = {}) {
+    const normalizedAgentId = clean(agentId);
+    const timestamp = new Date(clean(recoveredAt));
+    if (!normalizedAgentId || !Number.isFinite(timestamp.getTime())) {
+      throw new Error("Recovering consolidation runs requires Agent and valid time.");
+    }
+    const recoveredIso = timestamp.toISOString();
+    return this.transaction(() => {
+      const candidates = this.database.prepare(`
+        SELECT *
+        FROM memory_consolidation_runs
+        WHERE agent_id = ? AND status = 'running'
+          AND (? = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+        ORDER BY created_at ASC, id ASC
+      `).all(normalizedAgentId, force ? 1 : 0, recoveredIso).map(normalizeConsolidationRun);
+      const requeued = [];
+      const failed = [];
+      for (const run of candidates) {
+        const history = [
+          ...(Array.isArray(run.failureHistory) ? run.failureHistory : []),
+          {
+            attempt: run.attempt_count,
+            failedAt: recoveredIso,
+            error: force
+              ? "Consolidation run was interrupted by a local application restart."
+              : "Consolidation lease expired before completion.",
+            details: {
+              stage: "retrospective-consolidation-recovery",
+              reason: force ? "desktop-restart" : "lease-expired",
+              leaseOwner: clean(run.lease_owner),
+              leaseExpiredAt: clean(run.lease_expires_at),
+            },
+            structureProposalIds: run.structureProposalIds,
+            relationProposalIds: run.relationProposalIds,
+          },
+        ];
+        if (run.attempt_count < run.max_attempts) {
+          const update = this.database.prepare(`
+            UPDATE memory_consolidation_runs
+            SET status = 'planned', available_at = ?, lease_owner = '', lease_expires_at = NULL,
+                error_message = '', failure_history_json = ?, review_state = 'not-required',
+                reviewed_by = '', review_note = '', reviewed_at = NULL,
+                completed_at = NULL, updated_at = ?
+            WHERE agent_id = ? AND id = ? AND status = 'running'
+          `).run(
+            recoveredIso,
+            canonicalJson(history, []),
+            recoveredIso,
+            normalizedAgentId,
+            run.id,
+          );
+          if (Number(update.changes || 0) === 1) {
+            requeued.push(this.getConsolidationRun(normalizedAgentId, run.id));
+          }
+          continue;
+        }
+        const update = this.database.prepare(`
+          UPDATE memory_consolidation_runs
+          SET status = 'failed', lease_owner = '', lease_expires_at = NULL,
+              error_message = ?, failure_history_json = ?, review_state = 'pending',
+              reviewed_by = '', review_note = '', reviewed_at = NULL,
+              completed_at = ?, updated_at = ?
+          WHERE agent_id = ? AND id = ? AND status = 'running'
+        `).run(
+          force
+            ? "Consolidation run was interrupted by a local application restart after its final attempt."
+            : "Consolidation lease expired after maximum attempts.",
+          canonicalJson(history, []),
+          recoveredIso,
+          recoveredIso,
+          normalizedAgentId,
+          run.id,
+        );
+        if (Number(update.changes || 0) === 1) {
+          failed.push(this.getConsolidationRun(normalizedAgentId, run.id));
+        }
+      }
+      return { requeued: requeued.length, failed: failed.length, runs: [...requeued, ...failed] };
+    });
   }
 
   listClaimableConsolidationRuns(agentId, { now = nowIso(), limit = 100 } = {}) {
@@ -9244,6 +9575,45 @@ export class MemoryRepository {
         action: "edit",
         actor,
         reason,
+        before,
+        after,
+      });
+    });
+    return after;
+  }
+
+  updateMemoryMetadata({
+    agentId,
+    memoryId,
+    metadata,
+    actor = "system",
+    reason = "",
+  }) {
+    const before = this.getMemory(memoryId);
+    const normalizedMetadata = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? metadata
+      : null;
+    if (!before || before.agent_id !== clean(agentId)) throw new Error("没有找到要更新元数据的记忆。");
+    if (!normalizedMetadata) throw new Error("记忆元数据必须是对象。");
+    let after;
+    this.transaction(() => {
+      this.database.prepare(`
+        UPDATE memory_nodes
+        SET metadata_json = ?, updated_at = ?
+        WHERE agent_id = ? AND id = ?
+      `).run(
+        json(normalizedMetadata, {}),
+        nowIso(),
+        clean(agentId),
+        before.id,
+      );
+      after = this.getMemory(before.id);
+      this.recordMutation({
+        agentId: clean(agentId),
+        memoryId: before.id,
+        action: "edit",
+        actor: clean(actor) || "system",
+        reason: clean(reason),
         before,
         after,
       });

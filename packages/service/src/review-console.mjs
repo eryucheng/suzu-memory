@@ -170,7 +170,9 @@ function maintenanceFailureDetail(repository, agentId, task) {
     } : null;
   }).filter(Boolean);
   const inputEventIds = [...new Set(
-    (Array.isArray(task.payload?.inputEventIds) ? task.payload.inputEventIds : [])
+    (Array.isArray(task.payload?.inputEventIds)
+      ? task.payload.inputEventIds
+      : Array.isArray(task.payload?.eventIds) ? task.payload.eventIds : [])
       .map(clean)
       .filter(Boolean),
   )];
@@ -204,7 +206,9 @@ function maintenanceFailureDetail(repository, agentId, task) {
     : [];
   return {
     writePreview: {
-      kind: firstCandidate
+      kind: clean(task.task_type) === "long-term-extraction"
+        ? "long-term-extraction"
+        : firstCandidate
         ? "human-reviewed-retrieval-context"
         : inputEventIds.length
           ? "input-event-quarantine"
@@ -237,6 +241,10 @@ function maintenanceFailureDetail(repository, agentId, task) {
     maintenanceFailure: {
       lastError: clean(task.error_message),
       history: Array.isArray(task.failureHistory) ? task.failureHistory : [],
+      canRetryLongTermExtraction: clean(task.task_type) === "long-term-extraction"
+        && task.status === "failed"
+        && task.review_state === "pending"
+        && inputEventIds.length > 0,
     },
   };
 }
@@ -381,15 +389,18 @@ export function buildReviewProposalDetail({ repository, agentId, envelope }) {
     : type === "structure"
       ? structureDetail(repository, agentId, proposal)
       : relationDetail(repository, agentId, proposal);
+  const canRetryLongTermExtraction = Boolean(detail.maintenanceFailure?.canRetryLongTermExtraction);
   return {
     ...proposalSummary(type, proposal),
     proposal,
     ...detail,
     permissions: {
       canAccept: proposal.review_state === "pending"
-        && (type !== "maintenance-failure" || detail.reviewableCandidateCount > 0),
+        && (type !== "maintenance-failure"
+          || (detail.reviewableCandidateCount > 0 && !canRetryLongTermExtraction)),
       canDismiss: proposal.review_state === "pending",
       canRevoke: type === "relation" && proposal.review_state === "accepted",
+      canRetryLongTermExtraction,
     },
   };
 }

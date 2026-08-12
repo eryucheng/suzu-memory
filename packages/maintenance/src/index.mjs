@@ -425,6 +425,9 @@ function structureTaskResult(report) {
     status: clean(report?.status),
     batchId: clean(report?.batchId),
     proposedIds: (report?.proposed || []).map((item) => clean(item.id)).filter(Boolean),
+    provisionalMemoryIds: (report?.proposed || [])
+      .map((item) => clean(item.result_memory_id))
+      .filter(Boolean),
     duplicateIds: (report?.duplicates || []).map((item) => clean(item.id)).filter(Boolean),
     rejected: Array.isArray(report?.rejected) ? report.rejected.length : 0,
     warnings: Array.isArray(report?.warnings) ? report.warnings.map(clean).filter(Boolean) : [],
@@ -653,12 +656,31 @@ async function processStructureTasks({
         generator,
         usageLedgerPath,
       });
+      const provisionalMemoryIds = uniqueStrings((report.proposed || [])
+        .map((proposal) => proposal.result_memory_id));
+      const queued = provisionalMemoryIds.length
+        ? runImmediateMemoryMaintenance({
+          repository,
+          agentId,
+          batchId: `pending-structure:${clean(task.id)}`,
+          memoryIds: provisionalMemoryIds,
+          followUpTaskTypes: [
+            MAINTENANCE_TASK_TYPES.memoryEmbedding,
+            MAINTENANCE_TASK_TYPES.retrievalContext,
+          ],
+          planConsolidation: false,
+        })
+        : { status: "skipped", reason: "no-new-pending-structures", queued: [] };
       reports.push(report);
       completed.push(repository.finishMaintenanceTask({
         agentId,
         taskId: task.id,
         workerId,
-        result: structureTaskResult(report),
+        result: {
+          ...structureTaskResult(report),
+          queued: queued.queued,
+          maintenanceWarnings: queued.warnings,
+        },
       }));
     } catch (error) {
       reports.push({ status: "failed", taskId: task.id, error: error.message });
@@ -867,6 +889,11 @@ export function inspectMaintenance({ repository, agentId, limit = 100 } = {}) {
     limit: maximum,
     order: "asc",
   });
+  const runnableTaskCount = Number(repository.database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM memory_maintenance_tasks
+    WHERE agent_id = ? AND status IN ('pending', 'running')
+  `).get(normalizedAgentId)?.count || 0);
   const summarize = (items) => items.reduce((counts, item) => {
     const key = `${item.lane}:${item.task_type}:${item.status}`;
     counts[key] = (counts[key] || 0) + 1;
@@ -890,6 +917,7 @@ export function inspectMaintenance({ repository, agentId, limit = 100 } = {}) {
   return {
     status: "ready",
     taskCounts: summarize(tasks),
+    runnableTaskCount,
     tasks,
     pendingStateAnalysisRequests: stateRequestCounts.pending,
     stateAnalysisRequests: {

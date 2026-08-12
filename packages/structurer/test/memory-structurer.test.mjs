@@ -376,11 +376,12 @@ test("records only pending create and attach proposals with metered fake generat
   assert.equal(repository.listStructureProposals("agent-test", {
     reviewStates: ["pending"],
   }).length, 2);
-  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 0);
+  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 1);
+  assert.equal(repository.getMemory(result.proposed.find((proposal) => proposal.kind === "episode").result_memory_id).metadata.structureReviewState, "pending");
   assert.equal(repository.listTopicMembers({
     agentId: "agent-test",
     topicId: topic.id,
-  }).length, 1);
+  }).length, 2);
   assert.equal(received.schemaName, "memory-structure-proposals-v1");
   assert.equal(received.schema.type, "object");
   assert.doesNotMatch(received.input, /绝不能发送/u);
@@ -394,8 +395,12 @@ test("records only pending create and attach proposals with metered fake generat
     generator,
   });
   assert.equal(duplicateResult.proposed.length, 0);
-  assert.equal(duplicateResult.duplicates.length, 2);
-  assert.equal(duplicateResult.rejected.length, 2);
+  assert.equal(duplicateResult.duplicates.length, 1);
+  // The previously pending topic attachment is now an actual, pending node
+  // relationship. On replay, only its already-linked museum member is
+  // filtered; dinner is already linked as well, so the attach candidate is
+  // rejected as a no-op while the episode remains a hash duplicate.
+  assert.equal(duplicateResult.rejected.length, 3);
   const ledger = await readUsageEvents(ledgerPath);
   assert.equal(ledger.events.length, 1);
   assert.equal(ledger.events[0].feature, "memory-structure-proposal");
@@ -874,8 +879,9 @@ test("runs retrospective consolidation as reviewable new-old proposals without c
   assert.ok(received.every((input) => input.includes('"historicalMemoryIds"')));
   assert.equal(repository.listStructureProposals("agent-test")[0].review_state, "pending");
   assert.equal(repository.listRelationProposals("agent-test")[0].review_state, "pending");
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), beforeNodes);
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges);
+  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), beforeNodes + 1);
+  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges + 2);
+  assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 1);
   assert.equal(repository.findEdge({
     agentId: "agent-test",
     fromMemoryId: "old-heavy-rain",
@@ -969,7 +975,7 @@ test("retries retrospective consolidation three times, preserves partial proposa
   assert.deepEqual(failed.relationProposalIds, []);
   assert.equal(repository.listStructureProposals("agent-test").length, 1);
   assert.equal(repository.listRelationProposals("agent-test").length, 0);
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges);
+  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges + 2);
   const reviewed = repository.reviewConsolidationFailure({
     agentId: "agent-test",
     runId: plan.id,
@@ -1042,6 +1048,36 @@ test("reclaims an expired consolidation lease and rejects the stale worker", asy
   });
   assert.equal(finished.status, "no_proposals");
   assert.equal(finished.lease_owner, "");
+  database.close();
+});
+
+test("a local restart immediately requeues an interrupted consolidation lease", () => {
+  const { database, repository, plan } = consolidationFixture();
+  const claimed = repository.claimConsolidationRun({
+    agentId: "agent-test",
+    runId: plan.id,
+    workerId: "old-desktop-process",
+    leaseSeconds: 3600,
+    now: new Date(new Date(plan.created_at).getTime() + 1000).toISOString(),
+  });
+  const recovery = repository.recoverRunningConsolidationRuns("agent-test", {
+    force: true,
+    recoveredAt: new Date(new Date(claimed.created_at).getTime() + 2000).toISOString(),
+  });
+  assert.equal(recovery.requeued, 1);
+  assert.equal(recovery.failed, 0);
+  const requeued = repository.getConsolidationRun("agent-test", plan.id);
+  assert.equal(requeued.status, "planned");
+  assert.equal(requeued.lease_owner, "");
+  assert.equal(requeued.failureHistory.at(-1).details.reason, "desktop-restart");
+  const reclaimed = repository.claimConsolidationRun({
+    agentId: "agent-test",
+    runId: plan.id,
+    workerId: "new-desktop-process",
+    leaseSeconds: 60,
+    now: new Date(new Date(claimed.created_at).getTime() + 2000).toISOString(),
+  });
+  assert.equal(reclaimed.attempt_count, 2);
   database.close();
 });
 

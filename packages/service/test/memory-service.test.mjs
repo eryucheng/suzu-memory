@@ -294,11 +294,48 @@ test("service exposes the existing structured brain snapshot", () => {
   seedMemory(service);
   const snapshot = service.brainSnapshot({ cachePath: "" });
   assert.equal(snapshot.status, "ready");
-  assert.equal(snapshot.counts.nodes, 1);
-  assert.equal(snapshot.nodes[0].id, "event-museum");
+  assert.equal(snapshot.nodes.some((node) => node.id === "event-museum"), true);
+  assert.deepEqual(
+    snapshot.nodes
+      .filter((node) => node.graphNodeType)
+      .map((node) => node.id)
+      .sort(),
+    ["topology:agent", "topology:relationship", "topology:user"],
+  );
 });
 
-test("service reviews high-level structure proposals and queues accepted nodes for enrichment", async () => {
+test("service exposes a durable full association-graph rebuild", () => {
+  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  service.initialize();
+  service.withRepository((repository) => {
+    for (const [id, eventDate] of [
+      ["rebuild-first", "2026-08-01"],
+      ["rebuild-second", "2026-08-02"],
+    ]) {
+      repository.upsertMemory({
+        id,
+        agentId: service.agentId,
+        kind: "event",
+        layer: "episodic",
+        content: "两条记忆都和科技馆有关。",
+        eventDate,
+      });
+      repository.upsertEmbedding({
+        memoryId: id,
+        model: "test-embedding",
+        vector: [1, 0],
+      });
+    }
+  });
+  const rebuilt = service.rebuildAssociationGraph();
+  assert.equal(rebuilt.status, "completed");
+  assert.equal(rebuilt.associationEdges, 1);
+  assert.equal(service.brainSnapshot({ cachePath: "" }).edges.some((edge) => (
+    edge.relation === "associated_with"
+  )), true);
+});
+
+test("service uses pending structural nodes immediately and confirms them after review", async () => {
   const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
   service.initialize();
   const proposal = service.withRepository((repository) => {
@@ -362,6 +399,11 @@ test("service reviews high-level structure proposals and queues accepted nodes f
   assert.equal(consoleDetail.evidence[0].content, "我今天去了科技馆，回来以后还去吃了晚饭。");
   assert.equal(consoleDetail.evidence[0].speaker, "User");
   assert.equal(consoleDetail.permissions.canAccept, true);
+  assert.equal(consoleDetail.proposal.result_memory_id, proposal.result_memory_id);
+  assert.equal(service.getMemory(proposal.result_memory_id).memory.metadata.structureReviewState, "pending");
+  assert.ok((await service.search("还记得科技馆和之后的晚饭吗", {
+    persistTrace: false,
+  })).graph.selectedMemoryIds.includes(proposal.result_memory_id));
   const accepted = service.resolveHighLevelProposal("structure", proposal.id, {
     action: "accept",
     actor: "human:test",
@@ -807,6 +849,48 @@ test("service appends companion events without analysis and processes them later
   assert.equal(service.listInputEvents({ statuses: ["archived"] }).total, 1);
   assert.equal(service.listInputBatches()[0].status, "completed");
   assert.equal(service.listMemories({ statuses: [], kinds: ["utterance"] }).total, 1);
+});
+
+test("service retries a degraded long-term extraction from retained raw events after human review", async () => {
+  const service = createMemoryService({
+    dataRoot: temporaryDirectory(),
+    agentId: "retry-long-term-extraction",
+    defaults: { memoryOwner: "Companion", userName: "User" },
+  });
+  service.appendEvent(inputEvent("retry-long-term-event"));
+  let failedAttempts = 0;
+  const failingGenerator = async () => {
+    failedAttempts += 1;
+    const error = new Error("temporary extraction provider failure");
+    error.code = "MEMORY_GENERATION_INVALID_OUTPUT";
+    throw error;
+  };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await service.processPendingEvents({
+        generator: failingGenerator,
+        now: `2026-08-04T03:0${attempt}:00.000Z`,
+      });
+    } catch (error) {
+      assert.match(error.message, /temporary extraction provider failure/u);
+    }
+  }
+  assert.equal(failedAttempts, 3);
+  const review = service.listHighLevelProposals({ types: ["maintenance-failure"] }).items[0];
+  assert.equal(review.proposal.task_type, "long-term-extraction");
+  const detail = service.getReviewConsoleProposal("maintenance-failure", review.id);
+  assert.equal(detail.permissions.canRetryLongTermExtraction, true);
+  const retried = await service.retryLongTermExtractionFailure(review.id, {
+    actor: "human:test",
+    reason: "provider recovered",
+    now: "2026-08-04T03:10:00.000Z",
+    generator: async () => ({ output: { memories: [generatedEventCandidate()] }, usage: {} }),
+  });
+  assert.equal(retried.status, "retried");
+  assert.equal(retried.reviewTask.review_state, "accepted");
+  assert.equal(service.listInputEvents({ statuses: ["archived"] }).total, 1);
+  assert.equal(service.listMemories({ statuses: [], kinds: ["utterance"] }).total, 1);
+  assert.equal(service.listMemories({ statuses: [], kinds: ["event"] }).total, 1);
 });
 
 test("service carries configured identities from input through archive into entity-seeded recall", async () => {

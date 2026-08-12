@@ -19,6 +19,22 @@ function httpEndpoint(baseUrl, type = "", endpoint = "") {
   return openAiCompatibleEndpoint(normalized, "v1/chat/completions");
 }
 
+function anthropicMessagesEndpoint(baseUrl) {
+  const raw = clean(baseUrl);
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Provider API 地址必须是 HTTP(S) URL。");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Provider API 地址必须是 HTTP(S) URL。");
+  }
+  const pathname = parsed.pathname.replace(/\/+$/u, "");
+  if (!pathname.endsWith("/v1/messages")) parsed.pathname = `${pathname}/v1/messages`;
+  return parsed.toString();
+}
+
 function jsonName(value) {
   const normalized = clean(value).replace(/[^A-Za-z0-9_-]/gu, "_").slice(0, 64);
   return normalized || "memory_analysis";
@@ -61,6 +77,15 @@ function completionContent(payload, outputMode, schemaName) {
     return content.map((part) => clean(part?.text ?? part?.content)).filter(Boolean).join("\n");
   }
   return content;
+}
+
+function anthropicToolContent(payload, schemaName) {
+  const blocks = Array.isArray(payload?.content) ? payload.content : [];
+  const selected = blocks.find((block) => clean(block?.type).toLowerCase() === "tool_use" && clean(block?.name) === schemaName);
+  if (!selected || !Object.hasOwn(selected, "input")) {
+    throw new Error(`记忆处理 API 没有调用要求的结构化工具 ${schemaName}。`);
+  }
+  return selected.input;
 }
 
 function providerMessage(payload, status) {
@@ -120,8 +145,10 @@ function exhaustedTransportError(message, {
 
 /**
  * Creates the shared structured-generation contract used by long-term memory
- * extraction and specialist analysis. Provider-side JSON mode improves reliability; every specialist
- * still parses and validates the returned object against its own fixed rules.
+ * extraction and specialist analysis. OpenAI-compatible endpoints use JSON or
+ * strict tools; Anthropic-compatible endpoints use a forced tool call. Every
+ * specialist still parses and validates the returned object against its own
+ * fixed rules.
  */
 export function createOpenAiCompatibleStructuredGenerator({
   connection = {},
@@ -131,9 +158,14 @@ export function createOpenAiCompatibleStructuredGenerator({
 } = {}) {
   const apiKey = clean(connection.apiKey || connection.key);
   const model = clean(connection.model);
-  const endpoint = httpEndpoint(connection.baseUrl, connection.type, connection.endpoint);
-  const outputMode = clean(connection.structuredOutputMode || "json-object").toLowerCase();
-  if (!["json-object", "strict-tool"].includes(outputMode)) {
+  const anthropicCompatible = clean(connection.type).toLowerCase() === "anthropic-compatible";
+  const endpoint = anthropicCompatible
+    ? anthropicMessagesEndpoint(connection.baseUrl)
+    : httpEndpoint(connection.baseUrl, connection.type, connection.endpoint);
+  const outputMode = anthropicCompatible
+    ? "anthropic-tool"
+    : clean(connection.structuredOutputMode || "json-object").toLowerCase();
+  if (!["json-object", "strict-tool", "anthropic-tool"].includes(outputMode)) {
     throw new Error(`不支持的结构化输出方式：${outputMode}。`);
   }
   if (!apiKey) throw new Error("记忆处理 API 缺少可用密钥。");
@@ -168,40 +200,57 @@ export function createOpenAiCompatibleStructuredGenerator({
     const started = Date.now();
     const selectedSchemaName = jsonName(schemaName);
     const schemaText = JSON.stringify(schema);
-    const outputInstruction = outputMode === "strict-tool"
+    const outputInstruction = outputMode === "strict-tool" || outputMode === "anthropic-tool"
       ? `必须调用 ${selectedSchemaName}，并让参数严格符合它的 JSON Schema。不要输出解释。`
       : `只输出一个 JSON 对象，不要输出 Markdown 或解释。输出必须符合这个 JSON Schema：\n${schemaText}`;
-    const payload = {
-      ...(connection.extraBody && typeof connection.extraBody === "object"
-        && !Array.isArray(connection.extraBody) ? connection.extraBody : {}),
-      model,
-      messages: [
-        {
-          role: "system",
-          content: `${clean(systemPrompt)}\n\n${outputInstruction}`,
-        },
-        { role: "user", content: String(input ?? "") },
-      ],
-      temperature: 0,
-      max_tokens: outputLimit,
-      ...(outputMode === "strict-tool" ? {
+    const extraBody = connection.extraBody && typeof connection.extraBody === "object" && !Array.isArray(connection.extraBody)
+      ? connection.extraBody
+      : {};
+    const payload = anthropicCompatible
+      ? {
+        ...extraBody,
+        model,
+        max_tokens: outputLimit,
+        system: `${clean(systemPrompt)}\n\n${outputInstruction}`,
+        messages: [{ role: "user", content: String(input ?? "") }],
+        temperature: 0,
         tools: [{
-          type: "function",
-          function: {
-            name: selectedSchemaName,
-            description: "Return the validated structured memory result.",
-            strict: true,
-            parameters: schema,
-          },
+          name: selectedSchemaName,
+          description: "Return the validated structured memory result.",
+          input_schema: schema,
         }],
-        tool_choice: {
-          type: "function",
-          function: { name: selectedSchemaName },
-        },
-      } : {
-        response_format: { type: "json_object" },
-      }),
-    };
+        tool_choice: { type: "tool", name: selectedSchemaName },
+      }
+      : {
+        ...extraBody,
+        model,
+        messages: [
+          {
+            role: "system",
+            content: `${clean(systemPrompt)}\n\n${outputInstruction}`,
+          },
+          { role: "user", content: String(input ?? "") },
+        ],
+        temperature: 0,
+        max_tokens: outputLimit,
+        ...(outputMode === "strict-tool" ? {
+          tools: [{
+            type: "function",
+            function: {
+              name: selectedSchemaName,
+              description: "Return the validated structured memory result.",
+              strict: true,
+              parameters: schema,
+            },
+          }],
+          tool_choice: {
+            type: "function",
+            function: { name: selectedSchemaName },
+          },
+        } : {
+          response_format: { type: "json_object" },
+        }),
+      };
     for (let attempt = 1; attempt <= maximumTransportAttempts; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -212,7 +261,11 @@ export function createOpenAiCompatibleStructuredGenerator({
           headers: {
             ...(connection.extraHeaders && typeof connection.extraHeaders === "object"
               && !Array.isArray(connection.extraHeaders) ? connection.extraHeaders : {}),
-            Authorization: `Bearer ${apiKey}`,
+            ...(anthropicCompatible
+              ? (clean(connection.authMode).toLowerCase() === "auth-token"
+                ? { Authorization: `Bearer ${apiKey}`, "anthropic-version": "2023-06-01" }
+                : { "x-api-key": apiKey, "anthropic-version": "2023-06-01" })
+              : { Authorization: `Bearer ${apiKey}` }),
             "Content-Type": "application/json",
             "User-Agent": "suzu-memory/0.1",
           },
@@ -297,7 +350,9 @@ export function createOpenAiCompatibleStructuredGenerator({
         throw new Error(message);
       }
       return {
-        output: parseJsonContent(completionContent(envelope, outputMode, selectedSchemaName)),
+        output: parseJsonContent(anthropicCompatible
+          ? anthropicToolContent(envelope, selectedSchemaName)
+          : completionContent(envelope, outputMode, selectedSchemaName)),
         usage: envelope.usage || {},
         model: clean(envelope.model) || model,
         requestId: clean(envelope.id)

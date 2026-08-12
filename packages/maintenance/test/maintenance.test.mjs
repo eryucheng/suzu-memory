@@ -6,6 +6,7 @@ import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 import {
   autoAcceptReportedStateProposals,
   inspectMaintenance,
+  MAINTENANCE_TASK_TYPES,
   runEmbeddingMaintenance,
   runImmediateMemoryMaintenance,
   runSemanticMemoryMaintenance,
@@ -64,9 +65,26 @@ test("immediate lane performs deterministic work and only queues expensive follo
   assert.equal(replay.queued.every((task) => !task.wasInserted), true);
   const status = inspectMaintenance({ repository, agentId: AGENT_ID });
   assert.equal(status.tasks.length, 3);
+  assert.equal(status.runnableTaskCount, 3);
   assert.equal(status.taskCounts["embedding:memory-embedding:pending"], 1);
   assert.equal(status.taskCounts["semantic:retrieval-context:pending"], 1);
   assert.equal(status.taskCounts["semantic:structure-proposal:pending"], 1);
+  database.close();
+});
+
+test("maintenance inspection reports runnable work beyond its visible review list", () => {
+  const { database, repository } = fixture();
+  for (let index = 0; index < 501; index += 1) {
+    repository.enqueueMaintenanceTask({
+      agentId: AGENT_ID,
+      lane: "embedding",
+      taskType: "memory-embedding",
+      payload: { memoryIds: [`memory-${index}`] },
+    });
+  }
+  const status = inspectMaintenance({ repository, agentId: AGENT_ID, limit: 500 });
+  assert.equal(status.tasks.length, 500);
+  assert.equal(status.runnableTaskCount, 501);
   database.close();
 });
 
@@ -231,6 +249,63 @@ test("semantic lane keeps retrieval context and structure prompts separate", asy
   database.close();
 });
 
+test("pending topic and episode candidates immediately queue normal maintenance", async () => {
+  const { database, repository } = fixture();
+  seedMemory(repository, "event-1", "我们一起整理了新的记忆结构。");
+  seedMemory(repository, "event-2", "后来又确认了这个结构应当进入长期记忆。");
+  runImmediateMemoryMaintenance({
+    repository,
+    agentId: AGENT_ID,
+    batchId: "structure-candidate-source",
+    memoryIds: ["event-1", "event-2"],
+    followUpTaskTypes: [MAINTENANCE_TASK_TYPES.structureProposal],
+    planConsolidation: false,
+  });
+
+  const result = await runSemanticTaskMaintenance({
+    repository,
+    agentId: AGENT_ID,
+    retrievalContextGenerator: null,
+    structureGenerator: async ({ schemaName }) => {
+      assert.equal(schemaName, "memory-structure-proposals-v1");
+      return {
+        output: {
+          proposals: [{
+            operation: "create",
+            targetMemoryId: "",
+            kind: "episode",
+            title: "一起整理记忆结构",
+            content: "围绕同一件记忆整理工作形成的事件簇。",
+            subjectRole: "user",
+            subjectKey: "user",
+            eventDate: "",
+            eventStart: "",
+            eventEnd: "",
+            memberIds: ["event-1", "event-2"],
+            actorRoles: [],
+            confidence: 0.9,
+            rationale: "两条时间相邻的记忆描述了同一项整理工作。",
+          }],
+        },
+        usage: {},
+      };
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  const [proposal] = repository.listStructureProposals(AGENT_ID, { reviewStates: ["pending"] });
+  const pendingEpisode = repository.getMemory(proposal.result_memory_id);
+  assert.equal(pendingEpisode.status, "active");
+  assert.equal(pendingEpisode.metadata.structureReviewState, "pending");
+  const pendingTasks = repository.listMaintenanceTasks(AGENT_ID, { statuses: ["pending"] });
+  assert.deepEqual(
+    pendingTasks.map((task) => task.task_type).sort(),
+    [MAINTENANCE_TASK_TYPES.memoryEmbedding, MAINTENANCE_TASK_TYPES.retrievalContext].sort(),
+  );
+  assert.equal(pendingTasks.every((task) => task.payload.memoryIds.includes(pendingEpisode.id)), true);
+  database.close();
+});
+
 test("semantic failures retry three times, preserve partial success, and enter human review", async () => {
   const { database, repository } = fixture();
   seedMemory(repository, "event-good", "第一件需要检索上下文的短事件");
@@ -296,7 +371,7 @@ test("semantic failures retry three times, preserve partial success, and enter h
   database.close();
 });
 
-test("expired leases can be reclaimed and failures stay bounded", () => {
+test("expired leases can be reclaimed and embedding failures stay non-reviewable", () => {
   const { database, repository } = fixture();
   const task = repository.enqueueMaintenanceTask({
     agentId: AGENT_ID,
@@ -329,7 +404,7 @@ test("expired leases can be reclaimed and failures stay bounded", () => {
     failedAt: "2026-08-04T01:01:01.000Z",
   });
   assert.equal(failed.status, "failed");
-  assert.equal(failed.review_state, "pending");
+  assert.equal(failed.review_state, "not-required");
   assert.equal(failed.failureHistory.length, 1);
   assert.equal(failed.failureHistory[0].attempt, 2);
   assert.equal(failed.failureHistory[0].error, "provider failed");
@@ -339,23 +414,44 @@ test("expired leases can be reclaimed and failures stay bounded", () => {
     workerId: "worker-3",
     claimedAt: "2026-08-04T02:00:00.000Z",
   }).tasks.length, 0);
-  const accepted = repository.reviewMaintenanceTaskFailure({
-    agentId: AGENT_ID,
-    taskId: task.id,
-    action: "accept",
-    reviewedBy: "human:test",
-    note: "修好 Provider 后重试。",
-    reviewedAt: "2026-08-04T02:01:00.000Z",
-  });
-  assert.equal(accepted.status, "completed");
-  assert.equal(accepted.review_state, "accepted");
-  assert.equal(accepted.attempt_count, 2);
-  assert.equal(repository.claimMaintenanceTasks({
+  database.close();
+});
+
+test("a local restart immediately requeues interrupted maintenance work", () => {
+  const { database, repository } = fixture();
+  const task = repository.enqueueMaintenanceTask({
     agentId: AGENT_ID,
     lane: "embedding",
-    workerId: "worker-4",
-    claimedAt: "2026-08-04T02:02:00.000Z",
-  }).tasks.length, 0);
+    taskType: "memory-embedding",
+    payload: { memoryIds: ["event-1"] },
+    maxAttempts: 3,
+    availableAt: "2026-08-04T00:00:00.000Z",
+  });
+  repository.claimMaintenanceTasks({
+    agentId: AGENT_ID,
+    lane: "embedding",
+    workerId: "old-desktop-process",
+    leaseSeconds: 3600,
+    claimedAt: "2026-08-04T01:00:00.000Z",
+  });
+  const recovery = repository.recoverRunningMaintenanceTasks(AGENT_ID, {
+    force: true,
+    recoveredAt: "2026-08-04T01:01:00.000Z",
+  });
+  assert.equal(recovery.requeued, 1);
+  assert.equal(recovery.failed, 0);
+  const recovered = repository.getMaintenanceTask(AGENT_ID, task.id);
+  assert.equal(recovered.status, "pending");
+  assert.equal(recovered.lease_owner, "");
+  assert.equal(recovered.failureHistory.at(-1).details.reason, "desktop-restart");
+  const reclaimed = repository.claimMaintenanceTasks({
+    agentId: AGENT_ID,
+    lane: "embedding",
+    workerId: "new-desktop-process",
+    claimedAt: "2026-08-04T01:01:00.000Z",
+  });
+  assert.equal(reclaimed.tasks[0].id, task.id);
+  assert.equal(reclaimed.tasks[0].attempt_count, 2);
   database.close();
 });
 

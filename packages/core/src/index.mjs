@@ -78,6 +78,8 @@ export {
 } from "./policy.mjs";
 
 export {
+  materializeMemoryStructureProposal,
+  materializePendingMemoryStructureProposals,
   proposeMemoryStructure,
   resolveMemoryStructureProposal,
 } from "./structure-policy.mjs";

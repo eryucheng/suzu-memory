@@ -243,6 +243,197 @@ function proposalHash(candidate) {
   })).digest("hex");
 }
 
+function pendingStructureMetadata(proposal) {
+  return {
+    ...proposal.metadata,
+    structureProposalId: proposal.id,
+    structureProposalProvenance: proposal.provenance,
+    structureProposalRationale: proposal.rationale,
+    structureReviewState: "pending",
+  };
+}
+
+function pendingMembershipMetadata(proposal) {
+  return {
+    structureProposalId: proposal.id,
+    structureReviewState: "pending",
+  };
+}
+
+function linkProposalMember(repository, {
+  agentId,
+  proposal,
+  memoryId,
+  containerId,
+  metadata,
+}) {
+  const linkOptions = {
+    agentId,
+    memoryId,
+    confidence: proposal.confidence,
+    provenance: proposal.provenance,
+    metadata,
+  };
+  return proposal.kind === "episode"
+    ? repository.linkMemoryToEpisode({ ...linkOptions, episodeId: containerId })
+    : repository.linkMemoryToTopic({ ...linkOptions, topicId: containerId });
+}
+
+function proposalMembers(repository, { agentId, kind, memoryId }) {
+  return kind === "episode"
+    ? repository.listEpisodeMembers({ agentId, episodeId: memoryId })
+    : repository.listTopicMembers({ agentId, topicId: memoryId });
+}
+
+function proposalResultMemory(repository, proposal) {
+  const memory = repository.getMemory(proposal.result_memory_id);
+  if (!memory || memory.agent_id !== proposal.agent_id || memory.kind !== proposal.kind) {
+    throw new Error("Structure proposal points to an invalid result memory.");
+  }
+  if (memory.status === "deleted") {
+    throw new Error("Structure proposal result memory was deleted before review.");
+  }
+  return memory;
+}
+
+export function materializeMemoryStructureProposal(repository, {
+  agentId,
+  proposalId,
+} = {}) {
+  if (!repository) throw new Error("Materializing a structure proposal requires a repository.");
+  const normalizedAgentId = clean(agentId);
+  const proposal = repository.getStructureProposal(normalizedAgentId, proposalId);
+  if (!proposal) throw new Error("Structure proposal does not exist for this Agent.");
+  if (proposal.review_state !== "pending") {
+    throw new Error(`Only a pending structure proposal can be materialized; it is ${proposal.review_state}.`);
+  }
+  const target = proposal.operation === "attach"
+    ? validateAttachTarget(repository, {
+      agentId: normalizedAgentId,
+      kind: proposal.kind,
+      targetMemoryId: proposal.targetMemoryId,
+    })
+    : null;
+  const members = validateMembers(repository, {
+    agentId: normalizedAgentId,
+    kind: proposal.kind,
+    memberIds: proposal.memberIds,
+    minimum: proposal.operation === "attach" ? 1 : 2,
+    targetMemoryId: proposal.targetMemoryId,
+  });
+  if (proposal.result_memory_id) {
+    const memory = proposalResultMemory(repository, proposal);
+    return {
+      status: "already-materialized",
+      proposal,
+      memory,
+      addedMemberIds: [],
+      members: proposalMembers(repository, {
+        agentId: normalizedAgentId,
+        kind: proposal.kind,
+        memoryId: memory.id,
+      }),
+    };
+  }
+
+  return repository.transaction(() => {
+    const common = {
+      agentId: normalizedAgentId,
+      title: proposal.title,
+      content: proposal.content,
+      subjectRole: proposal.subject_role,
+      subjectKey: proposal.subject_key,
+      actorRoles: proposal.actorRoles,
+      confidence: proposal.confidence,
+      evidenceMode: "inferred",
+      metadata: pendingStructureMetadata(proposal),
+    };
+    let memory = target || (proposal.kind === "episode"
+      ? repository.upsertEpisode({
+        ...common,
+        eventDate: proposal.event_date,
+        eventStart: proposal.event_start,
+        eventEnd: proposal.event_end,
+      })
+      : repository.upsertTopic(common));
+    const existing = target
+      ? existingMembershipIds(repository, {
+        agentId: normalizedAgentId,
+        kind: proposal.kind,
+        targetMemoryId: target.id,
+      })
+      : new Set();
+    const addedMemberIds = [];
+    for (const member of members) {
+      if (existing.has(member.id)) continue;
+      linkProposalMember(repository, {
+        agentId: normalizedAgentId,
+        proposal,
+        memoryId: member.id,
+        containerId: memory.id,
+        metadata: pendingMembershipMetadata(proposal),
+      });
+      addedMemberIds.push(member.id);
+    }
+    if (target && proposal.kind === "episode") {
+      memory = repository.expandEpisodeToMemories({
+        agentId: normalizedAgentId,
+        episodeId: target.id,
+        memoryIds: members.map((member) => member.id),
+      });
+    }
+    const pending = repository.setPendingStructureProposalResult({
+      agentId: normalizedAgentId,
+      proposalId: proposal.id,
+      resultMemoryId: memory.id,
+    });
+    return {
+      status: "materialized-pending-review",
+      proposal: pending,
+      memory: repository.getMemory(memory.id),
+      addedMemberIds,
+      members: proposalMembers(repository, {
+        agentId: normalizedAgentId,
+        kind: proposal.kind,
+        memoryId: memory.id,
+      }),
+    };
+  });
+}
+
+export function materializePendingMemoryStructureProposals(repository, {
+  agentId,
+  limit = 100,
+} = {}) {
+  if (!repository) throw new Error("Materializing pending structure proposals requires a repository.");
+  const normalizedAgentId = clean(agentId);
+  if (!normalizedAgentId) throw new Error("Materializing pending structure proposals requires agentId.");
+  const proposals = repository.listStructureProposals(normalizedAgentId, {
+    reviewStates: ["pending"],
+    limit,
+  });
+  const materialized = [];
+  const skipped = [];
+  const failed = [];
+  for (const proposal of proposals) {
+    try {
+      const result = materializeMemoryStructureProposal(repository, {
+        agentId: normalizedAgentId,
+        proposalId: proposal.id,
+      });
+      (result.status === "already-materialized" ? skipped : materialized).push(result);
+    } catch (error) {
+      failed.push({ proposalId: proposal.id, error: error.message });
+    }
+  }
+  return {
+    total: proposals.length,
+    materialized,
+    skipped,
+    failed,
+  };
+}
+
 export function proposeMemoryStructure(repository, input = {}) {
   const candidate = normalizeProposal(repository, input);
   const hash = proposalHash(candidate);
@@ -250,10 +441,22 @@ export function proposeMemoryStructure(repository, input = {}) {
     .update(`${candidate.agentId}\u001f${hash}`)
     .digest("hex")
     .slice(0, 24)}`;
-  return repository.recordStructureProposal({
-    ...candidate,
-    id,
-    proposalHash: hash,
+  return repository.transaction(() => {
+    const proposal = repository.recordStructureProposal({
+      ...candidate,
+      id,
+      proposalHash: hash,
+    });
+    if (!proposal.wasInserted) return proposal;
+    const materialized = materializeMemoryStructureProposal(repository, {
+      agentId: candidate.agentId,
+      proposalId: proposal.id,
+    });
+    return {
+      ...materialized.proposal,
+      wasInserted: true,
+      materialization: materialized.status,
+    };
   });
 }
 
@@ -276,90 +479,71 @@ export function resolveMemoryStructureProposal(repository, {
     throw new Error(`Unknown structure proposal action: ${normalizedAction || "(empty)"}.`);
   }
   if (normalizedAction === "dismiss") {
-    return repository.transaction(() => ({
-      status: "dismissed",
-      proposal: repository.resolveStructureProposal({
-        agentId: normalizedAgentId,
-        proposalId: proposal.id,
-        resolution: "dismissed",
-        resolvedBy,
-        note,
-      }),
-      memory: null,
-      members: [],
-    }));
+    return repository.transaction(() => {
+      const provisional = proposal.result_memory_id
+        ? repository.getMemory(proposal.result_memory_id)
+        : null;
+      if (provisional && (provisional.agent_id !== normalizedAgentId || provisional.kind !== proposal.kind)) {
+        throw new Error("Structure proposal points to an invalid result memory.");
+      }
+      const removedMemberships = proposal.result_memory_id
+        ? repository.removeStructureProposalMemberships({
+          agentId: normalizedAgentId,
+          proposalId: proposal.id,
+        })
+        : 0;
+      const memory = provisional && provisional.status !== "deleted" && proposal.operation === "create"
+        ? repository.setMemoryDeleted({
+          agentId: normalizedAgentId,
+          memoryId: provisional.id,
+          actor: resolvedBy,
+          reason: clean(note) || "Structure proposal was dismissed during review.",
+        })
+        : null;
+      return {
+        status: "dismissed",
+        proposal: repository.resolveStructureProposal({
+          agentId: normalizedAgentId,
+          proposalId: proposal.id,
+          resolution: "dismissed",
+          resolvedBy,
+          note,
+        }),
+        memory,
+        removedMemberships,
+        members: [],
+      };
+    });
   }
 
-  const target = proposal.operation === "attach"
-    ? validateAttachTarget(repository, {
-      agentId: normalizedAgentId,
-      kind: proposal.kind,
-      targetMemoryId: proposal.targetMemoryId,
-    })
-    : null;
-  const members = validateMembers(repository, {
+  const materialized = materializeMemoryStructureProposal(repository, {
     agentId: normalizedAgentId,
-    kind: proposal.kind,
-    memberIds: proposal.memberIds,
-    minimum: proposal.operation === "attach" ? 1 : 2,
-    targetMemoryId: proposal.targetMemoryId,
+    proposalId: proposal.id,
   });
   return repository.transaction(() => {
-    const common = {
-      agentId: normalizedAgentId,
-      title: proposal.title,
-      content: proposal.content,
-      subjectRole: proposal.subject_role,
-      subjectKey: proposal.subject_key,
-      actorRoles: proposal.actorRoles,
-      confidence: proposal.confidence,
-      evidenceMode: "manual",
-      metadata: {
-        ...proposal.metadata,
-        structureProposalId: proposal.id,
-        structureProposalProvenance: proposal.provenance,
-        structureProposalRationale: proposal.rationale,
-      },
-    };
-    let memory = target || (proposal.kind === "episode"
-      ? repository.upsertEpisode({
-        ...common,
-        eventDate: proposal.event_date,
-        eventStart: proposal.event_start,
-        eventEnd: proposal.event_end,
-      })
-      : repository.upsertTopic(common));
-    const existing = target
-      ? existingMembershipIds(repository, {
+    let memory = materialized.memory;
+    const reviewedAt = new Date().toISOString();
+    if (proposal.operation === "create") {
+      memory = repository.updateMemoryMetadata({
         agentId: normalizedAgentId,
-        kind: proposal.kind,
-        targetMemoryId: target.id,
-      })
-      : new Set();
-    const addedMemberIds = [];
-    for (const member of members) {
-      if (existing.has(member.id)) continue;
-      const linkOptions = {
-        agentId: normalizedAgentId,
-        memoryId: member.id,
-        confidence: proposal.confidence,
-        provenance: proposal.provenance,
-        metadata: { structureProposalId: proposal.id },
-      };
-      if (proposal.kind === "episode") {
-        repository.linkMemoryToEpisode({ ...linkOptions, episodeId: memory.id });
-      } else {
-        repository.linkMemoryToTopic({ ...linkOptions, topicId: memory.id });
-      }
-      addedMemberIds.push(member.id);
-    }
-    if (target && proposal.kind === "episode") {
-      memory = repository.expandEpisodeToMemories({
-        agentId: normalizedAgentId,
-        episodeId: target.id,
-        memoryIds: members.map((member) => member.id),
+        memoryId: memory.id,
+        metadata: {
+          ...memory.metadata,
+          structureReviewState: "accepted",
+          structureReviewedBy: clean(resolvedBy) || "human",
+          structureReviewedAt: reviewedAt,
+        },
+        actor: resolvedBy,
+        reason: clean(note) || "Structure proposal accepted during review.",
       });
     }
+    repository.updateStructureProposalMembershipReviewState({
+      agentId: normalizedAgentId,
+      proposalId: proposal.id,
+      reviewState: "accepted",
+      reviewedBy: resolvedBy,
+      reviewedAt,
+    });
     const resolved = repository.resolveStructureProposal({
       agentId: normalizedAgentId,
       proposalId: proposal.id,
@@ -372,10 +556,12 @@ export function resolveMemoryStructureProposal(repository, {
       status: "accepted",
       proposal: resolved,
       memory: repository.getMemory(memory.id),
-      addedMemberIds,
-      members: proposal.kind === "episode"
-        ? repository.listEpisodeMembers({ agentId: normalizedAgentId, episodeId: memory.id })
-        : repository.listTopicMembers({ agentId: normalizedAgentId, topicId: memory.id }),
+      addedMemberIds: proposal.memberIds,
+      members: proposalMembers(repository, {
+        agentId: normalizedAgentId,
+        kind: proposal.kind,
+        memoryId: memory.id,
+      }),
     };
   });
 }
