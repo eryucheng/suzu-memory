@@ -88,7 +88,7 @@ test("local HTTP product surface reuses Service status, retrieval and editing", 
   assert.equal(unauthorized.status, 401);
   const headers = { authorization: "Bearer test-key", "content-type": "application/json" };
   const status = await json(await fetch(`${address.baseUrl}/v1/status`, { headers }));
-  assert.equal(status.data.memoryCount, 2);
+  assert.equal(status.data.memoryCount, 3);
 
   const search = await json(await fetch(`${address.baseUrl}/v1/search`, {
     method: "POST",

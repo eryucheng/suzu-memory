@@ -7,8 +7,8 @@ import {
   isStatefulMemoryKind,
 } from "@suzu-memory/core";
 
-// 主题根节点需要跨两侧半球均匀分布；升级布局版本以避免沿用独立哈希造成的单侧缓存位置。
-export const BRAIN_LAYOUT_VERSION = "brain-v6";
+// 普通节点改为全脑选座；升级布局版本以避免沿用围绕结构父节点聚团的旧缓存位置。
+export const BRAIN_LAYOUT_VERSION = "brain-v7";
 
 const STRUCTURAL_RELATIONS = new Set([
   "part_of_episode",
@@ -142,34 +142,6 @@ function deterministicPoint(id) {
   });
 }
 
-function deterministicOffset(id, scale = 0.16) {
-  return {
-    x: (hashUnit(id, "offset-x") * 2 - 1) * scale,
-    y: (hashUnit(id, "offset-y") * 2 - 1) * scale,
-    z: (hashUnit(id, "offset-z") * 2 - 1) * scale,
-  };
-}
-
-function semanticPosition(node) {
-  const stateFamily = clean(node.stateFamily || node.state_family);
-  const semanticType = node.visualTier === "state"
-    && !["", "not_applicable", "unspecified"].includes(stateFamily)
-    ? `state:${stateFamily}`
-    : `kind:${clean(node.kind) || clean(node.visualFamily) || "memory"}`;
-  const group = deterministicPoint(`type:${semanticType}`);
-  const individual = deterministicPoint(`node:${node.id}`);
-  const groupWeight = node.visualTier === "state" ? 0.62 : 0.2;
-  const local = deterministicOffset(
-    `type-offset:${node.id}`,
-    node.visualTier === "state" ? 0.12 : 0.04,
-  );
-  return constrainToBrain({
-    x: group.x * groupWeight + individual.x * (1 - groupWeight) + local.x,
-    y: group.y * groupWeight + individual.y * (1 - groupWeight) + local.y,
-    z: group.z * groupWeight + individual.z * (1 - groupWeight) + local.z,
-  });
-}
-
 function majorNodeOrder(left, right) {
   const rank = (node) => {
     const graphNodeType = clean(node.graphNodeType || node.graph_node_type);
@@ -269,33 +241,36 @@ export function nodeVisualProfile(node = {}) {
   return { visualTier: "minor", visualFamily: "event" };
 }
 
-function adjacencyFor(nodes, edges) {
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const adjacency = new Map(nodes.map((node) => [node.id, []]));
-  for (const edge of edges) {
-    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
-    const value = {
-      id: edge.id,
-      relation: edge.relation,
-      visualFamily: edge.visualFamily || relationVisualFamily(edge.relation),
-      structural: Boolean(edge.structural || STRUCTURAL_RELATIONS.has(edge.relation)),
-      weight: bounded(edge.weight, 0, 1),
-    };
-    adjacency.get(edge.source).push({ ...value, neighborId: edge.target });
-    adjacency.get(edge.target).push({ ...value, neighborId: edge.source });
+function squaredDistance(left, right) {
+  const x = left.x - right.x;
+  const y = left.y - right.y;
+  const z = left.z - right.z;
+  return x * x + y * y + z * z;
+}
+
+function distributedSeat(node, positions) {
+  const occupied = [...positions.values()];
+  const candidateCount = Math.min(48, 24 + Math.ceil(Math.sqrt(occupied.length)));
+  let selected = deterministicPoint(`seat:${node.id}:0`);
+  let greatestClearance = -1;
+  for (let index = 0; index < candidateCount; index += 1) {
+    const candidate = deterministicPoint(`seat:${node.id}:${index}`);
+    let nearestDistance = Infinity;
+    for (const occupiedPosition of occupied) {
+      const distance = squaredDistance(candidate, occupiedPosition);
+      if (distance < nearestDistance) nearestDistance = distance;
+      // Farthest-point sampling: this candidate can no longer beat the current one.
+      if (nearestDistance <= greatestClearance) break;
+    }
+    if (nearestDistance > greatestClearance) {
+      selected = candidate;
+      greatestClearance = nearestDistance;
+    }
   }
-  return adjacency;
+  return selected;
 }
 
-function averagePositions(values) {
-  return values.reduce((result, value) => ({
-    x: result.x + value.x / values.length,
-    y: result.y + value.y / values.length,
-    z: result.z + value.z / values.length,
-  }), { x: 0, y: 0, z: 0 });
-}
-
-function initialPositions(nodes, edges, cachedPositions) {
+function initialPositions(nodes, cachedPositions) {
   const positions = new Map();
   const existingIds = new Set();
   for (const node of nodes) {
@@ -308,13 +283,7 @@ function initialPositions(nodes, edges, cachedPositions) {
     }));
     existingIds.add(node.id);
   }
-  const adjacency = adjacencyFor(nodes, edges);
   const majorAnchors = majorAnchorPositions(nodes);
-  const structuralContainers = new Map(nodes.map((node) => [node.id, []]));
-  for (const edge of edges) {
-    if (!STRUCTURAL_RELATIONS.has(edge.relation)) continue;
-    structuralContainers.get(edge.source)?.push(edge.target);
-  }
   const ordered = [...nodes].sort((left, right) => (
     (left.visualTier === "major" ? 0 : 1) - (right.visualTier === "major" ? 0 : 1)
     || clean(left.eventDate || left.recordedAt).localeCompare(
@@ -328,81 +297,14 @@ function initialPositions(nodes, edges, cachedPositions) {
       positions.set(node.id, majorAnchors.get(node.id) || deterministicPoint(`major:${node.id}`));
       continue;
     }
-    const containerPositions = (structuralContainers.get(node.id) || [])
-      .map((id) => positions.get(id))
-      .filter(Boolean);
-    const neighborPositions = adjacency.get(node.id)
-      .map((value) => positions.get(value.neighborId))
-      .filter(Boolean);
-    const anchors = containerPositions.length ? containerPositions : neighborPositions;
-    if (!anchors.length) {
-      positions.set(node.id, semanticPosition(node));
-      continue;
-    }
-    const center = averagePositions(anchors);
-    const offset = deterministicOffset(node.id, containerPositions.length ? 0.13 : 0.17);
-    positions.set(node.id, constrainToBrain({
-      x: center.x + offset.x,
-      y: center.y + offset.y,
-      z: center.z + offset.z,
-    }));
+    // 结构边只表达关系，不再作为物理牵引，避免每个主题长成一团“爆炸头”。
+    positions.set(node.id, distributedSeat(node, positions));
   }
-  return { adjacency, existingIds, positions };
-}
-
-function relaxNewPositions(nodes, adjacency, positions, existingIds) {
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  const movableIds = nodes
-    .filter((node) => node.visualTier !== "major" && !existingIds.has(node.id))
-    .map((node) => node.id);
-  if (!movableIds.length) return;
-  const iterations = existingIds.size ? 22 : 72;
-  const allIds = nodes.map((node) => node.id);
-  for (let iteration = 0; iteration < iterations; iteration += 1) {
-    const changes = new Map();
-    for (const id of movableIds) {
-      const point = positions.get(id);
-      let dx = 0;
-      let dy = 0;
-      let dz = 0;
-      for (const edge of adjacency.get(id)) {
-        const neighbor = positions.get(edge.neighborId);
-        if (!neighbor) continue;
-        const pull = edge.structural
-          ? 0.095 + edge.weight * 0.055
-          : 0.018 + edge.weight * 0.024;
-        dx += (neighbor.x - point.x) * pull;
-        dy += (neighbor.y - point.y) * pull;
-        dz += (neighbor.z - point.z) * pull;
-      }
-      for (const otherId of allIds) {
-        if (otherId === id) continue;
-        const other = positions.get(otherId);
-        const x = point.x - other.x;
-        const y = point.y - other.y;
-        const z = point.z - other.z;
-        const distanceSquared = x * x + y * y + z * z;
-        if (distanceSquared <= 0.0001 || distanceSquared >= 0.075) continue;
-        const otherTier = nodeById.get(otherId)?.visualTier;
-        const repulsion = (otherTier === "major" ? 0.0009 : 0.00135) / distanceSquared;
-        dx += x * repulsion;
-        dy += y * repulsion;
-        dz += z * repulsion;
-      }
-      const magnitude = Math.max(1, Math.sqrt(dx * dx + dy * dy + dz * dz) / 0.052);
-      changes.set(id, constrainToBrain({
-        x: point.x + dx / magnitude,
-        y: point.y + dy / magnitude,
-        z: point.z + dz / magnitude,
-      }));
-    }
-    for (const [id, position] of changes) positions.set(id, position);
-  }
+  return { existingIds, positions };
 }
 
 export function layoutBrainGraph({
   nodes = [],
-  edges = [],
   cachePath = "",
   layoutVersion = BRAIN_LAYOUT_VERSION,
 } = {}) {
@@ -411,12 +313,10 @@ export function layoutBrainGraph({
     ...nodeVisualProfile(node),
   }));
   const cache = readCache(cachePath, layoutVersion);
-  const { adjacency, existingIds, positions } = initialPositions(
+  const { existingIds, positions } = initialPositions(
     profiledNodes,
-    edges,
     cache.positions || {},
   );
-  relaxNewPositions(profiledNodes, adjacency, positions, existingIds);
   const serialized = Object.fromEntries(profiledNodes.map((node) => [
     node.id,
     roundPosition(positions.get(node.id) || deterministicPoint(node.id)),
