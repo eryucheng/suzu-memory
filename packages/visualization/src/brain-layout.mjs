@@ -7,8 +7,8 @@ import {
   isStatefulMemoryKind,
 } from "@suzu-memory/core";
 
-// 角色根节点会改变结构性锚点；升级布局版本以避免沿用没有角色连线时的缓存位置。
-export const BRAIN_LAYOUT_VERSION = "brain-v5";
+// 主题根节点需要跨两侧半球均匀分布；升级布局版本以避免沿用独立哈希造成的单侧缓存位置。
+export const BRAIN_LAYOUT_VERSION = "brain-v6";
 
 const STRUCTURAL_RELATIONS = new Set([
   "part_of_episode",
@@ -170,6 +170,42 @@ function semanticPosition(node) {
   });
 }
 
+function majorNodeOrder(left, right) {
+  const rank = (node) => {
+    const graphNodeType = clean(node.graphNodeType || node.graph_node_type);
+    const actorRole = clean(node.actorRole || node.actor_role);
+    if (graphNodeType === "actor" && actorRole === "user") return 0;
+    if (clean(node.kind) === "episode") return 1;
+    if (graphNodeType === "relationship") return 2;
+    if (clean(node.kind) === "topic") return 3;
+    if (graphNodeType === "actor" && actorRole === "agent") return 4;
+    return 5;
+  };
+  return rank(left) - rank(right)
+    || clean(left.title).localeCompare(clean(right.title))
+    || left.id.localeCompare(right.id);
+}
+
+function majorAnchorPoint(index, total) {
+  const count = Math.max(1, total);
+  const angle = ((index + 0.5) / count) * Math.PI * 2 + Math.PI * 0.18;
+  return constrainToBrain({
+    x: Math.cos(angle) * 0.82,
+    y: Math.sin(angle) * 0.62,
+    z: Math.sin(angle * 1.7 + Math.PI * 0.21) * 0.5,
+  });
+}
+
+function majorAnchorPositions(nodes) {
+  const majors = nodes
+    .filter((node) => node.visualTier === "major")
+    .sort(majorNodeOrder);
+  return new Map(majors.map((node, index) => [
+    node.id,
+    majorAnchorPoint(index, majors.length),
+  ]));
+}
+
 function readCache(cachePath, layoutVersion) {
   if (!cachePath || !fs.existsSync(cachePath)) return { positions: {} };
   try {
@@ -273,6 +309,7 @@ function initialPositions(nodes, edges, cachedPositions) {
     existingIds.add(node.id);
   }
   const adjacency = adjacencyFor(nodes, edges);
+  const majorAnchors = majorAnchorPositions(nodes);
   const structuralContainers = new Map(nodes.map((node) => [node.id, []]));
   for (const edge of edges) {
     if (!STRUCTURAL_RELATIONS.has(edge.relation)) continue;
@@ -288,7 +325,7 @@ function initialPositions(nodes, edges, cachedPositions) {
   for (const node of ordered) {
     if (positions.has(node.id)) continue;
     if (node.visualTier === "major") {
-      positions.set(node.id, deterministicPoint(`major:${node.id}`));
+      positions.set(node.id, majorAnchors.get(node.id) || deterministicPoint(`major:${node.id}`));
       continue;
     }
     const containerPositions = (structuralContainers.get(node.id) || [])
