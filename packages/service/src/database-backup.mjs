@@ -24,6 +24,10 @@ function sqlString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+function sqlIdentifier(value) {
+  return `"${String(value).replaceAll('"', '""')}"`;
+}
+
 function closeDatabase(database) {
   try {
     database.close();
@@ -38,19 +42,37 @@ function atomicJson(filePath, value) {
   fs.renameSync(temporaryPath, filePath);
 }
 
+function databaseTables(database) {
+  return database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+  `).all().map((row) => clean(row.name)).filter(Boolean);
+}
+
+function tableColumns(database, table) {
+  return database.prepare(`PRAGMA table_info(${sqlIdentifier(table)})`).all()
+    .map((row) => ({
+      name: clean(row.name),
+      type: clean(row.type).toUpperCase(),
+    }))
+    .filter((column) => column.name);
+}
+
+function tablesWithColumn(database, columnName) {
+  const column = clean(columnName);
+  if (!column) return [];
+  return databaseTables(database).filter((table) => (
+    tableColumns(database, table).some((candidate) => candidate.name === column)
+  ));
+}
+
 function existingAgentIds(database) {
-  const tableNames = new Set(database.prepare(`
-    SELECT name FROM sqlite_master WHERE type = 'table'
-  `).all().map((row) => row.name));
-  const candidates = [
-    "entities",
-    "relationships",
-    "memory_nodes",
-    "memory_input_events",
-  ].filter((table) => tableNames.has(table));
   const ids = new Set();
-  for (const table of candidates) {
-    for (const row of database.prepare(`SELECT DISTINCT agent_id FROM ${table}`).all()) {
+  for (const table of tablesWithColumn(database, "agent_id")) {
+    for (const row of database.prepare(`
+      SELECT DISTINCT ${sqlIdentifier("agent_id")} AS agent_id
+      FROM ${sqlIdentifier(table)}
+    `).all()) {
       if (clean(row.agent_id)) ids.add(clean(row.agent_id));
     }
   }
@@ -80,7 +102,11 @@ export function inspectDatabaseBackup(databasePath, { verifyManifest = true } = 
     throw error;
   }
   const digest = sha256(resolved);
-  const { manifestPath, manifest } = readManifest(resolved);
+  // Importing a live database deliberately ignores any neighbouring backup
+  // manifest. A raw runtime DB can legitimately sit beside a stale manifest.
+  const { manifestPath, manifest } = verifyManifest
+    ? readManifest(resolved)
+    : { manifestPath: "", manifest: null };
   if (verifyManifest && manifest) {
     if (manifest.format !== BACKUP_FORMAT || clean(manifest.sha256) !== digest) {
       const error = new Error("Backup manifest does not match the database file.");
@@ -177,6 +203,146 @@ function moveIfPresent(from, to, moved) {
   moved.push({ from, to });
 }
 
+function snapshotDatabaseReadOnly(sourcePath, destinationPath) {
+  const sourceDatabase = openMemoryDatabase(sourcePath, { readOnly: true });
+  try {
+    // VACUUM INTO reads the source's current WAL state while writing only the
+    // staged destination. This is safer than copying a live .db file and it
+    // never mutates the file the user selected.
+    sourceDatabase.exec(`VACUUM INTO ${sqlString(destinationPath)}`);
+  } finally {
+    closeDatabase(sourceDatabase);
+  }
+}
+
+function rewriteJsonAgentIdentity(value, sourceAgentId, targetAgentId) {
+  if (typeof value === "string") {
+    if (value === sourceAgentId) return targetAgentId;
+    return value.replaceAll(`agent:${sourceAgentId}`, `agent:${targetAgentId}`);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => rewriteJsonAgentIdentity(item, sourceAgentId, targetAgentId));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      rewriteJsonAgentIdentity(item, sourceAgentId, targetAgentId),
+    ]));
+  }
+  return value;
+}
+
+function rewriteJsonColumns(database, table, columns, sourceAgentId, targetAgentId) {
+  for (const column of columns.filter((candidate) => candidate.name.endsWith("_json"))) {
+    const quotedTable = sqlIdentifier(table);
+    const quotedColumn = sqlIdentifier(column.name);
+    const rows = database.prepare(`
+      SELECT rowid AS row_id, ${quotedColumn} AS value
+      FROM ${quotedTable}
+      WHERE instr(${quotedColumn}, ?) > 0
+    `).all(sourceAgentId);
+    const update = database.prepare(`
+      UPDATE ${quotedTable} SET ${quotedColumn} = ? WHERE rowid = ?
+    `);
+    for (const row of rows) {
+      try {
+        const before = JSON.parse(String(row.value));
+        const after = rewriteJsonAgentIdentity(before, sourceAgentId, targetAgentId);
+        const serialized = JSON.stringify(after);
+        if (serialized !== row.value) update.run(serialized, row.row_id);
+      } catch (cause) {
+        const error = new Error(`Imported database contains invalid JSON in ${table}.${column.name}.`);
+        error.code = "IMPORT_JSON_INVALID";
+        error.cause = cause;
+        throw error;
+      }
+    }
+  }
+}
+
+const AGENT_IDENTITY_COLUMNS = new Set([
+  "actor_key",
+  "subject_key",
+  "proposed_subject_key",
+  "relationship_key",
+  "canonical_key",
+  "target_scope_key",
+  "proposed_scope_key",
+  "source_locator",
+  "space_id",
+  "companion_id",
+]);
+
+function rewriteAgentIdentityColumns(database, table, columns, sourceAgentId, targetAgentId) {
+  const quotedTable = sqlIdentifier(table);
+  for (const column of columns) {
+    if (!AGENT_IDENTITY_COLUMNS.has(column.name)) continue;
+    const quotedColumn = sqlIdentifier(column.name);
+    database.prepare(`
+      UPDATE ${quotedTable}
+      SET ${quotedColumn} = replace(${quotedColumn}, ?, ?)
+      WHERE instr(${quotedColumn}, ?) > 0
+    `).run(sourceAgentId, targetAgentId, sourceAgentId);
+  }
+}
+
+function rebindAgentScope(database, { sourceAgentId, targetAgentId }) {
+  const source = clean(sourceAgentId);
+  const target = clean(targetAgentId);
+  if (!source || !target || source === target) return;
+  const tables = databaseTables(database).map((table) => ({
+    table,
+    columns: tableColumns(database, table),
+  }));
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    // The database contains many composite foreign keys `(id, agent_id)`.
+    // Deferring them lets every scoped table move in one atomic transaction.
+    database.exec("PRAGMA defer_foreign_keys = ON");
+    for (const { table, columns } of tables) {
+      if (!columns.some((column) => column.name === "agent_id")) continue;
+      const quotedTable = sqlIdentifier(table);
+      const quotedAgentId = sqlIdentifier("agent_id");
+      database.prepare(`
+        UPDATE ${quotedTable}
+        SET ${quotedAgentId} = ?
+        WHERE ${quotedAgentId} = ?
+      `).run(target, source);
+    }
+    for (const { table, columns } of tables) {
+      rewriteAgentIdentityColumns(database, table, columns, source, target);
+      rewriteJsonColumns(database, table, columns, source, target);
+    }
+    const violations = database.prepare("PRAGMA foreign_key_check").all();
+    if (violations.length) {
+      const error = new Error("Imported database has invalid cross-table references.");
+      error.code = "IMPORT_FOREIGN_KEY_FAILED";
+      throw error;
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch { /* no open transaction */ }
+    throw error;
+  }
+}
+
+function replaceActiveDatabase({ target, stagedPath, retiredLabel }) {
+  const retiredSuffix = `.${retiredLabel}-${randomUUID()}`;
+  const moved = [];
+  try {
+    moveIfPresent(target, `${target}${retiredSuffix}`, moved);
+    moveIfPresent(`${target}-wal`, `${target}${retiredSuffix}-wal`, moved);
+    moveIfPresent(`${target}-shm`, `${target}${retiredSuffix}-shm`, moved);
+    fs.renameSync(stagedPath, target);
+  } catch (error) {
+    for (const item of [...moved].reverse()) {
+      if (fs.existsSync(item.to) && !fs.existsSync(item.from)) fs.renameSync(item.to, item.from);
+    }
+    throw error;
+  }
+  for (const item of moved) fs.rmSync(item.to, { force: true });
+}
+
 export function restoreDatabaseBackup({
   databasePath,
   sourcePath,
@@ -227,24 +393,85 @@ export function restoreDatabaseBackup({
       });
     }
 
-    const retiredSuffix = `.pre-restore-${randomUUID()}`;
-    const moved = [];
-    try {
-      moveIfPresent(target, `${target}${retiredSuffix}`, moved);
-      moveIfPresent(`${target}-wal`, `${target}${retiredSuffix}-wal`, moved);
-      moveIfPresent(`${target}-shm`, `${target}${retiredSuffix}-shm`, moved);
-      fs.renameSync(stagedPath, target);
-    } catch (error) {
-      for (const item of [...moved].reverse()) {
-        if (fs.existsSync(item.to) && !fs.existsSync(item.from)) fs.renameSync(item.to, item.from);
-      }
-      throw error;
-    }
-    for (const item of moved) fs.rmSync(item.to, { force: true });
+    replaceActiveDatabase({ target, stagedPath, retiredLabel: "pre-restore" });
     return {
       status: "restored",
       source: sourceInspection,
       restored: inspectDatabaseBackup(target, { verifyManifest: false }),
+      safetyBackup,
+    };
+  } finally {
+    fs.rmSync(stagedPath, { force: true });
+    fs.rmSync(`${stagedPath}-wal`, { force: true });
+    fs.rmSync(`${stagedPath}-shm`, { force: true });
+  }
+}
+
+export function importDatabaseAsAgent({
+  databasePath,
+  sourcePath,
+  agentId,
+  backupDirectory,
+  now = new Date(),
+} = {}) {
+  const target = path.resolve(clean(databasePath));
+  const source = path.resolve(clean(sourcePath));
+  const targetAgentId = clean(agentId);
+  if (!targetAgentId) throw new Error("Import requires a target Agent id.");
+  if (!clean(sourcePath) || source === target) {
+    throw new Error("Import source must be different from the active database.");
+  }
+  const sourceInspection = inspectDatabaseBackup(source, { verifyManifest: false });
+  if (sourceInspection.agentIds.length === 0) {
+    const error = new Error("Imported database does not contain an Agent scope to rebind.");
+    error.code = "IMPORT_AGENT_SCOPE_MISSING";
+    throw error;
+  }
+  if (sourceInspection.agentIds.length > 1) {
+    const error = new Error(
+      `Imported database contains multiple Agent scopes: ${sourceInspection.agentIds.join(", ")}`,
+    );
+    error.code = "IMPORT_MULTIPLE_AGENT_SCOPES";
+    throw error;
+  }
+  const sourceAgentId = clean(sourceInspection.agentIds[0]);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const stagedPath = path.join(path.dirname(target), `.import-${randomUUID()}.db`);
+  try {
+    snapshotDatabaseReadOnly(source, stagedPath);
+    const stagedDatabase = openMemoryDatabase(stagedPath);
+    try {
+      rebindAgentScope(stagedDatabase, { sourceAgentId, targetAgentId });
+      stagedDatabase.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      stagedDatabase.exec("PRAGMA journal_mode = DELETE");
+    } finally {
+      closeDatabase(stagedDatabase);
+    }
+    const imported = inspectDatabaseBackup(stagedPath, { verifyManifest: false });
+    if (imported.agentIds.some((id) => id !== targetAgentId)) {
+      const error = new Error("Imported database could not be rebound to the target Agent.");
+      error.code = "IMPORT_AGENT_REBIND_FAILED";
+      throw error;
+    }
+
+    let safetyBackup = null;
+    if (fs.existsSync(target)) {
+      const directory = path.resolve(clean(backupDirectory) || path.join(path.dirname(target), "backups"));
+      const backupPath = path.join(directory, `pre-import-${safeTimestamp(now)}.db`);
+      safetyBackup = createDatabaseBackup({
+        databasePath: target,
+        destinationPath: backupPath,
+        agentId: targetAgentId,
+        now,
+      });
+    }
+    replaceActiveDatabase({ target, stagedPath, retiredLabel: "pre-import" });
+    return {
+      status: "imported",
+      source: sourceInspection,
+      imported: inspectDatabaseBackup(target, { verifyManifest: false }),
+      reboundAgentId: sourceAgentId,
+      targetAgentId,
       safetyBackup,
     };
   } finally {

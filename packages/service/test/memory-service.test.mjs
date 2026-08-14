@@ -1095,6 +1095,107 @@ test("service creates verified backups and restores them with an automatic safet
   );
 });
 
+test("service imports another Agent database by rebinding its scoped records to the target Agent", () => {
+  const source = createMemoryService({
+    dataRoot: temporaryDirectory(),
+    agentId: "agent-source",
+    defaults: { companionId: "agent-source", memoryOwner: "旧联系人" },
+  });
+  source.initialize();
+  source.withRepository((repository) => {
+    repository.upsertMemory({
+      id: "imported-agent-memory",
+      agentId: "agent-source",
+      kind: "event",
+      layer: "long_term",
+      title: "复用的旧记忆",
+      content: "这是应该导入到新联系人的长期记忆。",
+      subjectRole: "agent",
+      subjectKey: "agent-source",
+      reality: "real",
+      evidenceMode: "explicit",
+      recordedAt: "2026-08-10T10:00:00.000Z",
+      status: "active",
+    });
+  });
+
+  const target = createMemoryService({
+    dataRoot: temporaryDirectory(),
+    agentId: "agent-target",
+    defaults: { companionId: "agent-target", memoryOwner: "新联系人" },
+  });
+  target.initialize();
+  target.withRepository((repository) => {
+    repository.upsertMemory({
+      id: "target-memory-to-back-up",
+      agentId: "agent-target",
+      kind: "event",
+      layer: "long_term",
+      title: "导入前的记忆",
+      content: "这条记忆会被导入前安全备份保留。",
+      subjectRole: "user",
+      subjectKey: "user",
+      reality: "real",
+      evidenceMode: "explicit",
+      recordedAt: "2026-08-10T11:00:00.000Z",
+      status: "active",
+    });
+  });
+
+  assert.throws(
+    () => target.importDatabaseAsAgent(source.paths.databasePath),
+    (error) => error.code === "IMPORT_CONFIRMATION_REQUIRED",
+  );
+  const imported = target.importDatabaseAsAgent(source.paths.databasePath, {
+    confirmAgentId: "agent-target",
+    now: "2026-08-11T00:00:00.000Z",
+  });
+  assert.equal(imported.status, "imported");
+  assert.deepEqual(imported.source.agentIds, ["agent-source"]);
+  assert.deepEqual(imported.imported.agentIds, ["agent-target"]);
+  assert.ok(fs.existsSync(imported.safetyBackup.databasePath));
+
+  const rebound = target.withRepository((repository, database) => ({
+    memory: repository.getMemory("imported-agent-memory"),
+    roles: repository.listMemoryRoles("imported-agent-memory"),
+    bindings: repository.listActorEntityBindings("agent-target"),
+    relationships: repository.listRelationships("agent-target"),
+    indexed: database.prepare("SELECT agent_id FROM memory_fts WHERE memory_id = ?")
+      .get("imported-agent-memory"),
+    retainedTargetMemory: repository.getMemory("target-memory-to-back-up"),
+  }), { readOnly: true });
+  assert.equal(rebound.memory.agent_id, "agent-target");
+  assert.equal(rebound.memory.subject_key, "agent-target");
+  assert.ok(rebound.roles.some((role) => role.actor_key === "agent-target"));
+  assert.equal(rebound.roles.some((role) => role.actor_key === "agent-source"), false);
+  assert.ok(rebound.bindings.some((binding) => binding.actor_role === "agent" && binding.actor_key === "agent-target"));
+  assert.equal(rebound.bindings.some((binding) => binding.actor_key === "agent-source"), false);
+  assert.ok(rebound.relationships.some((relationship) => relationship.relationship_key.includes("agent:agent-target")));
+  assert.equal(rebound.relationships.some((relationship) => relationship.relationship_key.includes("agent:agent-source")), false);
+  assert.equal(rebound.indexed.agent_id, "agent-target");
+  assert.equal(rebound.retainedTargetMemory, null);
+
+  assert.deepEqual(source.inspectDatabaseImport(source.paths.databasePath).agentIds, ["agent-source"]);
+});
+
+test("service rejects an unscoped database instead of reporting a no-op import", () => {
+  const sourceDirectory = temporaryDirectory();
+  const sourcePath = path.join(sourceDirectory, "unscoped-memory.db");
+  const sourceDatabase = openMemoryDatabase(sourcePath);
+  sourceDatabase.close();
+
+  const target = createMemoryService({
+    dataRoot: temporaryDirectory(),
+    agentId: "agent-target",
+  });
+  target.initialize();
+
+  assert.throws(
+    () => target.importDatabaseAsAgent(sourcePath, { confirmAgentId: "agent-target" }),
+    (error) => error.code === "IMPORT_AGENT_SCOPE_MISSING",
+  );
+});
+
 test("service rejects a backup whose manifest hash no longer matches", () => {
   const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
   const backup = service.backupDatabase({ now: "2026-08-05T04:10:00.000Z" });

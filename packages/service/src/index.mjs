@@ -41,6 +41,7 @@ import { processPlannedConsolidationRuns } from "@suzu-memory/structurer";
 import { createBrainSnapshot } from "@suzu-memory/visualization";
 import {
   createDatabaseBackup,
+  importDatabaseAsAgent,
   inspectDatabaseBackup,
   restoreDatabaseBackup,
 } from "./database-backup.mjs";
@@ -381,6 +382,12 @@ export class MemoryService {
     return inspectDatabaseBackup(sourcePath);
   }
 
+  inspectDatabaseImport(sourcePath) {
+    // An import accepts a raw runtime database, not only an exported backup.
+    // Ignore a neighbouring manifest because it may belong to an older copy.
+    return inspectDatabaseBackup(sourcePath, { verifyManifest: false });
+  }
+
   restoreDatabaseBackup(sourcePath, {
     confirmAgentId = "",
     now = new Date(),
@@ -397,6 +404,32 @@ export class MemoryService {
       backupDirectory: this.paths.backupDirectory,
       now: validDate(now, "database restore now"),
     });
+    this.initialized = false;
+    return {
+      ...result,
+      service: this.initialize(),
+    };
+  }
+
+  importDatabaseAsAgent(sourcePath, {
+    confirmAgentId = "",
+    now = new Date(),
+  } = {}) {
+    if (clean(confirmAgentId) !== this.agentId) {
+      const error = new Error(`Database import requires confirmAgentId=${this.agentId}.`);
+      error.code = "IMPORT_CONFIRMATION_REQUIRED";
+      throw error;
+    }
+    const result = importDatabaseAsAgent({
+      databasePath: this.paths.databasePath,
+      sourcePath,
+      agentId: this.agentId,
+      backupDirectory: this.paths.backupDirectory,
+      now: validDate(now, "database import now"),
+    });
+    // Layout coordinates are local presentation cache, not part of a portable
+    // memory DB. Rebuild them from the imported graph on the next view.
+    fs.rmSync(this.paths.visualizationCachePath, { force: true });
     this.initialized = false;
     return {
       ...result,
@@ -1385,6 +1418,7 @@ export function createMemoryService(options = {}) {
 
 export {
   createDatabaseBackup,
+  importDatabaseAsAgent,
   inspectDatabaseBackup,
   restoreDatabaseBackup,
 };
