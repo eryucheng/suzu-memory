@@ -8,7 +8,6 @@
     "test": "node --test test/*.test.mjs"
   },
   "files": [
-    "README.md",
     "src/**/*"
   ]
 }

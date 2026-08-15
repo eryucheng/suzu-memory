@@ -28,7 +28,6 @@
   "files": [
     "src/**/*",
     "fixtures/**/*",
-    "resources/**/*",
-    "README.md"
+    "resources/**/*"
   ]
 }
