@@ -8,8 +8,6 @@ import { DatabaseSync } from "node:sqlite";
 import {
   databaseInfo,
   ensureCompanionRelationshipStructure,
-  importLegacyEmbeddings,
-  importLegacyMemory,
   MemoryRepository,
   memoryRetrievalContextSourceHash,
   isStateAnalysisTargetComplete,
@@ -30,14 +28,6 @@ import { createHash } from "node:crypto";
 
 function temporaryDirectory(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
-function writeJsonl(filePath, rows) {
-  fs.writeFileSync(
-    filePath,
-    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
-    "utf8",
-  );
 }
 
 test("creates a versioned SQLite memory database with Chinese search", () => {
@@ -3170,143 +3160,6 @@ test("supports audited manual edits, soft deletion, and restoration", () => {
   assert.equal(detail.mutations[2].before.content, "去了错误的地点。");
   assert.equal(detail.mutations[2].after.content, "那天实际去了水族馆。");
   assert.equal(repository.getMemoryDetail("agent-other", "manual-memory"), null);
-  database.close();
-});
-
-test("imports legacy history and events idempotently with evidence links", () => {
-  const root = temporaryDirectory("suzu-memory-import-");
-  const historyPath = path.join(root, "history.jsonl");
-  const eventsPath = path.join(root, "events.jsonl");
-  writeJsonl(historyPath, [
-    {
-      id: "h1",
-      role: "user",
-      speaker: "User",
-      text: "我周六去了科技馆。",
-      timestamp: "2026-07-11T04:00:00.000Z",
-      source_kind: "user",
-      source_uuid: "u1",
-    },
-    {
-      id: "h2",
-      role: "assistant",
-      speaker: "Suzu",
-      text: "你看机器人展了吗？",
-      timestamp: "2026-07-11T04:01:00.000Z",
-      source_kind: "assistant",
-      source_uuid: "a1",
-    },
-  ]);
-  writeJsonl(eventsPath, [
-    {
-      id: "e1",
-      memory_type: "event",
-      title: "去了科技馆",
-      text: "用户周六去了科技馆，并聊到机器人展。",
-      event_date: "2026-07-11",
-      source_ids: ["h1", "h2"],
-      source_uuids: ["u1", "a1"],
-      source_start_timestamp: "2026-07-11T04:00:00.000Z",
-      source_end_timestamp: "2026-07-11T04:01:00.000Z",
-      status: "active",
-    },
-  ]);
-
-  const database = openMemoryDatabase(path.join(root, "memory.db"));
-  const repository = new MemoryRepository(database);
-  const first = importLegacyMemory({
-    repository,
-    agentId: "agent-test",
-    historyPath,
-    eventsPath,
-  });
-  const second = importLegacyMemory({
-    repository,
-    agentId: "agent-test",
-    historyPath,
-    eventsPath,
-  });
-  assert.equal(first.historySeen, 2);
-  assert.equal(first.eventsSeen, 1);
-  assert.equal(second.recordsAdded, 0);
-
-  const counts = database.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM source_records) AS sources,
-      (SELECT COUNT(*) FROM memory_nodes) AS memories,
-      (SELECT COUNT(*) FROM memory_edges WHERE relation = 'supported_by') AS evidence_edges
-  `).get();
-  assert.deepEqual(
-    {
-      sources: Number(counts.sources),
-      memories: Number(counts.memories),
-      evidenceEdges: Number(counts.evidence_edges),
-    },
-    { sources: 2, memories: 3, evidenceEdges: 2 },
-  );
-  assert.equal(repository.search("agent-test", "科技馆").length >= 1, true);
-  database.close();
-});
-
-test("migrates reusable legacy turn vectors into SQLite memory embeddings", () => {
-  const root = temporaryDirectory("suzu-legacy-vector-");
-  const historyPath = path.join(root, "history.jsonl");
-  const embeddingsPath = path.join(root, "embeddings.jsonl");
-  const rows = [
-    {
-      id: "message-user",
-      timestamp: "2026-07-01T08:00:00.000Z",
-      role: "user",
-      speaker: "User",
-      text: "我去了科技馆。",
-    },
-    {
-      id: "message-agent",
-      timestamp: "2026-07-01T08:01:00.000Z",
-      role: "assistant",
-      speaker: "Agent",
-      text: "你看了机器人展。",
-    },
-  ];
-  writeJsonl(historyPath, rows);
-  const turnId = createHash("sha256")
-    .update(rows.map((row) => row.id).join("\n"))
-    .digest("hex");
-  const rawVector = new Float32Array([1, 0]);
-  const encoded = Buffer.from(rawVector.buffer).toString("base64");
-  writeJsonl(embeddingsPath, [
-    {
-      type: "meta",
-      schema: 2,
-      model: "embedding-test",
-      dimensions: 2,
-    },
-    {
-      type: "chunk",
-      turnId,
-      textHash: "hash",
-      vector: encoded,
-    },
-  ]);
-
-  const database = openMemoryDatabase(":memory:");
-  const repository = new MemoryRepository(database);
-  importLegacyMemory({
-    repository,
-    agentId: "agent-test",
-    historyPath,
-    eventsPath: "",
-  });
-  const result = importLegacyEmbeddings({
-    repository,
-    agentId: "agent-test",
-    historyPath,
-    embeddingsPath,
-  });
-  assert.equal(result.imported, 2);
-  const embeddings = repository.listEmbeddings("agent-test", "embedding-test");
-  assert.equal(embeddings.length, 2);
-  assert.deepEqual([...embeddings[0].vector], [1, 0]);
   database.close();
 });
 

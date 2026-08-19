@@ -10,14 +10,6 @@ export {
 } from "./access-dynamics.mjs";
 
 export {
-  importLegacyMemory,
-} from "./legacy-import.mjs";
-
-export {
-  importLegacyEmbeddings,
-} from "./legacy-embeddings.mjs";
-
-export {
   rebuildAssociationGraph,
   updateAssociationGraph,
 } from "./association-graph.mjs";
