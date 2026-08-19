@@ -6,7 +6,7 @@ import {
   resolveMemoryDataRoot,
   stableAgentId,
 } from "@suzu-memory/runtime";
-import { createClaudeCliGenerator } from "@suzu-memory/providers";
+import { createInjectedStructuredGenerator } from "@suzu-memory/providers";
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
 import { processPendingRewardObservations } from "./reward-credit-service.mjs";
@@ -58,7 +58,7 @@ export function memoryRewardAnalysisUsage() {
 export async function runMemoryRewardAnalysisCli({
   args = process.argv.slice(2),
   stdout = process.stdout,
-  agentGeneratorFactory = createClaudeCliGenerator,
+  agentGeneratorFactory = null,
 } = {}) {
   const options = parseOptions(args);
   const projectRoot = path.resolve(clean(options["project-root"]) || process.cwd());
@@ -72,7 +72,10 @@ export async function runMemoryRewardAnalysisCli({
   }
   const maxObservations = maximum(options["max-observations"]);
   const usageLedgerPath = path.join(agentRoot, "cost-ledger", "events.jsonl");
-  const generator = agentGeneratorFactory({ model: clean(options.model) });
+  const generator = createInjectedStructuredGenerator(agentGeneratorFactory, {
+    label: "memory-reward-analyze",
+    model: clean(options.model),
+  });
   const analyzers = { outcome: generator, target: generator, credit: generator };
   const database = openMemoryDatabase(databasePath);
   let result;

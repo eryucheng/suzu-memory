@@ -1162,7 +1162,7 @@ test("binds one final response to one retrieval trace without pretending it was 
     agentId: "agent-test",
     sessionId: "session-test",
     responseText: "记得，你去了科技馆。",
-    metadata: { source: "claude-stop-hook" },
+    metadata: { source: "agent-stop-hook" },
     createdAt: "2026-08-01T01:01:00.000Z",
   });
   assert.equal(request.wasInserted, true);

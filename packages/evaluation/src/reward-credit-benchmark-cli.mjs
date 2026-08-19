@@ -6,7 +6,7 @@ import {
   resolveMemoryDataRoot,
   stableAgentId,
 } from "@suzu-memory/runtime";
-import { createClaudeCliGenerator } from "@suzu-memory/providers";
+import { createInjectedStructuredGenerator } from "@suzu-memory/providers";
 
 import { REWARD_CREDIT_HOLDOUT_V1 } from "../fixtures/reward-credit-holdout-v1.mjs";
 import { REWARD_CREDIT_MINI_V1 } from "../fixtures/reward-credit-mini-v1.mjs";
@@ -98,7 +98,7 @@ export function memoryRewardBenchmarkUsage() {
 export async function runMemoryRewardBenchmarkCli({
   args = process.argv.slice(2),
   stdout = process.stdout,
-  agentGeneratorFactory = createClaudeCliGenerator,
+  agentGeneratorFactory = null,
 } = {}) {
   const options = parseOptions(args);
   const selected = resolveBenchmarkSuite(options.suite);
@@ -143,7 +143,10 @@ export async function runMemoryRewardBenchmarkCli({
     "cost-ledger",
     "events.jsonl",
   );
-  const generator = agentGeneratorFactory({ model: clean(options.model) });
+  const generator = createInjectedStructuredGenerator(agentGeneratorFactory, {
+    label: "memory-reward-benchmark",
+    model: clean(options.model),
+  });
   const startedAt = new Date().toISOString();
   const checkpoint = { processing: [], results: [] };
   const report = await runRewardCreditBenchmark({

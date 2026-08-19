@@ -7,7 +7,7 @@ import {
   stableAgentId,
 } from "@suzu-memory/runtime";
 import {
-  createClaudeCliGenerator,
+  createInjectedStructuredGenerator,
 } from "@suzu-memory/providers";
 import {
   MemoryRepository,
@@ -70,7 +70,7 @@ export function memoryRetrievalUsageAnalysisUsage() {
 export async function runMemoryRetrievalUsageAnalysisCli({
   args = process.argv.slice(2),
   stdout = process.stdout,
-  agentGeneratorFactory = createClaudeCliGenerator,
+  agentGeneratorFactory = null,
 } = {}) {
   const options = parseOptions(args);
   const projectRoot = path.resolve(clean(options["project-root"]) || process.cwd());
@@ -86,7 +86,10 @@ export async function runMemoryRetrievalUsageAnalysisCli({
   }
   const maxRequests = boundedMaximum(options["max-requests"]);
   const usageLedgerPath = path.join(agentRoot, "cost-ledger", "events.jsonl");
-  const generator = agentGeneratorFactory({ model: clean(options.model) });
+  const generator = createInjectedStructuredGenerator(agentGeneratorFactory, {
+    label: "memory-usage-analyze",
+    model: clean(options.model),
+  });
   const database = openMemoryDatabase(databasePath);
   let result;
   try {

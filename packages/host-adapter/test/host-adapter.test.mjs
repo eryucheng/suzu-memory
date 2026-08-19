@@ -97,7 +97,7 @@ test("adapter exposes one host-neutral before/after reply lifecycle", async () =
   const memory = fakeMemory();
   const adapter = createChatHostMemoryAdapter({
     memory,
-    hostId: "claude-code",
+    hostId: "agent-host",
     identity: IDENTITY,
   });
   const prepared = await adapter.beforeReply({
@@ -161,7 +161,7 @@ test("runtime session heads are isolated when different hosts reuse the same ses
   });
   const second = createChatHostMemoryAdapter({
     memory: secondMemory,
-    hostId: "claude-code:desktop-a",
+    hostId: "agent-host:desktop-a",
     identity: IDENTITY,
   });
   const [firstPrepared, secondPrepared] = await Promise.all([
