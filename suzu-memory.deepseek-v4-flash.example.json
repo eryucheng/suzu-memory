@@ -39,7 +39,7 @@
     "embedding": {
       "type": "openai-compatible",
       "name": "DashScope",
-      "baseUrl": "https://ws-kbp30p5clsm7p1ml.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "endpoint": "embeddings",
       "model": "text-embedding-v4",
       "apiKeyEnv": "SUZU_MEMORY_EMBEDDING_API_KEY",
