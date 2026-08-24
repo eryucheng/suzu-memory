@@ -178,33 +178,6 @@
           }
         }
       ]
-    },
-    "qwen-voice-design": {
-      "label": "Qwen Voice Design",
-      "provider": "阿里云百炼",
-      "currency": "CNY",
-      "aliases": [
-        "qwen-voice-design"
-      ],
-      "sourceUrl": "https://help.aliyun.com/zh/model-studio/voice-design-user-guide",
-      "rateDefinitions": {
-        "generatedVoices": {
-          "label": "成功创建音色",
-          "unitLabel": "元 / 个",
-          "per": 1
-        }
-      },
-      "revisions": [
-        {
-          "id": "official-current",
-          "effectiveFrom": "1970-01-01T00:00:00.000Z",
-          "publishedAt": "2026-07-30",
-          "label": "官方标准价，不扣除新账号免费额度",
-          "rates": {
-            "generatedVoices": 0.2
-          }
-        }
-      ]
     }
   }
 }

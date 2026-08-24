@@ -56,19 +56,6 @@ test("falls back to raw usage when a compatibility event has empty units", () =>
   assert.equal(result.units.inputTokens, 1_000_000);
 });
 
-test("prices one successful Qwen voice design creation", () => {
-  const result = calculateCost({
-    model: "qwen-voice-design",
-    timestamp: "2026-07-30T00:00:00.000Z",
-    usage: {},
-    units: {
-      generatedVoices: 1,
-    },
-  });
-  assert.equal(result.status, "estimated");
-  assert.ok(Math.abs(result.amountCny - 0.2) < 0.000001);
-});
-
 test("matches custom prices by event timestamp without changing older events", () => {
   const customRevisions = [
     {
