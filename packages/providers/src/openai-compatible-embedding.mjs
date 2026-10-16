@@ -34,32 +34,36 @@ export function createOpenAiCompatibleEmbeddingProvider({
   if (!clean(baseUrl)) throw new Error("Embedding provider 需要 baseUrl。");
   if (!clean(model)) throw new Error("Embedding provider 需要 model。");
   if (typeof fetchImplementation !== "function") throw new Error("当前运行时没有 fetch。");
-  async function requestEmbeddings(inputs) {
+  const fixed = structuredClone({ baseUrl, type, endpoint, model: clean(model), dimensions, extraBody, extraHeaders });
+  const describeRequest = inputs => {
     const texts = (Array.isArray(inputs) ? inputs : [inputs]).map((text) => String(text || ""));
     if (!texts.length || texts.some((text) => !text.trim())) {
       throw new Error("Embedding provider 需要非空文本。");
     }
+    return { url: openAiCompatibleEndpoint(fixed.baseUrl, fixed.endpoint, fixed.type),
+      body: { ...fixed.extraBody, model: fixed.model, input: texts,
+        ...(Number(fixed.dimensions) > 0 ? { dimensions: Number(fixed.dimensions) } : {}) } };
+  };
+  async function requestEmbeddings(inputs, { signal } = {}) {
+    signal?.throwIfAborted();
+    const actual = describeRequest(inputs);
+    const texts = actual.body.input;
     const secret = clean(apiKey) || clean(process.env[clean(apiKeyEnv)]);
     if (!secret) throw new Error("Embedding API Key 未配置。");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs)));
     try {
       const response = await fetchImplementation(
-        openAiCompatibleEndpoint(baseUrl, endpoint, type),
+        actual.url,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${secret}`,
-            ...extraHeaders,
+            ...fixed.extraHeaders,
           },
-          body: JSON.stringify({
-            model,
-            input: texts,
-            ...(Number(dimensions) > 0 ? { dimensions: Number(dimensions) } : {}),
-            ...extraBody,
-          }),
-          signal: controller.signal,
+          body: JSON.stringify(actual.body),
+          signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
         },
       );
       const raw = await response.text();
@@ -79,7 +83,7 @@ export function createOpenAiCompatibleEmbeddingProvider({
       }
       return {
         vectors: data.map((item) => normalizeVector(item?.embedding)),
-        model: parsed.model || model,
+        model: parsed.model || fixed.model,
         usage: parsed.usage || {},
         requestId: response.headers.get("x-request-id") || parsed.request_id || "",
         metadata: { provider: "openai-compatible" },
@@ -89,14 +93,15 @@ export function createOpenAiCompatibleEmbeddingProvider({
     }
   }
 
-  const embed = async function embed(text) {
-    const response = await requestEmbeddings([text]);
+  const embed = async function embed(text, context) {
+    const response = await requestEmbeddings([text], context);
     return {
       ...response,
       vector: response.vectors[0],
     };
   };
   embed.embedMany = requestEmbeddings;
+  embed.describeRequest = describeRequest;
   embed.model = clean(model);
   embed.dimensions = Math.max(0, Math.trunc(Number(dimensions) || 0));
   return embed;

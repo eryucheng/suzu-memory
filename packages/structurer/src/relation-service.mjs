@@ -55,6 +55,30 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
   }
 }
 
+export function prepareRelationGeneration({
+  repository, agentId, batchId, memoryIds,
+  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator,
+}) {
+  const snapshot = buildRelationSnapshot({
+    repository,
+    agentId: agentId,
+    batchId: batchId,
+    memoryIds: memoryIds,
+    ...snapshotOptions,
+  });
+  if (snapshot.memories.length < 2 || !snapshot.sourceRecords.length) return { snapshot, request: null, reason: snapshot.memories.length < 2 ? "fewer-than-two-eligible-memories" : "no-source-evidence" };
+  const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
+  const request = {
+    input: buildRelationGenerationInput(snapshot),
+    systemPrompt,
+    schema: MEMORY_RELATION_OUTPUT_SCHEMA,
+    schemaName: "memory-relation-proposals-v1",
+    ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
+  };
+  generator?.assertRequestBudget?.(request);
+  return { snapshot, request };
+}
+
 export async function proposeRelationsForBatch({
   repository,
   agentId,
@@ -66,6 +90,7 @@ export async function proposeRelationsForBatch({
   snapshotOptions = {},
   candidatePolicy = {},
   maximumProposals = 20,
+  preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory relation structurer requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -77,34 +102,15 @@ export async function proposeRelationsForBatch({
     (Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean),
   )];
   const normalizedBatchId = clean(batchId) || stableBatchId(normalizedAgentId, normalizedMemoryIds);
-  const snapshot = buildRelationSnapshot({
-    repository,
-    agentId: normalizedAgentId,
-    batchId: normalizedBatchId,
-    memoryIds: normalizedMemoryIds,
-    ...snapshotOptions,
+  const prepared = preparedGeneration || prepareRelationGeneration({
+    repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
+    snapshotOptions, systemPromptPath, generator,
   });
-  if (snapshot.memories.length < 2 || !snapshot.sourceRecords.length) {
-    return {
-      status: "skipped",
-      reason: snapshot.memories.length < 2 ? "fewer-than-two-eligible-memories" : "no-source-evidence",
-      batchId: normalizedBatchId,
-      snapshot,
-      proposed: [],
-      duplicates: [],
-      rejected: [],
-      usageRecorded: false,
-      warnings: [],
-    };
-  }
-
-  const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
-  const generation = await generator({
-    input: buildRelationGenerationInput(snapshot),
-    systemPrompt,
-    schema: MEMORY_RELATION_OUTPUT_SCHEMA,
-    schemaName: "memory-relation-proposals-v1",
-  });
+  const { snapshot, request } = prepared;
+  if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
+    snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
+  generator.assertRequestBudget?.(request);
+  const generation = await generator(request);
   const warnings = [];
   const usageRecorded = await recordUsage({
     generation,

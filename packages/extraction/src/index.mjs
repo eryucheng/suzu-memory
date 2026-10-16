@@ -2,6 +2,7 @@ export {
   archiveLongTermEvidence,
   fallbackStateAnalysisToProvisionalReview,
   loadLongTermExtractionSystemPrompt,
+  resolveExtractedCandidateIdentity,
 } from "./archive.mjs";
 
 export {
@@ -19,3 +20,5 @@ export {
   DIRECT_USER_AGENT_DM_TOPOLOGY,
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
+
+export { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles } from './participant-identity.mjs';

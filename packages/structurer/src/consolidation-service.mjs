@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 
-import { proposeRelationsForBatch } from "./relation-service.mjs";
-import { proposeStructuresForBatch } from "./service.mjs";
-import { createConsolidationGenerationBatch } from "./consolidation-generation-batch.mjs";
+import { proposeRelationsForBatch, prepareRelationGeneration } from "./relation-service.mjs";
+import { proposeStructuresForBatch, prepareStructureGeneration } from "./service.mjs";
+import { createConsolidationGenerationBatch, buildConsolidationRequest } from "./consolidation-generation-batch.mjs";
+
+import { runBudgetedMemoryParts, memoryBudgetError } from "./budgeted-parts.mjs";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -72,82 +75,79 @@ export async function runMemoryConsolidation({
     };
   }
 
-  const memoryIds = [...run.triggerIds, ...run.candidateIds];
-  const retrospective = {
-    triggerMemoryIds: run.triggerIds,
-    historicalMemoryIds: run.candidateIds,
-  };
-  const retrospectivePolicy = {
-    requiredTriggerMemoryIds: run.triggerIds,
-    requiredHistoricalMemoryIds: run.candidateIds,
-    requireRetrospectiveParticipation: true,
-  };
+  const progress = run.metadata.organizationProgress || { parts: [{
+    id: run.id, memoryIds: run.triggerIds, historicalIds: run.candidateIds, status: "pending",
+  }] };
   let structure = null;
   let relations = null;
   let structureIds = [...run.structureProposalIds];
   let relationIds = [...run.relationProposalIds];
-  const proposeStructure = (generator) => proposeStructuresForBatch({
-    ...structureOptions,
-    repository,
-    agentId: normalizedAgentId,
-    batchId: `${run.id}:structure`,
-    memoryIds,
-    generator,
-    snapshotOptions: {
-      ...(structureOptions.snapshotOptions || {}),
-      retrospective,
-    },
-    candidatePolicy: {
-      ...(structureOptions.candidatePolicy || {}),
-      ...retrospectivePolicy,
-    },
-  });
-  const proposeRelations = (generator) => proposeRelationsForBatch({
-    ...relationOptions,
-    repository,
-    agentId: normalizedAgentId,
-    batchId: `${run.id}:relations`,
-    memoryIds,
-    generator,
-    snapshotOptions: {
-      ...(relationOptions.snapshotOptions || {}),
-      retrospective,
-    },
-    candidatePolicy: {
-      ...(relationOptions.candidatePolicy || {}),
-      ...retrospectivePolicy,
-    },
-  });
+  const checkpoint = () => {
+    structureIds = [...new Set([...structureIds, ...progress.parts.flatMap(part => proposalIds(part.structure))])];
+    relationIds = [...new Set([...relationIds, ...progress.parts.flatMap(part => proposalIds(part.relations))])];
+    repository.checkpointConsolidationRun({ agentId: normalizedAgentId, runId: run.id, workerId,
+      progress, structureProposalIds: structureIds, relationProposalIds: relationIds });
+  };
+  const optionsFor = (part, type) => {
+    const options = type === "structure" ? structureOptions : relationOptions;
+    return { ...options, repository, agentId: normalizedAgentId, batchId: `${part.id}:${type}`,
+      memoryIds: [...part.memoryIds, ...part.historicalIds],
+      snapshotOptions: { ...options.snapshotOptions, retrospective: {
+        triggerMemoryIds: part.memoryIds, historicalMemoryIds: part.historicalIds,
+      } },
+      candidatePolicy: { ...options.candidatePolicy, requiredTriggerMemoryIds: part.memoryIds,
+        requiredHistoricalMemoryIds: part.historicalIds, requireRetrospectiveParticipation: true },
+    };
+  };
+  const aggregate = key => {
+    const reports = progress.parts.map(part => part[key]).filter(Boolean);
+    if (!reports.length) return null;
+    return { ...reports[0], ...Object.fromEntries(["proposed", "duplicates", "rejected", "warnings"]
+      .map(field => [field, reports.flatMap(report => report[field] || [])])) };
+  };
   try {
-    const canCombine = typeof structureGenerator === "function"
-      && structureGenerator === relationGenerator
-      && structureGenerator.supportsCombinedConsolidation === true;
-    if (canCombine) {
-      const combined = createConsolidationGenerationBatch(structureGenerator);
-      const [structureResult, relationResult] = await Promise.allSettled([
-        proposeStructure(combined.structure),
-        proposeRelations(combined.relations),
-      ]);
-      if (structureResult.status === "fulfilled") {
-        structure = structureResult.value;
-        structureIds = [...new Set([...structureIds, ...proposalIds(structure)])];
-      }
-      if (relationResult.status === "fulfilled") {
-        relations = relationResult.value;
-        relationIds = [...new Set([...relationIds, ...proposalIds(relations)])];
-      }
-      const failure = [structureResult, relationResult]
-        .find((result) => result.status === "rejected");
-      if (failure) throw failure.reason;
-    } else {
-      if (typeof structureGenerator === "function") {
-        structure = await proposeStructure(structureGenerator);
-        structureIds = [...new Set([...structureIds, ...proposalIds(structure)])];
-      }
-      if (typeof relationGenerator === "function") {
-        relations = await proposeRelations(relationGenerator);
-        relationIds = [...new Set([...relationIds, ...proposalIds(relations)])];
-      }
+    checkpoint();
+    await runBudgetedMemoryParts({ parts: progress.parts, checkpoint,
+      prepare: part => {
+        const prepared = {};
+        if (!part.structure && typeof structureGenerator === "function") {
+          prepared.structure = prepareStructureGeneration({ ...optionsFor(part, "structure"), generator: structureGenerator });
+        }
+        if (!part.relations && typeof relationGenerator === "function") {
+          prepared.relations = prepareRelationGeneration({ ...optionsFor(part, "relations"), generator: relationGenerator });
+        }
+        const calls = Object.entries(prepared).filter(([, value]) => value.request)
+          .map(([key, value]) => ({ key, request: value.request }));
+        if (calls.length && structureGenerator === relationGenerator && structureGenerator?.supportsCombinedConsolidation) {
+          structureGenerator.assertRequestBudget?.(buildConsolidationRequest(calls));
+        }
+        return prepared;
+      },
+      execute: async (part, prepared) => {
+        const combined = structureGenerator === relationGenerator && structureGenerator?.supportsCombinedConsolidation
+          ? createConsolidationGenerationBatch(structureGenerator) : null;
+        const jobs = Object.entries(prepared).map(([key, preparedGeneration]) => {
+          const operation = key === "structure" ? proposeStructuresForBatch : proposeRelationsForBatch;
+          const generator = combined ? combined[key] : key === "structure" ? structureGenerator : relationGenerator;
+          return [key, operation({ ...optionsFor(part, key), generator, preparedGeneration })];
+        });
+        const results = await Promise.allSettled(jobs.map(([, promise]) => promise));
+        for (const [index, result] of results.entries()) {
+          if (result.status === "fulfilled") {
+            const { snapshot, ...report } = result.value;
+            part[jobs[index][0]] = report;
+          }
+        }
+        checkpoint();
+        const failure = results.find(result => result.status === "rejected");
+        if (failure) throw failure.reason;
+        return { status: "completed" };
+      },
+    });
+    structure = aggregate("structure");
+    relations = aggregate("relations");
+    if (progress.parts.some(part => part.status === "blocked")) {
+      throw memoryBudgetError("A complete new/old memory pair exceeds the organization budget; original material is retained for review.");
     }
     const hasProposals = structureIds.length > 0 || relationIds.length > 0;
     const finished = repository.finishConsolidationRun({
@@ -165,16 +165,21 @@ export async function runMemoryConsolidation({
       relations,
     };
   } catch (error) {
+    assertEventSourceExecutionCurrent();
+    structure = aggregate("structure");
+    relations = aggregate("relations");
     const failed = repository.failConsolidationRun({
       agentId: normalizedAgentId,
       runId: run.id,
       structureProposalIds: structureIds,
       relationProposalIds: relationIds,
       errorMessage: error.message,
+      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MAX_TOKENS"].includes(error.code),
       errorDetails: {
         stage: "retrospective-consolidation",
         errorCode: clean(error.code),
         errorName: clean(error.name),
+        providerDiagnostics: error.diagnostics || {},
       },
       workerId,
     });

@@ -24,9 +24,14 @@ function applyMigrations(database) {
 
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.version)) continue;
+    if (migration.foreignKeysOff) database.exec('PRAGMA foreign_keys = OFF');
     database.exec("BEGIN IMMEDIATE");
     try {
-      database.exec(migration.sql);
+      if (migration.apply) migration.apply(database);
+      else database.exec(migration.sql);
+      if (migration.foreignKeysOff && database.prepare('PRAGMA foreign_key_check').all().length) {
+        throw new Error(`Memory migration ${migration.version} would break foreign keys.`);
+      }
       database.prepare(`
         INSERT INTO schema_migrations (version, name, applied_at)
         VALUES (?, ?, ?)
@@ -35,6 +40,8 @@ function applyMigrations(database) {
     } catch (error) {
       database.exec("ROLLBACK");
       throw error;
+    } finally {
+      if (migration.foreignKeysOff) database.exec('PRAGMA foreign_keys = ON');
     }
   }
 }

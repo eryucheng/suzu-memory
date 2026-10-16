@@ -1,4 +1,4 @@
-import { MEMORY_STATE_FAMILIES } from "@suzu-memory/core";
+import { MEMORY_STATE_FAMILIES, executionEventSourceView } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -156,13 +156,14 @@ export function buildCanonicalStateEvidenceSnapshot({
   analysisRequestId = "",
   analysisRequestObservationIds = [],
   maxObservations = 400,
-  maxMemoryContentChars = 4000,
-  maxSourceContentChars = 8000,
-  maxCurrentStateContentChars = 4000,
+  maxMemoryContentChars,
+  maxSourceContentChars,
+  maxCurrentStateContentChars,
   maxSnapshotChars = 500_000,
 } = {}) {
   if (!repository) throw new Error("Canonical state review requires a repository.");
   const normalizedAgentId = clean(agentId);
+  const sourceView = executionEventSourceView(repository, normalizedAgentId);
   const normalizedStateFamily = clean(stateFamily);
   const normalizedSubjectRole = clean(subjectRole);
   const normalizedSubjectKey = clean(subjectKey);
@@ -230,6 +231,8 @@ export function buildCanonicalStateEvidenceSnapshot({
     canonicalKey: normalizedCanonicalKey,
     representationLayer: normalizedCurrentRepresentationLayer,
     stateFamily: normalizedStateFamily,
+    includePending: normalizedCurrentRepresentationLayer === "reported",
+    includeHistorical: normalizedCurrentRepresentationLayer === "reported",
   });
   let currentStateEvidenceMemoryIds = [];
   if (current) {
@@ -238,6 +241,7 @@ export function buildCanonicalStateEvidenceSnapshot({
       maxNodes: 500,
       relations: ["supported_by", "challenged_by"],
       traversal: "outgoing",
+      allowedMemoryIds: sourceView?.memoryIds,
     });
     if (graph.nodes.length >= 500) {
       throw new Error("Current state evidence graph reaches the complete 500-node safety limit.");
@@ -255,9 +259,10 @@ export function buildCanonicalStateEvidenceSnapshot({
     }
   }
 
+  const charLimit = boundedInteger(maxSnapshotChars, 500_000, 20_000, 2_000_000);
   const limits = {
-    maxMemoryContentChars: boundedInteger(maxMemoryContentChars, 4000, 100, 100_000),
-    maxSourceContentChars: boundedInteger(maxSourceContentChars, 8000, 100, 200_000),
+    maxMemoryContentChars: boundedInteger(maxMemoryContentChars, charLimit, 1, charLimit),
+    maxSourceContentChars: boundedInteger(maxSourceContentChars, charLimit, 1, charLimit),
   };
   const views = observations.map((observation) => buildObservationView(
     repository,
@@ -289,7 +294,7 @@ export function buildCanonicalStateEvidenceSnapshot({
       kind: current.kind,
       content: requireCompleteText(
         current.content,
-        boundedInteger(maxCurrentStateContentChars, 4000, 100, 100_000),
+        boundedInteger(maxCurrentStateContentChars, charLimit, 1, charLimit),
         `Current state ${current.id}`,
       ),
       scope: current.metadata?.scope || current.metadata?.preferenceScope || {},
@@ -297,6 +302,7 @@ export function buildCanonicalStateEvidenceSnapshot({
       validFrom: current.valid_from,
       validTo: current.valid_to,
       temporalState: current.temporal_state,
+      statePhase: current.state_phase,
       evidenceMode: current.evidence_mode,
       representationLayer: current.representation_layer,
     } : null,
@@ -330,7 +336,8 @@ export function buildCanonicalStateEvidenceSnapshot({
     inputPolicy: {
       targetIsFixedByCaller: true,
       familyIsolationIsRequired: true,
-      allCurrentObservationsAreIncluded: true,
+      allCurrentObservationsAreIncluded: !sourceView,
+      ...(sourceView ? { allEligibleCurrentObservationsAreIncluded: true } : {}),
       excludedAndUnresolvedAreVisible: true,
       evidenceGroupsAreNotVotes: true,
       familyThresholdsAreNotApplied: true,
@@ -342,7 +349,6 @@ export function buildCanonicalStateEvidenceSnapshot({
       } : null,
     },
   };
-  const charLimit = boundedInteger(maxSnapshotChars, 500_000, 20_000, 2_000_000);
   if (JSON.stringify(snapshot).length > charLimit) {
     throw new Error(`Canonical state review exceeds the complete ${charLimit}-character budget.`);
   }

@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -110,6 +112,7 @@ async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, ag
     });
     return "";
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return `费用流水写入失败：${error.message}`;
   }
 }
@@ -119,6 +122,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
     path.join(path.resolve(promptDirectory), definition.promptFile),
     "utf8",
   ).replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildBehaviorStateGenerationInput(snapshot, definition);
   let generation = null;
   try {
@@ -126,7 +130,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
       input,
       systemPrompt,
       schema: definition.schema,
-      schemaName: definition.schemaName,
+      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
       stateFamily: definition.stateFamily,
       analyzerRole: definition.role,
     });
@@ -148,6 +152,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
         ));
         seen.add(candidate.memoryId);
       } catch (error) {
+      assertEventSourceExecutionCurrent();
         rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
       }
     }
@@ -161,6 +166,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
       error: "",
     };
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return {
       definition,
       input,
@@ -469,6 +475,7 @@ export async function evaluateBehaviorStateEvidence({
       },
     },
   ]));
+  for (const snapshot of Object.values(snapshots)) snapshotOptions.prepareStateSnapshot?.(snapshot);
   if (!baseSnapshot.memories.length) {
     return {
       status: "skipped",
@@ -513,7 +520,7 @@ export async function evaluateBehaviorStateEvidence({
       batchId,
     });
     if (warning) warnings.push(warning);
-    runs[stateFamily] = repository.recordStateAnalysisRun({
+    runs[stateFamily] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
       agentId: clean(agentId),
       batchId,
       stateFamily,
@@ -525,7 +532,7 @@ export async function evaluateBehaviorStateEvidence({
       model: clean(invocation.generation?.model) || "unreported",
       promptVersion: invocation.definition.promptVersion,
       schemaVersion: invocation.definition.schemaName,
-      inputHash: createHash("sha256").update(invocation.input).digest("hex"),
+      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
       status: invocation.status,
       memoryIds: snapshot.memories.map((memory) => memory.id),
       sourceIds,

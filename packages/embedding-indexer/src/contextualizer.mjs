@@ -6,6 +6,9 @@ import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
   buildMemoryRetrievalContextSource,
   memoryRetrievalContextSourceHash,
+  executionEventSourceView,
+  eventSourceMaterial,
+  assertEventSourceExecutionCurrent,
 } from "@suzu-memory/core";
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -141,7 +144,7 @@ function readPrompt(promptDirectory, filename) {
     .trim();
 }
 
-function normalizeProposal(output) {
+export function normalizeProposal(output) {
   if (!hasExactKeys(output, ["context", "queryTerms"]) || !Array.isArray(output.queryTerms)) {
     throw new Error("检索上下文提案不符合固定 Schema。");
   }
@@ -156,7 +159,7 @@ function normalizeProposal(output) {
   return { context, queryTerms };
 }
 
-function normalizeCritique(output) {
+export function normalizeCritique(output) {
   if (!hasExactKeys(output, ["approved", "issues"]) || !Array.isArray(output.issues)) {
     throw new Error("检索上下文审查结果不符合固定 Schema。");
   }
@@ -242,7 +245,9 @@ export async function generateMemoryRetrievalContexts({
   const excluded = new Set((Array.isArray(excludedKinds) ? excludedKinds : []).map(clean));
   const selectedIds = new Set((Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean));
   const all = listActiveMemories(repository, normalizedAgentId);
+  const sourceView = executionEventSourceView(repository, normalizedAgentId);
   const eligible = all
+    .filter((memory) => !sourceView || sourceView.allows(memory))
     .filter((memory) => !excluded.has(memory.kind))
     .filter((memory) => !selectedIds.size || selectedIds.has(memory.id))
     .sort((left, right) => left.id.localeCompare(right.id));
@@ -295,6 +300,7 @@ export async function generateMemoryRetrievalContexts({
     const criticNeed = assessMemoryRetrievalContextCriticNeed(memory, selection);
     const source = buildMemoryRetrievalContextSource(memory);
     const sourceHash = memoryRetrievalContextSourceHash(memory);
+    const sourceMaterial = eventSourceMaterial(repository, normalizedAgentId, [memory.id]);
     let proposalGeneration = null;
     let criticGeneration = null;
     let proposal = null;
@@ -309,6 +315,7 @@ export async function generateMemoryRetrievalContexts({
         systemPrompt: proposalPrompt,
         schema: PROPOSAL_SCHEMA,
         schemaName: "memory_retrieval_context_proposal_v1",
+        ...(sourceMaterial ? { sourceMaterial } : {}),
         analyzerRole: "memory-retrieval-context-proposer",
       });
       proposal = normalizeProposal(proposalGeneration?.output);
@@ -326,6 +333,7 @@ export async function generateMemoryRetrievalContexts({
           systemPrompt: criticPrompt,
           schema: CRITIC_SCHEMA,
           schemaName: "memory_retrieval_context_critic_v1",
+          ...(sourceMaterial ? { sourceMaterial } : {}),
           analyzerRole: "memory-retrieval-context-critic",
         });
         report.criticCalls += 1;
@@ -369,6 +377,7 @@ export async function generateMemoryRetrievalContexts({
         report.results.push({ memoryId: memory.id, status: "added", contextId: stored.id });
       }
     } catch (error) {
+      assertEventSourceExecutionCurrent();
       report.failed += 1;
       report.results.push({
         memoryId: memory.id,

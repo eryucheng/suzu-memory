@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { databaseInfo, openMemoryDatabase } from "@suzu-memory/core";
+import { databaseInfo, MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
 const BACKUP_FORMAT = "suzu-memory-sqlite-backup-v1";
 
@@ -167,8 +167,10 @@ export function createDatabaseBackup({
   const temporaryPath = `${destination}.tmp-${randomUUID()}`;
   const database = openMemoryDatabase(source);
   try {
+    const repository = new MemoryRepository(database);
     database.exec("PRAGMA wal_checkpoint(FULL)");
     database.exec(`VACUUM INTO ${sqlString(temporaryPath)}`);
+    repository.sourceEpoch.assert();
   } finally {
     closeDatabase(database);
   }

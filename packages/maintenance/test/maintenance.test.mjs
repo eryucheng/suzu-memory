@@ -67,7 +67,7 @@ test("immediate lane performs deterministic work and only queues expensive follo
   assert.equal(status.tasks.length, 3);
   assert.equal(status.runnableTaskCount, 3);
   assert.equal(status.taskCounts["embedding:memory-embedding:pending"], 1);
-  assert.equal(status.taskCounts["semantic:retrieval-context:pending"], 1);
+  assert.equal(status.taskCounts["semantic:retrieval-context:pending"], undefined);
   assert.equal(status.taskCounts["semantic:structure-proposal:pending"], 1);
   database.close();
 });
@@ -191,11 +191,13 @@ test("embedding lane combines queued memory ids and reuses completed vectors", a
 test("semantic lane keeps retrieval context and structure prompts separate", async () => {
   const { database, repository } = fixture();
   seedMemory(repository, "event-1", "后来呢");
+  seedMemory(repository, "event-2", "后来我们一起完成了这件事。");
   runImmediateMemoryMaintenance({
     repository,
     agentId: AGENT_ID,
     batchId: "batch-1",
-    memoryIds: ["event-1"],
+    memoryIds: ["event-1", "event-2"],
+    followUpTaskTypes: Object.values(MAINTENANCE_TASK_TYPES),
   });
   const schemaNames = [];
   const generator = async ({ schemaName }) => {
@@ -223,10 +225,13 @@ test("semantic lane keeps retrieval context and structure prompts separate", asy
     retrievalContextGenerator: generator,
     structureGenerator: generator,
     maximumTasks: 10,
+    minimumStructureMemories: 2,
   });
   assert.equal(result.status, "completed");
   assert.equal(result.selected, 2);
   assert.deepEqual(schemaNames, [
+    "memory_retrieval_context_proposal_v1",
+    "memory_retrieval_context_critic_v1",
     "memory_retrieval_context_proposal_v1",
     "memory_retrieval_context_critic_v1",
     "memory-structure-proposals-v1",
@@ -266,6 +271,7 @@ test("pending topic and episode candidates immediately queue normal maintenance"
     repository,
     agentId: AGENT_ID,
     retrievalContextGenerator: null,
+    minimumStructureMemories: 2,
     structureGenerator: async ({ schemaName }) => {
       assert.equal(schemaName, "memory-structure-proposals-v1");
       return {
@@ -300,7 +306,7 @@ test("pending topic and episode candidates immediately queue normal maintenance"
   const pendingTasks = repository.listMaintenanceTasks(AGENT_ID, { statuses: ["pending"] });
   assert.deepEqual(
     pendingTasks.map((task) => task.task_type).sort(),
-    [MAINTENANCE_TASK_TYPES.memoryEmbedding, MAINTENANCE_TASK_TYPES.retrievalContext].sort(),
+    [MAINTENANCE_TASK_TYPES.memoryEmbedding],
   );
   assert.equal(pendingTasks.every((task) => task.payload.memoryIds.includes(pendingEpisode.id)), true);
   database.close();
@@ -315,6 +321,7 @@ test("semantic failures retry three times, preserve partial success, and enter h
     agentId: AGENT_ID,
     batchId: "batch-partial-failure",
     memoryIds: ["event-good", "event-failing"],
+    followUpTaskTypes: [MAINTENANCE_TASK_TYPES.retrievalContext],
   });
   const generator = async ({ input, schemaName }) => {
     const parsed = JSON.parse(input);
@@ -455,7 +462,8 @@ test("a local restart immediately requeues interrupted maintenance work", () => 
   database.close();
 });
 
-test("semantic maintenance auto-accepts only a request-bound explicit self report", async () => {
+for (const [subjectRole, subjectKey] of [["user", "human-a"], ["agent", AGENT_ID], ["other", "agent-b"], ["other", "human-b"]])
+test(`semantic maintenance accepts a request-bound self report from ${subjectRole}:${subjectKey}`, async () => {
   const { database, repository } = fixture();
   const source = repository.upsertSource({
     agentId: AGENT_ID,
@@ -471,15 +479,15 @@ test("semantic maintenance auto-accepts only a request-bound explicit self repor
     kind: "utterance",
     layer: "evidence",
     content: "我一直很喜欢解谜游戏。",
-    subjectRole: "user",
-    subjectKey: "user",
+    subjectRole,
+    subjectKey,
     evidenceMode: "explicit",
     temporalState: "historical",
     knownAt: "2026-08-04T08:00:00.000Z",
     actorRoles: [{
       role: "speaker",
-      actorRole: "user",
-      actorKey: "user",
+      actorRole: subjectRole,
+      actorKey: subjectKey,
       isPrimary: true,
       confidence: 1,
     }],
@@ -494,8 +502,8 @@ test("semantic maintenance auto-accepts only a request-bound explicit self repor
     batchId: "explicit-state-batch",
     candidateIndex: 0,
     stateFamily: "preference",
-    subjectRole: "user",
-    subjectKey: "user",
+    subjectRole,
+    subjectKey,
     canonicalKey: "user:preference:puzzle-games",
     targetLabel: "解谜游戏",
     representationLayer: "reported",
@@ -547,13 +555,15 @@ test("semantic maintenance auto-accepts only a request-bound explicit self repor
   const state = repository.listMemories(AGENT_ID, { kinds: ["preference"] });
   assert.equal(state.total, 1);
   assert.equal(state.items[0].representation_layer, "reported");
+  assert.equal(state.items[0].subject_role, subjectRole);
+  assert.equal(state.items[0].subject_key, subjectKey);
   assert.equal(repository.listReportedStateProposals(AGENT_ID, {
     reviewStates: ["pending"],
   }).length, 0);
   assert.deepEqual(
     repository.listMaintenanceTasks(AGENT_ID, { statuses: ["pending"] })
       .map((task) => task.task_type).sort(),
-    ["memory-embedding", "retrieval-context"],
+    ["memory-embedding", "structure-proposal"],
   );
 
   const reviewed = result.stateAnalysis.results[0].proposal;

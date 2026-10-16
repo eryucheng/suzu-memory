@@ -1,18 +1,32 @@
 import fs from "node:fs";
 import path from "node:path";
+import { appendMemoryEventSources } from './event-source-ingestion.mjs';
+import { adoptLegacySourceEvidence, adoptExperienceSourceEvidence } from './legacy-source-import.mjs';
+import { eraseMemoryEventSources, recoverMemoryEventSourceCleanups } from './event-source-cleanup.mjs';
+export { validateMemoryExtractionOutput } from './event-source-ingestion.mjs';
+export { assertMemoryTaskRequest, validateMemoryTaskOutput, isMemoryStateAnalysisRequest } from './model-task-validation.mjs';
 
 import { processPendingStateAnalysisRequests } from "@suzu-memory/analysis";
 import {
   databaseInfo,
+  assertEventSourceScope,
+  eventSourceState,
+  getEventSourceCleanup,
+  withEventSourceExecution,
+  assertEventSourceExecutionCurrent,
+  currentEventSourceExecution,
+  executionEventSourceView,
   ensureCompanionRelationshipStructure,
   materializePendingMemoryStructureProposals,
   MemoryRepository,
   openMemoryDatabase,
   rebuildAssociationGraph,
   resolveMemoryIngestionReview,
+  resolveEventContinuityReview,
   resolveMemoryRelationProposal,
   resolveMemoryStructureProposal,
   resolveReportedStateProposal,
+  resolvePreferenceStateProposal,
   revokeMemoryRelationProposal,
 } from "@suzu-memory/core";
 import { syncMemoryEmbeddings } from "@suzu-memory/embedding-indexer";
@@ -25,6 +39,7 @@ import {
   inspectMaintenance,
   MAINTENANCE_TASK_TYPES,
   runEmbeddingMaintenance,
+  DEFAULT_MINIMUM_STRUCTURE_MEMORIES,
   runImmediateMemoryMaintenance,
   runSemanticMemoryMaintenance,
 } from "@suzu-memory/maintenance";
@@ -50,6 +65,7 @@ import {
   consolidationFailureReviewEnvelope,
   inspectReviewConsoleStorage,
   reviewProposalSummary,
+  resolveIngestionReviewInput,
 } from "./review-console.mjs";
 
 const PRODUCT_NATURAL_DECAY = Object.freeze({
@@ -88,6 +104,13 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+function requireMaintenanceScope() {
+  const execution = currentEventSourceExecution();
+  if (execution?.sourceScoped && !execution.sourceScope) {
+    throw Object.assign(new Error('Event-backed maintenance requires its fixed sourceScope.'), { code: 'EVENT_SOURCE_SCOPE_REQUIRED' });
+  }
+}
+
 function maintenanceFailure(stage, error) {
   return {
     status: "failed",
@@ -103,8 +126,10 @@ function maintenanceFailure(stage, error) {
 const HIGH_LEVEL_PROPOSAL_TYPES = Object.freeze([
   "ingestion",
   "reported-state",
+  "preference-state",
   "structure",
   "relation",
+  "event-continuity",
   "maintenance-failure",
 ]);
 
@@ -125,40 +150,6 @@ function highLevelProposalEnvelope(type, proposal) {
     createdAt: proposal.created_at,
     updatedAt: proposal.updated_at,
     proposal,
-  };
-}
-
-function existingIngestionCandidate(repository, agentId, decision) {
-  const candidate = decision?.candidate && typeof decision.candidate === "object"
-    ? decision.candidate
-    : {};
-  const provisional = clean(decision?.provisional_memory_id)
-    ? repository.getMemory(decision.provisional_memory_id)
-    : null;
-  const request = repository.listStateAnalysisRequests(agentId, {
-    batchId: decision?.batch_id,
-    limit: 500,
-  }).find((item) => Number(item.candidate_index) === Number(decision?.candidate_index)) || null;
-  const subjectRole = clean(candidate.subjectRole || request?.subject_role || provisional?.subject_role);
-  const subjectKey = clean(candidate.subjectKey || request?.subject_key || provisional?.subject_key);
-  const actorRoles = (Array.isArray(candidate.actorRoles) ? candidate.actorRoles : []).map((actor) => {
-    const actorRole = clean(actor?.actorRole);
-    return {
-      ...actor,
-      actorKey: clean(actor?.actorKey)
-        || (actorRole === subjectRole ? subjectKey : actorRole === "agent" ? agentId : ""),
-    };
-  });
-  return {
-    ...candidate,
-    subjectRole,
-    subjectKey,
-    representationLayer: clean(
-      candidate.representationLayer
-      || request?.representation_layer
-      || provisional?.representation_layer,
-    ) || undefined,
-    actorRoles,
   };
 }
 
@@ -188,6 +179,7 @@ export function resolveMemoryServicePaths({
   dataRoot = "",
   projectRoot = "",
   agentId = "",
+  agentRoot = "",
   databasePath = "",
   usageLedgerPath = "",
 } = {}) {
@@ -196,22 +188,24 @@ export function resolveMemoryServicePaths({
   if (!resolvedAgentId) {
     throw new Error("Suzu Memory requires agentId or projectRoot.");
   }
-  const agentRoot = resolveAgentDataRoot({
+  const resolvedAgentRoot = clean(agentRoot) ? path.resolve(agentRoot) : resolveAgentDataRoot({
     dataRoot: resolvedDataRoot,
     agentId: resolvedAgentId,
   });
-  const memoryRoot = path.join(agentRoot, "memory");
+  const relative = path.relative(resolvedDataRoot, resolvedAgentRoot);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Memory Agent storage must belong to its configured data root.');
+  const memoryRoot = path.join(resolvedAgentRoot, "memory");
   return Object.freeze({
     dataRoot: resolvedDataRoot,
     agentId: resolvedAgentId,
-    agentRoot,
+    agentRoot: resolvedAgentRoot,
     memoryRoot,
     databasePath: clean(databasePath)
       ? path.resolve(databasePath)
       : path.join(memoryRoot, "memory.db"),
     usageLedgerPath: clean(usageLedgerPath)
       ? path.resolve(usageLedgerPath)
-      : path.join(agentRoot, "usage", "events.jsonl"),
+      : path.join(resolvedAgentRoot, "usage", "events.jsonl"),
     visualizationCachePath: path.join(memoryRoot, "visualization", "brain-layout.json"),
     backupDirectory: path.join(memoryRoot, "backups"),
   });
@@ -230,6 +224,7 @@ export class MemoryService {
     dataRoot = "",
     projectRoot = "",
     agentId = "",
+    agentRoot = "",
     databasePath = "",
     usageLedgerPath = "",
     providers = {},
@@ -239,6 +234,7 @@ export class MemoryService {
       dataRoot,
       projectRoot,
       agentId,
+      agentRoot,
       databasePath,
       usageLedgerPath,
     });
@@ -246,7 +242,7 @@ export class MemoryService {
     this.providers = Object.freeze({
       generator: providers.generator || null,
       structureGenerator: providers.structureGenerator || providers.generator || null,
-      retrievalContextGenerator: providers.retrievalContextGenerator || providers.generator || null,
+      retrievalContextGenerator: providers.retrievalContextGenerator || null,
       embedding: providers.embedding || null,
     });
     const maximumBatchCharacters = Math.max(
@@ -262,10 +258,11 @@ export class MemoryService {
     }
     this.defaults = Object.freeze({
       memoryOwner: clean(defaults.memoryOwner) || "记忆拥有者",
-      userName: clean(defaults.userName) || "对方",
-      primaryUserId: clean(defaults.primaryUserId) || "user",
+      userName: clean(defaults.userName) || (defaults.createPrimaryRelationship === false ? '' : '对方'),
+      primaryUserId: clean(defaults.primaryUserId) || (defaults.createPrimaryRelationship === false ? '' : 'user'),
       companionId: clean(defaults.companionId) || this.paths.agentId,
       relationshipLabel: clean(defaults.relationshipLabel) || "关系",
+      createPrimaryRelationship: defaults.createPrimaryRelationship !== false,
       defaultWorldId: clean(defaults.defaultWorldId) || "relationship",
       defaultWorldFrame: clean(defaults.defaultWorldFrame) || "relational",
       ingestion: Object.freeze({
@@ -289,7 +286,9 @@ export class MemoryService {
     const database = openMemoryDatabase(this.paths.databasePath);
     try {
       const repository = new MemoryRepository(database);
+      recoverMemoryEventSourceCleanups(this, repository);
       const identityStructure = ensureCompanionRelationshipStructure({
+        createPrimaryRelationship: this.defaults.createPrimaryRelationship,
         repository,
         agentId: this.agentId,
         primaryUserId: this.defaults.primaryUserId,
@@ -321,10 +320,10 @@ export class MemoryService {
           failed: pendingStructureMaterialization.failed,
         },
         identityStructure: {
-          userEntityId: identityStructure.user.id,
+          userEntityId: identityStructure.user?.id || '',
           companionEntityId: identityStructure.companion.id,
-          relationshipId: identityStructure.relationship.id,
-          relationshipLabel: identityStructure.relationship.label,
+          relationshipId: identityStructure.relationship?.id || '',
+          relationshipLabel: identityStructure.relationship?.label || '',
         },
         database: databaseInfo(database),
       };
@@ -339,12 +338,13 @@ export class MemoryService {
     if (!this.initialized) this.initialize();
   }
 
-  withRepository(callback, { readOnly = false } = {}) {
+  withRepository(callback, { readOnly = false, sourceScope = null, signal = null } = {}) {
     if (typeof callback !== "function") throw new Error("withRepository requires a callback.");
     this.ensureInitialized();
     const database = openMemoryDatabase(this.paths.databasePath, { readOnly });
     try {
-      const result = callback(new MemoryRepository(database), database);
+      const repository = new MemoryRepository(database);
+      const result = withEventSourceExecution(repository, () => callback(repository, database), { sourceScope, signal });
       if (result && typeof result.then === "function") {
         return Promise.resolve(result).finally(() => closeDatabase(database));
       }
@@ -358,6 +358,19 @@ export class MemoryService {
 
   info() {
     return this.initialize();
+  }
+
+  eraseEventSources(input) { this.ensureInitialized(); return eraseMemoryEventSources(this, input); }
+  getEventSourceCleanup(id) { return this.withRepository(repository => getEventSourceCleanup(repository, this.agentId, id), { readOnly: true }); }
+
+  getEventSourceProgress({ scope } = {}) {
+    return this.withRepository(repository => eventSourceState(repository,
+      assertEventSourceScope(repository, scope, this.agentId)), { readOnly: true });
+  }
+
+  recoverEventSourceCleanups() {
+    this.ensureInitialized();
+    return this.withRepository(repository => recoverMemoryEventSourceCleanups(this, repository));
   }
 
   backupDatabase({ destinationPath = "", overwrite = false, now = new Date() } = {}) {
@@ -464,6 +477,11 @@ export class MemoryService {
     return this.appendEvents([event]);
   }
 
+  appendEventSources(input) { return appendMemoryEventSources(this, input); }
+
+  adoptLegacySourceEvidence(input) { return adoptLegacySourceEvidence(this, input); }
+  adoptExperienceSourceEvidence(input) { return adoptExperienceSourceEvidence(this, input); }
+
   reviseEvent(targetEventId, {
     action,
     replacementEvent = null,
@@ -559,6 +577,10 @@ export class MemoryService {
           .map(clean)
           .filter(Boolean),
       )];
+      const view = executionEventSourceView(repository, this.agentId);
+      if (view && eventIds.some(id => !view.inputIds.has(id))) {
+        throw Object.assign(new Error('Extraction review sources await an eligible scope.'), { code: 'EVENT_SOURCE_TASK_DEFERRED' });
+      }
       if (!eventIds.length) {
         throw new Error("Long-term extraction failure has no recoverable source events.");
       }
@@ -582,6 +604,7 @@ export class MemoryService {
         });
         break;
       } catch (error) {
+        assertEventSourceExecutionCurrent();
         latestError = error;
       }
     }
@@ -610,6 +633,7 @@ export class MemoryService {
   }
 
   processPendingEvents({
+    chunkPolicy = null,
     maximumEvents = 100,
     maximumContentCharacters = this.defaults.ingestion.maximumBatchCharacters,
     candidateEventIds = [],
@@ -621,11 +645,14 @@ export class MemoryService {
     systemPrompt = "",
     now = new Date(),
     memoriesOverride = null,
+    sourceScope = null,
+    signal = null,
   } = {}) {
     return this.withRepository((repository) => processPendingCompanionEvents({
       repository,
       agentId: this.agentId,
       identity: this.companionIdentity(),
+      chunkPolicy,
       maximumEvents,
       maximumContentCharacters,
       candidateEventIds,
@@ -638,7 +665,7 @@ export class MemoryService {
       systemPrompt,
       now: validDate(now, "event processing now"),
       memoriesOverride,
-    }));
+    }), { sourceScope, signal });
   }
 
   maintenanceStatus({ limit = 100 } = {}) {
@@ -658,86 +685,116 @@ export class MemoryService {
     }, { readOnly: true });
   }
 
+  managementStatus() {
+    return this.withRepository((repository, database) => ({
+      status: 'ready', agentId: this.agentId, databasePath: this.paths.databasePath,
+      memories: repository.listMemories(this.agentId, { statuses: ['active'], limit: 1 }).total,
+      edges: Number(database.prepare('SELECT COUNT(*) AS count FROM memory_edges WHERE agent_id=?').get(this.agentId).count),
+      embeddings: Number(database.prepare(`SELECT COUNT(*) AS count FROM memory_embeddings embedding
+        JOIN memory_nodes memory ON memory.id=embedding.memory_id WHERE memory.agent_id=? AND memory.status='active'`).get(this.agentId).count),
+    }), { readOnly: true });
+  }
+
   runEmbeddingMaintenance({
     maximumTasks = 10,
     batchSize = 10,
     embeddingProvider = this.providers.embedding,
+    sourceScope = null,
+    signal = null,
   } = {}) {
-    return this.withRepository((repository) => runEmbeddingMaintenance({
-      repository,
-      agentId: this.agentId,
-      embeddingProvider,
-      usageLedgerPath: this.paths.usageLedgerPath,
-      maximumTasks,
-      batchSize,
-    }));
+    return this.withRepository((repository) => {
+      requireMaintenanceScope();
+      return runEmbeddingMaintenance({
+        repository,
+        agentId: this.agentId,
+        embeddingProvider,
+        usageLedgerPath: this.paths.usageLedgerPath,
+        maximumTasks,
+        batchSize,
+      });
+    }, { sourceScope, signal });
   }
 
   async runSemanticMaintenance({
+    embeddingProvider = this.providers.embedding,
+    chunkPolicy = null,
     processInputEvents = true,
     maximumInputBatches = 1,
     maximumEvents = 100,
     maximumContentCharacters = this.defaults.ingestion.maximumBatchCharacters,
     leaseSeconds = this.defaults.ingestion.leaseSeconds,
     maximumTasks = 10,
+    minimumStructureMemories = DEFAULT_MINIMUM_STRUCTURE_MEMORIES,
     maximumStateRequests = 10,
     maximumConsolidationRuns = 3,
     generator = this.providers.generator,
     structureGenerator = this.providers.structureGenerator,
     retrievalContextGenerator = this.providers.retrievalContextGenerator,
     now = new Date(),
+    sourceScope = null,
+    signal = null,
   } = {}) {
-    const inputBatches = [];
-    const failures = [];
-    const maximumBatches = Math.min(20, Math.max(1, Math.trunc(Number(maximumInputBatches) || 1)));
-    if (processInputEvents && typeof generator === "function") {
-      for (let index = 0; index < maximumBatches; index += 1) {
-        let result;
-        try {
-          result = await this.processPendingEvents({
-            maximumEvents,
-            maximumContentCharacters,
-            leaseSeconds,
-            generator,
-            now,
-          });
-        } catch (error) {
-          const failure = maintenanceFailure("input-events", error);
-          inputBatches.push(failure);
-          failures.push(failure);
-          break;
+    return this.withRepository(async () => {
+      requireMaintenanceScope();
+      const inputBatches = [];
+      const failures = [];
+      const maximumBatches = Math.min(20, Math.max(1, Math.trunc(Number(maximumInputBatches) || 1)));
+      if (processInputEvents && typeof generator === "function") {
+        for (let index = 0; index < maximumBatches; index += 1) {
+          let result;
+          try {
+            result = await this.processPendingEvents({
+              chunkPolicy,
+              maximumEvents,
+              maximumContentCharacters,
+              leaseSeconds,
+              generator,
+              now,
+            });
+          } catch (error) {
+            signal?.throwIfAborted();
+            assertEventSourceExecutionCurrent();
+            const failure = maintenanceFailure("input-events", error);
+            inputBatches.push(failure);
+            failures.push(failure);
+            break;
+          }
+          inputBatches.push(result);
+          if (!['processed', 'quarantined'].includes(result.status)) break;
         }
-        inputBatches.push(result);
-        if (!['processed', 'quarantined'].includes(result.status)) break;
       }
-    }
-    let semantic;
-    try {
-      semantic = await this.withRepository((repository) => runSemanticMemoryMaintenance({
-        repository,
-        agentId: this.agentId,
-        generator,
-        structureGenerator,
-        retrievalContextGenerator,
-        usageLedgerPath: this.paths.usageLedgerPath,
-        maximumTasks,
-        maximumStateRequests,
-        maximumConsolidationRuns,
-      }));
-    } catch (error) {
-      semantic = maintenanceFailure("semantic-tasks", error);
-      failures.push(semantic);
-    }
-    return {
-      ...semantic,
-      inputBatches: processInputEvents && typeof generator !== "function"
-        ? [{ status: "disabled", reason: "generation-provider-not-configured" }]
-        : inputBatches,
-      failures,
-      status: failures.length || semantic.status === "failed"
-        ? "completed-with-failures"
-        : semantic.status || "completed",
-    };
+      let semantic;
+      try {
+        semantic = await this.withRepository((repository) => runSemanticMemoryMaintenance({
+          repository,
+          embeddingProvider,
+          agentId: this.agentId,
+          generator,
+          structureGenerator,
+          retrievalContextGenerator,
+          usageLedgerPath: this.paths.usageLedgerPath,
+          maximumTasks,
+          minimumStructureMemories,
+          maximumStateRequests,
+          maximumConsolidationRuns,
+        }));
+      } catch (error) {
+        signal?.throwIfAborted();
+        assertEventSourceExecutionCurrent();
+        semantic = maintenanceFailure("semantic-tasks", error);
+        failures.push(semantic);
+      }
+      return {
+        ...semantic,
+        inputBatches: processInputEvents && typeof generator !== "function"
+          ? [{ status: "disabled", reason: "generation-provider-not-configured" }]
+          : inputBatches,
+        failures,
+        status: failures.length || semantic.status === "failed"
+          ? "completed-with-failures"
+          : semantic.status || "completed",
+      };
+    }, { sourceScope, signal });
   }
 
   async runMaintenance({ lane = "all", ...options } = {}) {
@@ -750,6 +807,9 @@ export class MemoryService {
       try {
         result.semantic = await this.runSemanticMaintenance(options);
       } catch (error) {
+        if (error.code?.startsWith('EVENT_SOURCE_')) throw error;
+        options.signal?.throwIfAborted();
+        assertEventSourceExecutionCurrent();
         result.semantic = maintenanceFailure("semantic", error);
         result.failures.push(result.semantic);
       }
@@ -758,6 +818,9 @@ export class MemoryService {
       try {
         result.embedding = await this.runEmbeddingMaintenance(options);
       } catch (error) {
+        if (error.code?.startsWith('EVENT_SOURCE_')) throw error;
+        options.signal?.throwIfAborted();
+        assertEventSourceExecutionCurrent();
         result.embedding = maintenanceFailure("embedding", error);
         result.failures.push(result.embedding);
       }
@@ -785,7 +848,9 @@ export class MemoryService {
           ? states
           : states.filter((state) => state !== "revoked");
         if (!supportedStates.length) continue;
-        const proposals = type === "ingestion"
+        const proposals = type === 'event-continuity'
+          ? repository.listMaintenanceTasks(this.agentId, { taskTypes: ['event-continuity-review'], reviewStates: supportedStates, limit: maximum, order: 'desc' })
+          : type === "ingestion"
           ? supportedStates.flatMap((reviewState) => repository.listIngestionDecisions(
             this.agentId,
             { reviewState, limit: maximum },
@@ -800,6 +865,11 @@ export class MemoryService {
               reviewStates: supportedStates,
               limit: maximum,
             })
+            : type === "preference-state"
+            ? repository.listPreferenceStateProposals(this.agentId, {
+              reviewStates: supportedStates,
+              limit: maximum,
+            })
             : type === "relation"
               ? repository.listRelationProposals(this.agentId, {
                 reviewStates: supportedStates,
@@ -810,7 +880,7 @@ export class MemoryService {
                   reviewStates: supportedStates,
                   limit: maximum,
                   order: "desc",
-                }),
+                }).filter(task => task.task_type !== 'event-continuity-review'),
                 ...repository.listConsolidationRuns(this.agentId, {
                   statuses: ["failed", "completed", "cancelled"],
                   limit: maximum,
@@ -841,6 +911,8 @@ export class MemoryService {
         ? repository.getReportedStateProposal(this.agentId, id)
         : normalizedType === "structure"
           ? repository.getStructureProposal(this.agentId, id)
+          : normalizedType === "preference-state"
+          ? repository.getPreferenceStateProposal(this.agentId, id)
           : normalizedType === "relation"
             ? repository.getRelationProposal(this.agentId, id)
             : repository.getMaintenanceTask(this.agentId, id)
@@ -915,6 +987,8 @@ export class MemoryService {
 
   resolveHighLevelProposal(type, proposalId, {
     action,
+    candidateMemoryId = '',
+    identityBindings = {},
     actor = "human",
     reason = "",
   } = {}) {
@@ -925,17 +999,26 @@ export class MemoryService {
     if (!["accept", "dismiss"].includes(normalizedAction)) {
       throw new Error("High-level proposal action must be accept or dismiss.");
     }
-    return this.withRepository((repository) => {
+    return this.withRepository((repository) => repository.transaction(() => {
+      if (normalizedType === 'event-continuity') {
+        const resolution = resolveEventContinuityReview(repository, { agentId: this.agentId, taskId: id,
+          action: normalizedAction, candidateMemoryId: clean(candidateMemoryId), actor: clean(actor) || 'human', reason: clean(reason) });
+        return { type: normalizedType, id, action: normalizedAction, resolution };
+      }
       if (normalizedType === "ingestion") {
         const current = repository.getIngestionDecision(this.agentId, id);
         if (!current) throw new Error("Memory ingestion review was not found.");
+        const input = normalizedAction === 'accept'
+          ? resolveIngestionReviewInput(repository, this.agentId, current, identityBindings) : null;
+        if (current.review_state === 'pending' && input?.identityChoices.some(choice => !identityBindings?.[choice.key])) {
+          return { type: normalizedType, id, action: normalizedAction,
+            resolution: { status: 'needs-correction', decision: current, memory: null, reasons: ['ambiguous-participant-identity'] } };
+        }
         const resolution = resolveMemoryIngestionReview(repository, {
           agentId: this.agentId,
           decisionId: id,
           action: normalizedAction,
-          candidate: normalizedAction === "accept"
-            ? existingIngestionCandidate(repository, this.agentId, current)
-            : null,
+          candidate: input?.candidate || null,
           note: clean(reason),
           resolvedBy: clean(actor) || "human",
         });
@@ -945,11 +1028,7 @@ export class MemoryService {
             agentId: this.agentId,
             batchId: `ingestion-review:${id}`,
             memoryIds: [resolution.memory.id],
-            followUpTaskTypes: [
-              MAINTENANCE_TASK_TYPES.memoryEmbedding,
-              MAINTENANCE_TASK_TYPES.retrievalContext,
-            ],
-            planConsolidation: false,
+            requiredFollowUpEnqueue: true,
           })
           : {
             status: "not-required",
@@ -1089,6 +1168,8 @@ export class MemoryService {
       };
       const resolution = normalizedType === "reported-state"
         ? resolveReportedStateProposal(repository, common)
+        : normalizedType === "preference-state"
+          ? resolvePreferenceStateProposal(repository, common)
         : normalizedType === "structure"
           ? resolveMemoryStructureProposal(repository, common)
           : resolveMemoryRelationProposal(repository, common);
@@ -1106,7 +1187,6 @@ export class MemoryService {
           memoryIds: [resolution.memory.id],
           followUpTaskTypes: [
             MAINTENANCE_TASK_TYPES.memoryEmbedding,
-            MAINTENANCE_TASK_TYPES.retrievalContext,
           ],
           planConsolidation: normalizedType === "reported-state",
         });
@@ -1118,7 +1198,7 @@ export class MemoryService {
         resolution,
         maintenance,
       };
-    });
+    }));
   }
 
   revokeHighLevelRelation(proposalId, {
@@ -1161,7 +1241,7 @@ export class MemoryService {
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
       throw new Error("editMemory requires a patch object.");
     }
-    return this.withRepository((repository) => {
+    return this.withRepository((repository) => repository.transaction(() => {
       const edited = repository.editMemoryManually({
         agentId: this.agentId,
         memoryId: id,
@@ -1175,21 +1255,35 @@ export class MemoryService {
           repository,
           agentId: this.agentId,
           batchId: `manual-edit:${edited.id}:${edited.updated_at}`,
-          memoryIds: [id],
+          memoryIds: [...new Set([id, ...(edited.eventContinuityInvalidatedMemoryIds || [])])],
+          requiredFollowUpEnqueue: true,
         }),
       };
-    });
+    }));
   }
 
   setMemoryDeleted(memoryId, deleted, { actor = "human", reason = "" } = {}) {
     const id = clean(memoryId);
     if (!id) throw new Error("setMemoryDeleted requires memoryId.");
-    return this.withRepository((repository) => repository.setMemoryDeleted({
-      agentId: this.agentId,
-      memoryId: id,
-      deleted: Boolean(deleted),
-      actor: clean(actor) || "human",
-      reason: clean(reason),
+    return this.withRepository((repository) => repository.transaction(() => {
+      const changed = repository.setMemoryDeleted({
+        agentId: this.agentId,
+        memoryId: id,
+        deleted: Boolean(deleted),
+        actor: clean(actor) || "human",
+        reason: clean(reason),
+      });
+      return {
+        ...changed,
+        maintenance: runImmediateMemoryMaintenance({
+          repository,
+          agentId: this.agentId,
+          batchId: `manual-${deleted ? 'delete' : 'restore'}:${changed.id}:${changed.updated_at}`,
+          memoryIds: [...new Set([id, ...(changed.eventContinuityInvalidatedMemoryIds || [])])],
+          ...(deleted ? { embeddingMemoryIds: [], followUpTaskTypes: ['event-continuity'], planConsolidation: false } : {}),
+          requiredFollowUpEnqueue: true,
+        }),
+      };
     }));
   }
 
@@ -1198,16 +1292,7 @@ export class MemoryService {
   }
 
   restoreMemory(memoryId, options = {}) {
-    const restored = this.setMemoryDeleted(memoryId, false, options);
-    return this.withRepository((repository) => ({
-      ...restored,
-      maintenance: runImmediateMemoryMaintenance({
-        repository,
-        agentId: this.agentId,
-        batchId: `manual-restore:${restored.id}:${restored.updated_at}`,
-        memoryIds: [clean(memoryId)],
-      }),
-    }));
+    return this.setMemoryDeleted(memoryId, false, options);
   }
 
   listRetrievalTraces(options = {}) {
@@ -1281,77 +1366,112 @@ export class MemoryService {
     options = {},
     embeddingProvider = this.providers.embedding,
     persistTrace = true,
+    reactivate = false,
+    activationId = "",
+    sourceScope = null,
+    signal = null,
   } = {}) {
-    const text = clean(query);
-    if (!text) throw new Error("search requires query.");
-    const executionTime = validDate(now, "search now");
-    const retrievalOptions = {
-      ...this.defaults.retrieval,
-      ...(options && typeof options === "object" ? options : {}),
-    };
-    const requestedWorld = world && typeof world === "object" && !Array.isArray(world)
-      ? world
-      : {};
-    const requestedWorldId = clean(requestedWorld.id || requestedWorld.worldId);
-    const requestedWorldFrame = clean(requestedWorld.frame || requestedWorld.worldFrame);
-    const hasRequestedWorld = Boolean(requestedWorldId || requestedWorldFrame);
-    const worldScope = hasRequestedWorld
-      ? {
-        id: requestedWorldId || this.defaults.defaultWorldId,
-        frame: requestedWorldFrame || this.defaults.defaultWorldFrame,
+    return this.withRepository(async () => {
+      const text = clean(query);
+      if (!text) throw new Error("search requires query.");
+      if (reactivate && !persistTrace && !clean(activationId)) {
+        throw new Error("Trace-free reactivation requires a stable activationId.");
       }
-      : {};
-    const providedQueryPerspective = queryPerspective && typeof queryPerspective === "object"
-      && !Array.isArray(queryPerspective)
-      ? queryPerspective
-      : {};
-    const resolvedQueryPerspective = {
-      speakerRole: "user",
-      speakerKey: this.defaults.primaryUserId,
-      speakerNames: [this.defaults.userName],
-      addresseeRole: "agent",
-      addresseeKey: this.defaults.companionId,
-      addresseeNames: [this.defaults.memoryOwner],
-      ...providedQueryPerspective,
-    };
-    const recallReactivationPolicy = normalizeRecallReactivationOptions(
-      retrievalOptions.recallReactivation,
-    );
-    this.initialize();
-    const result = await retrieveMemories({
-      databasePath: this.paths.databasePath,
-      agentId: this.agentId,
-      query: text,
-      anchorMemoryIds: anchors,
-      anchorSelection,
-      now: executionTime,
-      embeddingProvider,
-      usageLedgerPath: this.paths.usageLedgerPath,
-      queryPerspective: resolvedQueryPerspective,
-      world: worldScope,
-      allowCrossWorld: Boolean(allowCrossWorld || requestedWorld.allowCrossWorld),
-      options: retrievalOptions,
-    });
-    if (!persistTrace || !result.trace) return result;
-    const persisted = this.withRepository((repository) => repository.transaction(() => {
-      const storedTrace = repository.recordRetrievalTrace(result.trace);
-      const reactivation = repository.applyRecallReactivation({
+      const executionTime = validDate(now, "search now");
+      const retrievalOptions = {
+        ...this.defaults.retrieval,
+        ...(options && typeof options === "object" ? options : {}),
+      };
+      const requestedWorld = world && typeof world === "object" && !Array.isArray(world)
+        ? world
+        : {};
+      const requestedWorldId = clean(requestedWorld.id || requestedWorld.worldId);
+      const requestedWorldFrame = clean(requestedWorld.frame || requestedWorld.worldFrame);
+      const hasRequestedWorld = Boolean(requestedWorldId || requestedWorldFrame);
+      const worldScope = hasRequestedWorld
+        ? {
+          id: requestedWorldId || this.defaults.defaultWorldId,
+          frame: requestedWorldFrame || this.defaults.defaultWorldFrame,
+        }
+        : {};
+      const providedQueryPerspective = queryPerspective && typeof queryPerspective === "object"
+        && !Array.isArray(queryPerspective)
+        ? queryPerspective
+        : {};
+      const resolvedQueryPerspective = {
+        speakerRole: "user",
+        speakerKey: this.defaults.primaryUserId,
+        speakerNames: [this.defaults.userName],
+        addresseeRole: "agent",
+        addresseeKey: this.defaults.companionId,
+        addresseeNames: [this.defaults.memoryOwner],
+        ...providedQueryPerspective,
+      };
+      const recallReactivationPolicy = normalizeRecallReactivationOptions(
+        retrievalOptions.recallReactivation,
+      );
+      this.initialize();
+      if (sourceScope) sourceScope = this.withRepository(repository => assertEventSourceScope(repository, sourceScope, this.agentId));
+      const scopedEmbeddingProvider = embeddingProvider && Object.assign(
+        text => embeddingProvider(text, { signal }), embeddingProvider);
+      const result = await retrieveMemories({
+        databasePath: this.paths.databasePath,
         agentId: this.agentId,
-        traceId: storedTrace.id,
-        activatedAt: executionTime.toISOString(),
-        policy: recallReactivationPolicy,
+        query: text,
+        anchorMemoryIds: anchors,
+        anchorSelection,
+        now: executionTime,
+        embeddingProvider: scopedEmbeddingProvider,
+        usageLedgerPath: this.paths.usageLedgerPath,
+        queryPerspective: resolvedQueryPerspective,
+        world: worldScope,
+        allowCrossWorld: Boolean(allowCrossWorld || requestedWorld.allowCrossWorld),
+        options: retrievalOptions,
+        sourceScope,
       });
-      return { storedTrace, reactivation };
-    }));
-    return {
-      ...result,
-      trace: {
-        ...result.trace,
-        id: persisted.storedTrace.id,
-        persisted: true,
-        reactivation: persisted.reactivation,
-      },
-    };
+      assertEventSourceExecutionCurrent();
+      if ((!persistTrace && !reactivate) || !result.trace) return result;
+      const persisted = this.withRepository((repository) => repository.transaction(() => {
+        if (sourceScope) assertEventSourceScope(repository, sourceScope, this.agentId);
+        const storedTrace = persistTrace ? repository.recordRetrievalTrace(result.trace) : null;
+        const reactivation = reactivate ? repository.applyRecallReactivation({
+          agentId: this.agentId,
+          traceId: storedTrace?.id || "",
+          activationId: clean(activationId),
+          memoryIds: result.status === 'ready' ? [...new Set([
+            ...result.trace.selectedIds, ...(result.trace.metadata?.recalledMemoryIds || []),
+          ])] : [],
+          activatedAt: executionTime.toISOString(),
+          policy: recallReactivationPolicy,
+        }) : { status: "disabled", applied: 0, states: [] };
+        return { storedTrace, reactivation };
+      }));
+      return {
+        ...result,
+        trace: {
+          ...result.trace,
+          ...(persisted.storedTrace ? { id: persisted.storedTrace.id } : {}),
+          persisted: Boolean(persisted.storedTrace),
+          reactivation: persisted.reactivation,
+        },
+      };
+    }, { sourceScope, signal });
+  }
+
+  reactivateRecall({ activationId, memoryIds = [], options = {}, now = new Date(), sourceScope = null, signal = null } = {}) {
+    const key = clean(activationId);
+    if (!key) throw new Error("reactivateRecall requires a stable activationId.");
+    const retrieval = { ...this.defaults.retrieval, ...options };
+    const policy = normalizeRecallReactivationOptions(retrieval.recallReactivation);
+    return this.withRepository(repository => {
+      const view = executionEventSourceView(repository, this.agentId);
+      const selectedIds = [...new Set(memoryIds.map(clean).filter(Boolean))].filter(id => {
+        const node = repository.getMemory(id);
+        return node?.agent_id === this.agentId && node.status === 'active' && (!view || view.allows(node));
+      });
+      return repository.applyRecallReactivation({ agentId: this.agentId, activationId: key,
+        memoryIds: selectedIds, activatedAt: validDate(now, "recall activation now").toISOString(), policy });
+    }, { sourceScope, signal });
   }
 
   syncEmbeddings(options = {}) {
@@ -1362,7 +1482,7 @@ export class MemoryService {
       agentId: this.agentId,
       embeddingProvider,
       ledgerPath: clean(options.ledgerPath) || this.paths.usageLedgerPath,
-    }));
+    }), { sourceScope: options.sourceScope, signal: options.signal });
   }
 
   analyzePendingState({
@@ -1370,6 +1490,9 @@ export class MemoryService {
     generator = this.providers.generator,
     snapshotOptions = {},
     reviewVersion = "",
+    preferencePolicy,
+    sourceScope = null,
+    signal = null,
   } = {}) {
     return this.withRepository((repository) => processPendingStateAnalysisRequests({
       repository,
@@ -1379,12 +1502,15 @@ export class MemoryService {
       usageLedgerPath: this.paths.usageLedgerPath,
       snapshotOptions,
       reviewVersion,
-    }));
+      preferencePolicy,
+    }), { sourceScope, signal });
   }
 
   processConsolidation({
     maximumRuns = 3,
     generator = this.providers.structureGenerator,
+    sourceScope = null,
+    signal = null,
   } = {}) {
     return this.withRepository((repository) => processPlannedConsolidationRuns({
       repository,
@@ -1392,7 +1518,7 @@ export class MemoryService {
       generator,
       maximumRuns,
       usageLedgerPath: this.paths.usageLedgerPath,
-    }));
+    }), { sourceScope, signal });
   }
 
   rebuildAssociationGraph(options = {}) {

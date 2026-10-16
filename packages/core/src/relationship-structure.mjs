@@ -1,3 +1,5 @@
+import { memoryWorldsCompatible } from './ontology.mjs';
+import { createHash } from 'node:crypto';
 const AUTOMATIC_MEMBERSHIP_PROVENANCE = "deterministic-relationship-membership-v1";
 const PRIMARY_USER_AGENT_RELATIONSHIP_SCOPE = "primary-user-agent";
 
@@ -25,13 +27,6 @@ function relationshipMembershipType(memory) {
   return "shared_experience";
 }
 
-function isPrimaryUserAgentRelationship(relationship) {
-  if (relationship?.metadata?.scope !== PRIMARY_USER_AGENT_RELATIONSHIP_SCOPE
-    || relationship.kind !== "dyad" || relationship.members.length !== 2) return false;
-  const memberRoles = relationship.members.map((member) => member.member_role).sort();
-  return memberRoles[0] === "agent" && memberRoles[1] === "user";
-}
-
 export function primaryRelationshipKey({ primaryUserId, companionId }) {
   const user = encodedKey(primaryUserId);
   const companion = encodedKey(companionId);
@@ -50,12 +45,19 @@ export function ensureCompanionRelationshipStructure({
   worldId = "relationship",
   worldFrame = "relational",
   provenance = "suzu-memory-service-identity",
+  createPrimaryRelationship = true,
 } = {}) {
   const normalizedAgentId = clean(agentId);
   if (!repository || !normalizedAgentId) {
     throw new Error("Companion relationship structure requires repository and agentId.");
   }
   return repository.transaction(() => {
+    if (!createPrimaryRelationship) {
+      const actor = repository.ensureActorEntity({ agentId: normalizedAgentId, actorRole: 'agent',
+        actorKey: clean(companionId) || normalizedAgentId, displayName: clean(companionName) || 'Companion',
+        provenance, metadata: { primary: true } });
+      return { user: null, companion: repository.getEntity(normalizedAgentId, actor.entity.id), relationship: null };
+    }
     const user = repository.ensureActorEntity({
       agentId: normalizedAgentId,
       actorRole: "user",
@@ -111,6 +113,40 @@ export function ensureCompanionRelationshipStructure({
   });
 }
 
+function ensureParticipantRelationships(repository, agentId, memoryIds) {
+  return repository.transaction(() => {
+    for (const id of memoryIds) {
+      const memory = repository.getMemory(id);
+      if (!memory || memory.agent_id !== agentId || memory.status !== 'active' || memory.layer === 'provisional' || memory.kind === 'utterance') continue;
+      const roles = [...new Map(repository.listMemoryRoles(id).filter(role => ['subject', 'experiencer', 'participant'].includes(role.role)
+        && ['user', 'agent', 'other'].includes(role.actor_role) && role.actor_key)
+        .map(role => [actorIdentityKey(role.actor_role, role.actor_key), role])).values()];
+      if (roles.length < 2) continue;
+      const members = [...new Map(roles.map(role => {
+        const bound = repository.getActorEntityBinding({ agentId, actorRole: role.actor_role, actorKey: role.actor_key });
+        const entity = bound ? repository.getEntity(agentId, bound.entity_id)
+          : repository.ensureActorEntity({ agentId, actorRole: role.actor_role, actorKey: role.actor_key,
+            displayName: role.metadata?.actorName || role.metadata?.label || role.actor_key, provenance: AUTOMATIC_MEMBERSHIP_PROVENANCE }).entity;
+        return [entity.id, { entity, role }];
+      })).values()].sort((a, b) => a.entity.id.localeCompare(b.entity.id));
+      if (members.length < 2) continue;
+      const existing = repository.listRelationships(agentId, { statuses: ['active', 'archived', 'deleted'] }).find(relationship =>
+        memoryWorldsCompatible(memory, relationship, { allowRealSpaces: true }) && relationship.members.length === members.length
+        && members.every(member => relationship.members.some(entry => entry.entity_id === member.entity.id)));
+      if (existing) continue;
+      const ordinary = memory.reality === 'real' && ['physical', 'relational', 'unknown'].includes(memory.world_frame);
+      const worldId = ordinary ? 'relationship' : memory.world_id;
+      const worldFrame = ordinary ? 'relational' : memory.world_frame;
+      const relationshipKey = `participants:${createHash('sha256').update(JSON.stringify([memory.reality, worldId, worldFrame, members.map(member => member.entity.id)])).digest('hex')}`;
+      const relationship = repository.upsertRelationship({ agentId, relationshipKey, kind: members.length === 2 ? 'dyad' : 'group',
+        label: members.map(member => member.entity.canonical_name).join('、'), worldId, worldFrame,
+        metadata: { reality: memory.reality, scope: 'shared-participants', provenance: AUTOMATIC_MEMBERSHIP_PROVENANCE } });
+      for (const member of members) repository.addRelationshipMember({ agentId, relationshipId: relationship.id,
+        entityId: member.entity.id, memberRole: member.role.actor_role, provenance: AUTOMATIC_MEMBERSHIP_PROVENANCE });
+    }
+  });
+}
+
 export function syncMemoryRelationshipMemberships({
   repository,
   agentId,
@@ -126,9 +162,10 @@ export function syncMemoryRelationshipMemberships({
     return { status: "skipped", reason: "no-memories", linked: 0, removed: 0 };
   }
   const requestedRelationships = new Set(relationshipIds.map(clean).filter(Boolean));
+  if (!requestedRelationships.size) ensureParticipantRelationships(repository, normalizedAgentId, requestedMemoryIds);
   const relationships = repository.listRelationships(normalizedAgentId)
     .filter((relationship) => (
-      isPrimaryUserAgentRelationship(relationship)
+      relationship.members.length >= 2
       && (!requestedRelationships.size || requestedRelationships.has(relationship.id))
     ));
   if (!relationships.length) {
@@ -159,6 +196,7 @@ export function syncMemoryRelationshipMemberships({
           .filter((role) => ["subject", "experiencer", "participant"].includes(role.role))
           .map((role) => actorIdentityKey(role.actor_role, role.actor_key)));
         for (const relationship of relationships) {
+          if (!memoryWorldsCompatible(memory, relationship, { allowRealSpaces: true })) continue;
           const members = relationshipActors.get(relationship.id) || [];
           const allMembersExplicit = members.length >= 2 && members.every(({ bindings }) => (
             bindings.some((binding) => roleIdentities.has(actorIdentityKey(
@@ -166,16 +204,13 @@ export function syncMemoryRelationshipMemberships({
               binding.actor_key,
             )))
           ));
-          const primarySharedMemory = relationship.metadata?.primary === true
-            && memory.subject_role === "shared"
-            && memory.world_id === relationship.world_id;
-          if (!allMembersExplicit && !primarySharedMemory) continue;
+          if (!allMembersExplicit) continue;
           const membershipType = relationshipMembershipType(memory);
           desired.set(`${relationship.id}\u001f${membershipType}`, {
             relationship,
             membershipType,
-            confidence: allMembersExplicit ? 1 : 0.9,
-            basis: allMembersExplicit ? "all-members-explicit" : "primary-shared-subject",
+            confidence: 1,
+            basis: "all-members-explicit",
           });
         }
       }

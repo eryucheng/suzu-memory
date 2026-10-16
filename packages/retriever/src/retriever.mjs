@@ -1,5 +1,7 @@
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
+  createEventSourceView,
+  withEventSourceExecution,
   MemoryRepository,
   openMemoryDatabase,
 } from "@suzu-memory/core";
@@ -53,6 +55,7 @@ export const DEFAULT_RETRIEVAL_OPTIONS = Object.freeze({
   timeZone: "Asia/Shanghai",
   maximumCandidates: 20,
   maximumReturnedCandidates: 5,
+  includeCandidateContext: false,
   maximumEpisodicCandidates: 20,
   maximumContextChars: 1400,
   maximumEvidenceMessages: 2,
@@ -911,6 +914,9 @@ function sourceEvidenceNature(node, options) {
 }
 
 function evidenceNatureLine(node, options) {
+  if (isProvisionalNode(node) && node.metadata?.epistemicStatus === "reported_state") {
+    return stateEvidenceNature(node) ? `状态性质：${stateEvidenceNature(node)}` : "";
+  }
   if (isProvisionalNode(node)) {
     return "认知性质：这是 Agent 在相处中形成、尚未审核的个人印象；可能有偏差，不是主体确认的事实，用户可以随时纠正";
   }
@@ -1726,8 +1732,8 @@ function forwardHistoricalStateCandidates(repository, candidates, { includeHisto
   };
 }
 
-function stateScopeCompletion(database, primary) {
-  if (!primary || primary.status !== "active") return null;
+function stateScopeCompletion(database, primary, eligibleMemoryIds) {
+  if (!primary || primary.status !== "active" || !eligibleMemoryIds.has(primary.id)) return null;
   const scopeKey = clean(primary.state_scope_key);
   if (scopeKey === "root") {
     const rows = database.prepare(`
@@ -1759,7 +1765,7 @@ function stateScopeCompletion(database, primary) {
       primary.state_family,
       primary.world_id,
       primary.world_frame,
-    );
+    ).filter((node) => eligibleMemoryIds.has(node.id));
     if (!rows.length) return null;
     return {
       mode: "root-with-exceptions",
@@ -1786,8 +1792,7 @@ function stateScopeCompletion(database, primary) {
       AND broad.world_id = ?
       AND broad.world_frame = ?
     ORDER BY broad.updated_at DESC, broad.id ASC
-    LIMIT 1
-  `).get(
+  `).all(
     primary.agent_id,
     primary.id,
     primary.subject_role,
@@ -1797,7 +1802,7 @@ function stateScopeCompletion(database, primary) {
     primary.state_family,
     primary.world_id,
     primary.world_frame,
-  );
+  ).find((node) => eligibleMemoryIds.has(node.id));
   if (!root) return null;
   return {
     mode: "exception-with-root",
@@ -1934,8 +1939,31 @@ function formatRecallText({
   chain,
   lifecycleClosure,
   rawStateFallback,
+  pendingStateChanges = [],
   options,
 }) {
+  if (pendingStateChanges.length) {
+    const actionLabels = { create: "新增", reinforce: "再次确认", progress_update: "进展更新",
+      supersede: "已变更", narrow_scope: "适用范围已调整", add_scoped_exception: "新增例外",
+      pause: "已暂停", resume: "已恢复", complete: "已完成", cancel: "已取消", end: "已结束",
+      retire: "不再适用", interrupt: "已中断", stop: "已停止", revoke: "已撤回",
+      correct_attribution: "归属已更正" };
+    // Review status does not outrank time: newer accepted states also take precedence.
+    const ordered = [...chain.nodes].sort((left, right) =>
+      String(right.known_at || right.recorded_at).localeCompare(String(left.known_at || left.recorded_at)));
+    const sections = ordered.map(node => {
+      const time = timestampLabel(node.known_at || node.recorded_at, options.timeZone);
+      if (!node.metadata?.reportedStateProposalId || !isProvisionalNode(node)) {
+        return `[${time}] 记录：${node.content}`;
+      }
+      const label = actionLabels[node.metadata.reportedStateAction] || "更新";
+      return `[${time}] ${node.title || "状态"}（${label}）：${node.content}`;
+    });
+    if (["evidence", "counterevidence", "evidence-review", "utterance"].includes(intent)) {
+      sections.push(...evidence.map(node => formatEvidenceMemory(node, options)));
+    }
+    return joinBoundedSections(sections, options.maximumContextChars);
+  }
   const recallText = intent === "evidence-review"
     ? formatEvidenceReview({
       primary,
@@ -1989,14 +2017,18 @@ function disclosureLevelFor({ intent, primary, chain, stateCompletion, scopeComp
   return "conclusion";
 }
 
-async function vectorScores({
+function vectorScores(input) {
+  return withEventSourceExecution(input.repository, () => vectorScoresInExecution(input));
+}
+
+async function vectorScoresInExecution({
   repository,
   agentId,
   query,
   embeddingProvider,
   usageLedgerPath,
   now,
-  eligibleMemoryIds = new Set(),
+  eligibleMemoryIds = null,
 }) {
   if (typeof embeddingProvider !== "function") {
     return { status: "disabled", scores: new Map(), usageRecorded: false };
@@ -2018,7 +2050,7 @@ async function vectorScores({
   const embeddings = repository.listEmbeddings(agentId, response.model, {
     includeArchived: true,
   }).filter((embedding) => (
-    !eligibleMemoryIds.size || eligibleMemoryIds.has(embedding.memory_id)
+    !eligibleMemoryIds || eligibleMemoryIds.has(embedding.memory_id)
   ));
   const scores = new Map(embeddings.map((embedding) => [
     embedding.memory_id,
@@ -2069,6 +2101,7 @@ export async function retrieveMemories({
   queryPerspective = {},
   world = {},
   allowCrossWorld = false,
+  sourceScope = null,
   options: overrides = {},
 } = {}) {
   const normalizedAgentId = clean(agentId);
@@ -2140,8 +2173,28 @@ export async function retrieveMemories({
     };
   }
   const database = openMemoryDatabase(databasePath, { readOnly: true });
+  let sourceView = null;
+  let sourceReadTransaction = false;
   try {
-    const repository = new MemoryRepository(database);
+    if (sourceScope) {
+      // Canonical completion and graph/evidence reads must see the same body
+      // versions as candidate selection, including across an embedding await.
+      database.exec('BEGIN');
+      sourceReadTransaction = true;
+    }
+    const baseRepository = new MemoryRepository(database);
+    sourceView = sourceScope ? createEventSourceView(baseRepository, sourceScope, normalizedAgentId) : null;
+    const repository = sourceView ? new Proxy(baseRepository, { get(target, key) {
+      if (key === 'getCurrentCanonicalMemory') return (...args) => {
+        const node = target[key](...args); return sourceView.allows(node) ? node : null;
+      };
+      if (key === 'expand') return (agent, ids, options) => target.expand(agent, ids, { ...options, allowedMemoryIds: sourceView.memoryIds });
+      if (key === 'listEmbeddings') return (...args) => target.listEmbeddings(...args).filter(row => {
+        const ids = parseJson(row.source_memory_ids_json, []);
+        return ids.includes(row.memory_id) && ids.every(id => sourceView.memoryIds.has(id));
+      });
+      const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+    } }) : baseRepository;
     const accessibilityAdjustments = loadAccessibilityAdjustments(
       repository,
       normalizedAgentId,
@@ -2164,10 +2217,13 @@ export async function retrieveMemories({
     });
     const affectiveAdjustments = affectiveAdjustmentState.adjustments;
     const activeNodes = loadNodes(database, normalizedAgentId, ["active"])
+      .filter(node => !sourceView || sourceView.allows(node))
       .filter((node) => nodeMatchesWorldScope(node, worldScope));
     const historicalStateNodes = loadNodes(database, normalizedAgentId, ["superseded", "disputed"])
+      .filter(node => !sourceView || sourceView.allows(node))
       .filter((node) => nodeMatchesWorldScope(node, worldScope));
     const provisionalNodes = loadPendingProvisionalNodes(repository, normalizedAgentId)
+      .filter(node => !sourceView || sourceView.allows(node))
       .filter((node) => nodeMatchesWorldScope(node, worldScope));
     const nodes = [...activeNodes, ...historicalStateNodes, ...provisionalNodes];
     const eligibleMemoryIds = new Set(nodes.map((node) => node.id));
@@ -2655,7 +2711,7 @@ export async function retrieveMemories({
       : currentStateCompletion(repository, primary);
     const scopeCompletion = primaryIsProvisional
       ? null
-      : stateScopeCompletion(database, primary);
+      : stateScopeCompletion(database, primary, eligibleMemoryIds);
     const representationCompletion = !stateCompletion
       && !scopeCompletion
       && !["evidence", "counterevidence", "evidence-review", "utterance"].includes(intent)
@@ -2724,6 +2780,16 @@ export async function retrieveMemories({
       chain.paths = [];
       chain.activation = null;
     }
+    // All completion routes above and the final chain use the same eligible
+    // nodes resolved from this read snapshot, including Event source scope.
+    chain.nodes = chain.nodes.filter((node) => eligibleMemoryIds.has(node.id));
+    const selectedStateIds = new Set(chain.nodes.map(node => node.id));
+    const pendingStateChanges = provisionalNodes.filter(node => node.metadata?.reportedStateProposalId
+      && (selectedStateIds.has(node.id)
+        || selectedStateIds.has(node.metadata.reportedStatePreviousMemoryId)))
+      .sort((left, right) => String(right.known_at).localeCompare(String(left.known_at))
+        || String(right.recorded_at).localeCompare(String(left.recorded_at)));
+    chain.nodes = [...new Map([...pendingStateChanges, ...chain.nodes].map(node => [node.id, node])).values()];
     const lifecycleClosure = assessLifecycleClosure(chain.nodes, lifecycleIntent);
     seedRouting.subjectRouting = {
       ...seedRouting.subjectRouting,
@@ -2762,6 +2828,7 @@ export async function retrieveMemories({
       stateCompletion,
       scopeCompletion,
       chain: { ...chain, mode: chainIntent.mode, direction: chainIntent.direction },
+      pendingStateChanges,
       lifecycleClosure,
       rawStateFallback: primary.kind === "utterance" && subjectQuery.focus === "state",
     };
@@ -2962,6 +3029,13 @@ export async function retrieveMemories({
         kind: candidate.node.kind,
         title: candidate.node.title,
         content: candidate.node.content,
+        ...(options.includeCandidateContext ? {
+          recallContext: joinBoundedSections([
+            `记忆状态：${candidate.node.status}；现实范围：${candidate.node.reality || 'unknown'}；时间性质：${candidate.node.temporal_state || 'unknown'}。`,
+            formatPrimary(candidate.node, [], { ...options, maximumContextChars: 1100 }),
+          ], 1200),
+          ...(sourceView ? { eventSources: sourceView.sourcesFor([candidate.node.id]) } : {}),
+        } : {}),
         provisional: Boolean(candidate.provisional),
         provisionalReview: candidate.provisional ? {
           reviewDecisionId: candidate.provisional.reviewDecisionId,
@@ -3088,6 +3162,7 @@ export async function retrieveMemories({
           : "",
         text,
         evidenceIds: evidence.map((node) => node.id),
+        ...(sourceView ? { eventSources: sourceView.sourcesFor(displayedMemoryIds) } : {}),
       }],
       context,
       vector: { ...vector, scores: undefined },
@@ -3096,6 +3171,7 @@ export async function retrieveMemories({
       seedRouting,
     };
   } finally {
-    database.close();
+    if (sourceReadTransaction) database.exec('ROLLBACK');
+    try { sourceView?.assertCurrent(); } finally { database.close(); }
   }
 }

@@ -11,5 +11,8 @@
     "resources/**/*",
     "schema/**/*",
     "src/**/*"
-  ]
+  ],
+  "dependencies": {
+    "@suzu-memory/core": "0.1.0"
+  }
 }

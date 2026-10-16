@@ -43,7 +43,7 @@ export function buildRelationGenerationInput(snapshot) {
     "请根据以下受限记忆与原始证据提出因果关系候选。只输出符合 Schema 的 JSON。",
     "候选只供人工审核，不会由你直接写入记忆图。",
     "",
-    JSON.stringify(snapshot, null, 2),
+    JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2),
   ].join("\n");
 }
 

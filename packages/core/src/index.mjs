@@ -1,3 +1,9 @@
+export { EVENT_SOURCE_VERSION, EVENT_SOURCE_PROTOCOL_VERSION, eventSourceError, sourceSnapshot, sourceHash,
+  normalizeEventSource, normalizeEventSourceScope, eventSourceEligible, eventSourceOf } from './event-source-contract.mjs';
+export { assertEventSourceScope, observeEventSourceScope, eventSourceState, recordEventSourceConsumption,
+  beginEventSourceCleanup, getEventSourceCleanup, advanceEventSourceCleanup } from './event-source-state.mjs';
+export { eventContinuityFingerprint, recordEventContinuityReview, resolveEventContinuityReview, invalidateEventContinuity } from './event-continuity-policy.mjs';
+export { isRepeatedReportedStateTransition } from './reported-state-policy.mjs';
 export {
   databaseInfo,
   openMemoryDatabase,
@@ -54,6 +60,7 @@ export {
   SUBJECT_ROLES,
   TEMPORAL_STATES,
   WORLD_FRAMES,
+  memoryWorldsCompatible,
   isBigNeuronKind,
   isLegacyMemoryKind,
   isMemoryKindAllowedForStateFamily,
@@ -84,6 +91,7 @@ export {
 
 export {
   PREFERENCE_STATE_LEVELS,
+  materializePreferenceStateProposal,
   proposePreferenceState,
   resolvePreferenceStateProposal,
 } from "./preference-state-policy.mjs";
@@ -97,6 +105,8 @@ export {
 
 export {
   resolveReportedStateProposal,
+  materializeReportedStateProposal,
+  materializePendingReportedStateProposals,
 } from "./reported-state-policy.mjs";
 
 export {
@@ -129,3 +139,7 @@ export {
   buildMemoryRetrievalContextSource,
   memoryRetrievalContextSourceHash,
 } from "./retrieval-context.mjs";
+export { createEventSourceView } from './event-source-view.mjs';
+export { cleanEventSourceDatabase } from './event-source-cleanup.mjs';
+export { withEventSourceExecution, currentEventSourceExecution, executionEventSourceView,
+  assertEventSourceExecutionCurrent, eventSourceMaterial, mergeEventSourceMaterials } from './event-source-execution.mjs';

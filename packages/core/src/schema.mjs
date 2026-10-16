@@ -1,4 +1,5 @@
-export const SCHEMA_VERSION = 41;
+import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
+export const SCHEMA_VERSION = 44;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2239,6 +2240,41 @@ export const MIGRATIONS = Object.freeze([
       CREATE INDEX IF NOT EXISTS memory_input_events_disposition
         ON memory_input_events
           (agent_id, processing_disposition, occurred_at ASC, external_id ASC);
+    `,
+  },
+  EVENT_SOURCE_MIGRATION,
+  { version: 43,name: 'agent-experience-source-scope',sql: `
+    ALTER TABLE memory_event_source_scopes ADD COLUMN experience_scope_json TEXT CHECK(experience_scope_json IS NULL OR json_valid(experience_scope_json));
+    ALTER TABLE memory_event_source_scopes ADD COLUMN consumed_through_experience_sequence INTEGER NOT NULL DEFAULT 0 CHECK(consumed_through_experience_sequence>=0);
+    CREATE INDEX memory_input_events_experience_source ON memory_input_events(agent_id,json_extract(metadata_json,'$.eventSource.owner'),json_extract(metadata_json,'$.eventSource.experienceRef.experienceSequence'));
+    CREATE TRIGGER memory_input_events_experience_fence_insert BEFORE INSERT ON memory_input_events
+      WHEN json_extract(NEW.metadata_json,'$.eventSourceErased') IS NOT 1 AND json_extract(NEW.metadata_json,'$.eventSource.version')=2 AND EXISTS (
+        SELECT 1 FROM memory_event_source_scopes scope WHERE scope.agent_id=NEW.agent_id AND scope.owner=json_extract(NEW.metadata_json,'$.eventSource.owner')
+          AND (json_extract(scope.experience_scope_json,'$.agentGeneration')!=json_extract(NEW.metadata_json,'$.eventSource.agentGeneration')
+            OR json_extract(NEW.metadata_json,'$.eventSource.experienceRef.experienceSequence')<=json_extract(scope.experience_scope_json,'$.clearedThroughExperienceSequence')))
+      BEGIN SELECT RAISE(ABORT,'EVENT_SOURCE_CLEARED'); END;
+    CREATE TRIGGER memory_input_events_experience_fence_update BEFORE UPDATE ON memory_input_events
+      WHEN json_extract(NEW.metadata_json,'$.eventSourceErased') IS NOT 1 AND json_extract(NEW.metadata_json,'$.eventSource.version')=2 AND EXISTS (
+        SELECT 1 FROM memory_event_source_scopes scope WHERE scope.agent_id=NEW.agent_id AND scope.owner=json_extract(NEW.metadata_json,'$.eventSource.owner')
+          AND (json_extract(scope.experience_scope_json,'$.agentGeneration')!=json_extract(NEW.metadata_json,'$.eventSource.agentGeneration')
+            OR json_extract(NEW.metadata_json,'$.eventSource.experienceRef.experienceSequence')<=json_extract(scope.experience_scope_json,'$.clearedThroughExperienceSequence')))
+      BEGIN SELECT RAISE(ABORT,'EVENT_SOURCE_CLEARED'); END;
+  ` },
+  {
+    version: 44,
+    name: 'recall-reactivation-receipts',
+    sql: `
+      CREATE TABLE memory_recall_reactivation_receipts (
+        activation_id TEXT NOT NULL CHECK (length(trim(activation_id)) > 0),
+        agent_id TEXT NOT NULL,
+        memory_ids_json TEXT NOT NULL CHECK (json_valid(memory_ids_json)),
+        policy_version TEXT NOT NULL,
+        trace_id TEXT REFERENCES memory_retrieval_traces(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (activation_id, agent_id)
+      ) STRICT;
+      CREATE INDEX memory_recall_reactivation_receipts_agent_time
+        ON memory_recall_reactivation_receipts(agent_id, created_at DESC);
     `,
   },
 ]);

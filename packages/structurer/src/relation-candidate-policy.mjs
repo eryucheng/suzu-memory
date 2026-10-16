@@ -1,3 +1,5 @@
+import { memoryWorldsCompatible } from '@suzu-memory/core';
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -21,6 +23,9 @@ export function enforceRelationCandidatePolicy(candidate, snapshot, {
   const to = memories.get(toMemoryId);
   if (!from || !to) {
     throw new Error("Every relation endpoint must come from the bounded snapshot.");
+  }
+  if (!memoryWorldsCompatible(from, to, { allowRealSpaces: true })) {
+    throw new Error('Relation endpoints must belong to compatible worlds.');
   }
   const availableSourceIds = new Set(snapshot.sourceRecords.map((source) => source.id));
   const evidenceSourceIds = [...new Set(

@@ -66,18 +66,6 @@ function generatedEventCandidate({ content, sourceRef, eventStart }) {
     canonicalKey: "",
     stateFamily: "not_applicable",
     stateLabel: "",
-    stateTarget: {
-      type: "none",
-      identityField: "not_applicable",
-      fieldCardinality: "not_applicable",
-      objectRole: "not_applicable",
-      objectName: "",
-      counterpartRole: "not_applicable",
-      counterpartName: "",
-      direction: "not_applicable",
-      triggerRole: "not_applicable",
-      triggerName: "",
-    },
     reality: "fictional",
     evidenceMode: "explicit",
     temporalState: hasCalendarTimestamp ? "historical" : "timeless",
@@ -94,7 +82,7 @@ function generatedEventCandidate({ content, sourceRef, eventStart }) {
 
 function fixtureGenerator() {
   const generator = async ({ input, schemaName }) => {
-    if (schemaName === "long-term-memory-extraction-v1") {
+    if (schemaName === "long-term-memory-extraction-v2") {
       const memories = [...String(input).matchAll(
         /\[(M\d{4})\] \[([^\]]+)\](?: \[world=[^\]]+\])? 对方：([^\n]+)/gu,
       )].map((match) => generatedEventCandidate({
@@ -244,7 +232,7 @@ test("ZH-4O retries a transient extraction failure before evaluating the sample"
   const baseGenerator = fixtureGenerator();
   let extractionFailures = 0;
   const generator = async (request) => {
-    if (request.schemaName === "long-term-memory-extraction-v1" && extractionFailures < 2) {
+    if (request.schemaName === "long-term-memory-extraction-v2" && extractionFailures < 2) {
       extractionFailures += 1;
       const error = new Error("Temporary structured extraction failure.");
       error.code = "MEMORY_GENERATION_INVALID_OUTPUT";
@@ -281,7 +269,7 @@ test("ZH-4O preserves raw evidence when extraction exhausts its retry budget", a
   const baseGenerator = fixtureGenerator();
   let extractionFailures = 0;
   const generator = async (request) => {
-    if (request.schemaName === "long-term-memory-extraction-v1") {
+    if (request.schemaName === "long-term-memory-extraction-v2") {
       extractionFailures += 1;
       const error = new Error("Persistent structured extraction failure.");
       error.code = "MEMORY_GENERATION_INVALID_OUTPUT";

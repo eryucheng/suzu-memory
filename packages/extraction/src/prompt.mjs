@@ -3,6 +3,7 @@ import {
   EVIDENCE_MODES,
   MEMORY_ACTOR_ROLES,
   MEMORY_STATE_FAMILIES,
+  MEMORY_STATE_FAMILY_DEFINITIONS,
   REALITY_STATES,
   REVISION_ACTIONS,
   SUBJECT_ROLES,
@@ -10,6 +11,7 @@ import {
   isMemoryKindAllowedForStateFamily,
   isStatefulMemoryKind,
 } from "@suzu-memory/core";
+import { buildExtractionParticipants } from './participant-identity.mjs';
 
 export const RETENTION_REASONS = Object.freeze([
   "identity",
@@ -63,88 +65,60 @@ const GENERATED_IDENTITY_FIELDS = Object.freeze([
   "occupation", "employer", "education", "residence", "hometown", "nationality",
   "biography", "other",
 ]);
-const GENERATED_TARGET_ROLES = Object.freeze(["not_applicable", "user", "agent", "other", "world"]);
-const TARGET_SPEC_FAMILIES = new Set([
-  "identity", "belief", "relationship", "affective_association",
-]);
+const personRole = { type: "string", enum: ["user", "agent", "other"] };
+const personName = { type: "string", minLength: 1 };
+const GENERATED_TARGET_PROPERTIES = Object.freeze({
+  identity: {
+    identityField: { type: "string", enum: GENERATED_IDENTITY_FIELDS },
+    fieldCardinality: { type: "string", enum: ["single", "multi_item", "sequence"] },
+  },
+  belief: {
+    objectRole: { type: "string", enum: ["user", "agent", "other", "world"] },
+    objectName: personName,
+  },
+  relationship: { counterpartRole: personRole, counterpartName: personName },
+  affective_association: { triggerRole: personRole, triggerName: personName },
+});
+const TARGET_SPEC_FAMILIES = new Set(Object.keys(GENERATED_TARGET_PROPERTIES));
+const targetAlternatives = [
+  ...Object.entries(GENERATED_TARGET_PROPERTIES).map(([family, properties]) => ({
+    type: "object",
+    properties: {
+      stateFamily: { type: "string", enum: [family] },
+      stateTarget: { type: "object", additionalProperties: false, properties, required: Object.keys(properties) },
+    },
+    required: ["stateTarget"],
+  })),
+  { type: "object", properties: {
+    stateFamily: { type: "string", enum: ["not_applicable", ...MEMORY_STATE_FAMILIES.filter(family => !TARGET_SPEC_FAMILIES.has(family))] },
+    stateTarget: false,
+  } },
+];
 
 function normalizedGeneratedStateTarget(candidate, index) {
-  const value = candidate?.stateTarget;
+  const properties = GENERATED_TARGET_PROPERTIES[candidate.stateFamily];
+  if (!properties) {
+    if (Object.hasOwn(candidate, "stateTarget")) throw new Error(`memories[${index}].stateTarget 不适用于 ${candidate.stateFamily}，应省略。`);
+    return undefined;
+  }
+  const value = candidate.stateTarget;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`memories[${index}].stateTarget 必须是对象。`);
+    throw new Error(`memories[${index}].stateTarget 必须是 ${candidate.stateFamily} 的目标对象。`);
   }
-  const expected = [
-    "counterpartName", "counterpartRole", "direction", "fieldCardinality",
-    "identityField", "objectName", "objectRole", "triggerName", "triggerRole", "type",
-  ];
-  const keys = Object.keys(value).sort();
-  if (keys.length !== expected.length || keys.some((key, keyIndex) => key !== expected[keyIndex])) {
-    throw new Error(`memories[${index}].stateTarget 字段不符合约定。`);
-  }
-  const normalized = {
-    type: clean(value.type),
-    identityField: clean(value.identityField),
-    fieldCardinality: clean(value.fieldCardinality),
-    objectRole: clean(value.objectRole),
-    objectName: clean(value.objectName),
-    counterpartRole: clean(value.counterpartRole),
-    counterpartName: clean(value.counterpartName),
-    direction: clean(value.direction),
-    triggerRole: clean(value.triggerRole),
-    triggerName: clean(value.triggerName),
-  };
-  const empty = {
-    identityField: "not_applicable",
-    fieldCardinality: "not_applicable",
-    objectRole: "not_applicable",
-    objectName: "",
-    counterpartRole: "not_applicable",
-    counterpartName: "",
-    direction: "not_applicable",
-    triggerRole: "not_applicable",
-    triggerName: "",
-  };
-  const hasEmptyOtherFields = (except) => Object.entries(empty).every(([key, expectedValue]) => (
-    except.has(key) || normalized[key] === expectedValue
-  ));
-  if (!TARGET_SPEC_FAMILIES.has(candidate.stateFamily)) {
-    if (normalized.type !== "none" || !hasEmptyOtherFields(new Set())) {
-      throw new Error(`memories[${index}].stateTarget 不适用于 ${candidate.stateFamily}。`);
+  const expected = Object.keys(properties);
+  const missing = expected.filter(key => !Object.hasOwn(value, key));
+  const unexpected = Object.keys(value).filter(key => !Object.hasOwn(properties, key));
+  if (missing.length || unexpected.length) throw new Error(
+    `memories[${index}].stateTarget (${candidate.stateFamily}) 字段不符合约定；缺少：${missing.join(", ") || "无"}；不适用：${unexpected.join(", ") || "无"}。`,
+  );
+  return Object.fromEntries(expected.map(key => {
+    const field = properties[key];
+    const text = clean(value[key]);
+    if (typeof value[key] !== "string" || (field.enum ? !field.enum.includes(text) : !text)) {
+      throw new Error(`memories[${index}].stateTarget.${key} 无效。`);
     }
-    return normalized;
-  }
-  if (normalized.type !== candidate.stateFamily) {
-    throw new Error(`memories[${index}].stateTarget.type 与 stateFamily 不一致。`);
-  }
-  if (candidate.stateFamily === "identity") {
-    if (!GENERATED_IDENTITY_FIELDS.includes(normalized.identityField)
-      || !["single", "multi_item", "sequence"].includes(normalized.fieldCardinality)
-      || !hasEmptyOtherFields(new Set(["identityField", "fieldCardinality"]))) {
-      throw new Error(`memories[${index}].stateTarget 身份目标不完整。`);
-    }
-  } else if (candidate.stateFamily === "belief") {
-    if (!["user", "agent", "other", "world"].includes(normalized.objectRole)
-      || !normalized.objectName
-      || !hasEmptyOtherFields(new Set(["objectRole", "objectName"]))) {
-      throw new Error(
-        `memories[${index}].stateTarget 观念对象不完整，实际为 ${JSON.stringify(normalized).slice(0, 500)}。`,
-      );
-    }
-  } else if (candidate.stateFamily === "relationship") {
-    if (!["user", "agent", "other"].includes(normalized.counterpartRole)
-      || !normalized.counterpartName
-      || normalized.direction !== "holder_to_counterpart"
-      || !hasEmptyOtherFields(new Set(["counterpartRole", "counterpartName", "direction"]))) {
-      throw new Error(`memories[${index}].stateTarget 关系对象不完整。`);
-    }
-  } else if (candidate.stateFamily === "affective_association") {
-    if (!["user", "agent", "other"].includes(normalized.triggerRole)
-      || !normalized.triggerName
-      || !hasEmptyOtherFields(new Set(["triggerRole", "triggerName"]))) {
-      throw new Error(`memories[${index}].stateTarget 情绪触发对象不完整。`);
-    }
-  }
-  return normalized;
+    return [key, text];
+  }));
 }
 
 function clean(value) {
@@ -186,9 +160,10 @@ function archiveWindowLanguage(window) {
     window?.sourceLanguage || window?.outputLanguage || window?.language,
   );
   if (declared) return declared;
-  return detectExtractionLanguage((window?.messages || [])
-    .map((message) => String(message?.text || ""))
-    .join("\n"));
+  const languages = new Set((window?.messages || []).map(message =>
+    normalizeExtractionLanguage(message.sourceLanguage) || detectExtractionLanguage(message.text))
+    .filter(language => language !== 'unknown'));
+  return languages.size > 1 || languages.has('mixed') ? 'mixed' : [...languages][0] || 'unknown';
 }
 
 function roleLabel(role, language) {
@@ -199,27 +174,15 @@ function roleLabel(role, language) {
 
 function languageInstruction(language) {
   if (language === "en") {
-    return [
-      "【本窗口结构化输出语言 / Output language: English】",
-      "Every candidate whose sourceRefs only cite this window's M references must be written in English for its title, content, and stateLabel. Do not translate English evidence into Chinese.",
-    ];
+    return ["【本窗口输出语言：English】"];
   }
   if (language === "mixed") {
-    return [
-      "【本窗口结构化输出语言 / Output language: source-led mixed】",
-      "本窗口含中英文直接证据。每条候选应使用其 sourceRefs 所支持事实的主要语言：中文证据写中文，英文证据写英文；只有同一事实的直接证据本身确实混用两种语言时才可混用。不要为了统一风格翻译整段证据。",
-    ];
+    return ["【本窗口输出语言：逐候选跟随直接证据；混合输入不要求混合输出】"];
   }
   if (language === "unknown") {
-    return [
-      "【本窗口结构化输出语言】",
-      "无法可靠判断窗口语言时，保持直接证据的原始语言；不要自行翻译。",
-    ];
+    return ["【本窗口输出语言：保持原文】"];
   }
-  return [
-    "【本窗口结构化输出语言】",
-    "所有只引用本窗口 M 编号的候选，其 title、content 和 stateLabel 必须用中文撰写。不要把中文证据翻译成英文。",
-  ];
+  return ["【本窗口输出语言：中文】"];
 }
 
 export function assignMemoryRefs(messages = [], start = 1) {
@@ -233,17 +196,25 @@ function formatMessages(messages, {
   includeRefs = false,
   limit = Number.POSITIVE_INFINITY,
   language = "unknown",
+  participants = [],
 } = {}) {
-  return messages.slice(0, limit).map((message) => (
-    `${includeRefs ? `[${message.memoryRef}] ` : ""}[${message.timestamp || ""}] ${
+  return messages.slice(0, limit).map((message) => {
+    const source = message.eventSource;
+    const matches = source ? participants.filter(participant => participant.actorKey === source.sender.id) : [];
+    const participant = matches.length === 1 ? matches[0]
+      : matches.find(candidate => candidate.actorRole === message.speakerIdentity?.actorRole);
+    const context = source ? { spaceId: source.spaceId, spaceKind: source.topology?.spaceKind || source.topology?.kind } : null;
+    return `${includeRefs ? `[${message.memoryRef}] ` : ""}[${message.timestamp || ""}] ${
       message.worldFrame ? `[world=${message.worldFrame}:${message.worldId || "primary"}] ` : ""
     }${language === "mixed" && message.sourceLanguage && message.sourceLanguage !== "unknown"
       ? `[source-language=${message.sourceLanguage}] ` : ""
     }${message.logicalEvent?.complete && Number(message.logicalEvent.fragmentCount) > 1
       ? `[同一原始事件已完整重组，共${message.logicalEvent.fragmentCount}段] `
       : ""
-    }${roleLabel(message.role, language)}：${message.text}`
-  )).join("\n\n");
+    }${context ? `[来源 ${JSON.stringify(context)}] ${participant?.name || source.sender.name || source.sender.kind}` : roleLabel(message.role, language)}${
+      source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${message.knownAt}]` : ''
+    }：${message.text}`;
+  }).join("\n\n");
 }
 
 export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
@@ -266,9 +237,9 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           subjectRole: {
             type: "string",
             enum: SUBJECT_ROLES,
-            description: "必须遵守输入中的已知身份映射：记忆拥有者为 agent，对方为 user；第三方为 other。无法从直接证据确定主体时使用 unknown，不得猜测。",
+            description: "使用输入人物表中的角色：agent 为记忆拥有者，user 为实际出现的已知人类用户，other 为其他 Agent 或人物；shared 为多个实际主体的共同事件，unknown 为无法确定。",
           },
-          subjectName: { type: "string" },
+          subjectName: { type: "string", description: "已知人物使用人物表中的完整 name；未知人物只用直接证据支持的名称。" },
           actorRoles: {
             type: "array",
             description: "只填写直接证据明确支持的人物角色；不确定时留空数组。",
@@ -292,7 +263,13 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           stateFamily: {
             type: "string",
             enum: ["not_applicable", ...MEMORY_STATE_FAMILIES],
-            description: "人物状态候选必须指定要进入的专职分析家族；事件和反思使用 not_applicable。",
+            description: `分析家族含义：${JSON.stringify(Object.fromEntries(
+              MEMORY_STATE_FAMILIES.map(family => [family, MEMORY_STATE_FAMILY_DEFINITIONS[family].description]),
+            ))}。按 kind 选择兼容的分析家族：${JSON.stringify(Object.fromEntries(
+              DIRECT_INGESTION_MEMORY_KINDS.map(kind => [kind, isStatefulMemoryKind(kind)
+                ? MEMORY_STATE_FAMILIES.filter(family => isMemoryKindAllowedForStateFamily(kind, family))
+                : ['not_applicable']]),
+            ))}。`,
           },
           stateLabel: {
             type: "string",
@@ -300,27 +277,7 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           },
           stateTarget: {
             type: "object",
-            additionalProperties: false,
-            description: "仅 identity、belief、relationship、affective_association 填写对应目标，其余字段使用 not_applicable 或空字符串。",
-            properties: {
-              type: {
-                type: "string",
-                enum: ["none", "identity", "belief", "relationship", "affective_association"],
-              },
-              identityField: { type: "string", enum: ["not_applicable", ...GENERATED_IDENTITY_FIELDS] },
-              fieldCardinality: { type: "string", enum: ["not_applicable", "single", "multi_item", "sequence"] },
-              objectRole: { type: "string", enum: GENERATED_TARGET_ROLES },
-              objectName: { type: "string" },
-              counterpartRole: { type: "string", enum: GENERATED_TARGET_ROLES },
-              counterpartName: { type: "string" },
-              direction: { type: "string", enum: ["not_applicable", "holder_to_counterpart"] },
-              triggerRole: { type: "string", enum: GENERATED_TARGET_ROLES },
-              triggerName: { type: "string" },
-            },
-            required: [
-              "type", "identityField", "fieldCardinality", "objectRole", "objectName",
-              "counterpartRole", "counterpartName", "direction", "triggerRole", "triggerName",
-            ],
+            description: "按 stateFamily 选择对应的目标分支：identity 为身份字段，belief 为观念对象，relationship 为关系对象，affective_association 为触发对象；其他分类省略 stateTarget。",
           },
           reality: { type: "string", enum: REALITY_STATES },
           evidenceMode: {
@@ -351,6 +308,7 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
             items: { type: "string", pattern: "^M[0-9]{4}$" },
           },
         },
+        anyOf: targetAlternatives,
         required: [
           "kind",
           "title",
@@ -361,7 +319,6 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           "canonicalKey",
           "stateFamily",
           "stateLabel",
-          "stateTarget",
           "reality",
           "evidenceMode",
           "temporalState",
@@ -387,6 +344,7 @@ export function buildLongTermExtractionInput({
   archiveWindows = [],
   memoryOwner = "记忆拥有者",
   userName = "对方",
+  identity = {},
 }) {
   const sourceWindows = Array.isArray(archiveWindows) && archiveWindows.length
     ? archiveWindows
@@ -427,21 +385,28 @@ export function buildLongTermExtractionInput({
     };
   });
   const standardized = standardizedWindows.flatMap((window) => window.messages);
+  const allMessages = standardizedWindows.flatMap(window => [...window.previousContextMessages, ...window.messages, ...window.continuationGuidanceMessages]);
+  const participants = buildExtractionParticipants(allMessages, { companionName: memoryOwner, primaryUserName: userName, ...identity });
+  const owner = participants.find(participant => participant.actorRole === 'agent');
   const parts = [
-    `记忆拥有者：${memoryOwner}`,
-    `对方名字：${userName}`,
-    `已知身份映射：${memoryOwner}=agent，${userName}=user；该映射同样适用于 subjectRole、actorRoles 和 stateTarget 中具名人物的角色字段。`,
+    `记忆拥有者：${owner?.name || memoryOwner}`,
+    '记忆以拥有者的经历为中心；标题和正文叙述使用人物完整姓名，包括拥有者。原消息与引语中的人称按实际说话者解释。',
+    '【程序提供的人物身份】',
+    JSON.stringify(participants.map(({ actorRole, name }) => ({ role: actorRole, name }))),
   ];
   for (const window of standardizedWindows) {
     const previousContext = formatMessages(window.previousContextMessages, {
       language: window.sourceLanguage,
+      participants,
     });
     const conversation = formatMessages(window.messages, {
       includeRefs: true,
       language: window.sourceLanguage,
+      participants,
     });
     const continuationGuidance = formatMessages(window.continuationGuidanceMessages, {
       language: window.sourceLanguage,
+      participants,
     });
     if (standardizedWindows.length > 1 || window.id) {
       parts.push("", `【语义归档窗口 ${window.label}】`);
@@ -451,7 +416,6 @@ export function buildLongTermExtractionInput({
       parts.push(
         "",
         "【只读的前文衔接】",
-        "以下内容已经归档，只用于理解指代、承接和事件边界；它们没有 M 编号，不能再次成为候选或证据。",
         "",
         previousContext,
       );
@@ -463,7 +427,6 @@ export function buildLongTermExtractionInput({
       parts.push(
         "",
         "【只读的后文衔接】",
-        "以下内容尚不属于本次归档，只用于判断事情是否仍在继续；它们没有 M 编号，不能提前写成事实或证据。",
         "",
         continuationGuidance,
       );
@@ -479,6 +442,7 @@ export function buildLongTermExtractionInput({
     continuationGuidanceMessages: standardizedWindows.flatMap(
       (window) => window.continuationGuidanceMessages,
     ),
+    participants,
   };
 }
 
@@ -549,7 +513,6 @@ export function parseGeneratedLongTermExtraction(value) {
     "sourceRefs",
     "stateFamily",
     "stateLabel",
-    "stateTarget",
     "subjectName",
     "subjectRole",
     "temporalState",
@@ -559,10 +522,13 @@ export function parseGeneratedLongTermExtraction(value) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
       throw new Error(`memories[${index}] 必须是对象。`);
     }
+    const expectedCandidateKeys = [...expectedKeys,
+      ...(TARGET_SPEC_FAMILIES.has(candidate.stateFamily) ? ["stateTarget"] : []),
+    ].sort();
     const candidateKeys = Object.keys(candidate).sort();
     if (
-      candidateKeys.length !== expectedKeys.length
-      || candidateKeys.some((key, keyIndex) => key !== expectedKeys[keyIndex])
+      candidateKeys.length !== expectedCandidateKeys.length
+      || candidateKeys.some((key, keyIndex) => key !== expectedCandidateKeys[keyIndex])
     ) throw new Error(`memories[${index}] 字段不符合约定。`);
     for (const field of ["kind", "content", "subjectRole", "reality", "evidenceMode", "temporalState", "revisionAction"]) {
       if (!clean(candidate[field])) throw new Error(`memories[${index}].${field} 不能为空。`);
@@ -667,7 +633,7 @@ export function parseGeneratedLongTermExtraction(value) {
       canonicalKey: clean(candidate.canonicalKey),
       stateFamily: candidate.stateFamily,
       stateLabel,
-      stateTarget,
+      ...(stateTarget ? { stateTarget } : {}),
       actorRoles,
       eventDate,
       eventStart,

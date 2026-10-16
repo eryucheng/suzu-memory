@@ -1,4 +1,5 @@
-import { DIRECT_INGESTION_MEMORY_KINDS } from "@suzu-memory/core";
+import { memoryBudgetError } from "./budgeted-parts.mjs";
+import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, eventSourceMaterial } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -8,9 +9,15 @@ function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))];
 }
 
-function clip(value, maximum) {
-  const text = clean(value);
-  return text.length <= maximum ? text : `${text.slice(0, Math.max(0, maximum - 1))}…`;
+function completeLimit(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.trunc(parsed)) : Infinity;
+}
+
+function completeText(value, maximum, label) {
+  const text = String(value ?? "");
+  if (text.length > maximum) throw memoryBudgetError(`${label} exceeds the complete ${maximum}-character budget.`);
+  return text;
 }
 
 export function buildRelationSnapshot({
@@ -18,26 +25,30 @@ export function buildRelationSnapshot({
   agentId,
   batchId = "",
   memoryIds = [],
-  maxMemories = 32,
-  maxSourcesPerMemory = 6,
-  maxMemoryContentChars = 600,
-  maxSourceContentChars = 900,
+  maxMemories = Infinity,
+  maxSourcesPerMemory = Infinity,
+  maxMemoryContentChars = Infinity,
+  maxSourceContentChars = Infinity,
   maxSnapshotChars = 48_000,
   retrospective = null,
 } = {}) {
   if (!repository) throw new Error("Relation snapshot requires a repository.");
   const normalizedAgentId = clean(agentId);
   if (!normalizedAgentId) throw new Error("Relation snapshot requires agentId.");
-  const requestedIds = uniqueStrings(memoryIds);
-  const memoryLimit = Math.min(80, Math.max(2, Math.trunc(Number(maxMemories) || 32)));
-  const sourceLimit = Math.min(20, Math.max(1, Math.trunc(Number(maxSourcesPerMemory) || 6)));
-  const memoryCharLimit = Math.min(4000, Math.max(100, Math.trunc(Number(maxMemoryContentChars) || 600)));
-  const sourceCharLimit = Math.min(6000, Math.max(100, Math.trunc(Number(maxSourceContentChars) || 900)));
+  const sourceView = executionEventSourceView(repository, normalizedAgentId);
+  const requestedIds = uniqueStrings(memoryIds).filter(id => !sourceView || sourceView.memoryIds.has(id));
+  const memoryLimit = completeLimit(maxMemories);
+  const sourceLimit = completeLimit(maxSourcesPerMemory);
+  const memoryCharLimit = completeLimit(maxMemoryContentChars);
+  const sourceCharLimit = completeLimit(maxSourceContentChars);
   const snapshotCharLimit = Math.min(250_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 48_000)));
   const sourceRecords = new Map();
   const excluded = [];
   const memories = [];
-  for (const id of requestedIds.slice(0, memoryLimit)) {
+  if (requestedIds.length > memoryLimit) {
+    throw memoryBudgetError(`Relation snapshot exceeds the complete ${memoryLimit}-memory budget.`);
+  }
+  for (const id of requestedIds) {
     const memory = repository.getMemory(id);
     if (!memory || memory.agent_id !== normalizedAgentId) {
       throw new Error(`Relation snapshot memory must exist for the same Agent: ${id}`);
@@ -47,7 +58,10 @@ export function buildRelationSnapshot({
       continue;
     }
     const detail = repository.getMemoryDetail(normalizedAgentId, id);
-    const sources = detail.sources.slice(0, sourceLimit);
+    const sources = detail.sources.filter(source => !sourceView || sourceView.sourceIds.has(source.id));
+    if (sources.length > sourceLimit) {
+      throw memoryBudgetError(`Relation snapshot memory ${id} exceeds the complete ${sourceLimit}-source budget.`);
+    }
     for (const source of sources) {
       if (!sourceRecords.has(source.id)) {
         sourceRecords.set(source.id, {
@@ -57,7 +71,7 @@ export function buildRelationSnapshot({
           knownAt: source.known_at,
           recordedAt: source.recorded_at,
           speaker: source.speaker,
-          content: clip(source.content, sourceCharLimit),
+          content: completeText(source.content, sourceCharLimit, `Source ${source.id}`),
         });
       }
     }
@@ -65,18 +79,20 @@ export function buildRelationSnapshot({
       id: memory.id,
       kind: memory.kind,
       layer: memory.layer,
-      title: clip(memory.title, 160),
-      content: clip(memory.content, memoryCharLimit),
+      title: String(memory.title ?? ""),
+      content: completeText(memory.content, memoryCharLimit, `Memory ${memory.id}`),
       subjectRole: memory.subject_role,
       subjectKey: memory.subject_key,
       reality: memory.reality,
+      worldId: memory.world_id,
+      worldFrame: memory.world_frame,
       temporalState: memory.temporal_state,
       eventDate: memory.event_date,
       eventStart: memory.event_start,
       eventEnd: memory.event_end,
       knownAt: memory.known_at,
       sourceIds: sources.map((source) => source.id),
-      sourcesTruncated: detail.sources.length > sourceLimit,
+      sourcesTruncated: false,
     });
   }
   let retrospectiveContext = null;
@@ -107,11 +123,13 @@ export function buildRelationSnapshot({
     omitted: {
       requestedMemories: requestedIds.length,
       memoriesExcluded: excluded,
-      memoriesTruncated: Math.max(0, requestedIds.length - memoryLimit),
+      memoriesTruncated: 0,
     },
   };
+  const material = eventSourceMaterial(repository, normalizedAgentId, requestedIds, [...sourceRecords.keys()]);
   if (JSON.stringify(snapshot).length > snapshotCharLimit) {
-    throw new Error(`Relation snapshot exceeds the ${snapshotCharLimit}-character privacy budget.`);
+    throw memoryBudgetError(`Relation snapshot exceeds the ${snapshotCharLimit}-character privacy budget.`);
   }
+  if (material) snapshot.sourceMaterial = material;
   return snapshot;
 }

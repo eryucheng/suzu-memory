@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { retrieveMemories } from "../../retriever/src/index.mjs";
+import { syncMemoryEmbeddings } from "../../embedding-indexer/src/index.mjs";
+import { runSemanticMemoryMaintenance } from "../../maintenance/src/index.mjs";
+import { MemoryService } from "../../service/src/index.mjs";
+import { buildReviewProposalDetail } from "../../service/src/review-console.mjs";
 
 import {
   MemoryRepository,
   openMemoryDatabase,
   resolveReportedStateProposal,
+  materializeReportedStateProposal,
   stateScopeKeyFromScope,
 } from "../src/index.mjs";
 
@@ -222,7 +231,10 @@ test("rejects cross-layer evidence, family-kind mismatch, and stale current stat
     temporalState: "current",
     evidenceMode: "explicit",
   });
-  assert.throws(() => repository.recordReportedStateProposal(base), /changed after review/u);
+  const valid = addReportedBeliefObservation(repository, { id: "valid-stale-state-observation" });
+  assert.throws(() => repository.recordReportedStateProposal({ ...base,
+    proposedState: beliefDraft(valid), selectedObservationId: valid.id, consideredObservationIds: [valid.id],
+  }), /changed after review/u);
   database.close();
 });
 
@@ -807,4 +819,284 @@ test("rejects acceptance after a reviewed evidence source becomes inactive", () 
   }), /evidence source is no longer active/u);
   assert.equal(repository.getReportedStateProposal("agent-test", proposal.id).review_state, "pending");
   database.close();
+});
+
+for (const originReview of ['pending', 'accepted']) for (const action of ['accept', 'dismiss']) {
+  test(`repeated cancellation preserves the original close time and rollback owner: ${originReview}/${action}`, t => {
+    const { repository, propose } = pendingGoalFixture(t);
+    const initial = propose({ id: 'repeat-initial', content: '周末看展。' });
+    const previous = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id, action: 'accept' }).memory;
+    const cancel = propose({ id: 'repeat-original', action: 'cancel', previous, content: '看展取消了。', time: '2026-08-03T08:00:00.000Z' });
+    materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: cancel.id });
+    if (originReview === 'accepted') resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: cancel.id, action: 'accept' });
+    const closed = repository.getMemory(previous.id);
+    const repeated = propose({ id: 'repeat-confirmation', action: 'cancel', previous: closed, content: '那个展已经取消，不去了。', time: '2026-08-04T08:00:00.000Z' });
+    const pending = materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: repeated.id });
+    assert.ok(pending.memory.metadata.reportedStateConfirmation);
+    assert.equal(pending.memory.metadata.reportedStateTransition, undefined);
+    resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: repeated.id, action });
+    const after = repository.getMemory(previous.id);
+    assert.equal(after.valid_to, closed.valid_to);
+    assert.equal(after.state_phase, 'cancelled');
+    assert.equal(after.metadata.reportedStateTransitionId, closed.metadata.reportedStateTransitionId);
+    if (originReview === 'pending') {
+      resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: cancel.id, action: 'dismiss' });
+      assert.equal(repository.getMemory(previous.id).state_phase, 'active');
+    }
+  });
+}
+
+function pendingGoalFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pending-reported-goal-"));
+  const databasePath = path.join(root, "memory.db");
+  const database = openMemoryDatabase(databasePath);
+  t.after(() => database.close());
+  const repository = new MemoryRepository(database);
+  const canonicalKey = "user:goal:exhibition";
+  function propose({ id, action = "create", previous = null, content, time = "2026-08-02T08:00:00.000Z" }) {
+    const observation = addReportedBeliefObservation(repository, {
+      id, stateFamily: "goal", canonicalKey, sourceContent: content, content, occurredAt: time,
+    });
+    const draft = ["create", "reinforce", "supersede"].includes(action) ? {
+      ...beliefDraft(observation, { validFrom: time }), kind: "plan", stateFamily: "goal", canonicalKey,
+      goalClaim: { text: content },
+    } : null;
+    return repository.recordReportedStateProposal({
+      agentId: "agent-test", stateFamily: "goal", subjectRole: "user", subjectKey: "user", canonicalKey,
+      action, previousMemoryId: previous?.id, proposedState: draft,
+      reviewVersion: "test-pending-goal", inputHash: createHash("sha256").update(id).digest("hex"),
+      selectedObservationId: observation.id, consideredObservationIds: [observation.id],
+      metadata: { target: { subjectLabel: "小夏", stateLabel: "周末看展" } },
+    });
+  }
+  const recall = (anchorMemoryIds) => retrieveMemories({
+    databasePath, agentId: "agent-test", query: "看展的计划", anchorMemoryIds,
+    options: { maximumContextChars: 1200 },
+  });
+  return { repository, database, propose, recall };
+}
+
+for (const resolution of ["dismiss", "accept"]) {
+  for (const originalPending of [false, true]) test(`replacement applies before review: ${resolution}, original pending ${originalPending}`, async t => {
+    const { repository, propose, recall } = pendingGoalFixture(t);
+    const initial = propose({ id: 'saturday', content: '周六下午在西侧训练场练习。' });
+    const { memory: previous } = originalPending
+      ? materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id })
+      : resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id, action: 'accept' });
+    const proposal = propose({ id: 'sunday', action: 'supersede', previous,
+      content: '周六取消，改到周日上午东侧训练场。', time: '2026-08-03T08:00:00.000Z' });
+    const { memory: pending } = materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id });
+    assert.equal(repository.getMemory(previous.id).status, 'superseded');
+    assert.equal(repository.getReportedStateProposal('agent-test', proposal.id).review_state, 'pending');
+    assert.equal(repository.getCurrentCanonicalMemory({ agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+      canonicalKey: previous.canonical_key, representationLayer: 'reported', stateFamily: 'goal', includePending: true }).id, pending.id);
+    assert.match((await recall([pending.id])).context, /周六取消，改到周日上午/);
+    assert.equal(materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id }).status, 'existing');
+    if (originalPending) resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id, action: 'accept' });
+    const result = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id, action: resolution });
+    if (resolution === 'accept') {
+      assert.equal(result.memory.id, pending.id);
+      assert.equal(result.memory.status, 'active');
+      assert.equal(repository.getMemory(previous.id).status, 'superseded');
+    } else {
+      assert.equal(repository.getMemory(pending.id).status, 'deleted');
+      assert.equal(result.restored.id, previous.id);
+      assert.equal(result.restored.status, 'active');
+    }
+  });
+
+  test(`pending goal is indexed and recalled before ${resolution}, then its provisional copy leaves recall`, async (t) => {
+    const { repository, propose, recall } = pendingGoalFixture(t);
+    const proposal = propose({ id: "new-goal", content: "小夏说：我准备周末去看展。" });
+    // Also covers older pending proposals that predate materialization.
+    const maintenance = await runSemanticMemoryMaintenance({ repository, agentId: "agent-test" });
+    assert.equal(maintenance.pendingStateMaterialization.materialized.length, 1);
+    const [pending] = repository.listPendingProvisionalMemories("agent-test");
+    assert.equal(pending.metadata.reportedStateProposalId, proposal.id);
+    const second = materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: proposal.id });
+    assert.equal(second.status, "existing");
+    const embedded = [];
+    await syncMemoryEmbeddings({ repository, agentId: "agent-test", model: "test-pending", dimensions: 3, embeddingProvider: async text => {
+      embedded.push(text); return { vector: [1, 0, 0], model: "test-pending" };
+    } });
+    assert.ok(embedded.some(text => text.includes(pending.content)));
+    assert.ok(repository.listEmbeddings("agent-test", "test-pending", { includeArchived: true }).some(row => row.memory_id === pending.id));
+    const before = await recall([pending.id]);
+    assert.match(before.context, /准备周末去看展/);
+    assert.ok(before.candidates.some(candidate => candidate.memoryId === pending.id && candidate.provisional));
+    assert.ok(before.trace.metadata.provisionalMemoryIds.includes(pending.id));
+    const result = resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: proposal.id, action: resolution });
+    assert.equal(repository.listPendingProvisionalMemories("agent-test").length, 0);
+    assert.equal(repository.getMemory(pending.id).status, "deleted");
+    const after = await recall(resolution === "accept" ? [result.memory.id] : [pending.id]);
+    assert.ok(!after.candidates.some(candidate => candidate.memoryId === pending.id));
+    if (resolution === "accept") assert.match(after.context, /准备周末去看展/);
+  });
+
+  test(`cancellation takes effect before review and ${resolution} preserves the correct state`, async (t) => {
+    const { repository, propose, recall } = pendingGoalFixture(t);
+    const initial = propose({ id: "initial-goal", content: "小夏说：我准备周末去看展。" });
+    const { memory: previous } = resolveReportedStateProposal(repository, {
+      agentId: "agent-test", proposalId: initial.id, action: "accept",
+    });
+    const cancellation = propose({ id: "cancel-goal", action: "cancel", previous,
+      content: "小夏说：我不去了，那个计划取消。", time: "2026-08-03T08:00:00.000Z" });
+    const { memory: pending } = materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+    assert.equal(repository.getMemory(previous.id).status, "superseded");
+    assert.equal(repository.getMemory(previous.id).state_phase, "cancelled");
+    assert.equal(repository.getReportedStateProposal("agent-test", cancellation.id).review_state, "pending");
+    const detail = buildReviewProposalDetail({ repository, agentId: "agent-test",
+      envelope: { type: "reported-state", proposal: cancellation } });
+    assert.equal(detail.appliedBeforeReview, true);
+    assert.equal(detail.writePreview.statePhase, "cancelled");
+    assert.match(detail.writePreview.content, /那个计划取消/);
+    assert.equal(detail.permissions.canDismiss, true);
+    assert.equal(materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id }).status, "existing");
+    const recalled = await recall([previous.id]);
+    assert.ok(recalled.fragments[0].memoryIds.includes(pending.id));
+    assert.match(recalled.context, /已取消/);
+    assert.match(recalled.context, /那个计划取消/);
+    assert.ok(recalled.context.indexOf("那个计划取消") < recalled.context.indexOf("准备周末去看展"));
+    assert.ok(!recalled.trace.selectedIds.includes(pending.id));
+    const reviewed = MemoryService.prototype.resolveHighLevelProposal.call({
+      agentId: "agent-test", withRepository(callback) { return callback(repository); },
+    }, "reported-state", cancellation.id, { action: resolution });
+    if (resolution === "dismiss") assert.equal(reviewed.resolution.restored.id, previous.id);
+    assert.equal(repository.getMemory(previous.id).status, resolution === "accept" ? "superseded" : "active");
+    assert.equal(repository.getMemory(previous.id).state_phase, resolution === "accept" ? "cancelled" : "active");
+    const after = await recall([previous.id]);
+    assert.ok(!after.fragments.flatMap(fragment => fragment.memoryIds).includes(pending.id));
+    if (resolution === "dismiss") assert.doesNotMatch(after.context, /那个计划取消|已取消/);
+  });
+}
+
+test("an older pending cancellation does not precede a newer accepted replacement", async (t) => {
+  const { repository, propose, recall } = pendingGoalFixture(t);
+  const initial = propose({ id: "old-goal", content: "小夏说：我准备周末去看展。" });
+  const { memory: previous } = resolveReportedStateProposal(repository, {
+    agentId: "agent-test", proposalId: initial.id, action: "accept",
+  });
+  const cancellation = propose({ id: "older-cancel", action: "cancel", previous,
+    content: "小夏说：那次计划取消。", time: "2026-08-03T08:00:00.000Z" });
+  materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+  const replacement = propose({ id: "newer-plan", action: "supersede", previous,
+    content: "小夏说：已经重新约好了，下周一起看展。", time: "2026-08-04T08:00:00.000Z" });
+  resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: replacement.id, action: "accept" });
+  const result = await recall([previous.id]);
+  assert.match(result.context, /已经重新约好了/);
+  assert.match(result.context, /那次计划取消/);
+  assert.ok(result.context.indexOf("已经重新约好了") < result.context.indexOf("那次计划取消"));
+  const dismissed = resolveReportedStateProposal(repository, {
+    agentId: "agent-test", proposalId: cancellation.id, action: "dismiss",
+  });
+  assert.equal(dismissed.restored, null, "rejecting an older cancellation must not revive a replaced plan");
+  assert.equal(repository.getMemory(previous.id).status, "superseded");
+  assert.equal(repository.getCurrentCanonicalMemory({ agentId: "agent-test", subjectRole: "user", subjectKey: "user",
+    canonicalKey: previous.canonical_key, representationLayer: "reported", stateFamily: "goal" }).content,
+    "小夏说：已经重新约好了，下周一起看展。");
+});
+
+for (const resolution of ['accept', 'dismiss']) test(`reviewing an older pending replacement does not undo its successor: ${resolution}`, t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const initial = propose({ id: 'initial', content: '周六看展。' });
+  const { memory: first } = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id, action: 'accept' });
+  const secondProposal = propose({ id: 'second', action: 'supersede', previous: first, content: '改到周日。', time: '2026-08-03T08:00:00Z' });
+  const { memory: second } = materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: secondProposal.id });
+  const thirdProposal = propose({ id: 'third', action: 'supersede', previous: second, content: '改到下周。', time: '2026-08-04T08:00:00Z' });
+  const { memory: third } = materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: thirdProposal.id });
+  const reviewed = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: secondProposal.id, action: resolution });
+  assert.equal(repository.getMemory(first.id).status, 'superseded');
+  if (resolution === 'dismiss') assert.equal(reviewed.restored, null);
+  else assert.equal(reviewed.memory.status, 'superseded');
+  assert.equal(repository.getCurrentCanonicalMemory({ agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: first.canonical_key, representationLayer: 'reported', stateFamily: 'goal', includePending: true }).id, third.id);
+});
+
+for (const resolution of ["accept", "dismiss"]) {
+  for (const approveOriginalFirst of [true, false]) {
+    test(`pending original goal survives review order: cancel ${resolution}, original first ${approveOriginalFirst}`, t => {
+      const { repository, propose } = pendingGoalFixture(t);
+      const initial = propose({ id: "unreviewed-goal", content: "小夏说：我准备周末去看展。" });
+      const { memory: previous } = materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: initial.id });
+      const cancellation = propose({ id: "cancel-unreviewed", action: "cancel", previous,
+        content: "小夏说：看展的安排取消。", time: "2026-08-03T08:00:00.000Z" });
+      materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+      assert.equal(repository.getMemory(previous.id).state_phase, "cancelled");
+      const approveOriginal = () => resolveReportedStateProposal(repository, {
+        agentId: "agent-test", proposalId: initial.id, action: "accept",
+      });
+      if (approveOriginalFirst) {
+        const accepted = approveOriginal();
+        assert.equal(accepted.memory.id, previous.id, "dependent transitions must retain their target identity");
+        assert.equal(accepted.memory.state_phase, "cancelled", "approving the old plan must not reactivate it");
+      }
+      const reviewed = resolveReportedStateProposal(repository, {
+        agentId: "agent-test", proposalId: cancellation.id, action: resolution,
+      });
+      if (resolution === "dismiss") {
+        assert.equal(reviewed.restored.id, previous.id);
+        assert.equal(reviewed.restored.status, approveOriginalFirst ? "active" : "archived");
+        assert.equal(reviewed.restored.valid_to, null);
+      }
+      if (!approveOriginalFirst) approveOriginal();
+      const final = repository.getMemory(previous.id);
+      assert.equal(final.state_phase, resolution === "accept" ? "cancelled" : "active");
+      assert.equal(final.status, resolution === "accept" ? "superseded" : "active");
+      assert.equal(final.layer, "prospective");
+      assert.equal(repository.listPendingProvisionalMemories("agent-test").length, 0);
+    });
+  }
+}
+
+test("dismissing a cancellation does not restore a deleted original goal", t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const initial = propose({ id: "dismissed-original", content: "小夏说：我准备周末去看展。" });
+  const { memory: previous } = materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: initial.id });
+  const cancellation = propose({ id: "cancel-dismissed-original", action: "cancel", previous,
+    content: "小夏说：那个计划取消。", time: "2026-08-03T08:00:00.000Z" });
+  materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+  resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: initial.id, action: "dismiss" });
+  const result = resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id, action: "dismiss" });
+  assert.equal(result.restored, null);
+  assert.equal(repository.getMemory(previous.id).status, "deleted");
+});
+
+test("failed cancellation materialization rolls back the lifecycle change", t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const initial = propose({ id: "atomic-original", content: "小夏说：我准备周末去看展。" });
+  const { memory: previous } = resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: initial.id, action: "accept" });
+  const cancellation = propose({ id: "atomic-cancel", action: "cancel", previous,
+    content: "小夏说：那个计划取消。", time: "2026-08-03T08:00:00.000Z" });
+  const linkSource = repository.linkSource.bind(repository);
+  repository.linkSource = () => { throw new Error("simulated source link failure"); };
+  assert.throws(() => materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id }), /simulated/);
+  repository.linkSource = linkSource;
+  assert.equal(repository.getMemory(previous.id).status, "active");
+  assert.equal(repository.getMemory(previous.id).state_phase, "active");
+  assert.equal(repository.getMemory(previous.id).metadata.reportedStateTransitionId, undefined);
+  assert.equal(repository.listPendingProvisionalMemories("agent-test").length, 0);
+  materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+  assert.equal(repository.getMemory(previous.id).state_phase, "cancelled");
+});
+
+test("maintenance applies an older pending cancellation that already has a provisional record", async t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const initial = propose({ id: "legacy-original", content: "小夏说：我准备周末去看展。" });
+  const { memory: previous } = resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: initial.id, action: "accept" });
+  const cancellation = propose({ id: "legacy-cancel", action: "cancel", previous,
+    content: "小夏说：那个计划取消。", time: "2026-08-03T08:00:00.000Z" });
+  const { memory: pending } = materializeReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id });
+  // Reconstruct the persisted layout from before transitions applied at materialization.
+  repository.restoreReportedStateTransition({ agentId: "agent-test", proposalId: cancellation.id,
+    ...pending.metadata.reportedStateTransition });
+  const metadata = { ...pending.metadata };
+  delete metadata.reportedStateTransition;
+  repository.updateMemoryMetadata({ agentId: "agent-test", memoryId: pending.id, metadata });
+  assert.equal(repository.getMemory(previous.id).status, "active");
+  const result = await runSemanticMemoryMaintenance({ repository, agentId: "agent-test" });
+  assert.equal(result.pendingStateMaterialization.failed.length, 0);
+  assert.equal(repository.getMemory(previous.id).state_phase, "cancelled");
+  assert.ok(repository.getMemory(pending.id).metadata.reportedStateTransition);
+  const dismissed = resolveReportedStateProposal(repository, { agentId: "agent-test", proposalId: cancellation.id, action: "dismiss" });
+  assert.equal(dismissed.restored.status, "active");
 });

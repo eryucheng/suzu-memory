@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -18,11 +20,6 @@ const GOAL_MEMORY_KINDS = new Set(["plan", "commitment", "open_loop"]);
 
 function clean(value) {
   return String(value ?? "").trim();
-}
-
-function clip(value, maximum = 1200) {
-  const text = clean(value);
-  return text.length <= maximum ? text : `${text.slice(0, Math.max(0, maximum - 1))}…`;
 }
 
 function uniqueStrings(values) {
@@ -56,6 +53,8 @@ function currentStateView(
 ) {
   const current = repository.getCurrentCanonicalMemory({
     agentId, subjectRole, subjectKey, canonicalKey, representationLayer, stateFamily: "goal",
+    includePending: representationLayer === "reported",
+    includeHistorical: representationLayer === "reported",
   });
   if (!current) return null;
   if (!GOAL_MEMORY_KINDS.has(current.kind)) {
@@ -64,12 +63,13 @@ function currentStateView(
   return {
     id: current.id,
     kind: current.kind,
-    content: clip(current.content),
+    content: String(current.content ?? ""),
     subjectRole: current.subject_role,
     subjectKey: current.subject_key,
     canonicalKey: current.canonical_key,
     representationLayer: current.representation_layer,
     temporalState: current.temporal_state,
+    statePhase: current.state_phase,
     knownAt: current.known_at,
     validFrom: current.valid_from,
     validTo: current.valid_to,
@@ -141,6 +141,7 @@ async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, ag
     });
     return "";
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return `费用流水写入失败：${error.message}`;
   }
 }
@@ -150,6 +151,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
     path.join(path.resolve(promptDirectory), definition.promptFile),
     "utf8",
   ).replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildGoalGenerationInput(snapshot, definition);
   let generation = null;
   try {
@@ -157,7 +159,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
       input,
       systemPrompt,
       schema: definition.schema,
-      schemaName: definition.schemaName,
+      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
       stateFamily: "goal",
       analyzerRole: definition.role,
     });
@@ -173,6 +175,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
         accepted.push(enforceAnalysisBoundary(definition.role, candidate, snapshot));
         seen.add(candidate.memoryId);
       } catch (error) {
+      assertEventSourceExecutionCurrent();
         rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
       }
     }
@@ -186,6 +189,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
       error: "",
     };
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return {
       definition,
       input,
@@ -484,6 +488,7 @@ export async function evaluateGoalEvidence({
       sharedCommitmentsRequireSeparateBilateralReview: true,
     },
   };
+  snapshotOptions.prepareStateSnapshot?.(snapshot);
   const snapshotLimit = Math.min(250_000, Math.max(4_000, Math.trunc(Number(snapshotOptions.maxSnapshotChars) || 64_000)));
   if (JSON.stringify(snapshot).length > snapshotLimit) {
     throw new Error(`Goal evidence snapshot exceeds the ${snapshotLimit}-character privacy budget.`);
@@ -524,7 +529,7 @@ export async function evaluateGoalEvidence({
       batchId,
     });
     if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
       agentId: clean(agentId),
       batchId,
       stateFamily: "goal",
@@ -536,7 +541,7 @@ export async function evaluateGoalEvidence({
       model: clean(invocation.generation?.model) || "unreported",
       promptVersion: invocation.definition.promptVersion,
       schemaVersion: invocation.definition.schemaName,
-      inputHash: createHash("sha256").update(invocation.input).digest("hex"),
+      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
       status: invocation.status,
       memoryIds: snapshot.memories.map((memory) => memory.id),
       sourceIds,

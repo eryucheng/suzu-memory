@@ -38,8 +38,8 @@ function normalizeIdentity(identity = {}) {
   const value = plainObject(identity);
   return Object.freeze({
     spaceId: required(value.spaceId, "identity.spaceId"),
-    primaryUserId: required(value.primaryUserId, "identity.primaryUserId"),
-    primaryUserName: clean(value.primaryUserName) || "User",
+    primaryUserId: clean(value.primaryUserId),
+    primaryUserName: clean(value.primaryUserName) || (clean(value.primaryUserId) ? 'User' : ''),
     companionId: required(value.companionId, "identity.companionId"),
     companionName: clean(value.companionName) || "Companion",
     defaultWorldId: clean(value.defaultWorldId) || "relationship",
@@ -113,7 +113,7 @@ function archiveMemoryWindowUnitId(hostId, sessionId, turnId) {
 function normalizedParticipants(identity, participants = []) {
   const extras = Array.isArray(participants) ? participants : [];
   return [
-    { id: identity.primaryUserId, role: "user", name: identity.primaryUserName },
+    ...(identity.primaryUserId ? [{ id: identity.primaryUserId, role: "user", name: identity.primaryUserName }] : []),
     { id: identity.companionId, role: "companion", name: identity.companionName },
     ...extras.map((item) => ({
       id: required(item?.id, "participant.id"),
@@ -140,7 +140,7 @@ function eventForMessage({
 }) {
   const text = required(message?.text, `${role}Message.text`);
   const actor = role === "user"
-    ? { id: identity.primaryUserId, role: "user", name: identity.primaryUserName }
+    ? { id: required(identity.primaryUserId, 'userMessage participant identity'), role: "user", name: identity.primaryUserName }
     : { id: identity.companionId, role: "companion", name: identity.companionName };
   const occurredAt = timestamp(message?.occurredAt, `${role}Message.occurredAt`, recordedAt);
   const messageId = clean(message?.id);
@@ -465,6 +465,7 @@ export class ChatHostMemoryAdapter {
         allowCrossWorld: Boolean(world?.allowCrossWorld),
         options: recallOptions.options,
         persistTrace: true,
+        reactivate: true,
       });
       const selectedCount = Array.isArray(retrieval?.trace?.selectedIds)
         ? retrieval.trace.selectedIds.length

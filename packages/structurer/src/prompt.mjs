@@ -78,7 +78,7 @@ export function buildStructureGenerationInput(snapshot) {
   return [
     "请根据以下受限记忆快照提出结构候选。只输出符合 Schema 的 JSON。",
     "",
-    JSON.stringify(snapshot, null, 2),
+    JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2),
   ].join("\n");
 }
 

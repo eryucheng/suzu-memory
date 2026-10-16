@@ -1,6 +1,9 @@
+import { memoryBudgetError } from "./budgeted-parts.mjs";
 import {
   BIG_NEURON_KINDS,
   DIRECT_INGESTION_MEMORY_KINDS,
+  executionEventSourceView,
+  eventSourceMaterial,
 } from "@suzu-memory/core";
 
 function clean(value) {
@@ -11,9 +14,15 @@ function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))];
 }
 
-function clip(value, maximum) {
-  const text = clean(value);
-  return text.length <= maximum ? text : `${text.slice(0, Math.max(0, maximum - 1))}…`;
+function completeLimit(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.trunc(parsed)) : Infinity;
+}
+
+function completeText(value, maximum, label) {
+  const text = String(value ?? "");
+  if (text.length > maximum) throw memoryBudgetError(`${label} exceeds the complete ${maximum}-character budget.`);
+  return text;
 }
 
 function actorView(repository, memoryId) {
@@ -40,11 +49,13 @@ function memoryView(repository, memory, maximumContentChars) {
     id: memory.id,
     kind: memory.kind,
     layer: memory.layer,
-    title: clip(memory.title, 160),
-    content: clip(memory.content, maximumContentChars),
+    title: String(memory.title ?? ""),
+    content: completeText(memory.content, maximumContentChars, `Memory ${memory.id}`),
     subjectRole: memory.subject_role,
     subjectKey: memory.subject_key,
     reality: memory.reality,
+    worldId: memory.world_id,
+    worldFrame: memory.world_frame,
     temporalState: memory.temporal_state,
     eventDate: memory.event_date,
     eventStart: memory.event_start,
@@ -57,8 +68,8 @@ function memoryView(repository, memory, maximumContentChars) {
   };
 }
 
-function containerView(repository, memory, maximumContentChars, maximumMemberIds) {
-  const members = memory.kind === "episode"
+function containerView(repository, memory, maximumContentChars, maximumMemberIds, sourceView, materialIds) {
+  const allMembers = memory.kind === "episode"
     ? repository.listEpisodeMembers({
       agentId: memory.agent_id,
       episodeId: memory.id,
@@ -69,11 +80,16 @@ function containerView(repository, memory, maximumContentChars, maximumMemberIds
       topicId: memory.id,
       statuses: ["active", "superseded", "disputed", "archived"],
     });
+  const members = allMembers.filter(member => !sourceView || sourceView.allows(member));
+  if (members.length > maximumMemberIds) {
+    throw memoryBudgetError(`Container ${memory.id} exceeds the complete ${maximumMemberIds}-member budget.`);
+  }
+  for (const member of members) materialIds.add(member.id);
   return {
     ...memoryView(repository, memory, maximumContentChars),
-    memberIds: members.slice(0, maximumMemberIds).map((member) => member.id),
+    memberIds: members.map((member) => member.id),
     memberCount: members.length,
-    memberIdsTruncated: members.length > maximumMemberIds,
+    memberIdsTruncated: false,
   };
 }
 
@@ -91,25 +107,30 @@ export function buildStructureSnapshot({
   batchId = "",
   memoryIds = [],
   nearbyContainerIds = [],
-  maxMemories = 40,
+  maxMemories = Infinity,
   maxContainers = 12,
-  maxMemberIdsPerContainer = 30,
-  maxContentChars = 700,
+  maxMemberIdsPerContainer = Infinity,
+  maxContentChars = Infinity,
   maxSnapshotChars = 32_000,
   retrospective = null,
 } = {}) {
   if (!repository) throw new Error("Structure snapshot requires a repository.");
   const normalizedAgentId = clean(agentId);
   if (!normalizedAgentId) throw new Error("Structure snapshot requires agentId.");
-  const requestedIds = uniqueStrings(memoryIds);
-  const memoryLimit = Math.min(100, Math.max(1, Math.trunc(Number(maxMemories) || 40)));
+  const sourceView = executionEventSourceView(repository, normalizedAgentId);
+  const requestedIds = uniqueStrings(memoryIds).filter(id => !sourceView || sourceView.memoryIds.has(id));
+  const materialIds = new Set(requestedIds);
+  const memoryLimit = completeLimit(maxMemories);
   const containerLimit = Math.min(50, Math.max(0, Math.trunc(Number(maxContainers) || 12)));
-  const memberLimit = Math.min(200, Math.max(0, Math.trunc(Number(maxMemberIdsPerContainer) || 30)));
-  const perMemoryLimit = Math.min(4000, Math.max(100, Math.trunc(Number(maxContentChars) || 700)));
+  const memberLimit = completeLimit(maxMemberIdsPerContainer);
+  const perMemoryLimit = completeLimit(maxContentChars);
   const characterLimit = Math.min(200_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 32_000)));
   const excluded = [];
   const current = [];
-  for (const id of requestedIds.slice(0, memoryLimit)) {
+  if (requestedIds.length > memoryLimit) {
+    throw memoryBudgetError(`Structure snapshot exceeds the complete ${memoryLimit}-memory budget.`);
+  }
+  for (const id of requestedIds) {
     const memory = checkedMemory(repository, normalizedAgentId, id, "Current batch");
     if (memory.status !== "active" || !DIRECT_INGESTION_MEMORY_KINDS.includes(memory.kind)) {
       excluded.push({ id, reason: memory.status !== "active" ? "not-active" : "not-direct-memory" });
@@ -121,6 +142,7 @@ export function buildStructureSnapshot({
   const candidateIds = [];
   const addCandidate = (id) => {
     const normalized = clean(id);
+    if (sourceView && !sourceView.memoryIds.has(normalized)) return;
     if (normalized && !candidateIds.includes(normalized)) candidateIds.push(normalized);
   };
   for (const id of uniqueStrings(nearbyContainerIds)) {
@@ -132,6 +154,7 @@ export function buildStructureSnapshot({
       maxDepth: 1,
       maxNodes: current.length + containerLimit,
       relations: ["part_of_episode", "supports_topic"],
+      allowedMemoryIds: sourceView?.memoryIds,
     });
     for (const memory of graph.nodes) {
       if (memory.status === "active" && BIG_NEURON_KINDS.includes(memory.kind)) addCandidate(memory.id);
@@ -159,6 +182,7 @@ export function buildStructureSnapshot({
           maxDepth: 1,
           maxNodes: current.length + (containerLimit * 3),
           relations: ["associated_with", "same_thread", "shares_entity"],
+          allowedMemoryIds: sourceView?.memoryIds,
         },
       );
       const relatedIds = relatedGraph.nodes
@@ -173,6 +197,7 @@ export function buildStructureSnapshot({
           maxDepth: 1,
           maxNodes: relatedIds.length + containerLimit,
           relations: ["part_of_episode", "supports_topic"],
+          allowedMemoryIds: sourceView?.memoryIds,
         });
         for (const memory of containers.nodes) {
           if (memory.status === "active" && BIG_NEURON_KINDS.includes(memory.kind)) {
@@ -201,7 +226,7 @@ export function buildStructureSnapshot({
     batchId: clean(batchId),
     currentMemories: current.map((memory) => memoryView(repository, memory, perMemoryLimit)),
     candidateContainers: candidateIds.slice(0, containerLimit).map((id) => (
-      containerView(repository, repository.getMemory(id), perMemoryLimit, memberLimit)
+      containerView(repository, repository.getMemory(id), perMemoryLimit, memberLimit, sourceView, materialIds)
     )),
     retrospectiveContext,
     inputPolicy: {
@@ -214,12 +239,14 @@ export function buildStructureSnapshot({
     omitted: {
       requestedMemories: requestedIds.length,
       currentMemoriesExcluded: excluded,
-      currentMemoriesTruncated: Math.max(0, requestedIds.length - memoryLimit),
+      currentMemoriesTruncated: 0,
       candidateContainersTruncated: Math.max(0, candidateIds.length - containerLimit),
     },
   };
+  const material = eventSourceMaterial(repository, normalizedAgentId, [...materialIds, ...candidateIds]);
   if (JSON.stringify(snapshot).length > characterLimit) {
-    throw new Error(`Structure snapshot exceeds the ${characterLimit}-character privacy budget.`);
+    throw memoryBudgetError(`Structure snapshot exceeds the ${characterLimit}-character privacy budget.`);
   }
+  if (material) snapshot.sourceMaterial = material;
   return snapshot;
 }

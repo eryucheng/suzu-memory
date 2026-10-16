@@ -1,8 +1,15 @@
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { randomUUID } from "node:crypto";
+import { claimAccumulatedStructureTasks, deferSmallConsolidationRuns,
+  DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
+export { DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
 
-import { processPendingStateAnalysisRequests } from "@suzu-memory/analysis";
+import { processPendingStateAnalysisRequests, prepareEventContinuity, applyEventContinuity } from "@suzu-memory/analysis";
 import {
+  DIRECT_INGESTION_MEMORY_KINDS,
   resolveReportedStateProposal,
+  isRepeatedReportedStateTransition,
+  materializePendingReportedStateProposals,
   syncMemoryRelationshipMemberships,
   updateAssociationGraph,
 } from "@suzu-memory/core";
@@ -14,6 +21,9 @@ import {
   planMemoryConsolidation,
   processPlannedConsolidationRuns,
   proposeStructuresForBatch,
+  prepareStructureGeneration,
+  runBudgetedMemoryParts,
+  memoryBudgetError,
 } from "@suzu-memory/structurer";
 
 export const MAINTENANCE_LANES = Object.freeze({
@@ -25,6 +35,7 @@ export const MAINTENANCE_TASK_TYPES = Object.freeze({
   memoryEmbedding: "memory-embedding",
   retrievalContext: "retrieval-context",
   structureProposal: "structure-proposal",
+  eventContinuity: "event-continuity",
 });
 
 function clean(value) {
@@ -78,6 +89,7 @@ function enqueueFollowUpTasks({ repository, agentId, payload, taskTypes }) {
     [MAINTENANCE_LANES.embedding, MAINTENANCE_TASK_TYPES.memoryEmbedding],
     [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.retrievalContext],
     [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.structureProposal],
+    [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.eventContinuity],
   ].filter(([, taskType]) => taskTypes.includes(taskType));
   return definitions.map(([lane, taskType]) => repository.enqueueMaintenanceTask({
     agentId,
@@ -98,7 +110,7 @@ export function runImmediateMemoryMaintenance({
   batchId = "",
   memoryIds = [],
   embeddingMemoryIds = memoryIds,
-  followUpTaskTypes = Object.values(MAINTENANCE_TASK_TYPES),
+  followUpTaskTypes = [MAINTENANCE_TASK_TYPES.memoryEmbedding, MAINTENANCE_TASK_TYPES.structureProposal, MAINTENANCE_TASK_TYPES.eventContinuity],
   planConsolidation = true,
   requiredFollowUpEnqueue = false,
 } = {}) {
@@ -145,6 +157,7 @@ export function runImmediateMemoryMaintenance({
       })
       : relationshipMemberships;
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     warnings.push(`Relationship membership sync failed: ${error.message}`);
   }
   try {
@@ -154,18 +167,14 @@ export function runImmediateMemoryMaintenance({
       memoryIds: formalMemoryIds,
     }) : associations;
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     warnings.push(`Association update failed: ${error.message}`);
   }
   if (planConsolidation && formalMemoryIds.length) {
-    try {
-      consolidationPlan = planMemoryConsolidation({
-        repository,
-        agentId: normalizedAgentId,
-        triggerMemoryIds: formalMemoryIds,
-        metadata: { inputBatchId: clean(batchId) },
-      });
-    } catch (error) {
-      warnings.push(`Consolidation planning failed: ${error.message}`);
+    const eligibleIds = formalMemoryIds.filter(id => DIRECT_INGESTION_MEMORY_KINDS.includes(repository.getMemory(id)?.kind));
+    consolidationPlan = { status: "accumulating", memoryIds: eligibleIds };
+    if (eligibleIds.length && !normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.structureProposal)) {
+      normalizedFollowUpTaskTypes.push(MAINTENANCE_TASK_TYPES.structureProposal);
     }
   }
   try {
@@ -184,8 +193,15 @@ export function runImmediateMemoryMaintenance({
         }));
       }
     }
+    const eventIds = formalMemoryIds.filter(id => {
+      const memory = repository.getMemory(id);
+      return memory?.kind === 'event' && memory.status === 'active' && !memory.metadata?.eventContinuity;
+    });
+    if (eventIds.length && normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.eventContinuity)) queued.push(...enqueueFollowUpTasks({ repository, agentId: normalizedAgentId,
+      payload: taskPayload({ repository, agentId: normalizedAgentId, batchId, memoryIds: eventIds }),
+      taskTypes: [MAINTENANCE_TASK_TYPES.eventContinuity] }));
     const semanticTaskTypes = normalizedFollowUpTaskTypes.filter((taskType) => (
-      taskType !== MAINTENANCE_TASK_TYPES.memoryEmbedding
+      taskType !== MAINTENANCE_TASK_TYPES.memoryEmbedding && taskType !== MAINTENANCE_TASK_TYPES.eventContinuity
     ));
     if (formalMemoryIds.length && semanticTaskTypes.length) {
       queued.push(...enqueueFollowUpTasks({
@@ -201,6 +217,7 @@ export function runImmediateMemoryMaintenance({
       }));
     }
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     if (requiredFollowUpEnqueue) throw error;
     warnings.push(`Follow-up maintenance enqueue failed: ${error.message}`);
   }
@@ -273,10 +290,10 @@ export function assessReportedStateAutoAcceptance({
   if (proposal.review_state !== "pending") {
     return { eligible: false, reason: `proposal-${proposal.review_state}`, proposal };
   }
-  if (!SAFE_AUTOMATIC_REPORTED_STATE_ACTIONS.has(proposal.action)) {
+  if (!SAFE_AUTOMATIC_REPORTED_STATE_ACTIONS.has(proposal.action) && !isRepeatedReportedStateTransition(repository, proposal)) {
     return { eligible: false, reason: "state-transition-requires-review", proposal };
   }
-  if (!["user", "agent"].includes(proposal.subject_role)) {
+  if (!["user", "agent", "other"].includes(proposal.subject_role)) {
     return { eligible: false, reason: "subject-is-not-an-individual", proposal };
   }
   const requestId = clean(proposal.metadata?.stateAnalysisRequestId);
@@ -369,12 +386,12 @@ export function autoAcceptReportedStateProposals({
           memoryIds,
           followUpTaskTypes: [
             MAINTENANCE_TASK_TYPES.memoryEmbedding,
-            MAINTENANCE_TASK_TYPES.retrievalContext,
           ],
           planConsolidation: true,
         }),
       });
     } catch (error) {
+    assertEventSourceExecutionCurrent();
       deferred.push({
         proposalId,
         reason: "acceptance-revalidation-failed",
@@ -563,6 +580,7 @@ export async function runEmbeddingMaintenance({
       workerId: claimed.workerId,
     };
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     const failed = claimed.tasks.map((task) => repository.failMaintenanceTask({
       agentId: normalizedAgentId,
       taskId: task.id,
@@ -635,73 +653,70 @@ async function processRetrievalContextTasks({
   return { report, queuedEmbedding, ...taskResults };
 }
 
-async function processStructureTasks({
-  repository,
-  agentId,
-  tasks,
-  workerId,
-  generator,
-  usageLedgerPath,
-}) {
-  const completed = [];
-  const failed = [];
-  const reports = [];
-  for (const task of tasks) {
-    try {
-      const report = await proposeStructuresForBatch({
-        repository,
-        agentId,
-        batchId: clean(task.payload?.batchId),
-        memoryIds: uniqueStrings(task.payload?.memoryIds),
-        generator,
-        usageLedgerPath,
-      });
-      const provisionalMemoryIds = uniqueStrings((report.proposed || [])
-        .map((proposal) => proposal.result_memory_id));
-      const queued = provisionalMemoryIds.length
-        ? runImmediateMemoryMaintenance({
-          repository,
-          agentId,
-          batchId: `pending-structure:${clean(task.id)}`,
-          memoryIds: provisionalMemoryIds,
-          followUpTaskTypes: [
-            MAINTENANCE_TASK_TYPES.memoryEmbedding,
-            MAINTENANCE_TASK_TYPES.retrievalContext,
-          ],
-          planConsolidation: false,
-        })
-        : { status: "skipped", reason: "no-new-pending-structures", queued: [] };
-      reports.push(report);
-      completed.push(repository.finishMaintenanceTask({
-        agentId,
-        taskId: task.id,
-        workerId,
-        result: {
-          ...structureTaskResult(report),
-          queued: queued.queued,
-          maintenanceWarnings: queued.warnings,
-        },
-      }));
-    } catch (error) {
-      reports.push({ status: "failed", taskId: task.id, error: error.message });
-      failed.push(repository.failMaintenanceTask({
-        agentId,
-        taskId: task.id,
-        workerId,
-        errorMessage: error.message,
-        errorDetails: {
-          lane: MAINTENANCE_LANES.semantic,
-          taskType: clean(task.task_type),
-          memoryIds: uniqueStrings(task.payload?.memoryIds),
-          stage: "structure-proposal",
-          errorCode: clean(error.code),
-          errorName: clean(error.name),
-        },
-        result: { status: "failed", error: error.message },
-      }));
+async function processStructureTasks({ repository, agentId, tasks, batch,
+  workerId, generator, usageLedgerPath }) {
+  const checkpoint = () => repository.transaction(() => {
+    for (const task of tasks) repository.checkpointMaintenanceTask({ agentId, taskId: task.id, workerId,
+      result: { structureBatch: batch } });
+  });
+  try {
+    await runBudgetedMemoryParts({ parts: batch.parts, checkpoint,
+      prepare: part => prepareStructureGeneration({ repository, agentId, batchId: part.id,
+        memoryIds: part.memoryIds, generator }),
+      execute: async (part, preparedGeneration) => {
+        const report = await proposeStructuresForBatch({ repository, agentId, batchId: part.id,
+          memoryIds: part.memoryIds, generator, usageLedgerPath, preparedGeneration });
+        const provisionalMemoryIds = uniqueStrings([...report.proposed, ...report.duplicates]
+          .map(proposal => proposal.result_memory_id));
+        const queued = provisionalMemoryIds.length ? runImmediateMemoryMaintenance({
+          repository, agentId, batchId: `pending-structure:${part.id}`, memoryIds: provisionalMemoryIds,
+          followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding], planConsolidation: false,
+        }) : { queued: [], warnings: [] };
+        return { ...structureTaskResult(report), queued: queued.queued, maintenanceWarnings: queued.warnings };
+      },
+    });
+    const finishedIds = uniqueStrings(batch.parts.filter(part => part.status === "completed").flatMap(part => part.memoryIds));
+    if (!batch.consolidationPlanned) {
+      const consolidationPlan = finishedIds.length ? planMemoryConsolidation({
+        repository, agentId, triggerMemoryIds: finishedIds,
+        metadata: { accumulatedStructureBatchId: batch.id },
+      }) : null;
+      batch.consolidationPlanned = true;
+      batch.consolidationRunId = consolidationPlan?.id || "";
+      checkpoint();
     }
+    if (batch.parts.some(part => part.status === "blocked")) {
+      throw memoryBudgetError("One or more complete memory items exceed the organization budget; original material is retained for review.");
+    }
+    const completed = repository.transaction(() => tasks.map(task => repository.finishMaintenanceTask({
+      agentId, taskId: task.id, workerId, result: { status: "completed", structureBatch: batch,
+        processedMemoryVersions: batch.memoryVersions, consolidationRunId: batch.consolidationRunId },
+    })));
+    return { reports: batch.parts.map(part => part.result), completed, failed: [] };
+  } catch (error) {
+    assertEventSourceExecutionCurrent();
+    const blockedIds = error.code === "MEMORY_STRUCTURE_INPUT_TOO_LARGE"
+      ? new Set(batch.parts.filter(part => part.status === "blocked").flatMap(part => part.memoryIds)) : null;
+    const completed = [];
+    const failed = repository.transaction(() => tasks.flatMap(task => {
+      if (blockedIds && !(task.payload.memoryIds || []).some(id => blockedIds.has(id))) {
+        completed.push(repository.finishMaintenanceTask({ agentId, taskId: task.id, workerId,
+          result: { status: "completed", structureBatch: batch,
+            processedMemoryVersions: batch.memoryVersions.filter(memory => !blockedIds.has(memory.id)),
+            consolidationRunId: batch.consolidationRunId } }));
+        return [];
+      }
+      return [repository.failMaintenanceTask({
+      agentId, taskId: task.id, workerId, errorMessage: error.message,
+      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MAX_TOKENS"].includes(error.code),
+      errorDetails: { lane: "semantic", taskType: "structure-proposal", memoryIds: batch.memoryIds,
+        stage: "structure-proposal", errorCode: clean(error.code), errorName: clean(error.name),
+        providerDiagnostics: error.diagnostics || {} },
+      result: { status: "failed", error: error.message, structureBatch: batch },
+      })];
+    }));
+    return { reports: [{ status: "failed", error: error.message }], completed, failed };
   }
-  return { reports, completed, failed };
 }
 
 export async function runSemanticTaskMaintenance({
@@ -711,30 +726,34 @@ export async function runSemanticTaskMaintenance({
   structureGenerator,
   usageLedgerPath = "",
   maximumTasks = 10,
+  minimumStructureMemories = DEFAULT_MINIMUM_STRUCTURE_MEMORIES,
   workerId = `semantic-${randomUUID()}`,
 } = {}) {
   if (!repository) throw new Error("Semantic task maintenance requires a repository.");
   const normalizedAgentId = clean(agentId);
   if (!normalizedAgentId) throw new Error("Semantic task maintenance requires agentId.");
   const supported = [];
-  if (typeof retrievalContextGenerator === "function") {
+  if (typeof retrievalContextGenerator === "function" || retrievalContextGenerator === null) {
     supported.push(MAINTENANCE_TASK_TYPES.retrievalContext);
   }
-  if (typeof structureGenerator === "function") {
-    supported.push(MAINTENANCE_TASK_TYPES.structureProposal);
-  }
-  if (!supported.length) {
+  if (!supported.length && typeof structureGenerator !== "function") {
     return { status: "disabled", reason: "semantic-providers-not-configured", selected: 0 };
   }
-  const claimed = repository.claimMaintenanceTasks({
+  const claimed = supported.length ? repository.claimMaintenanceTasks({
     agentId: normalizedAgentId,
     lane: MAINTENANCE_LANES.semantic,
     taskTypes: supported,
     maximumTasks: boundedInteger(maximumTasks, 10, 1, 100, "maximumTasks"),
     workerId,
-  });
+  }) : { workerId, tasks: [] };
+  const structureBatch = typeof structureGenerator === "function"
+    ? claimAccumulatedStructureTasks({ repository, agentId: normalizedAgentId, workerId,
+      minimumMemories: boundedInteger(minimumStructureMemories, DEFAULT_MINIMUM_STRUCTURE_MEMORIES, 2, 100, "minimumStructureMemories") })
+    : { tasks: [], memoryIds: [], pendingMemoryCount: 0 };
+  claimed.tasks.push(...structureBatch.tasks);
   if (!claimed.tasks.length) {
-    return { status: "empty", selected: 0, workerId: claimed.workerId };
+    return { status: structureBatch.pendingMemoryCount ? "accumulating" : "empty", selected: 0,
+      pendingMemoryCount: structureBatch.pendingMemoryCount, workerId: claimed.workerId };
   }
   const contexts = claimed.tasks.filter((task) => (
     task.task_type === MAINTENANCE_TASK_TYPES.retrievalContext
@@ -745,7 +764,13 @@ export async function runSemanticTaskMaintenance({
   const results = {};
   if (contexts.length) {
     try {
-      results.retrievalContexts = await processRetrievalContextTasks({
+      results.retrievalContexts = retrievalContextGenerator === null ? {
+        completed: contexts.map(task => repository.finishMaintenanceTask({
+          agentId: normalizedAgentId, taskId: task.id, workerId: claimed.workerId,
+          result: { status: 'skipped', reason: 'retrieval-context-generation-disabled' },
+        })),
+        failed: [],
+      } : await processRetrievalContextTasks({
         repository,
         agentId: normalizedAgentId,
         tasks: contexts,
@@ -754,6 +779,7 @@ export async function runSemanticTaskMaintenance({
         usageLedgerPath,
       });
     } catch (error) {
+    assertEventSourceExecutionCurrent();
       results.retrievalContexts = {
         error: error.message,
         completed: [],
@@ -780,6 +806,7 @@ export async function runSemanticTaskMaintenance({
       repository,
       agentId: normalizedAgentId,
       tasks: structures,
+      batch: structureBatch.batch,
       workerId: claimed.workerId,
       generator: structureGenerator,
       usageLedgerPath,
@@ -801,14 +828,54 @@ export async function runSemanticTaskMaintenance({
   };
 }
 
+export async function runEventContinuityMaintenance({ repository, agentId, generator, embeddingProvider,
+  maximumTasks = 10, usageLedgerPath = '' }) {
+  if (typeof generator !== 'function' || typeof embeddingProvider !== 'function') {
+    return { status: 'disabled', reason: 'event-continuity-provider-not-configured', completed: [], failed: [] };
+  }
+  const claimed = repository.claimMaintenanceTasks({ agentId, lane: 'semantic',
+    taskTypes: [MAINTENANCE_TASK_TYPES.eventContinuity], maximumTasks, workerId: `event-continuity-${randomUUID()}` });
+  const completed = [], failed = [];
+  for (const task of claimed.tasks) {
+    const progress = task.result?.eventContinuityProgress || { parts: [{ id: task.id, memoryIds: task.payload.memoryIds, status: 'pending' }] };
+    const checkpoint = () => repository.checkpointMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
+      result: { eventContinuityProgress: progress } });
+    try {
+      await runBudgetedMemoryParts({ parts: progress.parts, checkpoint,
+        prepare: async part => {
+          try { return await prepareEventContinuity({ repository, agentId, memoryIds: part.memoryIds, generator, embeddingProvider, usageLedgerPath }); }
+          catch (error) {
+            if (error.code === 'MEMORY_STATE_ANALYSIS_INPUT_TOO_LARGE') throw memoryBudgetError(error.message);
+            throw error;
+          }
+        },
+        execute: (part, prepared) => applyEventContinuity({ repository, agentId, prepared, generator, usageLedgerPath }),
+      });
+      if (progress.parts.some(part => part.status === 'blocked')) throw memoryBudgetError('Complete event continuity evidence exceeds the request budget.');
+      completed.push(repository.finishMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
+        result: { eventContinuityProgress: progress } }));
+    } catch (error) {
+      assertEventSourceExecutionCurrent();
+      failed.push(repository.failMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
+        errorMessage: error.message, retry: !['MAX_TOKENS', 'MEMORY_STRUCTURE_INPUT_TOO_LARGE'].includes(error.code),
+          errorDetails: { stage: 'event-continuity', memoryIds: task.payload.memoryIds, errorCode: error.code || '',
+            providerDiagnostics: error.diagnostics || {} },
+        result: { eventContinuityProgress: progress } }));
+    }
+  }
+  return { status: failed.length ? 'partial-failure' : 'completed', completed, failed };
+}
+
 export async function runSemanticMemoryMaintenance({
   repository,
+  embeddingProvider,
   agentId,
   generator,
   structureGenerator = generator,
-  retrievalContextGenerator = generator,
+  retrievalContextGenerator = null,
   usageLedgerPath = "",
   maximumTasks = 10,
+  minimumStructureMemories = DEFAULT_MINIMUM_STRUCTURE_MEMORIES,
   maximumStateRequests = 10,
   maximumConsolidationRuns = 3,
 } = {}) {
@@ -819,6 +886,7 @@ export async function runSemanticMemoryMaintenance({
   const stateAnalysis = typeof generator === "function"
     ? await processPendingStateAnalysisRequests({
       repository,
+      embeddingProvider,
       agentId: normalizedAgentId,
       generator,
       maxRequests: boundedInteger(
@@ -840,6 +908,23 @@ export async function runSemanticMemoryMaintenance({
         .map((result) => clean(result.proposal?.id))
         .filter(Boolean),
     });
+  const pendingStateMaterialization = materializePendingReportedStateProposals(repository, {
+    agentId: normalizedAgentId,
+  });
+  const eventContinuity = await runEventContinuityMaintenance({ repository, agentId: normalizedAgentId,
+    generator, embeddingProvider, maximumTasks, usageLedgerPath });
+  const pendingStateMemories = repository.listPendingProvisionalMemories(normalizedAgentId, { limit: 5_000 })
+    .filter(memory => memory.metadata?.reportedStateProposalId || memory.metadata?.preferenceProposalId);
+  for (const memory of pendingStateMemories) {
+    runImmediateMemoryMaintenance({
+      repository, agentId: normalizedAgentId, batchId: `pending-reported-state:${memory.id}`,
+      memoryIds: [memory.id], followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding],
+      planConsolidation: false,
+    });
+  }
+  if (typeof structureGenerator === "function") deferSmallConsolidationRuns({
+    repository, agentId: normalizedAgentId, minimumMemories: minimumStructureMemories,
+  });
   const semanticTasks = await runSemanticTaskMaintenance({
     repository,
     agentId: normalizedAgentId,
@@ -847,6 +932,7 @@ export async function runSemanticMemoryMaintenance({
     structureGenerator,
     usageLedgerPath,
     maximumTasks,
+    minimumStructureMemories,
   });
   const consolidation = typeof structureGenerator === "function"
     ? await processPlannedConsolidationRuns({
@@ -861,6 +947,7 @@ export async function runSemanticMemoryMaintenance({
         "maximumConsolidationRuns",
       ),
       usageLedgerPath,
+      minimumTriggerMemories: minimumStructureMemories,
     })
     : { status: "disabled", reason: "structure-provider-not-configured", selected: 0 };
   const hasFailures = [
@@ -868,12 +955,15 @@ export async function runSemanticMemoryMaintenance({
     stateAnalysis.status,
     automaticStateAcceptance.status,
     consolidation.status,
+    eventContinuity.status,
   ].some((status) => ["failed", "partial-failure", "completed-with-failures"].includes(status));
   return {
-    status: hasFailures ? "completed-with-failures" : "completed",
+    status: hasFailures || pendingStateMaterialization.failed.length ? "completed-with-failures" : "completed",
     semanticTasks,
     stateAnalysis,
     automaticStateAcceptance,
+    pendingStateMaterialization,
+    eventContinuity,
     consolidation,
   };
 }

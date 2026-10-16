@@ -426,30 +426,14 @@ function extractionCandidate(overrides = {}) {
     commitment: "goal",
     open_loop: "goal",
   }[candidate.kind];
-  const emptyTarget = {
-    type: "none",
-    identityField: "not_applicable",
-    fieldCardinality: "not_applicable",
-    objectRole: "not_applicable",
-    objectName: "",
-    counterpartRole: "not_applicable",
-    counterpartName: "",
-    direction: "not_applicable",
-    triggerRole: "not_applicable",
-    triggerName: "",
-  };
-  const stateTarget = overrides.stateTarget || (stateFamily === "identity" ? {
-    ...emptyTarget,
-    type: "identity",
-    identityField: "other",
-    fieldCardinality: "multi_item",
-  } : emptyTarget);
+  const stateTarget = overrides.stateTarget || (stateFamily === "identity"
+    ? { identityField: "other", fieldCardinality: "multi_item" } : null);
   return {
     ...candidate,
     canonicalKey: candidate.canonicalKey || `test:${stateFamily}:${candidate.kind}`,
     stateFamily: stateFamily || "not_applicable",
     stateLabel: overrides.stateLabel ?? (stateFamily ? candidate.title : ""),
-    stateTarget,
+    ...(stateTarget ? { stateTarget } : {}),
   };
 }
 
@@ -923,7 +907,7 @@ test("long-term extraction executor uses the production schema contract", async 
     messages: [{ ref: "M0001", role: "user", text: "今天下雨。", timestamp: "2026-08-01" }],
     expect: { maximumMemories: 0 },
   });
-  assert.equal(request.schemaName, "long-term-memory-extraction-v1");
+  assert.equal(request.schemaName, "long-term-memory-extraction-v2");
   assert.deepEqual(request.schema.required, ["memories"]);
   assert.equal(request.systemPrompt, "只输出结构化记忆。");
   assert.match(request.input, /\[M0001\]/u);

@@ -15,6 +15,7 @@ import {
   DIRECT_USER_AGENT_DM_TOPOLOGY,
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
+import { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles } from './participant-identity.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "system-prompt.md");
@@ -67,13 +68,18 @@ function isoTimestamp(value, fallback = null) {
 }
 
 function actorKeyFor(actorRole, actorName, agentId, identity = {}) {
-  const primaryUserId = clean(identity?.primaryUserId) || "user";
+  const resolved = resolveExtractionParticipant(actorName, identity.participants);
+  if (resolved.status === 'known' && resolved.participant.actorRole === actorRole) return resolved.participant.actorKey;
+  if (resolved.status === 'ambiguous') return '';
+  if (identity.eventSourceIdentity && ['user', 'agent'].includes(actorRole)) return '';
+  const primaryUserId = clean(identity?.primaryUserId ?? "user");
   const companionId = clean(identity?.companionId) || clean(agentId);
   switch (actorRole) {
     case "user": return primaryUserId;
     case "agent": return companionId;
-    case "shared": return `shared:${companionId}:${primaryUserId}`;
-    case "other": return clean(actorName).toLocaleLowerCase("zh-CN");
+    case "shared": return identity.eventSourceIdentity || !primaryUserId ? '' : `shared:${companionId}:${primaryUserId}`;
+    case "other": return clean(actorName) && identity.unresolvedActorScope
+      ? stableId('unresolved-person', agentId, identity.unresolvedActorScope, clean(actorName).normalize('NFKC').toLocaleLowerCase('zh-CN')) : '';
     case "world": return "";
     default: return "";
   }
@@ -81,12 +87,22 @@ function actorKeyFor(actorRole, actorName, agentId, identity = {}) {
 
 function actorIdentityKeys(agentId, identity = {}) {
   return {
-    primaryUserId: clean(identity?.primaryUserId) || "user",
+    primaryUserId: clean(identity?.primaryUserId ?? "user"),
     companionId: clean(identity?.companionId) || clean(agentId),
+    participants: identity.participants || [],
+    unresolvedActorScope: clean(identity.unresolvedActorScope),
+    ...(identity.eventSourceIdentity ? { eventSourceIdentity: true } : {}),
   };
 }
 
 function subjectKeyFor(candidate, agentId, identity) {
+  if (candidate.subjectRole === 'shared' && identity?.eventSourceIdentity) {
+    const actors = [...new Set(candidate.actorRoles.filter(actor => ['experiencer', 'participant'].includes(actor.role))
+      .map(actor => resolveExtractionParticipant(actor.actorName, identity.participants))
+      .filter(resolved => resolved.status === 'known')
+      .map(({ participant }) => `${participant.actorRole}:${encodeURIComponent(participant.actorKey)}`))].sort();
+    return actors.length >= 2 ? `shared:${actors.join('|')}` : '';
+  }
   return actorKeyFor(candidate.subjectRole, candidate.subjectName, agentId, identity);
 }
 
@@ -115,7 +131,7 @@ function requestTargetSpec(candidate, agentId, identity) {
         identity,
       ),
       counterpartLabel: target.counterpartName,
-      direction: target.direction,
+      direction: "holder_to_counterpart",
     }, { allowEmpty: false });
   }
   if (candidate.stateFamily === "affective_association") {
@@ -136,7 +152,9 @@ function structuredActorRoles(candidate, agentId, identity) {
     isPrimary: false,
     confidence: actor.confidence,
     provenance: "suzu-memory-extraction-v1",
-    metadata: { actorName: clean(actor.actorName) },
+    metadata: { actorName: clean(actor.actorName),
+      ...(actor.actorRole === 'other' && resolveExtractionParticipant(actor.actorName, identity.participants).status === 'unknown'
+        ? { identityStatus: 'unresolved', evidenceScope: clean(identity.unresolvedActorScope) } : {}) },
   }));
   const holderRole = candidate.kind === "belief_state"
     ? "belief_holder"
@@ -162,6 +180,12 @@ function structuredActorRoles(candidate, agentId, identity) {
   return roles;
 }
 
+/** Resolve extraction names once against the host's participant snapshot. */
+export function resolveExtractedCandidateIdentity(candidate, agentId, identity) {
+  return { subjectKey: subjectKeyFor(candidate, agentId, identity),
+    actorRoles: structuredActorRoles(candidate, agentId, identity) };
+}
+
 function firstEvidenceTime(referenced, fallback) {
   return referenced.reduce((earliest, item) => {
     const timestamp = isoTimestamp(item.message.timestamp);
@@ -183,24 +207,24 @@ function sameNamedActor(candidate, actor) {
     === clean(candidate.subjectName).toLocaleLowerCase("zh-CN");
 }
 
-function evidenceAlignmentProblems(candidate, referencedMessages) {
+function evidenceAlignmentProblems(candidate, referencedMessages, identity = {}) {
   const problems = new Set();
   const hasUserEvidence = referencedMessages.some((message) => message.role === "user");
   const hasAgentEvidence = referencedMessages.some((message) => message.role === "assistant");
   if (!isRetentionReasonCompatible(candidate.kind, candidate.retentionReason)) {
     problems.add("retention-reason-kind-mismatch");
   }
-  if (candidate.subjectRole === "user" && !referencedMessages.some((message) => message.role === "user")) {
+  if (!identity.eventSourceIdentity && candidate.subjectRole === "user" && !referencedMessages.some((message) => message.role === "user")) {
     problems.add("user-memory-without-user-source");
   }
-  if (candidate.subjectRole === "agent" && !referencedMessages.some((message) => message.role === "assistant")) {
+  if (!identity.eventSourceIdentity && candidate.subjectRole === "agent" && !referencedMessages.some((message) => message.role === "assistant")) {
     problems.add("agent-memory-without-agent-source");
   }
   if (candidate.subjectRole === "other" && !clean(candidate.subjectName)) {
     problems.add("other-memory-without-subject-name");
   }
   if (
-    candidate.kind === "commitment"
+    !identity.eventSourceIdentity && candidate.kind === "commitment"
     && candidate.subjectRole === "shared"
     && (!hasUserEvidence || !hasAgentEvidence)
   ) {
@@ -212,18 +236,35 @@ function evidenceAlignmentProblems(candidate, referencedMessages) {
     : candidate.kind === "preference" ? "preference_holder" : "";
   for (const actor of Array.isArray(candidate.actorRoles) ? candidate.actorRoles : []) {
     if (
-      actor.actorRole === "user"
+      !identity.eventSourceIdentity && actor.actorRole === "user"
       && !hasUserEvidence
       && candidate.subjectRole !== "user"
     ) problems.add("user-actor-without-user-source");
     if (
-      actor.actorRole === "agent"
+      !identity.eventSourceIdentity && actor.actorRole === "agent"
       && !hasAgentEvidence
       && candidate.subjectRole !== "agent"
     ) problems.add("agent-actor-without-agent-source");
     if (holderRole && actor.role === holderRole && !sameNamedActor(candidate, actor)) {
       problems.add("holder-conflicts-with-subject");
     }
+  }
+  if (identity.eventSourceIdentity) {
+    const people = [[candidate.subjectName, candidate.subjectRole], ...candidate.actorRoles.map(actor => [actor.actorName, actor.actorRole]),
+      ...['object', 'counterpart', 'trigger'].map(prefix => [candidate.stateTarget?.[`${prefix}Name`], candidate.stateTarget?.[`${prefix}Role`]])];
+    for (const [name, role] of people) {
+      const resolved = resolveExtractionParticipant(name, identity.participants);
+      if (resolved.status === 'ambiguous') problems.add('ambiguous-participant-identity');
+      if (['user', 'agent'].includes(role) && (resolved.status !== 'known' || resolved.participant.actorRole !== role)) {
+        problems.add('participant-identity-mismatch');
+      }
+    }
+    if (candidate.evidenceMode === 'explicit' && ['user', 'agent', 'other'].includes(candidate.subjectRole)) {
+      const subject = resolveExtractionParticipant(candidate.subjectName, identity.participants);
+      if (subject.status !== 'known' || !referencedMessages.some(message => message.speakerIdentity?.actorKey === subject.participant.actorKey
+        && message.speakerIdentity?.actorRole === subject.participant.actorRole)) problems.add('explicit-memory-without-subject-source');
+    }
+    if (candidate.subjectRole === 'shared' && !subjectKeyFor(candidate, '', identity)) problems.add('shared-memory-needs-explicit-participants');
   }
   return [...problems];
 }
@@ -355,7 +396,7 @@ export function fallbackStateAnalysisToProvisionalReview({
   if (!decision) {
     throw new Error("State analysis fallback could not find its ingestion decision.");
   }
-  const generated = decision.candidate;
+  const generated = { ...decision.candidate, canonicalKey: request.canonical_key };
   const referenced = decision.sourceIds.map((sourceId, index) => {
     const source = repository.getSource(sourceId);
     if (!source) throw new Error(`State analysis fallback source is missing: ${sourceId}`);
@@ -390,6 +431,13 @@ export function fallbackStateAnalysisToProvisionalReview({
       identity: actorIdentity,
     });
     if (!provisional) throw new Error("State analysis fallback did not create a provisional memory.");
+    if (request.metadata?.stateIdentityResolution?.resolution === 'matched') {
+      repository.upsertEdge({ agentId: request.agent_id, fromMemoryId: provisional.id,
+        toMemoryId: request.metadata.stateIdentityResolution.candidateId, relation: 'associated_with',
+        direction: 'directed', weight: 1, confidence: generated.confidence,
+        provenance: 'state-identity-resolution-v1',
+        metadata: { stateAnalysisRequestId: request.id, reviewRequired: true } });
+    }
     const updatedDecision = repository.deferIngestionDecisionForReview({
       agentId: request.agent_id,
       decisionId: decision.id,
@@ -428,6 +476,12 @@ export function archiveLongTermEvidence({
   conversationTopology,
   identity = {},
 }) {
+  identity = { ...identity, participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
+  if (messages.some(message => message.eventSource)) {
+    identity = { ...identity, eventSourceIdentity: true,
+      participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
+    generatedMemories = normalizeExtractionParticipantRoles({ memories: generatedMemories }, identity.participants).output.memories;
+  }
   const sourceByRef = new Map();
   const messageMemories = [];
   const results = [];
@@ -437,7 +491,7 @@ export function archiveLongTermEvidence({
         candidateIndex,
         ...result,
         sourceRefs: generated.sourceRefs,
-        candidate: generated,
+        candidate: { ...generated, metadata: { ...generated.metadata, actorIdentity: actorIdentityKeys(agentId, identity) } },
       };
       const provisional = recorded.status === "review"
         ? storeProvisionalImpression({
@@ -459,7 +513,7 @@ export function archiveLongTermEvidence({
         decision: decisionForResult(recorded),
         resultStatus: recorded.status,
         reasonCodes: recorded.reasons,
-        candidate: generated,
+        candidate: recorded.candidate,
         sourceRefs: generated.sourceRefs,
         sourceIds: referenced.map((item) => item.source.id),
         knownAt: firstEvidenceTime(referenced, null),
@@ -476,7 +530,9 @@ export function archiveLongTermEvidence({
         agentId,
         primaryUserId: identity.primaryUserId,
         companionId: identity.companionId,
-        conversationTopology,
+        conversationTopology: message.conversationTopology ?? conversationTopology,
+        actualSpeaker: message.speakerIdentity || null,
+        actualParticipants: message.eventSource ? message.participants : [],
         provenance: "suzu-memory-extraction-v1-utterance",
       });
       const source = repository.upsertSource({
@@ -542,6 +598,7 @@ export function archiveLongTermEvidence({
             ? message.inputEventIds.map(clean).filter(Boolean)
             : [clean(message.inputEventId)].filter(Boolean),
           ...(message.logicalEvent ? { logicalEvent: message.logicalEvent } : {}),
+          ...(message.eventSource ? { eventSource: message.eventSource, conversationTopology: message.conversationTopology } : {}),
         },
       });
       repository.linkSource(memoryId, source.id, "verbatim", {
@@ -576,10 +633,14 @@ export function archiveLongTermEvidence({
       });
     }
 
-    for (const [candidateIndex, generated] of generatedMemories.entries()) {
+    for (const [candidateIndex, rawCandidate] of generatedMemories.entries()) {
+      const generated = rawCandidate.kind === 'event'
+        ? { ...rawCandidate, canonicalKey: stableId('event', agentId, batchId, candidateIndex) } : rawCandidate;
       const referenced = generated.sourceRefs
         .map((reference) => sourceByRef.get(reference))
         .filter(Boolean);
+      identity = { ...identity, unresolvedActorScope: stableId('evidence', agentId,
+        ...referenced.map(item => item.source.id).sort()) };
       const missingRefs = generated.sourceRefs.filter((reference) => !sourceByRef.has(reference));
       if (missingRefs.length) {
         keepResult(candidateIndex, generated, {
@@ -612,6 +673,7 @@ export function archiveLongTermEvidence({
       const alignmentProblems = evidenceAlignmentProblems(
         generated,
         referenced.map((item) => item.message),
+        identity,
       );
       if (alignmentProblems.length) {
         keepResult(candidateIndex, generated, {
@@ -637,7 +699,7 @@ export function archiveLongTermEvidence({
           }, referenced);
           continue;
         }
-        if (generated.evidenceMode !== "explicit") {
+        if (generated.evidenceMode !== "explicit" && generated.stateFamily !== "preference") {
           keepResult(candidateIndex, generated, {
             status: "review",
             reasons: ["state-analysis-awaits-inferred-specialist"],
@@ -715,6 +777,8 @@ export function archiveLongTermEvidence({
           const sameSubject = (
             (generated.subjectRole === "user" && item.message.role === "user")
             || (generated.subjectRole === "agent" && item.message.role === "assistant")
+            || (generated.subjectRole === 'other' && item.message.speakerIdentity?.actorRole === 'other'
+              && item.message.speakerIdentity.actorKey === subjectKeyFor(generated, agentId, identity))
           );
           const authority = generated.evidenceMode === "inferred"
             ? "model_inference"

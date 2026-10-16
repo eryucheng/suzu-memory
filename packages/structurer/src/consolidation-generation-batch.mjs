@@ -1,3 +1,5 @@
+import { mergeEventSourceMaterials } from '@suzu-memory/core';
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -58,6 +60,21 @@ function splitGeneration(generation, calls) {
   });
 }
 
+export function buildConsolidationRequest(calls) {
+  if (calls.length === 1) return calls[0].request;
+  const first = calls[0].request;
+  return {
+    ...first,
+    input: combinedInput(calls),
+    systemPrompt: combinedPrompt(calls),
+    schema: combinedSchema(calls),
+    schemaName: "memory-consolidation-combined-v1",
+    analyzerRole: "memory-consolidation-combined",
+    combinedOutputs: calls.map(call => call.key),
+    ...(first.sourceMaterial ? { sourceMaterial: mergeEventSourceMaterials(calls.map(call => call.request.sourceMaterial)) } : {}),
+  };
+}
+
 export function createConsolidationGenerationBatch(generator) {
   if (typeof generator !== "function") {
     throw new Error("Combined consolidation requires a generator.");
@@ -78,16 +95,7 @@ export function createConsolidationGenerationBatch(generator) {
             pending[0].resolve(await generator(pending[0].request));
             return;
           }
-          const first = pending[0].request;
-          const generation = await generator({
-            ...first,
-            input: combinedInput(pending),
-            systemPrompt: combinedPrompt(pending),
-            schema: combinedSchema(pending),
-            schemaName: "memory-consolidation-combined-v1",
-            analyzerRole: "memory-consolidation-combined",
-            combinedOutputs: pending.map((call) => call.key),
-          });
+          const generation = await generator(buildConsolidationRequest(pending));
           const outputs = splitGeneration(generation, pending);
           pending.forEach((call, index) => call.resolve(outputs[index]));
         } catch (error) {

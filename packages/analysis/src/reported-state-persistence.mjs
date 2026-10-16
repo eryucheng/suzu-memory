@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
+  materializeReportedStateProposal,
   MEMORY_STATE_FAMILIES,
   REPORTED_STATE_PROPOSAL_ACTIONS,
 } from "@suzu-memory/core";
@@ -105,6 +106,7 @@ export function proposeReportedStateFromReview({
       truthBoundary: reviewResult.truthBoundary || {},
     },
   });
+  materializeReportedStateProposal(repository, { agentId: snapshot.agentId, proposalId: proposal.id });
   return {
     status: "pending",
     reason: "",

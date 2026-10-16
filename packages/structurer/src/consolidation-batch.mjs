@@ -1,4 +1,5 @@
 import { runMemoryConsolidation } from "./consolidation-service.mjs";
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -22,6 +23,7 @@ export async function processPlannedConsolidationRuns({
   agentId,
   generator,
   maximumRuns,
+  minimumTriggerMemories = 0,
   usageLedgerPath = "",
   leaseSeconds = 900,
   now = new Date().toISOString(),
@@ -36,7 +38,9 @@ export async function processPlannedConsolidationRuns({
   const selected = repository.listClaimableConsolidationRuns(normalizedAgentId, {
     now,
     limit,
-  });
+  }).filter(run => run.triggerIds.length >= minimumTriggerMemories
+    || run.structureProposalIds.length || run.relationProposalIds.length
+    || run.metadata?.accumulatedStructureBatchId || run.metadata?.organizationProgress);
   const results = [];
   for (const run of selected) {
     try {
@@ -58,6 +62,7 @@ export async function processPlannedConsolidationRuns({
         error: clean(result.error),
       });
     } catch (error) {
+      assertEventSourceExecutionCurrent();
       results.push({
         runId: run.id,
         status: "failed-to-run",

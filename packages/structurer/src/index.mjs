@@ -14,7 +14,10 @@ export {
 
 export {
   proposeStructuresForBatch,
+  prepareStructureGeneration,
 } from "./service.mjs";
+
+export { runBudgetedMemoryParts, memoryBudgetError } from "./budgeted-parts.mjs";
 
 export {
   buildRelationSnapshot,

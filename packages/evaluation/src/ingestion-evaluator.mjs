@@ -192,7 +192,7 @@ export function createLongTermExtractionExecutor({ generate, systemPrompt }) {
       input: buildIngestionEvaluationInput(testCase),
       systemPrompt,
       schema: LONG_TERM_EXTRACTION_SCHEMA,
-      schemaName: "long-term-memory-extraction-v1",
+      schemaName: "long-term-memory-extraction-v2",
     });
     return generation?.output ?? generation;
   };

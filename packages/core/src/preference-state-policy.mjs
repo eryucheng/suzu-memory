@@ -501,7 +501,8 @@ function validateCanonicalReviewSnapshot(repository, proposal) {
   }
 }
 
-function attachEvidence(repository, proposal, targetMemory) {
+function attachEvidence(repository, proposal, targetMemory, { pending = false } = {}) {
+  const provenance = pending ? "pending-preference-state-proposal-v1" : "accepted-preference-state-proposal-v1";
   for (const item of proposal.evidence) {
     const currentSnapshotHash = preferenceEvidenceSnapshot(repository, {
       agentId: proposal.agent_id,
@@ -521,7 +522,7 @@ function attachEvidence(repository, proposal, targetMemory) {
         authority: clean(source?.authority) || "model_inference",
         sourceTrust: bounded(source?.source_trust, 0.5),
         evidenceStrength: bounded(item.confidence, 0.5),
-        provenance: "accepted-preference-state-proposal-v1",
+        provenance,
         metadata: {
           preferenceProposalId: proposal.id,
           evidenceMemoryId: item.memoryId,
@@ -538,7 +539,7 @@ function attachEvidence(repository, proposal, targetMemory) {
       direction: "directed",
       weight: item.direction === "support" ? 0.85 : 0.7,
       confidence: item.confidence,
-      provenance: "accepted-preference-state-proposal-v1",
+      provenance,
       metadata: {
         preferenceProposalId: proposal.id,
         signal: item.signal,
@@ -547,6 +548,46 @@ function attachEvidence(repository, proposal, targetMemory) {
       },
     });
   }
+}
+
+function provisionalPreferenceId(proposal) {
+  return `pending-preference-${canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24)}`;
+}
+
+export function materializePreferenceStateProposal(repository, { agentId, proposalId } = {}) {
+  const proposal = repository.getPreferenceStateProposal(clean(agentId), proposalId);
+  if (!proposal) throw new Error("Preference state proposal does not exist for this Agent.");
+  if (proposal.representation_layer !== "inferred") throw new Error("Pending preference materialization requires an inferred proposal.");
+  if (proposal.review_state !== "pending") return { status: "skipped", proposal, memory: null };
+  const existing = repository.getMemory(provisionalPreferenceId(proposal));
+  if (existing) return { status: "existing", proposal, memory: existing };
+  return repository.transaction(() => {
+    const first = repository.getMemory(proposal.evidence[0]?.memoryId);
+    const memory = repository.upsertMemory({
+      id: provisionalPreferenceId(proposal), agentId: proposal.agent_id,
+      kind: proposal.proposed_kind, layer: "provisional", status: "archived",
+      title: proposal.title, content: proposal.content,
+      subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
+      canonicalKey: proposal.canonical_key, reality: "real", evidenceMode: "inferred",
+      worldId: first?.world_id, worldFrame: first?.world_frame,
+      representationLayer: "inferred", stateFamily: "preference", stateScopeKey: proposal.state_scope_key,
+      statePhase: "active", temporalState: "current", knownAt: proposal.known_at,
+      validFrom: proposal.valid_from, confidence: Math.min(0.65, proposal.confidence), importance: 0.6,
+      actorRoles: [{ role: "preference_holder", actorRole: proposal.subject_role, actorKey: proposal.subject_key,
+        isPrimary: true, confidence: proposal.confidence, provenance: "pending-preference-state-proposal-v1" }],
+      metadata: { provisional: true, reviewState: "pending", epistemicStatus: "inferred_preference",
+        preferenceProposalId: proposal.id, preferenceStateLevel: proposal.proposed_level,
+        preferenceMetrics: proposal.metrics, preferencePolicyVersion: proposal.policy_version },
+    });
+    attachEvidence(repository, proposal, memory, { pending: true });
+    return { status: "created", proposal, memory };
+  });
+}
+
+function removeProvisionalPreference(repository, proposal, actor) {
+  const memory = repository.getMemory(provisionalPreferenceId(proposal));
+  if (memory && memory.status !== "deleted") repository.setMemoryDeleted({ agentId: proposal.agent_id,
+    memoryId: memory.id, actor, reason: "Preference state proposal resolved." });
 }
 
 export function resolvePreferenceStateProposal(repository, {
@@ -568,25 +609,35 @@ export function resolvePreferenceStateProposal(repository, {
     throw new Error(`Unknown preference state proposal action: ${normalizedAction || "(empty)"}.`);
   }
   if (normalizedAction === "dismiss") {
-    return repository.transaction(() => ({
-      status: "dismissed",
-      proposal: repository.resolvePreferenceStateProposal({
-        agentId: normalizedAgentId,
-        proposalId: proposal.id,
-        resolution: "dismissed",
-        resolvedBy,
-        note,
-      }),
-      memory: null,
-      previous: proposal.previousMemoryId
-        ? repository.getMemory(proposal.previousMemoryId)
-        : null,
-    }));
+    return repository.transaction(() => {
+      removeProvisionalPreference(repository, proposal, resolvedBy);
+      return {
+        status: "dismissed",
+        proposal: repository.resolvePreferenceStateProposal({
+          agentId: normalizedAgentId,
+          proposalId: proposal.id,
+          resolution: "dismissed",
+          resolvedBy,
+          note,
+        }),
+        memory: null,
+        previous: proposal.previousMemoryId
+          ? repository.getMemory(proposal.previousMemoryId)
+          : null,
+      };
+    });
   }
 
   return repository.transaction(() => {
     const current = currentStateForProposal(repository, proposal);
     validateCanonicalReviewSnapshot(repository, proposal);
+    for (const expected of proposal.metadata?.observationHashes || []) {
+      const observation = repository.getStateEvidenceObservation(normalizedAgentId, expected.id);
+      if (!observation || observation.lifecycle !== "current" || observation.observation_hash !== expected.hash) {
+        throw new Error("Preference evidence changed after accumulation; review it again.");
+      }
+    }
+    removeProvisionalPreference(repository, proposal, resolvedBy);
     if (current && !["challenge", "reinforce"].includes(proposal.transition)
       && repository.listCurrentScopedExceptions({
         agentId: normalizedAgentId,

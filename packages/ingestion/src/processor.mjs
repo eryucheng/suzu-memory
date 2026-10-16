@@ -1,4 +1,7 @@
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { executionEventSourceView } from '@suzu-memory/core';
 import { normalizeCompanionIdentity } from "./protocol.mjs";
+import { selectReplyChunk } from './reply-chunks.mjs';
 import {
   archiveCompanionEventBatch,
   generateCompanionEventBatch,
@@ -49,7 +52,7 @@ function recordProcessingFailure({
   const failure = processingFailure(error, stage, transportAttempts);
   const recorded = repository.recordInputBatchProcessingFailure(agentId, claimed.batch.id, {
     leaseOwner: claimed.batch.lease_owner,
-    maximumAttempts: MAXIMUM_EXTRACTION_ATTEMPTS,
+    maximumAttempts: error?.code === 'MAX_TOKENS' ? 1 : MAXIMUM_EXTRACTION_ATTEMPTS,
     attemptIncrement: failure.attemptIncrement,
     failedAt: completedAt,
     failure,
@@ -109,6 +112,7 @@ export async function processPendingCompanionEvents({
   usageLedgerPath = "",
   systemPrompt = "",
   memoriesOverride = null,
+  chunkPolicy = null,
   now = new Date(),
 } = {}) {
   if (!repository || !clean(agentId)) {
@@ -122,6 +126,26 @@ export async function processPendingCompanionEvents({
     agentId,
     spaceId: identity.spaceId || agentId,
   });
+  let chunk = null;
+  if (chunkPolicy) {
+    chunk = await selectReplyChunk({ repository, agentId, identity: normalizedIdentity, systemPrompt, policy: chunkPolicy });
+    if (chunk.status === 'blocked') {
+      const review = repository.claimPendingInputEvents(agentId, { candidateEventIds: chunk.inputEventIds,
+        maximumEvents: 500, maximumContentCharacters: 10_000_000, createdAt: completedAt,
+        validateLogicalEvent: () => ({ code: 'INPUT_EVENT_CHUNK_LIMIT',
+          message: 'The complete input event cannot fit the extraction chunk; original content is retained for review.',
+          details: { reason: chunk.reason, maximumRequestTokens: chunkPolicy.maximumRequestTokens,
+            estimatedRequestTokens: chunk.estimatedRequestTokens } }),
+      });
+      return { status: 'quarantined', reason: chunk.reason, eventsProcessed: 0, quarantined: review.quarantined };
+    }
+    if (chunk.status !== 'ready') return chunk;
+    candidateEventIds = chunk.events.map(row => row.id);
+    previousContextEvents = chunk.previousContextEvents;
+    continuationGuidanceEvents = chunk.continuationGuidanceEvents;
+    maximumEvents = candidateEventIds.length;
+    maximumContentCharacters = 10_000_000;
+  }
   const claimed = repository.claimPendingInputEvents(agentId, {
     maximumEvents,
     maximumContentCharacters,
@@ -129,6 +153,10 @@ export async function processPendingCompanionEvents({
     leaseSeconds,
     createdAt: completedAt,
   });
+  if (chunk && claimed.batch) {
+    const order = new Map(candidateEventIds.map((id, index) => [id, index]));
+    claimed.events.sort((a, b) => order.get(a.id) - order.get(b.id));
+  }
   if (!claimed.batch) {
     if (claimed.quarantined?.length) {
       return {
@@ -142,6 +170,17 @@ export async function processPendingCompanionEvents({
   }
 
   let generated;
+  const sourceView = executionEventSourceView(repository, agentId);
+  if (sourceView) {
+    const eligibleContext = rows => rows.filter(row => sourceView.inputIds.has(row.id))
+      .map(row => repository.getInputEvent(agentId, row.id));
+    previousContextEvents = eligibleContext(previousContextEvents);
+    continuationGuidanceEvents = eligibleContext(continuationGuidanceEvents);
+    archiveWindows = archiveWindows.map(window => ({ ...window,
+      previousContextEvents: eligibleContext(window.previousContextEvents || []),
+      continuationGuidanceEvents: eligibleContext(window.continuationGuidanceEvents || []),
+    }));
+  }
   let terminalGenerationFailure = null;
   try {
     generated = await generateCompanionEventBatch({
@@ -155,6 +194,7 @@ export async function processPendingCompanionEvents({
       systemPrompt,
     });
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
     const transportAttempts = error?.code === "MEMORY_PROVIDER_TRANSPORT_EXHAUSTED"
       ? Number(error.transportAttempts || error.maximumTransportAttempts || MAXIMUM_EXTRACTION_ATTEMPTS)
@@ -203,6 +243,7 @@ export async function processPendingCompanionEvents({
       identity: normalizedIdentity,
     });
   } catch (error) {
+    assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
     const { failure, recorded } = recordProcessingFailure({
       repository,
@@ -284,6 +325,8 @@ export async function processPendingCompanionEvents({
 
   return {
     status: "processed",
+    ...(chunk ? { chunk: { reason: chunk.reason, estimatedRequestTokens: chunk.estimatedRequestTokens,
+      maximumRequestTokens: chunk.maximumRequestTokens } } : {}),
     batchId: claimed.batch.id,
     eventsProcessed: claimed.events.length,
     quarantined: claimed.quarantined || [],

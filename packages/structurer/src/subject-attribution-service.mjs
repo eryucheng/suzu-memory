@@ -6,6 +6,7 @@ import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
   buildSubjectAttributionSnapshot,
   proposeMemorySubjectAttribution,
+  eventSourceMaterial,
 } from "@suzu-memory/core";
 
 import {
@@ -75,11 +76,13 @@ export async function proposeSubjectAttributionForMemory({
     ...snapshotOptions,
   });
   const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
+  const sourceMaterial = eventSourceMaterial(repository, normalizedAgentId, [snapshot.memory.id], snapshot.sources.map(source => source.id));
   const generation = await generator({
     input: buildSubjectAttributionGenerationInput(snapshot),
     systemPrompt,
     schema: MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA,
     schemaName: "memory-subject-attribution-v1",
+    ...(sourceMaterial ? { sourceMaterial } : {}),
   });
   const warnings = [];
   const usageRecorded = await recordUsage({

@@ -68,18 +68,6 @@ function generatedEventCandidate() {
     canonicalKey: "",
     stateFamily: "not_applicable",
     stateLabel: "",
-    stateTarget: {
-      type: "none",
-      identityField: "not_applicable",
-      fieldCardinality: "not_applicable",
-      objectRole: "not_applicable",
-      objectName: "",
-      counterpartRole: "not_applicable",
-      counterpartName: "",
-      direction: "not_applicable",
-      triggerRole: "not_applicable",
-      triggerName: "",
-    },
     reality: "real",
     evidenceMode: "explicit",
     temporalState: "historical",
@@ -160,6 +148,7 @@ test("service persists the real retriever trace without changing retrieval behav
 
   const result = await service.search("记得我上周六去科技馆吗", {
     now: "2026-07-30T12:00:00.000Z",
+    reactivate: true,
   });
   assert.equal(result.status, "ready");
   assert.equal(result.fragments[0].memoryId, "event-museum");
@@ -193,6 +182,7 @@ test("service persists the real retriever trace without changing retrieval behav
 
   const recalledAgain = await service.search("记得我上周六去科技馆吗", {
     now: "2026-07-30T13:00:00.000Z",
+    reactivate: true,
   });
   assert.ok(recalledAgain.candidates[0].recallReactivation.scoreAdjustment > 0);
   const stateAfterSecondRecall = service.withRepository(
@@ -204,6 +194,49 @@ test("service persists the real retriever trace without changing retrieval behav
   );
   assert.equal(stateAfterSecondRecall.activation_count, 2);
   assert.equal(service.listRetrievalTraces().length, 2);
+});
+
+test("trace persistence and activation can be selected independently", async () => {
+  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  service.initialize();
+  seedMemory(service);
+  const options = { now: "2026-07-30T12:00:00.000Z" };
+  await service.search("科技馆", { ...options, persistTrace: false, reactivate: false });
+  assert.equal(service.listRetrievalTraces().length, 0);
+  const logged = await service.search("科技馆", { ...options, persistTrace: true });
+  assert.equal(logged.trace.reactivation.status, "disabled");
+  assert.equal(service.listRetrievalTraces().length, 1);
+  assert.equal(service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")), null);
+  const activated = await service.search("科技馆", { ...options, persistTrace: false, reactivate: true, activationId: "message-a" });
+  assert.equal(activated.trace.persisted, false);
+  assert.equal(activated.trace.reactivation.applied, 1);
+  assert.equal(service.listRetrievalTraces().length, 1);
+  const replay = await service.search("科技馆", { ...options, persistTrace: false, reactivate: true, activationId: "message-a" });
+  assert.equal(replay.trace.reactivation.applied, 0);
+  assert.equal(service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")).activation_count, 1);
+  service.reactivateRecall({ activationId: "message-b", memoryIds: ["event-museum"], now: options.now });
+  const reopened = createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId });
+  assert.equal(reopened.reactivateRecall({ activationId: "message-a", memoryIds: ["event-museum"], now: options.now }).applied, 0);
+  assert.equal(reopened.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")).activation_count, 2);
+  assert.equal(reopened.reactivateRecall({ activationId: "policy-off", memoryIds: ["event-museum"],
+    options: { recallReactivation: { enabled: false } } }).status, "disabled");
+  assert.equal(reopened.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")).activation_count, 2);
+  await assert.rejects(service.search("科技馆", { ...options, persistTrace: false, reactivate: true }), /stable activationId/);
+});
+
+test("receipt migration preserves existing activation state", async () => {
+  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  service.initialize();
+  seedMemory(service);
+  const recalled = await service.search("科技馆", { reactivate: true });
+  const previous = service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum"));
+  service.withRepository((_repository, database) => database.exec("DROP TABLE memory_recall_reactivation_receipts; DELETE FROM schema_migrations WHERE version=44"));
+  const migrated = createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId });
+  assert.equal(migrated.info().database.schemaVersion, 44);
+  assert.deepEqual(migrated.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")), previous);
+  const reapplication = migrated.withRepository(repository => repository.applyRecallReactivation({ agentId: service.agentId,
+    traceId: recalled.trace.id, policy: service.defaults.retrieval.recallReactivation }));
+  assert.equal(reapplication.applied, 0);
 });
 
 test("service scopes explicit worlds end-to-end without breaking unscoped callers", async () => {
@@ -300,7 +333,7 @@ test("service exposes the existing structured brain snapshot", () => {
       .filter((node) => node.graphNodeType)
       .map((node) => node.id)
       .sort(),
-    ["topology:agent", "topology:relationship", "topology:user"],
+    ["topology:actor:user:user%3Atest", "topology:agent"],
   );
 });
 
@@ -413,7 +446,7 @@ test("service uses pending structural nodes immediately and confirms them after 
   assert.equal(accepted.resolution.memory.kind, "episode");
   assert.deepEqual(
     accepted.maintenance.queued.map((task) => task.taskType).sort(),
-    ["memory-embedding", "retrieval-context"],
+    ["memory-embedding"],
   );
   const recalled = await service.search("还记得科技馆和之后的晚饭吗", {
     persistTrace: false,
@@ -666,18 +699,6 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
       canonicalKey: request.canonical_key,
       stateFamily: "preference",
       stateLabel: "喜欢解谜游戏",
-      stateTarget: {
-        type: "none",
-        identityField: "not_applicable",
-        fieldCardinality: "not_applicable",
-        objectRole: "not_applicable",
-        objectName: "",
-        counterpartRole: "not_applicable",
-        counterpartName: "",
-        direction: "not_applicable",
-        triggerRole: "not_applicable",
-        triggerName: "",
-      },
       reality: "real",
       evidenceMode: "explicit",
       temporalState: "current",
@@ -697,6 +718,8 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
       sourceIds: [source.id],
       knownAt: source.known_at,
     });
+    repository.bindStateAnalysisTarget({ agentId: service.agentId, requestId: request.id,
+      canonicalKey: "state-resolved-puzzle-games" });
     return { evidenceId: evidence.id, requestId: request.id };
   });
 
@@ -722,6 +745,9 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
   assert.equal(detail.members[0].memory.layer, "provisional");
   assert.equal(detail.maintenanceFailure.history.length, 3);
   assert.equal(detail.stateAnalysisRequest.id, seeded.requestId);
+  assert.equal(detail.writePreview.canonicalKey, "state-resolved-puzzle-games");
+  assert.equal(detail.proposal.candidate.canonicalKey, "user:preference:puzzle-games",
+    "the original extraction remains available for auditing");
 
   const callsBeforeHumanDecision = modelCalls;
   const accepted = service.resolveHighLevelProposal("ingestion", pending.items[0].id, {
@@ -731,6 +757,8 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
   });
   assert.equal(accepted.resolution.status, "accepted");
   assert.equal(accepted.resolution.memory.layer, "semantic");
+  assert.equal(accepted.resolution.memory.canonical_key, detail.writePreview.canonicalKey);
+  assert.equal(accepted.resolution.decision.resolvedCandidate.canonicalKey, detail.writePreview.canonicalKey);
   assert.equal(modelCalls, callsBeforeHumanDecision);
   assert.equal(service.listHighLevelProposals({ types: ["ingestion"] }).total, 0);
   assert.equal(service.listHighLevelProposals({
@@ -963,11 +991,11 @@ test("service carries configured identities from input through archive into enti
   )));
 });
 
-test("service flushes semantic responsibilities before the changed embedding batch", async () => {
+test("service embeds new memories while structure maintenance accumulates", async () => {
   const schemas = [];
   const generator = async ({ schemaName }) => {
     schemas.push(schemaName);
-    if (schemaName === "long-term-memory-extraction-v1") {
+    if (schemaName === "long-term-memory-extraction-v2") {
       return { output: { memories: [generatedEventCandidate()] }, usage: {} };
     }
     if (schemaName === "memory_retrieval_context_proposal_v1") {
@@ -1003,22 +1031,25 @@ test("service flushes semantic responsibilities before the changed embedding bat
   service.appendEvent(inputEvent("maintenance-event-1"));
   const result = await service.runMaintenance({ lane: "all" });
   assert.equal(result.semantic.inputBatches[0].status, "processed");
-  assert.equal(result.semantic.semanticTasks.selected, 2);
-  assert.equal(result.embedding.selected, 2);
-  assert.equal(result.embedding.report.added, 2);
+  assert.equal(result.semantic.semanticTasks.selected, 0);
+  assert.equal(result.semantic.semanticTasks.status, "accumulating");
+  assert.equal(result.semantic.semanticTasks.pendingMemoryCount, 1);
+  assert.equal(result.embedding.selected, 1);
+  assert.equal(result.embedding.report.added, 1);
+  assert.equal(result.embedding.report.reused, 1);
   assert.deepEqual(
     new Set(result.embedding.memoryIds.map((memoryId) => service.getMemory(memoryId).memory.kind)),
     new Set(["event", "utterance"]),
   );
   assert.deepEqual(schemas, [
-    "long-term-memory-extraction-v1",
-    "memory_retrieval_context_proposal_v1",
-    "memory_retrieval_context_critic_v1",
-    "memory-structure-proposals-v1",
+    "long-term-memory-extraction-v2",
   ]);
   const status = service.maintenanceStatus();
   assert.equal(status.pendingInputEvents, 0);
-  assert.equal(status.tasks.filter((task) => task.status === "pending").length, 0);
+  const pending = status.tasks.filter((task) => task.status === "pending");
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].task_type, "structure-proposal");
+  assert.equal(pending[0].attempt_count, 0);
 });
 
 test("a recoverable semantic failure does not prevent the embedding lane from running", async () => {

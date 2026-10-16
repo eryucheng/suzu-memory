@@ -40,6 +40,27 @@ function temporaryDatabase() {
   return { root, databasePath, database, repository: new MemoryRepository(database) };
 }
 
+test('explicit candidate materialization returns independent readable memories without widening default output', async () => {
+  const { databasePath, database, repository } = temporaryDatabase();
+  for (const [id, title, content] of [
+    ['gallery', '星河美术馆', '用户参观了星河美术馆。'],
+    ['restaurant', '星河餐厅', '用户在星河餐厅吃了晚饭。'],
+  ]) repository.upsertMemory({ id, agentId: 'agent-test', kind: 'event', layer: 'episodic', title, content,
+    eventDate: '2026-10-01', reality: 'real', temporalState: 'historical' });
+  database.close();
+  const ordinary = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '星河' });
+  assert.equal(ordinary.candidates[0].recallContext, undefined);
+  const result = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '星河',
+    options: { includeCandidateContext: true, maximumReturnedCandidates: 10 } });
+  assert.equal(result.candidates.length, 2);
+  for (const candidate of result.candidates) {
+    assert.ok(candidate.recallContext.includes(candidate.title));
+    assert.match(candidate.recallContext, /2026-10-01/);
+    assert.match(candidate.recallContext, /记忆状态：active/);
+    assert.ok(candidate.recallContext.length <= 1200);
+  }
+});
+
 function explicitPlasticityOptions() {
   return {
     enabled: true,

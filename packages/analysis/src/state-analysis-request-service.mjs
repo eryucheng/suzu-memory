@@ -1,3 +1,4 @@
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import {
   buildPreferenceEvidenceSnapshot,
 } from "./preference-snapshot.mjs";
@@ -48,6 +49,9 @@ import { evaluateAffectiveAssociationEvidence } from "./affective-association-se
 import { AFFECTIVE_ASSOCIATION_ANALYZERS } from "./affective-association-contracts.mjs";
 import { reviewReportedAffectiveAssociationState } from "./reported-affective-association-review.mjs";
 import { createRelatedAnalyzerBatch } from "./related-analyzer-batch.mjs";
+import { isStateAnalysisBudgetError } from "./request-budget.mjs";
+import { accumulateInferredPreference, DEFAULT_PREFERENCE_FORMATION_POLICY } from "./inferred-preference.mjs";
+import { prepareStateMemoryCandidates } from './state-memory-candidates.mjs';
 
 export const STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION = "state-analysis-request-v3";
 export const REPORTED_PREFERENCE_REVIEW_VERSION = "reported-preference-review-v1";
@@ -80,19 +84,27 @@ function sameMembers(left, right) {
 }
 
 function supportedRequest(request) {
+  if (request?.state_family === "preference" && request.representation_layer === "inferred"
+    && ["observed", "inferred"].includes(request.evidence_mode)) {
+    return isStateAnalysisTargetComplete(request.state_family, request.targetSpec);
+  }
   return Boolean(REPORTED_STATE_REQUEST_REVIEW_VERSIONS[request?.state_family])
     && request?.representation_layer === "reported"
     && request.evidence_mode === "explicit"
     && isStateAnalysisTargetComplete(request.state_family, request.targetSpec);
 }
 
-function requestAnalyzers(definitions, generator, request) {
+function requestAnalyzers(definitions, generator, request, onBudgetExceeded, stateContext = null) {
   return createRelatedAnalyzerBatch({
     definitions,
     generator,
+    onBudgetExceeded,
+    stateContext,
+    onGenerationError: error => { if (error?.code === 'MAX_TOKENS') onBudgetExceeded(error); },
     request: {
       id: request.id,
       processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
+      attempt: Number(request.metadata?.attemptCount || 0) + 1,
     },
   });
 }
@@ -340,7 +352,7 @@ function retryOrFallbackRequest(repository, request, reason, details = {}) {
     requestId: request.id,
     errorMessage: reason,
     errorDetails: details,
-    maxAttempts: 3,
+    maxAttempts: details.errorCode === 'MAX_TOKENS' ? 1 : 3,
   });
   if (!recorded.exhausted) {
     return {
@@ -365,14 +377,16 @@ function retryOrFallbackRequest(repository, request, reason, details = {}) {
   };
 }
 
-export async function processStateAnalysisRequest({
+async function processStateAnalysisRequestInternal({
   repository,
+  embeddingProvider,
   agentId,
   requestId,
   generator,
   usageLedgerPath = "",
   snapshotOptions = {},
   reviewVersion = "",
+  preferencePolicy = DEFAULT_PREFERENCE_FORMATION_POLICY,
 } = {}) {
   if (!repository) throw new Error("State analysis request processing requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -423,12 +437,17 @@ export async function processStateAnalysisRequest({
   });
   const boundaryProblem = validatePreflight(request, preflight);
   if (boundaryProblem) return fallbackRequest(repository, request, boundaryProblem);
+  const stateContext = await prepareStateMemoryCandidates({ repository, request, embeddingProvider, usageLedgerPath });
+  if (stateContext) boundedSnapshotOptions.prepareStateSnapshot = snapshot => stateContext.attach(snapshot);
 
   let evaluation;
   let merged;
   let review;
+  let inferredPreference = null;
+  let budgetError = null;
+  const onBudgetExceeded = error => { budgetError = error; };
   if (request.state_family === "preference") {
-    const analyzers = requestAnalyzers(PREFERENCE_SPECIALIST_ANALYZERS, generator, request);
+    const analyzers = requestAnalyzers(PREFERENCE_SPECIALIST_ANALYZERS, generator, request, onBudgetExceeded, stateContext);
     evaluation = await evaluatePreferenceEvidenceSpecialists({
       repository,
       agentId: normalizedAgentId,
@@ -441,11 +460,26 @@ export async function processStateAnalysisRequest({
       usageLedgerPath,
       snapshotOptions: boundedSnapshotOptions,
     });
+    if (stateContext?.ambiguous && evaluation.status !== 'incomplete') {
+      return { ...fallbackRequest(repository, request, 'state-identity-needs-human-resolution'), evaluation };
+    }
     if (evaluation.status !== "incomplete") {
       merged = mergePreferenceSpecialistEvidence(repository, {
         evaluation,
         analysisRequest: request,
+        policy: preferencePolicy,
       });
+      inferredPreference = accumulateInferredPreference({ repository, request, policy: preferencePolicy });
+      if (request.representation_layer === "inferred") {
+        if (inferredPreference.status === "review-required") {
+          return { ...fallbackRequest(repository, request, inferredPreference.reason), evaluation, merged, inferredPreference };
+        }
+        const resolved = repository.resolveStateAnalysisRequest({ agentId: normalizedAgentId, requestId: request.id,
+          status: "completed", analysisBatchId: evaluation.batchId,
+          metadata: { outcome: inferredPreference.status, preferenceProposalId: inferredPreference.proposal?.id || "" } });
+        return { status: inferredPreference.status === "proposal-pending" ? "proposal-pending" : "completed-without-proposal",
+          request: resolved, evaluation, merged, inferredPreference, preferenceProposal: inferredPreference.proposal, proposal: null };
+      }
       review = reviewReportedPreferenceState({
         repository,
         agentId: normalizedAgentId,
@@ -466,9 +500,12 @@ export async function processStateAnalysisRequest({
     );
     evaluation = await adapter.evaluate(
       common,
-      requestAnalyzers(adapter.definitions, generator, request),
+      requestAnalyzers(adapter.definitions, generator, request, onBudgetExceeded, stateContext),
       request,
     );
+    if (stateContext?.ambiguous && evaluation.status !== 'incomplete') {
+      return { ...fallbackRequest(repository, request, 'state-identity-needs-human-resolution'), evaluation };
+    }
     if (evaluation.status !== "incomplete") {
       const observationIds = evaluationObservationIds(evaluation, request.state_family);
       merged = {
@@ -498,6 +535,12 @@ export async function processStateAnalysisRequest({
     }
   }
   if (evaluation.status === "incomplete") {
+    if (budgetError?.code === 'MAX_TOKENS') return { ...retryOrFallbackRequest(repository, request, budgetError.message, {
+      stage: 'specialist-analysis', stateFamily: request.state_family, errorCode: budgetError.code,
+      failedRoles: evaluation.failedRoles || [], analysisBatchId: clean(evaluation.batchId),
+      providerDiagnostics: budgetError.diagnostics || {},
+    }), evaluation };
+    if (budgetError) return { ...fallbackRequest(repository, request, budgetError.message), evaluation };
     const retry = retryOrFallbackRequest(repository, request, evaluation.reason, {
       stage: "specialist-analysis",
       stateFamily: request.state_family,
@@ -510,9 +553,22 @@ export async function processStateAnalysisRequest({
   const resolvedReviewVersion = clean(reviewVersion)
     || REPORTED_STATE_REQUEST_REVIEW_VERSIONS[request.state_family];
   if (review.status !== "ready") {
+    if (request.state_family === "preference" && inferredPreference
+      && inferredPreference.status !== "review-required"
+      && merged.observations.some(item => item.scope?.currentRepresentationLayer === "inferred")
+      && !merged.observations.some(item => item.signal.startsWith("explicit_"))) {
+      const resolved = repository.resolveStateAnalysisRequest({ agentId: normalizedAgentId, requestId: request.id,
+        status: "completed", analysisBatchId: evaluation.batchId,
+        metadata: { outcome: inferredPreference.status, preferenceProposalId: inferredPreference.proposal?.id || "" } });
+      return { status: inferredPreference.status === "proposal-pending" ? "proposal-pending" : "completed-without-proposal",
+        request: resolved, evaluation, merged, review, inferredPreference, preferenceProposal: inferredPreference.proposal, proposal: null };
+    }
     const fallback = fallbackRequest(repository, request, clean(review.reason) || "state-analysis-review-rejected");
     return { ...fallback, evaluation, merged, review };
   }
+  // The stored narrative must not depend on whether vector matching was enabled.
+  const semanticMemory = stateContext?.draft
+    || repository.materializeStateAnalysisMemory(normalizedAgentId, request.id);
   const proposalResult = review.status === "ready"
     ? proposeReportedStateFromReview({
       repository,
@@ -521,6 +577,8 @@ export async function processStateAnalysisRequest({
       batchId: evaluation.batchId,
       metadata: {
         stateAnalysisRequestId: request.id,
+        semanticMemoryId: semanticMemory?.id || '',
+        ...(semanticMemory ? { semanticMemorySnapshot: { title: semanticMemory.title, content: semanticMemory.content } } : {}),
         processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
       },
     })
@@ -546,17 +604,32 @@ export async function processStateAnalysisRequest({
     merged,
     review,
     proposal: proposalResult.proposal,
+    inferredPreference,
+    preferenceProposal: inferredPreference?.proposal || null,
   };
+}
+
+export async function processStateAnalysisRequest(options = {}) {
+  try {
+    return await processStateAnalysisRequestInternal(options);
+  } catch (error) {
+    assertEventSourceExecutionCurrent();
+    if (!isStateAnalysisBudgetError(error)) throw error;
+    const request = options.repository.getStateAnalysisRequest(options.agentId, options.requestId);
+    return fallbackRequest(options.repository, request, error.message);
+  }
 }
 
 export async function processPendingStateAnalysisRequests({
   repository,
+  embeddingProvider,
   agentId,
   generator,
   maxRequests,
   usageLedgerPath = "",
   snapshotOptions = {},
   reviewVersion = "",
+  preferencePolicy = DEFAULT_PREFERENCE_FORMATION_POLICY,
 } = {}) {
   if (!repository) throw new Error("State analysis batch processing requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -574,8 +647,6 @@ export async function processPendingStateAnalysisRequests({
   const requests = repository.listStateAnalysisRequests(normalizedAgentId, {
     statuses: ["pending"],
     stateFamilies: Object.keys(REPORTED_STATE_REQUEST_REVIEW_VERSIONS),
-    representationLayer: "reported",
-    evidenceMode: "explicit",
     limit: 500,
   }).filter(supportedRequest).slice(0, normalizedMaximum);
   const results = [];
@@ -586,14 +657,21 @@ export async function processPendingStateAnalysisRequests({
       try {
         result = await processStateAnalysisRequest({
           repository,
+          embeddingProvider,
           agentId: normalizedAgentId,
           requestId: request.id,
           generator,
           usageLedgerPath,
           snapshotOptions,
           reviewVersion,
+          preferencePolicy,
         });
       } catch (error) {
+        assertEventSourceExecutionCurrent();
+        if (['EVENT_SOURCE_TASK_DEFERRED', 'EVENT_SOURCE_MATERIAL_INELIGIBLE'].includes(error.code)) {
+          result = { status: 'deferred', reason: error.message, request };
+          break;
+        }
         const reason = clean(error?.message) || "state-analysis-request-failed";
         try {
           result = retryOrFallbackRequest(repository, request, reason, {
@@ -601,6 +679,7 @@ export async function processPendingStateAnalysisRequests({
             stateFamily: request.state_family,
             errorCode: clean(error?.code),
             errorName: clean(error?.name),
+            providerDiagnostics: error?.diagnostics || {},
           });
         } catch (fallbackError) {
           result = {

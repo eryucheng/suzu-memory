@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
+import { executionEventSourceView, eventSourceMaterial, currentEventSourceExecution,
+  assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 
 const DEFAULT_EXCLUDED_KINDS = Object.freeze(["topic_or_episode"]);
 const DEFAULT_BATCH_SIZE = 10;
@@ -43,22 +45,11 @@ function displayValue(value) {
 }
 
 export function buildMemoryEmbeddingDocument(memory = {}, { retrievalContext = null } = {}) {
+  // Only semantic text contributes to the vector. Identity, lifecycle and
+  // temporal fields remain structured data for filtering and state updates.
   const lines = [
-    ["记忆类型", displayValue(memory.kind)],
     ["标题", displayValue(memory.title)],
     ["内容", displayValue(memory.content)],
-    ["主体角色", displayValue(memory.subject_role)],
-    ["主体标识", displayValue(memory.subject_key)],
-    ["稳定语义键", displayValue(memory.canonical_key)],
-    ["状态类别", displayValue(memory.state_family)],
-    ["状态阶段", displayValue(memory.state_phase)],
-    ["表示层", displayValue(memory.representation_layer)],
-    ["时间状态", displayValue(memory.temporal_state)],
-    ["发生日期", displayValue(memory.event_date)],
-    ["发生时间", displayValue(memory.event_start)],
-    ["有效开始", displayValue(memory.valid_from)],
-    ["有效结束", displayValue(memory.valid_to)],
-    ["现实属性", displayValue(memory.reality)],
     ["检索上下文", displayValue(retrievalContext?.context_text ?? retrievalContext?.contextText)],
     ["常见查询表达", Array.isArray(retrievalContext?.queryTerms)
       ? retrievalContext.queryTerms.map(displayValue).filter(Boolean).join("；")
@@ -74,7 +65,18 @@ export function memoryEmbeddingContentHash(memory, options = {}) {
   return sha256(buildMemoryEmbeddingDocument(memory, options));
 }
 
-function utteranceRetrievalContext(repository, agentId, memory) {
+export function prepareMemoryEmbeddingDocument(repository, memory, {
+  sourceView = executionEventSourceView(repository, memory.agent_id),
+} = {}) {
+  let retrievalContext = memory.kind === "utterance"
+    ? utteranceRetrievalContext(repository, memory.agent_id, memory, sourceView)
+    : repository.getCurrentMemoryRetrievalContext?.(memory.id) || null;
+  if (sourceView && retrievalContext?.sourceMemoryIds?.some(id => !sourceView.memoryIds.has(id))) retrievalContext = null;
+  const text = buildMemoryEmbeddingDocument(memory, { retrievalContext });
+  return { text, contentHash: sha256(text), retrievalContext };
+}
+
+function utteranceRetrievalContext(repository, agentId, memory, sourceView) {
   if (memory.kind !== "utterance" || typeof repository.expand !== "function") return null;
   const expanded = repository.expand(agentId, [memory.id], {
     maxDepth: 1,
@@ -82,6 +84,7 @@ function utteranceRetrievalContext(repository, agentId, memory) {
     minimumWeight: 0.65,
     relations: ["followed_by"],
     traversal: "both",
+    allowedMemoryIds: sourceView?.memoryIds,
   });
   const utterances = expanded.nodes
     .filter((node) => node.kind === "utterance")
@@ -98,6 +101,7 @@ function utteranceRetrievalContext(repository, agentId, memory) {
       return `${speaker}：${clean(node.content)}`;
     }).join("\n").slice(0, 2_000),
     queryTerms: [],
+    sourceMemoryIds: utterances.map(node => node.id),
   };
 }
 
@@ -136,9 +140,9 @@ function isRetryable(error) {
   return /HTTP\s+(?:429|5\d\d)\b/u.test(String(error?.message || ""));
 }
 
-async function requestVectors(provider, texts) {
+async function requestVectors(provider, texts, context) {
   if (typeof provider?.embedMany === "function") {
-    const response = await provider.embedMany(texts);
+    const response = await provider.embedMany(texts, context);
     return {
       vectors: response.vectors,
       model: response.model,
@@ -149,7 +153,7 @@ async function requestVectors(provider, texts) {
       }],
     };
   }
-  const response = await provider(texts[0]);
+  const response = await provider(texts[0], context);
   return {
     vectors: [response.vector],
     model: response.model,
@@ -161,13 +165,17 @@ async function requestVectors(provider, texts) {
   };
 }
 
-async function requestVectorsWithRetry(provider, texts, maxRetries, retryDelayMs) {
+async function requestVectorsWithRetry(provider, texts, maxRetries, retryDelayMs, context) {
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
-      return await requestVectors(provider, texts);
+      assertEventSourceExecutionCurrent();
+      const result = await requestVectors(provider, texts, context);
+      assertEventSourceExecutionCurrent();
+      return result;
     } catch (error) {
       lastError = error;
+      assertEventSourceExecutionCurrent();
       if (!isRetryable(error) || attempt >= maxRetries) break;
       await sleep(Math.min(4_000, retryDelayMs * (2 ** attempt)));
     }
@@ -239,9 +247,19 @@ export async function syncMemoryEmbeddings({
   const excluded = new Set((Array.isArray(excludedKinds) ? excludedKinds : []).map(clean));
   const selectedIds = new Set((Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean));
   const indexable = listIndexableMemories(repository, normalizedAgentId);
+  const sourceView = executionEventSourceView(repository, normalizedAgentId);
+  // Analysis drafts use the same node and vector stores, but are only indexed
+  // when explicitly requested; they are not recalled as established memories.
+  for (const id of selectedIds) {
+    if (indexable.all.some(memory => memory.id === id)) continue;
+    const memory = repository.getMemory(id);
+    if (memory?.agent_id === normalizedAgentId && memory.status !== 'deleted'
+      && memory.metadata?.stateAnalysisDraft === true) indexable.all.push(memory);
+  }
   const all = indexable.all;
   const longTerm = all.filter((memory) => !excluded.has(memory.kind));
   const eligible = longTerm
+    .filter((memory) => !sourceView || sourceView.allows(memory))
     .filter((memory) => !selectedIds.size || selectedIds.has(memory.id))
     .sort((left, right) => left.id.localeCompare(right.id));
   const existing = new Map(
@@ -249,20 +267,30 @@ export async function syncMemoryEmbeddings({
       .map((embedding) => [embedding.memory_id, embedding]),
   );
   const prepared = eligible.map((memory) => {
-    const retrievalContext = memory.kind === "utterance"
-      ? utteranceRetrievalContext(repository, normalizedAgentId, memory)
-      : repository.getCurrentMemoryRetrievalContext?.(memory.id) || null;
-    const text = buildMemoryEmbeddingDocument(memory, { retrievalContext });
     return {
       memory,
-      retrievalContext,
-      text,
-      contentHash: sha256(text),
+      ...prepareMemoryEmbeddingDocument(repository, memory, { sourceView }),
       current: existing.get(memory.id) || null,
     };
   });
-  const reusable = prepared.filter((item) => !force && item.current?.content_hash === item.contentHash);
-  const allPending = prepared.filter((item) => force || item.current?.content_hash !== item.contentHash);
+  const byContent = new Map([...existing.values()].filter(embedding => (
+    (!dimensions || embedding.dimensions === dimensions)
+    && (!sourceView || sourceView.allows(repository.getMemory(embedding.memory_id)))
+  )).map(embedding => [embedding.content_hash, embedding]));
+  const canReuse = item => !force && item.current?.content_hash === item.contentHash
+    && (!dimensions || item.current.dimensions === dimensions);
+  const reusable = prepared.filter(canReuse);
+  const copied = [];
+  const allPending = prepared.filter((item) => {
+    if (canReuse(item)) return false;
+    const cached = !force && byContent.get(item.contentHash);
+    if (!cached) return true;
+    if (!dryRun) repository.upsertEmbedding({ memoryId: item.memory.id, model: normalizedModel,
+      vector: cached.vector, contentHash: item.contentHash,
+      sourceMemoryIds: item.retrievalContext?.sourceMemoryIds || [item.memory.id] });
+    copied.push(item);
+    return false;
+  });
   const pending = allPending.slice(
     0,
     Math.max(0, Number.isFinite(Number(limit)) ? Math.trunc(Number(limit)) : prepared.length),
@@ -279,7 +307,8 @@ export async function syncMemoryEmbeddings({
     totalEligible: eligible.length,
     excludedByKind: all.length - longTerm.length,
     notSelected: selectedIds.size ? longTerm.length - eligible.length : 0,
-    reused: reusable.length,
+    reused: reusable.length + copied.length,
+    copied: copied.length,
     pending: pending.length,
     deferred: allPending.length - pending.length,
     added: 0,
@@ -301,6 +330,10 @@ export async function syncMemoryEmbeddings({
         batch.map((item) => item.text),
         Math.max(0, Math.trunc(Number(maxRetries) || 0)),
         Math.max(1, Math.trunc(Number(retryDelayMs) || 500)),
+        { sourceMaterial: eventSourceMaterial(repository, normalizedAgentId,
+          batch.flatMap(item => [item.memory.id, ...(item.retrievalContext?.sourceMemoryIds || [])])),
+          signal: currentEventSourceExecution()?.signal,
+          model: normalizedModel, dimensions: expectedDimensions },
       );
       if (clean(response.model) && clean(response.model) !== normalizedModel) {
         throw new Error(`Embedding 模型发生变化：预期 ${normalizedModel}，实际 ${response.model}。`);
@@ -322,6 +355,7 @@ export async function syncMemoryEmbeddings({
             model: normalizedModel,
             vector: vectors[index],
             contentHash: batch[index].contentHash,
+            sourceMemoryIds: batch[index].retrievalContext?.sourceMemoryIds || [batch[index].memory.id],
           });
         }
       });
@@ -335,6 +369,7 @@ export async function syncMemoryEmbeddings({
         dimensions: expectedDimensions,
       }));
     } catch (error) {
+      assertEventSourceExecutionCurrent();
       report.failed += batch.length;
       report.failures.push({
         memoryIds: batch.map((item) => item.memory.id),
@@ -363,6 +398,8 @@ export {
 
 export {
   assessMemoryRetrievalContextCriticNeed,
+  normalizeProposal as parseMemoryRetrievalContextProposal,
+  normalizeCritique as parseMemoryRetrievalContextCritique,
   assessMemoryRetrievalContextNeed,
   generateMemoryRetrievalContexts,
   CRITIC_SCHEMA as MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA,

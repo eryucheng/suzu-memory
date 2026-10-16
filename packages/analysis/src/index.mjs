@@ -36,5 +36,8 @@ export * from "./self-concept-contracts.mjs";
 export * from "./self-concept-service.mjs";
 export * from "./state-analysis-cli.mjs";
 export * from "./state-analysis-request-service.mjs";
+export { STATE_MEMORY_MATCH_SCHEMA, stateMatchAnalysisSchema } from './state-memory-candidates.mjs';
+export * from "./inferred-preference.mjs";
 export * from "./value-contracts.mjs";
 export * from "./value-service.mjs";
+export * from './event-continuity.mjs';

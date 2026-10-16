@@ -139,3 +139,31 @@ test("repeated recall approaches the configured activation ceiling without excee
   assert.ok(latestGain < POLICY.activationGain / 100);
   database.close();
 });
+
+test("trace-free activation receipts deduplicate interleaved inputs", () => {
+  const database = openMemoryDatabase(":memory:");
+  const repository = new MemoryRepository(database);
+  repository.upsertMemory({ id: "selected-memory", agentId: "agent-test", kind: "event", layer: "episodic", content: "一次参观。" });
+  const activate = activationId => repository.applyRecallReactivation({ agentId: "agent-test", activationId,
+    memoryIds: ["selected-memory"], activatedAt: "2026-08-01T00:00:00.000Z", policy: POLICY });
+  assert.equal(activate("input-a").applied, 1);
+  assert.equal(activate("input-b").applied, 1);
+  assert.equal(activate("input-a").applied, 0);
+  assert.equal(repository.getMemoryRecallReactivationState("agent-test", "selected-memory").activation_count, 2);
+  assert.equal(repository.getMemoryRecallReactivationState("agent-test", "selected-memory").last_trace_id, null);
+  assert.equal(repository.listRetrievalTraces("agent-test").length, 0);
+  assert.equal(database.prepare("SELECT COUNT(*) AS n FROM memory_recall_reactivation_receipts").get().n, 2);
+  database.close();
+});
+
+test("activation and its durable receipt roll back together", () => {
+  const database = openMemoryDatabase(":memory:");
+  const repository = new MemoryRepository(database);
+  repository.upsertMemory({ id: "selected-memory", agentId: "agent-test", kind: "event", layer: "episodic", content: "一次参观。" });
+  database.exec("CREATE TRIGGER fail_receipt BEFORE INSERT ON memory_recall_reactivation_receipts BEGIN SELECT RAISE(ABORT, 'controlled receipt failure'); END");
+  assert.throws(() => repository.applyRecallReactivation({ agentId: "agent-test", activationId: "input-a",
+    memoryIds: ["selected-memory"], policy: POLICY }), /controlled receipt failure/);
+  assert.equal(repository.getMemoryRecallReactivationState("agent-test", "selected-memory"), null);
+  assert.equal(database.prepare("SELECT COUNT(*) AS n FROM memory_recall_reactivation_receipts").get().n, 0);
+  database.close();
+});

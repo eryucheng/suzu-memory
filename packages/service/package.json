@@ -15,7 +15,8 @@
     "@suzu-memory/retriever": "0.1.0",
     "@suzu-memory/runtime": "0.1.0",
     "@suzu-memory/structurer": "0.1.0",
-    "@suzu-memory/visualization": "0.1.0"
+    "@suzu-memory/visualization": "0.1.0",
+    "@suzu-memory/extraction": "0.1.0"
   },
   "engines": {
     "node": ">=22.5.0"

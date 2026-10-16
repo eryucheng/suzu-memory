@@ -12,8 +12,8 @@ function validatedAnalysisRequest(repository, evaluation, value) {
   const target = evaluation.snapshot.target;
   if (!request
     || request.state_family !== "preference"
-    || request.representation_layer !== "reported"
-    || request.evidence_mode !== "explicit"
+    || !["reported", "inferred"].includes(request.representation_layer)
+    || (request.representation_layer === "reported") !== (request.evidence_mode === "explicit")
     || request.subject_role !== target.subjectRole
     || request.subject_key !== target.subjectKey
     || request.canonical_key !== target.canonicalKey) {
@@ -234,6 +234,7 @@ export function mergePreferenceSpecialistEvidence(repository, {
   });
   const candidates = buildMergedCandidates(evaluation).map((candidate) => {
     if (candidate.preGate || !currentState
+      || (policy && persistedRequest && !candidate.label.signal.startsWith("explicit_"))
       || directionForSignal(candidate.label.signal) !== "opposition") return candidate;
     return {
       ...candidate,
@@ -296,7 +297,8 @@ export function mergePreferenceSpecialistEvidence(repository, {
           label: candidate.timeScope?.scopeLabel || candidate.object?.matchedLabel || "",
           context: candidate.timeScope?.contextLabel || "",
           ...(persistedRequest ? {
-            currentRepresentationLayer: persistedRequest.representation_layer,
+            currentRepresentationLayer: candidate.label.signal.startsWith("explicit_")
+              ? persistedRequest.representation_layer : "inferred",
           } : {}),
         },
         payloadSchemaVersion: persistedRequest

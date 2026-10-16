@@ -12,7 +12,7 @@ import {
   parseStructureGeneration,
 } from "./prompt.mjs";
 import { buildStructureSnapshot } from "./snapshot.mjs";
-import { enforceStructureCandidatePolicy } from "./policy.mjs";
+import { canProposeStructure, enforceStructureCandidatePolicy } from "./policy.mjs";
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "system-prompt.md");
@@ -55,6 +55,32 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
   }
 }
 
+export function prepareStructureGeneration({
+  repository, agentId, batchId, memoryIds, nearbyContainerIds = [], candidatePolicy = {},
+  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator,
+}) {
+  const snapshot = buildStructureSnapshot({
+    repository,
+    agentId: agentId,
+    batchId: batchId,
+    memoryIds: memoryIds,
+    nearbyContainerIds,
+    ...snapshotOptions,
+  });
+  if (!snapshot.currentMemories.length || !canProposeStructure(snapshot, candidatePolicy)) return { snapshot, request: null, reason: snapshot.currentMemories.length ? "no-possible-structure-operation" : "no-eligible-current-memories" };
+  const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
+  const input = buildStructureGenerationInput(snapshot);
+  const request = {
+    input,
+    systemPrompt,
+    schema: MEMORY_STRUCTURE_OUTPUT_SCHEMA,
+    schemaName: "memory-structure-proposals-v1",
+    ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
+  };
+  generator?.assertRequestBudget?.(request);
+  return { snapshot, request };
+}
+
 export async function proposeStructuresForBatch({
   repository,
   agentId,
@@ -67,6 +93,7 @@ export async function proposeStructuresForBatch({
   snapshotOptions = {},
   candidatePolicy = {},
   maximumProposals = 20,
+  preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory structurer requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -76,36 +103,15 @@ export async function proposeStructuresForBatch({
     (Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean),
   )];
   const normalizedBatchId = clean(batchId) || stableBatchId(normalizedAgentId, normalizedMemoryIds);
-  const snapshot = buildStructureSnapshot({
-    repository,
-    agentId: normalizedAgentId,
-    batchId: normalizedBatchId,
-    memoryIds: normalizedMemoryIds,
-    nearbyContainerIds,
-    ...snapshotOptions,
+  const prepared = preparedGeneration || prepareStructureGeneration({
+    repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
+    nearbyContainerIds, candidatePolicy, snapshotOptions, systemPromptPath, generator,
   });
-  if (!snapshot.currentMemories.length) {
-    return {
-      status: "skipped",
-      reason: "no-eligible-current-memories",
-      batchId: normalizedBatchId,
-      snapshot,
-      proposed: [],
-      duplicates: [],
-      rejected: [],
-      usageRecorded: false,
-      warnings: [],
-    };
-  }
-
-  const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
-  const input = buildStructureGenerationInput(snapshot);
-  const generation = await generator({
-    input,
-    systemPrompt,
-    schema: MEMORY_STRUCTURE_OUTPUT_SCHEMA,
-    schemaName: "memory-structure-proposals-v1",
-  });
+  const { snapshot, request } = prepared;
+  if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
+    snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
+  generator.assertRequestBudget?.(request);
+  const generation = await generator(request);
   const warnings = [];
   const usageRecorded = await recordUsage({
     generation,

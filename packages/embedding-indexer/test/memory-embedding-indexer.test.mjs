@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   assessMemoryRetrievalContextCriticNeed,
   buildMemoryEmbeddingDocument,
   generateMemoryRetrievalContexts,
+  memoryEmbeddingContentHash,
   syncMemoryEmbeddings,
 } from "../src/index.mjs";
 
@@ -163,19 +165,89 @@ test("uses an independent critic only for subject, world, state, time, negation,
 });
 
 test("builds deterministic text from semantic fields without metadata noise", () => {
-  const text = buildMemoryEmbeddingDocument({
+  const memory = {
     id: "memory-1",
     kind: "relationship",
-    title: "关系",
-    content: "用户把 Agent 当成恋人。",
+    title: "周六整理书单的约定",
+    content: "我答应 Mio 周六九点整理小说书单。",
     subject_role: "user",
-    subject_key: "user",
+    subject_key: "person-internal-id",
+    canonical_key: "generated-booklist-key",
+    state_family: "goal",
+    state_phase: "active",
+    representation_layer: "reported",
+    temporal_state: "current",
+    event_date: "2026-09-26",
+    event_start: "2026-09-26T01:00:00.000Z",
+    valid_from: "2026-09-22T01:00:00.000Z",
+    valid_to: "2026-09-27T01:00:00.000Z",
     reality: "real",
     metadata: { privateNoise: "不应进入向量" },
+  };
+  const text = buildMemoryEmbeddingDocument(memory);
+  assert.equal(text, "标题：周六整理书单的约定\n内容：我答应 Mio 周六九点整理小说书单。");
+  assert.equal(memoryEmbeddingContentHash(memory), memoryEmbeddingContentHash({
+    title: memory.title, content: memory.content,
+  }));
+});
+
+test("reuses vectors after structured state and relationship changes", async (t) => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const provider = fakeProvider();
+  const sync = () => syncMemoryEmbeddings({
+    repository, agentId: "agent-test", embeddingProvider: provider,
+    memoryIds: ["museum-event"],
   });
-  assert.match(text, /记忆类型：relationship/u);
-  assert.match(text, /主体角色：user/u);
-  assert.doesNotMatch(text, /privateNoise|不应进入向量/u);
+  await sync();
+  const original = repository.listEmbeddings("agent-test", provider.model)[0];
+  const memory = repository.getMemory("museum-event");
+  repository.upsertMemory({
+    id: memory.id, agentId: "agent-test", kind: memory.kind, layer: memory.layer,
+    title: memory.title, content: memory.content,
+    subjectRole: "user", subjectKey: "person-internal-id",
+    canonicalKey: "resolved-museum-key", temporalState: "historical",
+    eventDate: "2026-07-12", validTo: "2026-07-13T00:00:00.000Z",
+    metadata: { reviewState: "accepted" },
+  });
+  repository.upsertEdge({
+    agentId: "agent-test", fromMemoryId: memory.id,
+    toMemoryId: "relationship-state", relation: "associated_with",
+    direction: "directed", weight: 1, confidence: 1,
+  });
+  const report = await sync();
+  assert.equal(report.reused, 1);
+  assert.equal(report.added, 0);
+  assert.equal(provider.calls.length, 1);
+  assert.equal(repository.getMemory(memory.id).canonical_key, "resolved-museum-key");
+  assert.equal(repository.getMemory(memory.id).event_date, "2026-07-12");
+  assert.equal(repository.listEmbeddings("agent-test", provider.model)[0].content_hash, original.content_hash);
+});
+
+test("replaces a metadata-bearing legacy vector once during ordinary synchronization", async (t) => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const provider = fakeProvider();
+  const legacyText = [
+    "记忆类型：event", "标题：科技馆之行", "内容：用户周六去了科技馆。",
+    "主体角色：user", "主体标识：user", "发生日期：2026-07-11", "现实属性：real",
+  ].join("\n");
+  repository.upsertEmbedding({
+    memoryId: "museum-event", model: provider.model, vector: new Float32Array([1, 0, 0]),
+    contentHash: createHash("sha256").update(legacyText).digest("hex"),
+  });
+  const options = { repository, agentId: "agent-test", embeddingProvider: provider, memoryIds: ["museum-event"] };
+  const plan = await syncMemoryEmbeddings({ ...options, dryRun: true });
+  assert.equal(plan.pending, 1);
+  assert.equal(provider.calls.length, 0);
+  const result = await syncMemoryEmbeddings(options);
+  assert.equal(result.added, 1);
+  assert.equal(provider.calls[0][0], "标题：科技馆之行\n内容：用户周六去了科技馆。");
+  assert.equal(repository.listEmbeddings("agent-test", provider.model)[0].content_hash,
+    memoryEmbeddingContentHash(repository.getMemory("museum-event")));
+  const repeated = await syncMemoryEmbeddings(options);
+  assert.equal(repeated.reused, 1);
+  assert.equal(provider.calls.length, 1);
 });
 
 test("indexes structured memories and raw evidence, reuses hashes, and reindexes a changed node", async () => {
@@ -216,6 +288,79 @@ test("indexes structured memories and raw evidence, reuses hashes, and reindexes
   assert.equal(provider.calls.length, 2);
   assert.match(provider.calls.at(-1)[0], /机器人展/u);
   database.close();
+});
+
+
+for (const [beforeDimensions, afterDimensions] of [[2, 3], [3, 2]]) {
+  test("rebuilds same-text vectors when selected dimensions change from " + beforeDimensions + " to " + afterDimensions, async t => {
+    const { database, repository } = fixture();
+    t.after(() => database.close());
+    const first = fakeProvider({ dimensions: beforeDimensions });
+    await syncMemoryEmbeddings({ repository, agentId: "agent-test", embeddingProvider: first });
+    const before = repository.listEmbeddings("agent-test", first.model);
+    const changed = fakeProvider({ dimensions: afterDimensions });
+    const options = { repository, agentId: "agent-test", embeddingProvider: changed };
+    const planned = await syncMemoryEmbeddings({ ...options, dryRun: true });
+    assert.equal(planned.pending, 3);
+    assert.equal(planned.reused, 0);
+    assert.equal(changed.calls.length, 0);
+    assert.deepEqual(repository.listEmbeddings("agent-test", first.model), before);
+    const rebuilt = await syncMemoryEmbeddings(options);
+    assert.equal(rebuilt.added, 3);
+    assert.equal(rebuilt.reused, 0);
+    assert.equal(changed.calls.length, 1);
+    const after = repository.listEmbeddings("agent-test", first.model);
+    assert.ok(after.every(row => row.dimensions === afterDimensions));
+    assert.deepEqual(after.map(row => row.content_hash), before.map(row => row.content_hash));
+    const repeated = await syncMemoryEmbeddings(options);
+    assert.equal(repeated.reused, 3);
+    assert.equal(repeated.added, 0);
+    assert.equal(changed.calls.length, 1);
+    const defaults = await syncMemoryEmbeddings({ ...options, dimensions: 0 });
+    assert.equal(defaults.reused, 3);
+    assert.equal(changed.calls.length, 1);
+  });
+}
+
+test("copies only dimension-compatible same-content vectors instead of reusing an incompatible node vector", async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const target = repository.getMemory("museum-event");
+  for (const id of ["museum-copy-a", "museum-copy-b"]) repository.upsertMemory({
+    id, agentId: "agent-test", kind: target.kind, layer: target.layer,
+    title: target.title, content: target.content, subjectRole: "user", subjectKey: "user",
+  });
+  const model = "text-embedding-v4", contentHash = memoryEmbeddingContentHash(target);
+  repository.upsertEmbedding({ memoryId: target.id, model, vector: [1, 0], contentHash });
+  repository.upsertEmbedding({ memoryId: "museum-copy-a", model, vector: [0, 1, 0], contentHash });
+  repository.upsertEmbedding({ memoryId: "museum-copy-b", model, vector: [1, 0], contentHash });
+  const provider = fakeProvider({ dimensions: 3 });
+  const result = await syncMemoryEmbeddings({ repository, agentId: "agent-test", embeddingProvider: provider,
+    memoryIds: [target.id] });
+  assert.equal(result.copied, 1);
+  assert.equal(result.reused, 1);
+  assert.equal(result.added, 0);
+  assert.equal(provider.calls.length, 0);
+  const stored = repository.listEmbeddings("agent-test", model).find(row => row.memory_id === target.id);
+  assert.equal(stored.dimensions, 3);
+  assert.deepEqual(Array.from(stored.vector), [0, 1, 0]);
+});
+
+test("keeps old vectors on a failed dimension rebuild and retries them during later maintenance", async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const original = fakeProvider({ dimensions: 2 });
+  await syncMemoryEmbeddings({ repository, agentId: "agent-test", embeddingProvider: original });
+  const before = repository.listEmbeddings("agent-test", original.model);
+  const failed = await syncMemoryEmbeddings({ repository, agentId: "agent-test",
+    embeddingProvider: fakeProvider({ dimensions: 3, fail: true }), maxRetries: 0 });
+  assert.equal(failed.status, "error");
+  assert.equal(failed.failed, 3);
+  assert.equal(failed.reused, 0);
+  assert.deepEqual(repository.listEmbeddings("agent-test", original.model), before);
+  const recovered = await syncMemoryEmbeddings({ repository, agentId: "agent-test", embeddingProvider: fakeProvider({ dimensions: 3 }) });
+  assert.equal(recovered.added, 3);
+  assert.ok(repository.listEmbeddings("agent-test", original.model).every(row => row.dimensions === 3));
 });
 
 test("adds the adjacent exchange to an utterance embedding without changing the stored utterance", async () => {

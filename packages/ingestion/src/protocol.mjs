@@ -1,3 +1,4 @@
+import { normalizeEventSource } from '@suzu-memory/core';
 export const COMPANION_EVENT_PROTOCOL_VERSION = 1;
 export const DEFAULT_MAXIMUM_INPUT_EVENT_CHARACTERS = 12_000;
 export const COMPANION_EVENT_TYPES = Object.freeze([
@@ -119,11 +120,11 @@ function isoTimestamp(value, label, fallback = "") {
   return parsed.toISOString();
 }
 
-function normalizeParticipant(value, index, identity) {
+function normalizeParticipant(value, index, identity, productSource = null) {
   const participant = plainObject(value, `participants[${index}]`, { required: true });
   const role = clean(participant.role);
   const id = clean(participant.id);
-  if (!PARTICIPANT_ROLES.has(role) || !id) {
+  if (!(productSource ? ['user', 'companion', 'other', 'system', 'world', 'unknown'].includes(role) : PARTICIPANT_ROLES.has(role)) || !id) {
     throw new Error(`participants[${index}] requires a supported role and id.`);
   }
   if (role === "user" && id !== identity.primaryUserId) {
@@ -138,7 +139,7 @@ function normalizeParticipant(value, index, identity) {
 export function normalizeCompanionIdentity(options = {}) {
   const spaceId = clean(options.spaceId || options.agentId);
   const companionId = clean(options.companionId || options.agentId);
-  const primaryUserId = clean(options.primaryUserId) || "user";
+  const primaryUserId = Object.hasOwn(options, 'primaryUserId') ? clean(options.primaryUserId) : 'user';
   if (!spaceId || !companionId) {
     throw new Error("Companion event identity requires spaceId and companionId.");
   }
@@ -147,7 +148,7 @@ export function normalizeCompanionIdentity(options = {}) {
     companionId,
     primaryUserId,
     companionName: clean(options.companionName) || "Companion",
-    primaryUserName: clean(options.primaryUserName) || "User",
+    primaryUserName: clean(options.primaryUserName) || (primaryUserId ? 'User' : ''),
     defaultWorldId: clean(options.defaultWorldId) || "relationship",
     defaultWorldFrame: clean(options.defaultWorldFrame) || "relational",
   });
@@ -157,21 +158,22 @@ export function normalizeCompanionEvent(value, options = {}) {
   const identity = normalizeCompanionIdentity(options);
   const input = plainObject(value, "event", { required: true });
   const protocolVersion = Number(input.protocolVersion ?? COMPANION_EVENT_PROTOCOL_VERSION);
-  if (protocolVersion !== COMPANION_EVENT_PROTOCOL_VERSION) {
+  if (![COMPANION_EVENT_PROTOCOL_VERSION, 2].includes(protocolVersion)) {
     throw new Error(`Unsupported companion event protocolVersion: ${protocolVersion}.`);
   }
   const eventId = clean(input.eventId);
   const spaceId = clean(input.spaceId) || identity.spaceId;
   const eventType = clean(input.eventType);
   if (!eventId) throw new Error("eventId is required.");
-  if (spaceId !== identity.spaceId) throw new Error("Event belongs to another memory space.");
-  if (!COMPANION_EVENT_TYPES.includes(eventType)) {
+  const productSource = protocolVersion === 2 ? normalizeEventSource(input.metadata?.eventSource, identity.companionId) : null;
+  if (productSource ? spaceId !== productSource.spaceId : spaceId !== identity.spaceId) throw new Error("Event belongs to another memory space.");
+  if (!eventType || (!productSource && !COMPANION_EVENT_TYPES.includes(eventType))) {
     throw new Error(`Unsupported companion eventType: ${eventType}.`);
   }
   const actor = plainObject(input.actor, "actor", { required: true });
   const actorRole = clean(actor.role);
   const actorId = clean(actor.id);
-  if (!PRIMARY_ROLES.has(actorRole) || !actorId) {
+  if (!(productSource ? ['user', 'companion', 'other', 'system', 'world', 'unknown'].includes(actorRole) : PRIMARY_ROLES.has(actorRole)) || !actorId) {
     throw new Error("actor must identify the primary user or companion.");
   }
   if (actorRole === "user" && actorId !== identity.primaryUserId) {
@@ -180,16 +182,24 @@ export function normalizeCompanionEvent(value, options = {}) {
   if (actorRole === "companion" && actorId !== identity.companionId) {
     throw new Error("Companion actor does not match this memory space.");
   }
+  if (productSource && actorId !== productSource.sender.id) throw new Error('Event actor must preserve the actual sender.');
+  if (productSource) {
+    const sender = productSource.sender;
+    const expectedRole = sender.kind === 'local-user' && sender.id === identity.primaryUserId ? 'user'
+      : sender.kind === 'agent' && sender.id === identity.companionId ? 'companion'
+      : ['system', 'world', 'unknown'].includes(sender.kind) ? sender.kind : 'other';
+    if (actorRole !== expectedRole || eventType !== productSource.eventType) throw new Error('Event role and type must match their actual source.');
+  }
   const participants = Array.isArray(input.participants)
-    ? input.participants.map((participant, index) => normalizeParticipant(participant, index, identity))
+    ? input.participants.map((participant, index) => normalizeParticipant(participant, index, identity, productSource))
     : [];
   const byRole = new Map(participants.map((participant) => [participant.role, participant]));
-  if (!byRole.has("user")) participants.push({
+  if (!productSource && identity.primaryUserId && !byRole.has("user")) participants.push({
     id: identity.primaryUserId,
     role: "user",
     name: identity.primaryUserName,
   });
-  if (!byRole.has("companion")) participants.push({
+  if (!productSource && !byRole.has("companion")) participants.push({
     id: identity.companionId,
     role: "companion",
     name: identity.companionName,

@@ -5,8 +5,10 @@ import {
   loadLongTermExtractionSystemPrompt,
   LONG_TERM_EXTRACTION_SCHEMA,
   parseGeneratedLongTermExtraction,
+  normalizeExtractionParticipantRoles,
 } from "@suzu-memory/extraction";
 import { ensureCompanionRelationshipStructure } from "@suzu-memory/core";
+import { currentEventSourceExecution, eventSourceMaterial, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { runImmediateMemoryMaintenance } from "@suzu-memory/maintenance";
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
@@ -86,54 +88,6 @@ function extractionRepairLanguageInstruction(messages = []) {
   ];
 }
 
-function normalizedParticipantName(value) {
-  return clean(value).normalize("NFKC").toLocaleLowerCase("zh-CN");
-}
-
-function knownParticipantRole(name, identity) {
-  const selected = normalizedParticipantName(name);
-  if (!selected) return "";
-  const user = normalizedParticipantName(identity?.primaryUserName);
-  const agent = normalizedParticipantName(identity?.companionName);
-  if (!user || !agent || user === agent) return "";
-  if (selected === user) return "user";
-  if (selected === agent) return "agent";
-  return "";
-}
-
-function normalizeKnownParticipantRoles(output, identity) {
-  const corrections = [];
-  const memories = output.memories.map((candidate, candidateIndex) => {
-    const normalized = {
-      ...candidate,
-      actorRoles: candidate.actorRoles.map((actor, actorIndex) => {
-        const knownRole = knownParticipantRole(actor.actorName, identity);
-        if (!knownRole || knownRole === actor.actorRole) return actor;
-        corrections.push({ candidateIndex, field: `actorRoles[${actorIndex}].actorRole` });
-        return { ...actor, actorRole: knownRole };
-      }),
-      stateTarget: { ...candidate.stateTarget },
-    };
-    const subjectRole = knownParticipantRole(candidate.subjectName, identity);
-    if (subjectRole && subjectRole !== candidate.subjectRole) {
-      normalized.subjectRole = subjectRole;
-      corrections.push({ candidateIndex, field: "subjectRole" });
-    }
-    for (const [nameField, roleField] of [
-      ["objectName", "objectRole"],
-      ["counterpartName", "counterpartRole"],
-      ["triggerName", "triggerRole"],
-    ]) {
-      const knownRole = knownParticipantRole(normalized.stateTarget[nameField], identity);
-      if (!knownRole || knownRole === normalized.stateTarget[roleField]) continue;
-      normalized.stateTarget[roleField] = knownRole;
-      corrections.push({ candidateIndex, field: `stateTarget.${roleField}` });
-    }
-    return normalized;
-  });
-  return { output: { memories }, corrections };
-}
-
 function companionEventFragment(event) {
   const fragment = event?.metadata?.suzuMemoryFragment;
   if (!fragment || typeof fragment !== "object" || Array.isArray(fragment)) return null;
@@ -167,6 +121,7 @@ export function companionMessageFromEvent(event, identity, index) {
   // synthetic value to the extraction model as an asserted real-world date.
   const sourceTimeKnown = eventMetadata.sourceTimeKnown !== false
     && eventMetadata.timelineOrder !== "synthetic-only";
+  const productSource = eventMetadata.eventSource;
   return {
     id: eventId,
     externalId,
@@ -177,8 +132,8 @@ export function companionMessageFromEvent(event, identity, index) {
     timestamp: sourceTimeKnown ? occurredAt : "unknown",
     occurredAt,
     knownAt,
-    role: companion ? "assistant" : "user",
-    speaker: actorKey === identity.companionId
+    role: companion ? "assistant" : productSource && actorRole !== 'user' ? actorRole : "user",
+    speaker: productSource ? productSource.sender.name || productSource.sender.id : actorKey === identity.companionId
       ? identity.companionName
       : identity.primaryUserName,
     text: clean(event.content?.text),
@@ -196,6 +151,8 @@ export function companionMessageFromEvent(event, identity, index) {
     worldId,
     worldFrame,
     participants: Array.isArray(event.participants) ? event.participants : [],
+    ...(productSource ? { eventSource: productSource, conversationTopology: productSource.topology.kind,
+      speakerIdentity: { actorRole: companion ? 'agent' : actorRole === 'system' ? 'unknown' : actorRole, actorKey } } : {}),
   };
 }
 
@@ -337,14 +294,12 @@ function companionArchiveWindows(events, archiveWindows, identity) {
   }));
 }
 
-export async function generateCompanionEventBatch({
+export function buildCompanionExtractionRequest({
   events,
   previousContextEvents = [],
   continuationGuidanceEvents = [],
   archiveWindows = [],
   identity,
-  generator,
-  memoriesOverride = null,
   systemPrompt = "",
 }) {
   const semanticWindows = companionArchiveWindows(events, archiveWindows, identity);
@@ -361,9 +316,24 @@ export async function generateCompanionEventBatch({
     archiveWindows: semanticWindows,
     memoryOwner: identity.companionName,
     userName: identity.primaryUserName,
+    identity,
   });
+  return { built, request: {
+    input: built.input,
+    systemPrompt: clean(systemPrompt) || loadLongTermExtractionSystemPrompt(),
+    schema: LONG_TERM_EXTRACTION_SCHEMA,
+    schemaName: "long-term-memory-extraction-v2",
+  } };
+}
+
+export async function generateCompanionEventBatch({ events, previousContextEvents = [],
+  continuationGuidanceEvents = [], archiveWindows = [], identity, generator,
+  memoriesOverride = null, systemPrompt = '' }) {
+  const { built, request: generationRequest } = buildCompanionExtractionRequest({ events,
+    previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt });
   if (Array.isArray(memoriesOverride)) {
     return {
+      participants: built.participants,
       messages: built.messages,
       archiveWindows: built.archiveWindows,
       previousContextMessages: built.previousContextMessages,
@@ -382,13 +352,18 @@ export async function generateCompanionEventBatch({
   if (typeof generator !== "function") {
     throw new Error("Processing pending events requires a generation provider.");
   }
-  const generationRequest = {
-    input: built.input,
-    systemPrompt: clean(systemPrompt) || loadLongTermExtractionSystemPrompt(),
-    schema: LONG_TERM_EXTRACTION_SCHEMA,
-    schemaName: "long-term-memory-extraction-v1",
-  };
+  const execution = currentEventSourceExecution();
+  if (execution?.sourceScope) {
+    // built contains precisely the messages serialized by the existing input
+    // builder, including archive-window context and fragmented input IDs.
+    const messages = [...(built.messages || []), ...(built.previousContextMessages || []), ...(built.continuationGuidanceMessages || []),
+      ...(built.archiveWindows || []).flatMap(window => [...(window.messages || []),
+        ...(window.previousContextMessages || []), ...(window.continuationGuidanceMessages || [])])];
+    const ids = messages.flatMap(message => message.inputEventIds || [message.inputEventId]).filter(Boolean);
+    generationRequest.sourceMaterial = eventSourceMaterial(execution.repository, identity.agentId || identity.companionId, [], [], ids);
+  }
   const generation = await generator(generationRequest);
+  assertEventSourceExecutionCurrent();
   let parsedOutput;
   try {
     parsedOutput = parseGeneratedLongTermExtraction(generation.output);
@@ -422,8 +397,10 @@ export async function generateCompanionEventBatch({
             ...extractionRepairLanguageInstruction(built.messages),
           ].join("\n"),
           schema: LONG_TERM_EXTRACTION_SCHEMA,
-          schemaName: "long-term-memory-extraction-repair-v1",
+          schemaName: "long-term-memory-extraction-repair-v2",
+          ...(generationRequest.sourceMaterial ? { sourceMaterial: generationRequest.sourceMaterial } : {}),
         });
+        assertEventSourceExecutionCurrent();
         const repairedOnly = parseGeneratedLongTermExtraction(repair.output);
         parsedOutput = {
           memories: mergeExtractionCandidates(
@@ -432,6 +409,7 @@ export async function generateCompanionEventBatch({
           ),
         };
       } catch (error) {
+        assertEventSourceExecutionCurrent();
         repairError = error;
       }
     }
@@ -478,7 +456,7 @@ export async function generateCompanionEventBatch({
       },
     });
   }
-  const participantNormalization = normalizeKnownParticipantRoles(parsedOutput, identity);
+  const participantNormalization = normalizeExtractionParticipantRoles(parsedOutput, built.participants);
   parsedOutput = participantNormalization.output;
   generation.output = parsedOutput;
   generation.metadata = {
@@ -493,6 +471,7 @@ export async function generateCompanionEventBatch({
   };
   return {
     messages: built.messages,
+    participants: built.participants,
     archiveWindows: built.archiveWindows,
     previousContextMessages: built.previousContextMessages,
     continuationGuidanceMessages: built.continuationGuidanceMessages,
@@ -520,6 +499,7 @@ export function archiveCompanionEventBatch({
   repository.transaction(() => {
     repository.assertInputBatchLease(agentId, batchId, leaseOwner);
     ensureCompanionRelationshipStructure({
+      createPrimaryRelationship: Boolean(identity.primaryUserId) && !generated.messages.some(message => message.eventSource),
       repository,
       agentId,
       primaryUserId: identity.primaryUserId,
@@ -540,8 +520,8 @@ export function archiveCompanionEventBatch({
       generatedMemories: generated.generation.output.memories,
       batchId,
       recordedAt: completedAt,
-      conversationTopology: DIRECT_USER_AGENT_DM_TOPOLOGY,
-      identity,
+      conversationTopology: generated.messages.some(message => message.eventSource) ? '' : DIRECT_USER_AGENT_DM_TOPOLOGY,
+      identity: { ...identity, participants: generated.participants },
     });
     if (terminalFailure) {
       const eventIds = [...new Set(generated.messages

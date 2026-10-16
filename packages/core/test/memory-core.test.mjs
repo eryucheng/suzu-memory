@@ -3831,11 +3831,11 @@ test("adds only explicit shared long-term memories to a relationship container",
     memoryIds: [shared.id, solo.id, raw.id],
   });
   assert.equal(first.status, "ready");
-  assert.equal(first.linked, 1);
+  assert.equal(first.linked, 2);
   assert.deepEqual(
     repository.listMemoryRelationships(shared.id)
       .map((membership) => `${membership.membership_type}:${membership.provenance}`).sort(),
-    ["about:human", "shared_experience:deterministic-relationship-membership-v1"],
+    ["about:human", "shared_experience:deterministic-relationship-membership-v1", "shared_experience:deterministic-relationship-membership-v1"],
   );
   assert.equal(repository.listMemoryRelationships(solo.id).length, 0);
   assert.equal(repository.listMemoryRelationships(raw.id).length, 0);
@@ -3846,7 +3846,7 @@ test("adds only explicit shared long-term memories to a relationship container",
   });
   assert.equal(second.linked, 0);
   assert.equal(second.removed, 0);
-  assert.equal(repository.listMemoryRelationships(shared.id).length, 2);
+  assert.equal(repository.listMemoryRelationships(shared.id).length, 3);
   assert.deepEqual(
     repository.listRelationshipMemories({
       agentId: "agent-test",

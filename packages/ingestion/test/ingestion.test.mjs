@@ -59,18 +59,6 @@ function generatedEventCandidate(overrides = {}) {
     canonicalKey: "",
     stateFamily: "not_applicable",
     stateLabel: "",
-    stateTarget: {
-      type: "none",
-      identityField: "not_applicable",
-      fieldCardinality: "not_applicable",
-      objectRole: "not_applicable",
-      objectName: "",
-      counterpartRole: "not_applicable",
-      counterpartName: "",
-      direction: "not_applicable",
-      triggerRole: "not_applicable",
-      triggerName: "",
-    },
     reality: "real",
     evidenceMode: "explicit",
     temporalState: "historical",
@@ -125,7 +113,7 @@ test("repairs one schema-valid JSON object that fails strict extraction validati
   const schemas = [];
   const generator = async ({ input, schemaName }) => {
     schemas.push(schemaName);
-    if (schemaName === "long-term-memory-extraction-v1") {
+    if (schemaName === "long-term-memory-extraction-v2") {
       return {
         output: { memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] },
         usage: { prompt_tokens: 10, completion_tokens: 5 },
@@ -149,8 +137,8 @@ test("repairs one schema-valid JSON object that fails strict extraction validati
     generator,
   });
   assert.deepEqual(schemas, [
-    "long-term-memory-extraction-v1",
-    "long-term-memory-extraction-repair-v1",
+    "long-term-memory-extraction-v2",
+    "long-term-memory-extraction-repair-v2",
   ]);
   assert.equal(generated.generation.output.memories[0].eventDate, "2026-08-04");
   assert.deepEqual(generated.generation.usage, { prompt_tokens: 14, completion_tokens: 7 });
@@ -172,7 +160,7 @@ test("keeps the repair pass in the source language of the invalid candidate", as
     events: pending,
     identity: IDENTITY,
     generator: async ({ schemaName, systemPrompt }) => {
-      if (schemaName === "long-term-memory-extraction-v1") {
+      if (schemaName === "long-term-memory-extraction-v2") {
         return {
           output: { memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] },
           usage: {},
@@ -950,6 +938,27 @@ test("returns failed batches to pending so generation can be retried safely", as
   database.close();
 });
 
+test("output exhaustion preserves raw evidence and enters review after one extraction attempt", async () => {
+  const { database, repository } = repositoryFixture();
+  appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
+  let calls = 0;
+  const diagnostics = { maxOutputTokens: 65536, usage: { outputTokens: 65536 } };
+  const run = () => processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+    generator: async () => { calls++; throw Object.assign(new Error('Output protection reached'), { code: 'MAX_TOKENS', diagnostics }); },
+    now: new Date('2026-08-04T02:05:00.000Z') });
+  const result = await run();
+  assert.equal(result.status, 'processed');
+  assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 1);
+  const review = repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] })[0];
+  assert.equal(review.review_state, 'pending');
+  assert.equal(review.attempt_count, 1);
+  assert.equal(review.result.failures[0].errorCode, 'MAX_TOKENS');
+  assert.deepEqual(review.result.failures[0].details.providerDiagnostics, diagnostics);
+  await run();
+  assert.equal(calls, 1);
+  database.close();
+});
+
 test("archives raw evidence and queues human review after three ordinary extraction failures", async () => {
   const { database, repository } = repositoryFixture();
   appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
@@ -1170,7 +1179,7 @@ test("queues expensive post-processing without calling providers in the archive 
     result.maintenanceTasks.map((task) => `${task.lane}:${task.taskType}`).sort(),
     [
       "embedding:memory-embedding",
-      "semantic:retrieval-context",
+      "semantic:event-continuity",
       "semantic:structure-proposal",
     ],
   );
@@ -1247,18 +1256,6 @@ test("stores review-gated personal impressions as isolated provisional memories"
       canonicalKey: "preference:museum-visits",
       stateFamily: "preference",
       stateLabel: "喜欢逛科技馆",
-      stateTarget: {
-        type: "none",
-        identityField: "not_applicable",
-        fieldCardinality: "not_applicable",
-        objectRole: "not_applicable",
-        objectName: "",
-        counterpartRole: "not_applicable",
-        counterpartName: "",
-        direction: "not_applicable",
-        triggerRole: "not_applicable",
-        triggerName: "",
-      },
       evidenceMode: "inferred",
       temporalState: "current",
       retentionReason: "explicit_preference",
@@ -1289,7 +1286,7 @@ test("stores review-gated personal impressions as isolated provisional memories"
   database.close();
 });
 
-test("keeps inferred state candidates recallable as provisional instead of orphaning analysis requests", async () => {
+test("queues inferred preference candidates for the behavioral specialist", async () => {
   const { database, repository } = repositoryFixture();
   appendCompanionEvents({
     repository,
@@ -1321,15 +1318,12 @@ test("keeps inferred state candidates recallable as provisional instead of orpha
       sourceRefs: ["M0001"],
     })],
   });
-  assert.equal(result.stateAnalysisRequestsQueued, 0);
-  assert.equal(result.candidateResults[0].status, "review");
-  assert.deepEqual(
-    result.candidateResults[0].reasons,
-    ["state-analysis-awaits-inferred-specialist"],
-  );
-  assert.ok(result.candidateResults[0].provisionalMemoryId);
-  assert.equal(repository.listStateAnalysisRequests(AGENT_ID, { statuses: ["pending"] }).length, 0);
-  assert.equal(repository.listPendingProvisionalMemories(AGENT_ID).length, 1);
+  assert.equal(result.stateAnalysisRequestsQueued, 1);
+  assert.equal(result.candidateResults[0].status, "analysis_pending");
+  const requests = repository.listStateAnalysisRequests(AGENT_ID, { statuses: ["pending"] });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].representation_layer, "inferred");
+  assert.equal(repository.listPendingProvisionalMemories(AGENT_ID).length, 0);
   database.close();
 });
 

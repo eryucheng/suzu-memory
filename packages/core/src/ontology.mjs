@@ -60,6 +60,17 @@ export const WORLD_FRAMES = values([
   "unknown",
 ]);
 
+export function memoryWorldsCompatible(left, right, { allowRealSpaces = false } = {}) {
+  const reality = memory => memory.reality || memory.metadata?.reality || (['fictional', 'hypothetical', 'dream'].includes(memory.world_frame ?? memory.worldFrame)
+    ? memory.world_frame ?? memory.worldFrame : 'real');
+  if (reality(left) !== reality(right)) return false;
+  const frame = memory => memory.world_frame ?? memory.worldFrame ?? 'unknown';
+  const world = memory => memory.world_id ?? memory.worldId ?? 'primary';
+  const ordinary = new Set(['physical', 'relational', 'unknown']);
+  return (allowRealSpaces && reality(left) === 'real' && ordinary.has(frame(left)) && ordinary.has(frame(right)))
+    || (world(left) === world(right) && frame(left) === frame(right));
+}
+
 export const EVIDENCE_MODES = values([
   "explicit",
   "observed",

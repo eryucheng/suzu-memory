@@ -6,12 +6,12 @@ function clean(value) {
 
 function speakerIdentity(messageRole, {
   agentId = "",
-  primaryUserId = "",
+  primaryUserId = "user",
   companionId = "",
 } = {}) {
-  const userKey = clean(primaryUserId) || "user";
+  const userKey = clean(primaryUserId);
   const companionKey = clean(companionId) || clean(agentId);
-  if (messageRole === "user") return { actorRole: "user", actorKey: userKey };
+  if (messageRole === "user" && userKey) return { actorRole: "user", actorKey: userKey };
   if (messageRole === "assistant" && companionKey) {
     return { actorRole: "agent", actorKey: companionKey };
   }
@@ -21,14 +21,16 @@ function speakerIdentity(messageRole, {
 export function buildArchivedUtteranceIdentity({
   messageRole,
   agentId,
-  primaryUserId = "",
+  primaryUserId = "user",
   companionId = "",
   conversationTopology = "",
+  actualSpeaker = null,
+  actualParticipants = [],
   provenance = "suzu-memory-extraction-v1-utterance",
 } = {}) {
-  const userKey = clean(primaryUserId) || "user";
+  const userKey = clean(primaryUserId);
   const companionKey = clean(companionId) || clean(agentId);
-  const speaker = speakerIdentity(clean(messageRole), {
+  const speaker = actualSpeaker || speakerIdentity(clean(messageRole), {
     agentId,
     primaryUserId: userKey,
     companionId: companionKey,
@@ -52,10 +54,13 @@ export function buildArchivedUtteranceIdentity({
     clean(conversationTopology) === DIRECT_USER_AGENT_DM_TOPOLOGY
     && companionKey
   ) {
-    actorRoles.push({
+    const counterparts = actualSpeaker ? actualParticipants.filter(participant => participant.id !== speaker.actorKey)
+      .map(participant => ({ actorRole: participant.role === 'companion' ? 'agent' : participant.role === 'system' ? 'unknown' : participant.role,
+        actorKey: participant.id })) : [{ actorRole: speaker.actorRole === 'user' ? 'agent' : 'user',
+        actorKey: speaker.actorRole === 'user' ? companionKey : userKey }];
+    for (const counterpart of counterparts.filter(actor => clean(actor.actorKey))) actorRoles.push({
       role: "participant",
-      actorRole: speaker.actorRole === "user" ? "agent" : "user",
-      actorKey: speaker.actorRole === "user" ? companionKey : userKey,
+      ...counterpart,
       isPrimary: false,
       confidence: 1,
       provenance: `${clean(provenance)}-dm-counterpart`,

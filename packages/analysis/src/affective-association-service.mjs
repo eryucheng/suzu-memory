@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,7 +11,6 @@ import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_DIRECTORY = path.join(ROOT, "resources");
 function clean(v) { return String(v ?? "").trim(); }
-function clip(v, max = 1200) { const t = clean(v); return t.length <= max ? t : `${t.slice(0, max - 1)}…`; }
 function unique(v) { return [...new Set((Array.isArray(v) ? v : []).map(clean).filter(Boolean))]; }
 function batchId(args) { const raw = [args.agentId, args.subjectRole, args.subjectKey, args.triggerRole,
   args.triggerKey, clean(args.canonicalKey).toLocaleLowerCase("en-US"), args.currentRepresentationLayer,
@@ -26,7 +27,7 @@ function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey,
   });
   if (!current) return null;
   if (!new Set(["belief_state", "derived_hypothesis"]).has(current.kind)) throw new Error("Affective canonicalKey resolves to a non-affective-compatible memory kind.");
-  return { id: current.id, kind: current.kind, content: clip(current.content), subjectRole: current.subject_role,
+  return { id: current.id, kind: current.kind, content: String(current.content ?? ""), subjectRole: current.subject_role,
     subjectKey: current.subject_key, canonicalKey: current.canonical_key, temporalState: current.temporal_state,
     representationLayer: current.representation_layer, knownAt: current.known_at,
     validFrom: current.valid_from, validTo: current.valid_to };
@@ -58,21 +59,25 @@ async function usage({ pathValue, generation, definition, agentId, batch }) {
     model: generation.model, source: "memory-evaluation", feature: `memory-affective-${definition.role}`,
     requestId: generation.requestId || "", usage: generation.usage,
     metadata: { batchId: batch, durationMs: Number(generation.durationMs || 0), ...generation.metadata } }); return ""; }
-  catch (error) { return `费用流水写入失败：${error.message}`; }
+  catch (error) {
+      assertEventSourceExecutionCurrent(); return `费用流水写入失败：${error.message}`; }
 }
 async function invoke({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
   const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8").replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildAffectiveAssociationGenerationInput(snapshot, definition); let generation = null;
-  try { generation = await generator({ input, systemPrompt, schema: definition.schema, schemaName: definition.schemaName,
+  try { generation = await generator({ input, systemPrompt, schema: definition.schema, schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
     stateFamily: "affective_association", analyzerRole: definition.role });
     const parsed = parseAffectiveAssociationGeneration(definition.role, generation?.output, { maximumAnalyses });
     const analyses = []; const rejected = []; const seen = new Set();
     for (const [index, item] of parsed.analyses.entries()) { try { if (seen.has(item.memoryId)) throw new Error("Duplicate memory analysis.");
       analyses.push(enforce(definition.role, item, snapshot)); seen.add(item.memoryId); }
-    catch (error) { rejected.push({ index, memoryId: item.memoryId, error: error.message }); } }
+    catch (error) {
+      assertEventSourceExecutionCurrent(); rejected.push({ index, memoryId: item.memoryId, error: error.message }); } }
     return { definition, input, generation, analyses, rejected,
       status: analyses.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" }; }
-  catch (error) { return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
+  catch (error) {
+      assertEventSourceExecutionCurrent(); return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
 }
 function mapBy(items) { return new Map((items || []).map((x) => [x.memoryId, x])); }
 function gate({ trigger, experiencer, basis, time, relation, current }) {
@@ -188,6 +193,7 @@ export async function evaluateAffectiveAssociationEvidence({ repository, agentId
     inputPolicy: { ...base.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
       modelCanChooseStateAction: false, currentMoodCannotRewriteMemory: true, activationBiasAllowed: false } };
+  snapshotOptions.prepareStateSnapshot?.(snapshot);
   const limit = Math.min(250000, Math.max(4000, Math.trunc(Number(snapshotOptions.maxSnapshotChars) || 64000)));
   if (JSON.stringify(snapshot).length > limit) throw new Error(`Affective evidence snapshot exceeds the ${limit}-character privacy budget.`);
   if (!snapshot.memories.length) return { status: "skipped", reason: "no-eligible-memories-with-direct-sources", batchId: batch,
@@ -200,11 +206,11 @@ export async function evaluateAffectiveAssociationEvidence({ repository, agentId
   const rejected = {}; const warnings = [];
   for (const [key, call] of invocations) { const warning = await usage({ pathValue: usageLedgerPath, generation: call.generation,
     definition: call.definition, agentId: clean(agentId), batch }); if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ agentId: clean(agentId), batchId: batch, stateFamily: "affective_association",
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot), agentId: clean(agentId), batchId: batch, stateFamily: "affective_association",
       analyzerRole: call.definition.role, subjectRole: snapshot.target.subjectRole, subjectKey: snapshot.target.subjectKey,
       canonicalKey: snapshot.target.canonicalKey, provider: clean(call.generation?.metadata?.provider) || "unreported",
       model: clean(call.generation?.model) || "unreported", promptVersion: call.definition.promptVersion,
-      schemaVersion: call.definition.schemaName, inputHash: createHash("sha256").update(call.input).digest("hex"),
+      schemaVersion: call.definition.schemaName, inputHash: call.generation?.metadata?.analysisInputHash || createHash("sha256").update(call.input).digest("hex"),
       status: call.status, memoryIds: snapshot.memories.map((m) => m.id), sourceIds, output: call.generation?.output ?? {},
       rejected: call.rejected, usage: call.generation?.usage || {},
       costAmount: Number(call.generation?.costAmount ?? call.generation?.metadata?.costAmount ?? 0) || 0,

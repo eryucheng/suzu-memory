@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertEventSourceExecutionCurrent } from "./event-source-execution.mjs";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -48,6 +49,17 @@ const TERMINAL_ACTIONS = Object.freeze({
   revoke: Object.freeze({ statePhase: "ended", temporalState: "historical" }),
 });
 
+const PENDING_TRANSITION_ACTIONS = new Set([
+  ...Object.keys(TERMINAL_ACTIONS), ...[...NEW_STATE_ACTIONS].filter(action => action !== 'create'),
+]);
+
+export function isRepeatedReportedStateTransition(repository, proposal) {
+  const terminal = TERMINAL_ACTIONS[proposal.action];
+  const previous = proposal.previousMemoryId && repository.getMemory(proposal.previousMemoryId);
+  return Boolean(terminal && previous?.agent_id === proposal.agent_id && previous.status === 'superseded'
+    && previous.state_phase === terminal.statePhase && previous.temporal_state === terminal.temporalState);
+}
+
 function memoryLayer(stateFamily) {
   if (stateFamily === "goal") return "prospective";
   if (stateFamily === "relationship") return "relational";
@@ -63,6 +75,9 @@ function currentState(repository, proposal) {
     representationLayer: "reported",
     stateFamily: proposal.state_family,
     stateScopeKey: proposal.target_scope_key,
+    includePending: true,
+    includeHistorical: proposal.action !== "create",
+    excludeMemoryId: provisionalStateId(proposal),
   });
   if ((current?.id || "") !== proposal.previousMemoryId) {
     throw new Error("Reported state changed after the proposal was reviewed.");
@@ -167,14 +182,14 @@ function reviewedEvidence(repository, proposal) {
   return selected;
 }
 
-function actorRoles(proposal) {
+function actorRoles(proposal, { provisional = false } = {}) {
   const roles = [{
     role: "subject",
     actorRole: proposal.subject_role,
     actorKey: proposal.subject_key,
     isPrimary: true,
     confidence: 1,
-    provenance: "accepted-reported-state-proposal-v1",
+    provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
     metadata: { reportedStateProposalId: proposal.id },
   }];
   if (proposal.proposed_kind === "belief_state") {
@@ -197,7 +212,7 @@ function actorRoles(proposal) {
       actorKey: clean(counterpart.key),
       isPrimary: false,
       confidence: 1,
-      provenance: "accepted-reported-state-proposal-v1",
+      provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
       metadata: {
         reportedStateProposalId: proposal.id,
         label: clean(counterpart.label),
@@ -209,7 +224,11 @@ function actorRoles(proposal) {
 
 function materializeState(repository, proposal, evidence) {
   const validityStart = iso(proposal.draft.validFrom, "validity start");
-  const memoryId = `reported-state-${createHash("sha256")
+  const pending = repository.getMemory(provisionalStateId(proposal));
+  // Keep the referenced state identity when a subsequent transition already used it.
+  const referenced = pending && (pending.metadata?.reportedStateTransition || repository.database.prepare(`SELECT 1 FROM memory_reported_state_proposals
+    WHERE agent_id = ? AND previous_memory_id = ? LIMIT 1`).get(proposal.agent_id, pending.id));
+  const memoryId = referenced ? pending.id : `reported-state-${createHash("sha256")
     .update(`${proposal.agent_id}\u001f${proposal.id}`)
     .digest("hex")
     .slice(0, 24)}`;
@@ -219,24 +238,27 @@ function materializeState(repository, proposal, evidence) {
     agentId: proposal.agent_id,
     kind: proposal.proposed_kind,
     layer: memoryLayer(proposal.state_family),
-    title: stateLabel,
-    content: evidence.contentSnapshot,
+    title: semanticDraft(repository, proposal)?.title ?? stateLabel,
+    content: semanticDraft(repository, proposal)?.content ?? evidence.contentSnapshot,
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
     canonicalKey: proposal.canonical_key,
     reality: "real",
+    worldId: pending?.world_id || evidence.detail.memory.world_id,
+    worldFrame: pending?.world_frame || evidence.detail.memory.world_frame,
     evidenceMode: "explicit",
     representationLayer: "reported",
     stateFamily: proposal.state_family,
     stateScopeKey: proposal.proposed_scope_key,
-    statePhase: proposal.state_phase,
-    temporalState: proposal.temporal_state,
+    statePhase: referenced ? pending.state_phase : proposal.state_phase,
+    temporalState: referenced ? pending.temporal_state : proposal.temporal_state,
     revisionAction: ["create", "add_scoped_exception"].includes(proposal.action)
       ? "add"
       : "update",
     knownAt: evidence.detail.memory.known_at || evidence.observation.observed_at,
     validFrom: validityStart,
-    status: "active",
+    validTo: referenced ? pending.valid_to : null,
+    status: referenced && pending.status === "superseded" ? pending.status : "active",
     confidence: bounded(evidence.observation.confidence, 0.75),
     importance: 0.6,
     actorRoles: actorRoles(proposal),
@@ -247,12 +269,15 @@ function materializeState(repository, proposal, evidence) {
       reportedStateInputHash: proposal.input_hash,
       reportedStateDraft: proposal.draft,
       truthBoundary: proposal.metadata?.truthBoundary || {},
+      ...(referenced && pending.metadata?.reportedStateTransitionId
+        ? { reportedStateTransitionId: pending.metadata.reportedStateTransitionId } : {}),
     },
   });
 }
 
 function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
   challenged = false,
+  provisional = false,
 } = {}) {
   const sourceById = new Map(evidence.detail.sources.map((source) => [source.id, source]));
   for (const sourceId of evidence.observation.sourceIds) {
@@ -261,7 +286,7 @@ function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
       authority: clean(source?.authority) || "subject_firsthand",
       sourceTrust: bounded(source?.source_trust, 0.8),
       evidenceStrength: bounded(evidence.observation.confidence, 0.75),
-      provenance: "accepted-reported-state-proposal-v1",
+      provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
       metadata: {
         reportedStateProposalId: proposal.id,
         stateFamily: proposal.state_family,
@@ -279,7 +304,7 @@ function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
       direction: "directed",
       weight: challenged ? 0.8 : 0.9,
       confidence: bounded(evidence.observation.confidence, 0.75),
-      provenance: "accepted-reported-state-proposal-v1",
+      provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
       metadata: {
         reportedStateProposalId: proposal.id,
         stateFamily: proposal.state_family,
@@ -290,7 +315,128 @@ function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
   }
 }
 
+function provisionalStateId(proposal) {
+  return `pending-reported-state-${canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24)}`;
+}
+
+function semanticDraft(repository, proposal) {
+  const id = proposal.metadata?.semanticMemoryId;
+  if (!id) return null;
+  const memory = repository.getMemory(id);
+  if (!memory || memory.agent_id !== proposal.agent_id || memory.status === 'deleted'
+    || memory.metadata?.stateAnalysisDraft !== true
+    || memory.metadata.stateAnalysisRequestId !== proposal.metadata.stateAnalysisRequestId
+    || memory.title !== proposal.metadata.semanticMemorySnapshot?.title
+    || memory.content !== proposal.metadata.semanticMemorySnapshot?.content) {
+    throw new Error('Reported state semantic memory is no longer available.');
+  }
+  return memory;
+}
+
+export function materializeReportedStateProposal(repository, { agentId, proposalId } = {}) {
+  const proposal = repository.getReportedStateProposal(clean(agentId), proposalId);
+  if (!proposal) throw new Error("Reported state proposal does not exist for this Agent.");
+  if (proposal.review_state !== "pending") return { status: "skipped", proposal, memory: null };
+  const existing = repository.getMemory(provisionalStateId(proposal));
+  if (existing && (existing.status === 'deleted' || !PENDING_TRANSITION_ACTIONS.has(proposal.action) || existing.metadata?.reportedStateTransition || existing.metadata?.reportedStateConfirmation)) {
+    return { status: "existing", proposal, memory: existing };
+  }
+  return repository.transaction(() => {
+    const previous = proposal.previousMemoryId ? repository.getMemory(proposal.previousMemoryId) : null;
+    const evidence = reviewedEvidence(repository, proposal);
+    const terminal = TERMINAL_ACTIONS[proposal.action];
+    let transition = null;
+    let confirmation = null;
+    if (PENDING_TRANSITION_ACTIONS.has(proposal.action)) {
+      const current = currentState(repository, proposal);
+      if (!current) throw new Error("Reported state transition lost its reviewed current state.");
+      if (isRepeatedReportedStateTransition(repository, proposal)) {
+        confirmation = { memoryId: current.id, statePhase: current.state_phase, validTo: current.valid_to };
+      } else {
+        rejectUnsafeRootTransition(repository, proposal, current);
+        const closed = terminal ? repository.closeReportedMemoryState({ agentId: proposal.agent_id,
+          memoryId: current.id, stateFamily: proposal.state_family,
+          statePhase: terminal.statePhase, temporalState: terminal.temporalState,
+          validTo: evidence.observation.observed_at, allowPending: true })
+          : current.status === 'superseded' ? current : repository.closeCurrentMemoryState({ agentId: proposal.agent_id,
+            memoryId: current.id, validTo: proposal.draft.validFrom, allowPending: true });
+        repository.updateMemoryMetadata({ agentId: proposal.agent_id, memoryId: current.id,
+          metadata: { ...current.metadata, reportedStateTransitionId: proposal.id },
+          reason: "Apply reported state transition pending human review." });
+        const fields = memory => ({ ...Object.fromEntries(["layer", "status", "state_phase", "temporal_state", "valid_to"]
+          .map(key => [key, memory[key]])), transitionId: memory.metadata?.reportedStateTransitionId || '' });
+        transition = { memoryId: current.id, before: fields(current), applied: fields(closed) };
+      }
+    }
+    const memory = repository.upsertMemory({
+      id: provisionalStateId(proposal), agentId: proposal.agent_id,
+      kind: proposal.proposed_kind || previous?.kind,
+      layer: "provisional", status: "archived",
+      title: semanticDraft(repository, proposal)?.title ?? (clean(proposal.metadata?.target?.stateLabel) || previous?.title || ""),
+      content: semanticDraft(repository, proposal)?.content ?? evidence.contentSnapshot,
+      subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
+      canonicalKey: proposal.canonical_key, reality: "real", evidenceMode: "explicit",
+      worldId: evidence.detail.memory.world_id, worldFrame: evidence.detail.memory.world_frame,
+      representationLayer: "reported", stateFamily: proposal.state_family,
+      stateScopeKey: proposal.proposed_scope_key,
+      statePhase: terminal?.statePhase || proposal.state_phase || previous?.state_phase,
+      temporalState: terminal?.temporalState || proposal.temporal_state || previous?.temporal_state,
+      knownAt: evidence.detail.memory.known_at || evidence.observation.observed_at,
+      validFrom: proposal.draft?.validFrom || evidence.observation.observed_at,
+      confidence: bounded(evidence.observation.confidence, 0.75), importance: 0.6,
+      actorRoles: actorRoles({ ...proposal, proposed_kind: proposal.proposed_kind || previous?.kind }, { provisional: true }),
+      metadata: {
+        provisional: true, reviewState: "pending", epistemicStatus: "reported_state",
+        reportedStateProposalId: proposal.id, reportedStateAction: proposal.action,
+        reportedStatePreviousMemoryId: proposal.previousMemoryId,
+        reportedStateDraft: proposal.draft,
+          ...(transition ? { reportedStateTransition: transition } : {}),
+          ...(confirmation ? { reportedStateConfirmation: confirmation } : {}),
+      },
+    });
+    attachSelectedEvidence(repository, proposal, memory, evidence, { provisional: true });
+    if (transition && !terminal) repository.upsertEdge({
+      agentId: proposal.agent_id, fromMemoryId: memory.id, toMemoryId: previous.id,
+      relation: 'supersedes', direction: 'directed', weight: 1,
+      confidence: bounded(evidence.observation.confidence, 0.75),
+      provenance: 'pending-reported-state-proposal-v1',
+      metadata: { reportedStateProposalId: proposal.id, transition: proposal.action },
+    });
+    return { status: "created", proposal, memory };
+  });
+}
+
+export function materializePendingReportedStateProposals(repository, { agentId } = {}) {
+  const ids = repository.database.prepare(`
+    SELECT proposal.id FROM memory_reported_state_proposals proposal
+    WHERE proposal.agent_id = ? AND proposal.review_state = 'pending'
+      AND NOT EXISTS (SELECT 1 FROM memory_nodes memory WHERE memory.agent_id = proposal.agent_id
+        AND memory.layer = 'provisional'
+        AND json_extract(memory.metadata_json, '$.reportedStateProposalId') = proposal.id
+        AND (proposal.action NOT IN (${[...PENDING_TRANSITION_ACTIONS].map(() => '?').join(',')})
+          OR memory.status = 'deleted'
+            OR json_extract(memory.metadata_json, '$.reportedStateTransition') IS NOT NULL
+            OR json_extract(memory.metadata_json, '$.reportedStateConfirmation') IS NOT NULL))
+    ORDER BY proposal.created_at, proposal.id
+  `).all(clean(agentId), ...PENDING_TRANSITION_ACTIONS);
+  const materialized = [];
+  const failed = [];
+  for (const { id } of ids) {
+    try { materialized.push(materializeReportedStateProposal(repository, { agentId, proposalId: id })); }
+    catch (error) { assertEventSourceExecutionCurrent(); failed.push({ proposalId: id, error: error.message }); }
+  }
+  return { materialized, failed };
+}
+
+function removeProvisionalState(repository, proposal, actor, reason, retainedMemoryId = "") {
+  const memory = repository.getMemory(provisionalStateId(proposal));
+  if (memory && memory.id !== retainedMemoryId && memory.status !== "deleted") repository.setMemoryDeleted({
+    agentId: proposal.agent_id, memoryId: memory.id, actor, reason,
+  });
+}
+
 function finish(repository, proposal, memory, resolvedBy, note, status, previous = null) {
+  removeProvisionalState(repository, proposal, resolvedBy, "Reported state proposal accepted.", memory.id);
   return {
     status,
     proposal: repository.resolveReportedStateProposalRecord({
@@ -342,23 +488,55 @@ export function resolveReportedStateProposal(repository, {
     throw new Error(`Unknown reported state proposal action: ${normalizedAction || "(empty)"}.`);
   }
   if (normalizedAction === "dismiss") {
-    return repository.transaction(() => ({
-      status: "dismissed",
-      proposal: repository.dismissReportedStateProposal({
-        agentId: normalizedAgentId,
-        proposalId: proposal.id,
-        resolvedBy,
-        note,
-      }),
-      memory: null,
-      previous: proposal.previousMemoryId
-        ? repository.getMemory(proposal.previousMemoryId)
-        : null,
-    }));
+    return repository.transaction(() => {
+      const transition = repository.getMemory(provisionalStateId(proposal))?.metadata?.reportedStateTransition;
+      removeProvisionalState(repository, proposal, resolvedBy, "Reported state proposal dismissed.");
+      const restored = transition ? repository.restoreReportedStateTransition({
+        agentId: normalizedAgentId, proposalId: proposal.id, ...transition,
+        actor: resolvedBy, reason: note || "Reported state transition dismissed.",
+      }) : null;
+      return {
+        status: "dismissed",
+        proposal: repository.dismissReportedStateProposal({
+          agentId: normalizedAgentId,
+          proposalId: proposal.id,
+          resolvedBy,
+          note,
+        }),
+        memory: null,
+        restored,
+        previous: proposal.previousMemoryId
+          ? repository.getMemory(proposal.previousMemoryId)
+          : null,
+      };
+    });
   }
   return repository.transaction(() => {
-    const current = currentState(repository, proposal);
     const evidence = reviewedEvidence(repository, proposal);
+    const confirmation = repository.getMemory(provisionalStateId(proposal))?.metadata?.reportedStateConfirmation;
+    if (confirmation) {
+      const memory = repository.getMemory(confirmation.memoryId);
+      if (!isRepeatedReportedStateTransition(repository, proposal) || memory.valid_to !== confirmation.validTo) {
+        throw new Error('Reported state confirmation changed after review.');
+      }
+      attachSelectedEvidence(repository, proposal, memory, evidence);
+      return finish(repository, proposal, memory, resolvedBy, note, 'reinforced', memory);
+    }
+    const transition = repository.getMemory(provisionalStateId(proposal))?.metadata?.reportedStateTransition;
+    if (transition && TERMINAL_ACTIONS[proposal.action]) {
+      const memory = repository.getMemory(transition.memoryId);
+      if (!memory || memory.agent_id !== normalizedAgentId || memory.status === "deleted") {
+        throw new Error("Reported state transition target is no longer available.");
+      }
+      attachSelectedEvidence(repository, proposal, memory, evidence);
+      return finish(repository, proposal, memory, resolvedBy, note, proposal.action, memory);
+    }
+    const pending = repository.getMemory(provisionalStateId(proposal));
+    // A pending original may already have been replaced by a later proposal.
+    // Accepting its evidence must preserve that newer state and its identity.
+    const replacedPending = pending?.status === 'superseded' && pending.metadata?.reportedStateTransitionId;
+    const current = replacedPending && (proposal.action === 'create' || transition)
+      ? (transition ? repository.getMemory(transition.memoryId) : null) : currentState(repository, proposal);
 
     if (proposal.action === "create") {
       const memory = materializeState(repository, proposal, evidence);
@@ -428,11 +606,14 @@ export function resolveReportedStateProposal(repository, {
     if (NEW_STATE_ACTIONS.has(proposal.action)) {
       const memory = materializeState(repository, proposal, evidence);
       attachSelectedEvidence(repository, proposal, memory, evidence);
-      repository.closeCurrentMemoryState({
-        agentId: normalizedAgentId,
-        memoryId: current.id,
-        validTo: proposal.draft.validFrom,
-      });
+      if (current.status !== "superseded") {
+        repository.closeCurrentMemoryState({
+          agentId: normalizedAgentId,
+          memoryId: current.id,
+          validTo: proposal.draft.validFrom,
+          allowPending: true,
+        });
+      }
       repository.upsertEdge({
         agentId: normalizedAgentId,
         fromMemoryId: memory.id,
@@ -453,6 +634,7 @@ export function resolveReportedStateProposal(repository, {
     const terminal = TERMINAL_ACTIONS[proposal.action];
     if (terminal) {
       attachSelectedEvidence(repository, proposal, current, evidence);
+      if (isRepeatedReportedStateTransition(repository, proposal)) return finish(repository, proposal, current, resolvedBy, note, 'reinforced', current);
       const closed = repository.closeReportedMemoryState({
         agentId: normalizedAgentId,
         memoryId: current.id,

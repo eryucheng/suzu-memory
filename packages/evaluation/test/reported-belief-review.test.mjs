@@ -196,7 +196,8 @@ test("bridges a ready reported belief into one pending proposal without writing 
   assert.equal(first.proposal.representation_layer, "reported");
   assert.equal(replay.proposal.wasInserted, false);
   assert.equal(replay.proposal.id, first.proposal.id);
-  assert.equal(Number(fixture.database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), before);
+  assert.equal(Number(fixture.database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), before + 1);
+  assert.equal(fixture.repository.listPendingProvisionalMemories("agent-test").length, 1);
   fixture.database.close();
 });
 

@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,7 +13,6 @@ const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_DIRECTORY = path.join(PACKAGE_ROOT, "resources");
 const SELF_CONCEPT_MEMORY_KINDS = new Set(["belief_state", "reflection"]);
 function clean(value) { return String(value ?? "").trim(); }
-function clip(value, maximum = 1200) { const text = clean(value); return text.length <= maximum ? text : `${text.slice(0, maximum - 1)}…`; }
 function uniqueStrings(values) { return [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))]; }
 function stableBatchId({ agentId, subjectRole, subjectKey, canonicalKey, currentRepresentationLayer, memoryIds }) {
   const value = [clean(agentId), clean(subjectRole), clean(subjectKey), clean(canonicalKey).toLocaleLowerCase("en-US"),
@@ -23,7 +24,7 @@ function currentStateView(repository, agentId, subjectRole, subjectKey, canonica
     representationLayer, stateFamily: "self_concept" });
   if (!current) return null;
   if (!SELF_CONCEPT_MEMORY_KINDS.has(current.kind)) throw new Error("Self-concept canonicalKey currently resolves to a non-self-concept-compatible memory kind.");
-  return { id: current.id, kind: current.kind, content: clip(current.content), subjectRole: current.subject_role,
+  return { id: current.id, kind: current.kind, content: String(current.content ?? ""), subjectRole: current.subject_role,
     subjectKey: current.subject_key, canonicalKey: current.canonical_key,
     representationLayer: current.representation_layer, temporalState: current.temporal_state,
     knownAt: current.known_at, validFrom: current.valid_from, validTo: current.valid_to };
@@ -62,27 +63,31 @@ async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, ag
       requestId: generation.requestId || "", usage: generation.usage,
       metadata: { batchId, durationMs: Number(generation.durationMs || 0), ...generation.metadata } });
     return "";
-  } catch (error) { return `费用流水写入失败：${error.message}`; }
+  } catch (error) {
+      assertEventSourceExecutionCurrent(); return `费用流水写入失败：${error.message}`; }
 }
 async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
   const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8")
     .replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildSelfConceptGenerationInput(snapshot, definition);
   let generation = null;
   try {
     generation = await generator({ input, systemPrompt, schema: definition.schema,
-      schemaName: definition.schemaName, stateFamily: "self_concept", analyzerRole: definition.role });
+      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}), stateFamily: "self_concept", analyzerRole: definition.role });
     const parsed = parseSelfConceptGeneration(definition.role, generation?.output, { maximumAnalyses });
     const accepted = []; const rejected = []; const seen = new Set();
     for (const [index, item] of parsed.analyses.entries()) {
       try {
         if (seen.has(item.memoryId)) throw new Error("A self-concept analyzer can analyze each memory at most once.");
         accepted.push(enforceBoundary(definition.role, item, snapshot)); seen.add(item.memoryId);
-      } catch (error) { rejected.push({ index, memoryId: item.memoryId, error: error.message }); }
+      } catch (error) {
+      assertEventSourceExecutionCurrent(); rejected.push({ index, memoryId: item.memoryId, error: error.message }); }
     }
     return { definition, input, generation, analyses: accepted, rejected,
       status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" };
-  } catch (error) { return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
+  } catch (error) {
+      assertEventSourceExecutionCurrent(); return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
 }
 function byMemory(items) { return new Map((Array.isArray(items) ? items : []).map((item) => [item.memoryId, item])); }
 function selfConceptGate({ concept, holder, stability, time, relation, currentState }) {
@@ -219,6 +224,7 @@ export async function evaluateSelfConceptEvidence({
     inputPolicy: { ...baseSnapshot.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
       modelCanChooseStateAction: false, modelSummaryCannotBecomeSubjectSelfConcept: true } };
+  snapshotOptions.prepareStateSnapshot?.(snapshot);
   const snapshotLimit = Math.min(250_000, Math.max(4_000, Math.trunc(Number(snapshotOptions.maxSnapshotChars) || 64_000)));
   if (JSON.stringify(snapshot).length > snapshotLimit) throw new Error(`Self-concept evidence snapshot exceeds the ${snapshotLimit}-character privacy budget.`);
   if (!snapshot.memories.length) return { status: "skipped", reason: "no-eligible-memories-with-direct-sources",
@@ -233,12 +239,12 @@ export async function evaluateSelfConceptEvidence({
     const warning = await appendAnalyzerUsage({ usageLedgerPath, generation: invocation.generation,
       definition: invocation.definition, agentId: clean(agentId), batchId });
     if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ agentId: clean(agentId), batchId, stateFamily: "self_concept",
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot), agentId: clean(agentId), batchId, stateFamily: "self_concept",
       analyzerRole: invocation.definition.role, subjectRole: snapshot.target.subjectRole,
       subjectKey: snapshot.target.subjectKey, canonicalKey: snapshot.target.canonicalKey,
       provider: clean(invocation.generation?.metadata?.provider) || "unreported",
       model: clean(invocation.generation?.model) || "unreported", promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName, inputHash: createHash("sha256").update(invocation.input).digest("hex"),
+      schemaVersion: invocation.definition.schemaName, inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
       status: invocation.status, memoryIds: snapshot.memories.map((memory) => memory.id), sourceIds,
       output: invocation.generation?.output ?? {}, rejected: invocation.rejected, usage: invocation.generation?.usage || {},
       costAmount: Number(invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0) || 0,

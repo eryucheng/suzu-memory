@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,11 +23,6 @@ const CARDINALITIES = new Set(["single", "multi_item", "sequence"]);
 
 function clean(value) {
   return String(value ?? "").trim();
-}
-
-function clip(value, maximum = 1200) {
-  const text = clean(value);
-  return text.length <= maximum ? text : `${text.slice(0, maximum - 1)}…`;
 }
 
 function unique(values) {
@@ -62,7 +59,7 @@ function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey,
   return {
     id: current.id,
     kind: current.kind,
-    content: clip(current.content),
+    content: String(current.content ?? ""),
     subjectRole: current.subject_role,
     subjectKey: current.subject_key,
     canonicalKey: current.canonical_key,
@@ -132,6 +129,7 @@ async function appendUsage({ usageLedgerPath, generation, definition, agentId, b
     });
     return "";
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return `费用流水写入失败：${error.message}`;
   }
 }
@@ -141,6 +139,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
     path.join(path.resolve(promptDirectory), definition.promptFile),
     "utf8",
   ).replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildIdentityGenerationInput(snapshot, definition);
   let generation = null;
   try {
@@ -148,7 +147,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
       input,
       systemPrompt,
       schema: definition.schema,
-      schemaName: definition.schemaName,
+      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
       stateFamily: "identity",
       analyzerRole: definition.role,
     });
@@ -162,6 +161,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
         analyses.push(enforce(definition.role, item, snapshot));
         seen.add(item.memoryId);
       } catch (error) {
+      assertEventSourceExecutionCurrent();
         rejected.push({ index, memoryId: item.memoryId, error: error.message });
       }
     }
@@ -175,6 +175,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
       error: "",
     };
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return {
       definition,
       input,
@@ -471,6 +472,7 @@ export async function evaluateIdentityEvidence({
       automaticStateWriteAllowed: false,
     },
   };
+  snapshotOptions.prepareStateSnapshot?.(snapshot);
   const limit = Math.min(
     250000,
     Math.max(4000, Math.trunc(Number(snapshotOptions.maxSnapshotChars) || 64000)),
@@ -520,7 +522,7 @@ export async function evaluateIdentityEvidence({
       batch,
     });
     if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
       agentId: clean(agentId),
       batchId: batch,
       stateFamily: "identity",

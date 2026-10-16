@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolveExtractedCandidateIdentity, resolveExtractionParticipant } from '@suzu-memory/extraction';
 
 import { inspectDatabaseBackup } from "./database-backup.mjs";
 
@@ -75,6 +76,11 @@ export function consolidationFailureReviewEnvelope(run) {
 }
 
 function proposalSummary(type, proposal) {
+  if (type === 'event-continuity') return {
+    type, id: proposal.id, reviewState: proposal.review_state, title: '确认事件关联', statement: proposal.result?.rationale || '',
+    confidence: 0, action: '选择关联或保持独立', subjectRole: '', subjectKey: '', batchId: '',
+    createdAt: proposal.created_at, updatedAt: proposal.updated_at,
+  };
   const draft = proposal?.draft || {};
   const candidate = proposal?.candidate || {};
   const statement = type === "ingestion"
@@ -83,7 +89,7 @@ function proposalSummary(type, proposal) {
     ? clean(proposal.error_message)
     : type === "reported-state"
     ? clean(draft.content || draft.title || proposal.target_label || proposal.canonical_key)
-    : type === "structure"
+    : ["structure", "preference-state"].includes(type)
       ? clean(proposal.content || proposal.title)
       : clean(proposal.rationale || `${proposal.from_memory_id} → ${proposal.to_memory_id}`);
   const title = type === "ingestion"
@@ -92,7 +98,7 @@ function proposalSummary(type, proposal) {
     ? `${clean(proposal.task_type) || "维护任务"}失败`
     : type === "reported-state"
     ? clean(draft.title || proposal.target_label || proposal.canonical_key) || "人物状态候选"
-    : type === "structure"
+    : ["structure", "preference-state"].includes(type)
       ? clean(proposal.title) || `${proposal.kind || "高层"}候选`
       : "因果关系候选";
   return {
@@ -106,7 +112,7 @@ function proposalSummary(type, proposal) {
       ? "human-decision"
       : type === "maintenance-failure"
       ? "human-decision"
-      : clean(proposal.action || proposal.operation || proposal.relation),
+      : clean(proposal.action || proposal.operation || proposal.transition || proposal.relation),
     subjectRole: clean(proposal.subject_role || candidate.subjectRole),
     subjectKey: clean(proposal.subject_key || candidate.subjectKey),
     batchId: clean(proposal.batch_id),
@@ -115,17 +121,80 @@ function proposalSummary(type, proposal) {
   };
 }
 
+export function resolveIngestionReviewInput(repository, agentId, decision, identityBindings = {}) {
+  let candidate = decision?.candidate && typeof decision.candidate === "object" ? decision.candidate : {};
+  const provisional = clean(decision?.provisional_memory_id)
+    ? repository.getMemory(decision.provisional_memory_id) : null;
+  const request = repository.listStateAnalysisRequests(agentId, {
+    batchId: decision?.batch_id, limit: 500,
+  }).find(item => Number(item.candidate_index) === Number(decision?.candidate_index)) || null;
+  const identity = candidate.metadata?.actorIdentity || request?.metadata?.actorIdentity || provisional?.metadata?.actorIdentity || {};
+  const identityChoices = new Map();
+  function selectedPerson(name, role) {
+    const resolved = resolveExtractionParticipant(name, identity.participants);
+    if (resolved.status !== 'ambiguous') return { name, role };
+    const key = JSON.stringify([role, name]);
+    const options = resolved.matches.map(person => ({ value: JSON.stringify([person.actorRole, person.actorKey]),
+      name: person.name, actorRole: person.actorRole, actorKey: person.actorKey }));
+    identityChoices.set(key, { key, name, role, options });
+    const selection = clean(identityBindings?.[key]);
+    if (!selection) return { name, role };
+    const person = options.find(option => option.value === selection);
+    if (!person) throw new Error('Selected person is not an identity candidate for this review.');
+    return { name: person.name, role: person.actorRole };
+  }
+  const subject = selectedPerson(candidate.subjectName, candidate.subjectRole);
+  const stateTarget = { ...candidate.stateTarget };
+  for (const prefix of ['object', 'counterpart', 'trigger']) {
+    if (!stateTarget[`${prefix}Role`]) continue;
+    const person = selectedPerson(stateTarget[`${prefix}Name`], stateTarget[`${prefix}Role`]);
+    stateTarget[`${prefix}Name`] = person.name;
+    stateTarget[`${prefix}Role`] = person.role;
+  }
+  candidate = { ...candidate, subjectName: subject.name, subjectRole: subject.role,
+    ...(candidate.stateTarget ? { stateTarget } : {}),
+    actorRoles: (candidate.actorRoles || []).map(actor => {
+      const person = selectedPerson(actor.actorName, actor.actorRole);
+      return { ...actor, actorName: person.name, actorRole: person.role };
+    }) };
+  for (const key of Object.keys(identityBindings || {})) {
+    if (!identityChoices.has(key)) throw new Error('Unknown identity binding for this review.');
+  }
+  const resolved = resolveExtractedCandidateIdentity(candidate, agentId, identity);
+  const subjectRole = clean(candidate.subjectRole || request?.subject_role || provisional?.subject_role);
+  const subjectKey = clean(candidate.subjectKey || request?.subject_key || provisional?.subject_key || resolved.subjectKey);
+  const storedRoles = provisional ? repository.listMemoryRoles(provisional.id) : [];
+  const actorRoles = resolved.actorRoles.map((actor, index) => {
+    const original = candidate.actorRoles[index];
+    const stored = storedRoles.find(value => value.role === actor.role && value.actor_role === actor.actorRole
+      && clean(value.metadata?.actorName) && clean(value.metadata.actorName) === clean(actor.metadata?.actorName));
+    const isSubject = actor.actorRole === subjectRole && clean(actor.metadata?.actorName)
+      && clean(actor.metadata.actorName) === clean(candidate.subjectName);
+    return { ...actor, actorKey: clean(original?.actorKey || stored?.actor_key || (isSubject ? subjectKey : '') || actor.actorKey) };
+  });
+  for (const observer of storedRoles.filter(role => role.role === 'observer')) {
+    if (!actorRoles.some(role => role.role === 'observer' && role.actorRole === observer.actor_role && role.actorKey === observer.actor_key)) {
+      actorRoles.push({ role: 'observer', actorRole: observer.actor_role, actorKey: observer.actor_key,
+        confidence: observer.confidence, metadata: observer.metadata, provenance: observer.provenance });
+    }
+  }
+  return { request, identityChoices: [...identityChoices.values()], candidate: {
+    ...candidate, subjectRole, subjectKey, actorRoles,
+    metadata: { ...candidate.metadata, ...(Object.keys(identityBindings || {}).length ? { humanIdentityBindings: identityBindings } : {}) },
+    canonicalKey: clean(request?.canonical_key || candidate.canonicalKey || provisional?.canonical_key),
+    representationLayer: clean(candidate.representationLayer || request?.representation_layer
+      || provisional?.representation_layer) || undefined,
+  } };
+}
+
 function ingestionReviewDetail(repository, agentId, decision) {
-  const candidate = decision.candidate || {};
+  const { candidate, request, identityChoices } = resolveIngestionReviewInput(repository, agentId, decision);
   const provisional = memoryDetail(repository, agentId, decision.provisional_memory_id);
   const evidence = uniqueEvidence((decision.sourceIds || []).map((sourceId) => (
     evidenceSource(sourceById(repository, agentId, sourceId), { kind: "source" })
   )).filter(Boolean));
-  const request = repository.listStateAnalysisRequests(agentId, {
-    batchId: decision.batch_id,
-    limit: 500,
-  }).find((item) => Number(item.candidate_index) === Number(decision.candidate_index)) || null;
   return {
+    identityChoices,
     writePreview: {
       kind: clean(candidate.kind),
       title: clean(candidate.title || candidate.stateLabel),
@@ -140,10 +209,14 @@ function ingestionReviewDetail(repository, agentId, decision) {
     currentState: null,
     observations: [],
     evidence,
-    members: provisional ? [{
+    members: [...(provisional ? [{
       memory: compactMemory(provisional),
       evidence,
-    }] : [],
+    }] : []), ...(request?.metadata?.stateCandidateIds || []).map(id => {
+      const detail = memoryDetail(repository, agentId, id);
+      return detail ? { memory: compactMemory(detail), evidence: (detail.sources || [])
+        .map(source => evidenceSource(source, { kind: 'source', memoryId: id })) } : null;
+    }).filter(Boolean)],
     endpoints: null,
     maintenanceFailure: request ? {
       lastError: clean(request.error_message || request.metadata?.lastFailure?.error),
@@ -249,6 +322,18 @@ function maintenanceFailureDetail(repository, agentId, task) {
   };
 }
 
+function eventContinuityReviewDetail(repository, agentId, task) {
+  const current = memoryDetail(repository, agentId, task.payload.memoryId);
+  const candidates = task.payload.candidateIds.map(id => memoryDetail(repository, agentId, id)).filter(Boolean);
+  return {
+    writePreview: { title: current?.memory.title || '事件关联', content: current?.memory.content || '', rationale: task.result.rationale },
+    eventContinuity: { candidates: candidates.map(detail => compactMemory(detail)) },
+    currentState: null, observations: [], endpoints: null,
+    members: candidates.map(detail => ({ memory: compactMemory(detail), evidence: detail.sources.map(source => evidenceSource(source)) })),
+    evidence: uniqueEvidence([current, ...candidates].filter(Boolean).flatMap(detail => detail.sources.map(source => evidenceSource(source)))),
+  };
+}
+
 function memoryDetail(repository, agentId, memoryId) {
   const id = clean(memoryId);
   return id ? repository.getMemoryDetail(agentId, id) : null;
@@ -271,6 +356,11 @@ function uniqueEvidence(items) {
 }
 
 function reportedStateDetail(repository, agentId, proposal) {
+  const previous = memoryDetail(repository, agentId, proposal.previousMemoryId);
+  const pendingId = repository.database.prepare(`SELECT id FROM memory_nodes
+    WHERE agent_id = ? AND layer = 'provisional'
+      AND json_extract(metadata_json, '$.reportedStateProposalId') = ? LIMIT 1`).get(agentId, proposal.id)?.id;
+  const pending = pendingId ? repository.getMemory(pendingId) : null;
   const observations = (proposal.consideredObservationIds || []).map((observationId) => {
     const observation = repository.getStateEvidenceObservation(agentId, observationId);
     if (!observation) return null;
@@ -296,12 +386,12 @@ function reportedStateDetail(repository, agentId, proposal) {
   }).filter(Boolean);
   return {
     writePreview: {
-      kind: clean(proposal.draft?.kind),
-      title: clean(proposal.draft?.title),
-      content: clean(proposal.draft?.content),
+      kind: clean(pending?.kind || proposal.draft?.kind),
+      title: clean(pending?.title || proposal.draft?.title),
+      content: clean(pending?.content || proposal.draft?.content),
       stateFamily: clean(proposal.state_family),
-      statePhase: clean(proposal.state_phase),
-      temporalState: clean(proposal.temporal_state),
+      statePhase: clean(pending?.state_phase || proposal.state_phase),
+      temporalState: clean(pending?.temporal_state || proposal.temporal_state),
       subjectRole: clean(proposal.subject_role),
       subjectKey: clean(proposal.subject_key),
       canonicalKey: clean(proposal.canonical_key),
@@ -309,7 +399,8 @@ function reportedStateDetail(repository, agentId, proposal) {
       proposedScopeKey: clean(proposal.proposedScopeKey),
       action: clean(proposal.action),
     },
-    currentState: compactMemory(memoryDetail(repository, agentId, proposal.previousMemoryId)),
+    currentState: compactMemory(previous),
+    appliedBeforeReview: Boolean(pending?.metadata?.reportedStateTransition),
     observations,
     evidence: uniqueEvidence(observations.flatMap((item) => item.sources)),
     members: [],
@@ -348,6 +439,24 @@ function structureDetail(repository, agentId, proposal) {
   };
 }
 
+function preferenceDetail(repository, agentId, proposal) {
+  const observations = (proposal.evidence || []).map(item => {
+    const detail = memoryDetail(repository, agentId, item.memoryId);
+    return { id: item.memoryId, signal: item.signal, direction: item.direction, confidence: item.confidence,
+      memory: compactMemory(detail), payload: item.label,
+      sources: (detail?.sources || []).filter(source => item.sourceIds.includes(source.id))
+        .map(source => evidenceSource(source, { kind: "source", memoryId: item.memoryId })) };
+  });
+  return {
+    writePreview: { kind: proposal.proposed_kind, title: proposal.title, content: proposal.content,
+      stateFamily: "preference", representationLayer: proposal.representation_layer,
+      proposedLevel: proposal.proposed_level, subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
+      canonicalKey: proposal.canonical_key, action: proposal.transition },
+    currentState: compactMemory(memoryDetail(repository, agentId, proposal.previousMemoryId)),
+    observations, evidence: uniqueEvidence(observations.flatMap(item => item.sources)), members: [], endpoints: null,
+  };
+}
+
 function relationDetail(repository, agentId, proposal) {
   const from = memoryDetail(repository, agentId, proposal.from_memory_id);
   const to = memoryDetail(repository, agentId, proposal.to_memory_id);
@@ -380,12 +489,16 @@ export function buildReviewProposalDetail({ repository, agentId, envelope }) {
   }
   const type = clean(envelope.type);
   const proposal = envelope.proposal;
-  const detail = type === "ingestion"
+  const detail = type === 'event-continuity'
+    ? eventContinuityReviewDetail(repository, agentId, proposal)
+    : type === "ingestion"
     ? ingestionReviewDetail(repository, agentId, proposal)
     : type === "maintenance-failure"
     ? maintenanceFailureDetail(repository, agentId, proposal)
     : type === "reported-state"
     ? reportedStateDetail(repository, agentId, proposal)
+    : type === "preference-state"
+    ? preferenceDetail(repository, agentId, proposal)
     : type === "structure"
       ? structureDetail(repository, agentId, proposal)
       : relationDetail(repository, agentId, proposal);

@@ -3,12 +3,22 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { currentEventSourceExecution } from '@suzu-memory/core';
 
 import {
   DEFAULT_PRICE_CATALOG,
   resolveCatalogModel,
 } from "./catalog.mjs";
 import { normalizeUsage } from "./calculator.mjs";
+
+const usageRecorders = new AsyncLocalStorage();
+
+// An embedding Host may own billing while standalone Memory keeps its ledger.
+export function withUsageRecorder(recorder, action) {
+  if (typeof recorder !== 'function' || typeof action !== 'function') throw new TypeError('Usage recorder and action are required.');
+  return usageRecorders.run(recorder, action);
+}
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -56,6 +66,22 @@ export function createUsageEvent(input = {}, catalog = DEFAULT_PRICE_CATALOG) {
 export async function appendUsageEvent(ledgerPath, input, catalog = DEFAULT_PRICE_CATALOG) {
   const destination = path.resolve(ledgerPath);
   const event = createUsageEvent(input, catalog);
+  const recorder = usageRecorders.getStore();
+  if (recorder) {
+    await recorder(event);
+    return event;
+  }
+  const execution = currentEventSourceExecution();
+  if (execution?.sourceScoped) {
+    // Product Event accounting retains counters and routing IDs, never provider
+    // echoes or diagnostic bodies whose source dependencies cannot be verified.
+    event.metadata = {};
+    event.usage = Object.fromEntries(Object.entries(event.usage).filter(([, value]) => typeof value === 'number' && Number.isFinite(value)));
+    execution.assertCurrent();
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.appendFileSync(destination, `${JSON.stringify(event)}\n`, 'utf8');
+    return event;
+  }
   await fsp.mkdir(path.dirname(destination), { recursive: true });
   await fsp.appendFile(destination, `${JSON.stringify(event)}\n`, "utf8");
   return event;

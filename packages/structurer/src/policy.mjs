@@ -1,3 +1,5 @@
+import { memoryWorldsCompatible } from '@suzu-memory/core';
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -35,6 +37,18 @@ function deriveEpisodeBoundary(members) {
   };
 }
 
+export function canProposeStructure(snapshot, {
+  minimumTopicEvidenceDates = 2,
+  minimumEpisodeTimedMembers = 2,
+} = {}) {
+  const memories = snapshot.currentMemories;
+  if (snapshot.candidateContainers.some(container => memories.some(memory => !container.memberIds.includes(memory.id)))) return true;
+  const timed = memories.filter(memory => datePart(memory.eventDate) || datePart(memory.eventStart));
+  if (timed.length >= Math.max(2, Math.trunc(Number(minimumEpisodeTimedMembers) || 2))) return true;
+  return new Set(memories.map(temporalEvidence).filter(Boolean)).size
+    >= Math.max(2, Math.trunc(Number(minimumTopicEvidenceDates) || 2));
+}
+
 export function enforceStructureCandidatePolicy(candidate, snapshot, {
   minimumTopicEvidenceDates = 2,
   minimumEpisodeTimedMembers = 2,
@@ -49,6 +63,10 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   )];
   if (!memberIds.length || memberIds.some((id) => !currentById.has(id))) {
     throw new Error("Every structure member must come from currentMemories in this bounded snapshot.");
+  }
+  const scopedMembers = memberIds.map(id => currentById.get(id));
+  if (scopedMembers.some(memory => !memoryWorldsCompatible(scopedMembers[0], memory))) {
+    throw new Error("Structure members must share their reality and world scope.");
   }
   const operation = clean(candidate.operation);
   const kind = clean(candidate.kind);
@@ -77,6 +95,7 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
     if (!target || target.kind !== kind) {
       throw new Error("Attach target must be a matching candidateContainer in this bounded snapshot.");
     }
+    if (!memoryWorldsCompatible(target, scopedMembers[0])) throw new Error("Structure target is outside its members' world scope.");
     return enforceRetrospectiveParticipation({ ...candidate, memberIds });
   }
   if (operation !== "create") {

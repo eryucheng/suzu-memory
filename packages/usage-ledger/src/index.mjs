@@ -17,4 +17,5 @@ export {
   appendUsageEvent,
   createUsageEvent,
   readUsageEvents,
+  withUsageRecorder,
 } from "./store.mjs";

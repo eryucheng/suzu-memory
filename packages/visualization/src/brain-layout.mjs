@@ -14,6 +14,8 @@ const STRUCTURAL_RELATIONS = new Set([
   "part_of_episode",
   "supports_topic",
   "about_subject",
+  "observed_by",
+  "remembered_by",
   "belongs_to_relationship",
   "member_of_relationship",
 ]);
@@ -37,6 +39,8 @@ const RELATION_FAMILIES = Object.freeze({
   shares_entity: "entity",
   associated_with: "associative",
   about_subject: "actor",
+  observed_by: "actor",
+  remembered_by: "actor",
   belongs_to_relationship: "relationship",
   member_of_relationship: "relationship",
 });
@@ -275,6 +279,11 @@ function initialPositions(nodes, cachedPositions) {
   const existingIds = new Set();
   for (const node of nodes) {
     const cached = cachedPositions[node.id];
+    if (node.isOwner) {
+      positions.set(node.id, { x: 0, y: 0, z: 0 });
+      if (positionValid(cached)) existingIds.add(node.id);
+      continue;
+    }
     if (!positionValid(cached)) continue;
     positions.set(node.id, constrainToBrain({
       x: Number(cached.x),
@@ -345,7 +354,8 @@ export function loadStructuredMemoryGraph(repository, agentId) {
            reality, evidence_mode,
            subject_role, subject_key, temporal_state, valid_from, valid_to,
            representation_layer, state_family, state_phase,
-           json_extract(metadata_json, '$.structureReviewState') AS structure_review_state
+           json_extract(metadata_json, '$.structureReviewState') AS structure_review_state,
+           json_extract(metadata_json, '$.subjectName') AS subject_name
     FROM memory_nodes
     WHERE agent_id = ? AND status = 'active' AND kind <> 'utterance'
     ORDER BY COALESCE(event_date, event_start, recorded_at), id
@@ -367,6 +377,7 @@ export function loadStructuredMemoryGraph(repository, agentId) {
       evidenceMode: row.evidence_mode || "unknown",
       subjectRole: row.subject_role || "unknown",
       subjectKey: row.subject_key || "",
+      subjectName: clean(row.subject_name),
       temporalState: row.temporal_state || "unknown",
       validFrom: row.valid_from || "",
       validTo: row.valid_to || "",
@@ -402,254 +413,89 @@ export function loadStructuredMemoryGraph(repository, agentId) {
     structural: STRUCTURAL_RELATIONS.has(row.relation),
   }));
   if (topologyTablesAvailable(repository.database)) {
-    const actorBindings = repository.database.prepare(`
-      SELECT actor_role, actor_key, display_name
-      FROM actor_entity_bindings
-      WHERE agent_id = ?
-      ORDER BY actor_role ASC, actor_key ASC
-    `).all(normalizedAgentId);
-    const user = actorBindings.find((binding) => clean(binding.actor_role) === "user");
-    const agent = actorBindings.find((binding) => (
-      clean(binding.actor_role) === "agent"
-      && clean(binding.actor_key) === normalizedAgentId
-    )) || actorBindings.find((binding) => clean(binding.actor_role) === "agent");
-    const relationships = repository.database.prepare(`
-      SELECT id, label,
-             json_extract(metadata_json, '$.companionActorKey') AS companion_actor_key
-      FROM relationships
-      WHERE agent_id = ? AND status = 'active'
-      ORDER BY updated_at DESC, id ASC
-    `).all(normalizedAgentId);
-    const primaryRelationship = relationships.find((relationship) => (
-      clean(relationship.companion_actor_key) === normalizedAgentId
-    )) || relationships[0] || null;
-    const roots = {
-      user: user ? topologyNodeId("user") : "",
-      agent: agent ? topologyNodeId("agent") : "",
-      relationship: primaryRelationship ? topologyNodeId("relationship") : "",
-    };
-    const userName = clean(user?.display_name) || "当前用户";
-    const agentName = clean(agent?.display_name) || "当前 Agent";
-    if (roots.user) {
-      nodes.push({
-        id: roots.user,
-        graphNodeType: "actor",
-        actorRole: "user",
-        kind: "actor_entity",
-        layer: "topology",
-        title: "我",
-        preview: userName,
-        confidence: 1,
-        importance: 1,
-        status: "active",
-      });
+    const actorBindings = repository.listActorEntityBindings(normalizedAgentId);
+    const identityKey = (role, key) => JSON.stringify([clean(role), clean(key)]);
+    const bindings = new Map(actorBindings.map(binding => [identityKey(binding.actor_role, binding.actor_key), binding]));
+    // Select a stable representative for each confirmed person, independent of memory order.
+    const entityBindings = new Map();
+    for (const binding of actorBindings) {
+      if (!entityBindings.has(binding.entity_id)
+        || (binding.actor_role === 'agent' && binding.actor_key === normalizedAgentId)) {
+        entityBindings.set(binding.entity_id, binding);
+      }
     }
-    if (roots.agent) {
-      nodes.push({
-        id: roots.agent,
-        graphNodeType: "actor",
-        actorRole: "agent",
-        kind: "actor_entity",
-        layer: "topology",
-        title: "Agent",
-        preview: agentName,
-        confidence: 1,
-        importance: 1,
-        status: "active",
-      });
-    }
-    if (roots.relationship) {
-      nodes.push({
-        id: roots.relationship,
-        graphNodeType: "relationship",
-        kind: "relationship_context",
-        layer: "topology",
-        title: clean(primaryRelationship.label) || "关系",
-        preview: `${userName} 与 ${agentName}`,
-        confidence: 1,
-        importance: 1,
-        status: "active",
-      });
-    }
-
-    const memoryNodeIds = new Set(memoryNodes.map((node) => node.id));
-    const actorRootByRole = {
-      user: roots.user,
-      agent: roots.agent,
-    };
+    const actors = new Map();
     const topologyEdgeKeys = new Set();
-    const addTopologyEdge = ({
-      id,
-      source,
-      target,
-      relation,
-      weight = 0.82,
-      confidence = 1,
-    }) => {
-      if (!source || !target) return false;
-      const key = `${source}\u001f${target}\u001f${relation}`;
-      if (topologyEdgeKeys.has(key)) return false;
+    function actorNode(role, key, name = '') {
+      if (!['user', 'agent', 'other'].includes(role) || !clean(key)) return null;
+      const binding = bindings.get(identityKey(role, key));
+      const identity = binding ? JSON.stringify(['entity', binding.entity_id]) : JSON.stringify(['actor', role, key]);
+      if (actors.has(identity)) return actors.get(identity);
+      const representative = binding ? entityBindings.get(binding.entity_id) : null;
+      role = representative?.actor_role || role;
+      key = representative?.actor_key || key;
+      const isOwner = role === 'agent' && key === normalizedAgentId;
+      const displayName = clean(representative?.display_name) || clean(name) || (isOwner ? '记忆主体' : '未命名人物');
+      const node = { id: isOwner ? topologyNodeId('agent') : topologyNodeId(`actor:${encodeURIComponent(role)}:${encodeURIComponent(key)}`),
+        graphNodeType: 'actor', actorRole: role, actorKey: key, entityId: binding?.entity_id || '', isOwner,
+        kind: 'actor_entity', layer: 'topology', title: isOwner ? '我' : displayName,
+        preview: isOwner ? displayName : `我记忆中的${displayName}：与这个人有关的经历、看法和约定。`,
+        confidence: 1, importance: 1, status: 'active' };
+      actors.set(identity, node);
+      nodes.push(node);
+      return node;
+    }
+    function addTopologyEdge(source, target, relation, confidence = 1) {
+      if (!source || !target) return;
+      const key = JSON.stringify([source, target, relation]);
+      if (topologyEdgeKeys.has(key)) return;
       topologyEdgeKeys.add(key);
-      edges.push({
-        id,
-        source,
-        target,
-        relation,
-        direction: "directed",
-        weight,
-        confidence,
-        visualFamily: relationVisualFamily(relation),
-        structural: true,
-      });
-      return true;
-    };
-
-    // `subject_role` 只能表达一个主语。新版抽取还会保存说话者、参与者、经历者等
-    // `memory_actor_roles`；大脑里的“我 / Agent / 关系”应按这些真实角色连线，
-    // 而不是退回旧的实体关联表或凭固定身份造关联。
-    const roleRootsByMemory = new Map();
-    const sharedRoleMemoryIds = new Set();
+      edges.push({ id: `topology:edge:${key}`, source, target, relation, direction: 'directed',
+        weight: 0.82, confidence: finite(confidence, 1), visualFamily: relationVisualFamily(relation), structural: true });
+    }
+    const owner = actorNode('agent', normalizedAgentId);
+    const memoryNodeIds = new Set(memoryNodes.map(node => node.id));
     if (memoryActorRolesAvailable(repository.database)) {
-      const actorRoles = repository.database.prepare(`
-        SELECT role.memory_id, role.actor_role, role.confidence
+      const roles = repository.database.prepare(`
+        SELECT role.memory_id, role.actor_role, role.actor_key, role.role, role.confidence,
+               json_extract(role.metadata_json, '$.actorName') AS actor_name
         FROM memory_actor_roles AS role
-        JOIN memory_nodes AS memory
-          ON memory.id = role.memory_id
-         AND memory.agent_id = role.agent_id
-        WHERE role.agent_id = ?
-          AND memory.status = 'active'
-          AND memory.kind <> 'utterance'
-        ORDER BY role.memory_id, role.actor_role, role.role, role.is_primary DESC
+        JOIN memory_nodes AS memory ON memory.id = role.memory_id AND memory.agent_id = role.agent_id
+        WHERE role.agent_id = ? AND memory.status = 'active' AND memory.kind <> 'utterance'
+        ORDER BY role.memory_id, role.actor_role, role.actor_key, role.role
       `).all(normalizedAgentId);
-      for (const actorRole of actorRoles) {
-        if (!memoryNodeIds.has(actorRole.memory_id)) continue;
-        const normalizedActorRole = clean(actorRole.actor_role);
-        if (normalizedActorRole === "shared") {
-          sharedRoleMemoryIds.add(actorRole.memory_id);
-          continue;
-        }
-        const rootId = actorRootByRole[normalizedActorRole];
-        if (!rootId) continue;
-        const rootIds = roleRootsByMemory.get(actorRole.memory_id) || new Set();
-        rootIds.add(rootId);
-        roleRootsByMemory.set(actorRole.memory_id, rootIds);
-        addTopologyEdge({
-          id: `topology:actor-role:${actorRole.memory_id}:${rootId}`,
-          source: actorRole.memory_id,
-          target: rootId,
-          relation: "about_subject",
-          weight: 0.82,
-          confidence: finite(actorRole.confidence, 1),
-        });
+      for (const role of roles) {
+        const actor = actorNode(role.actor_role, role.actor_key, role.actor_name);
+        if (actor) addTopologyEdge(role.memory_id, actor.id, role.role === 'observer' ? 'observed_by' : 'about_subject', role.confidence);
       }
     }
     for (const memory of memoryNodes) {
-      const subjectRole = clean(memory.subjectRole);
-      if (subjectRole === "shared") {
-        sharedRoleMemoryIds.add(memory.id);
-        continue;
-      }
-      const rootId = actorRootByRole[subjectRole];
-      // 旧库没有角色表、或者新版记录没有可用角色时，仍保留旧主语映射。
-      if (rootId && !roleRootsByMemory.get(memory.id)?.has(rootId)) {
-        addTopologyEdge({
-          id: `topology:subject:${memory.id}:${rootId}`,
-          source: memory.id,
-          target: rootId,
-          relation: "about_subject",
-        });
-      }
+      const actor = actorNode(memory.subjectRole, memory.subjectKey, memory.subjectName);
+      if (actor) addTopologyEdge(memory.id, actor.id, 'about_subject');
     }
-
-    if (roots.relationship) {
-      const relationshipMemberships = repository.database.prepare(`
-        SELECT membership.memory_id, membership.membership_type,
-               membership.confidence
-        FROM memory_relationship_memberships AS membership
-        JOIN memory_nodes AS memory
-          ON memory.id = membership.memory_id
-         AND memory.agent_id = membership.agent_id
-        JOIN relationships AS relationship
-          ON relationship.id = membership.relationship_id
-         AND relationship.agent_id = membership.agent_id
-        WHERE membership.agent_id = ?
-          AND memory.status = 'active'
-          AND memory.kind <> 'utterance'
-          AND relationship.status = 'active'
-        ORDER BY membership.relationship_id, membership.memory_id, membership.membership_type
-      `).all(normalizedAgentId);
-      const relationshipMemoryIds = new Set();
-      for (const memoryId of sharedRoleMemoryIds) {
-        relationshipMemoryIds.add(memoryId);
-        addTopologyEdge({
-          id: `topology:relationship-shared:${memoryId}`,
-          source: memoryId,
-          target: roots.relationship,
-          relation: "belongs_to_relationship",
-          weight: 0.82,
-        });
-      }
-      // 同一条记忆同时涉及用户与 Agent 时，它本身就是这段关系的内容。
-      // 这条边来自真实角色记录，补足尚未跑到关系成员同步的新版数据。
-      for (const [memoryId, rootIds] of roleRootsByMemory) {
-        if (!rootIds.has(roots.user) || !rootIds.has(roots.agent)) continue;
-        relationshipMemoryIds.add(memoryId);
-        addTopologyEdge({
-          id: `topology:relationship-roles:${memoryId}`,
-          source: memoryId,
-          target: roots.relationship,
-          relation: "belongs_to_relationship",
-          weight: 0.82,
-        });
-      }
-      for (const membership of relationshipMemberships) {
+    const memberships = repository.database.prepare(`
+      SELECT membership.memory_id, membership.relationship_id, membership.confidence
+      FROM memory_relationship_memberships AS membership
+      JOIN memory_nodes AS memory ON memory.id = membership.memory_id AND memory.agent_id = membership.agent_id
+      WHERE membership.agent_id = ? AND memory.status = 'active' AND memory.kind <> 'utterance'
+      ORDER BY membership.relationship_id, membership.memory_id
+    `).all(normalizedAgentId);
+    const usedRelationships = new Set(memberships.map(membership => membership.relationship_id));
+    for (const relationship of repository.listRelationships(normalizedAgentId)) {
+      if (!usedRelationships.has(relationship.id)) continue;
+      const members = relationship.members.flatMap(member => actorBindings
+        .filter(binding => binding.entity_id === member.entity_id)
+        .map(binding => actorNode(binding.actor_role, binding.actor_key, binding.display_name)));
+      const memberNodes = [...new Map(members.filter(Boolean).map(node => [node.id, node])).values()];
+      // Relationship membership supplies person links, not another visual hub.
+      // The same memory node can belong to several people without duplication.
+      for (const membership of memberships.filter(item => item.relationship_id === relationship.id)) {
         if (!memoryNodeIds.has(membership.memory_id)) continue;
-        relationshipMemoryIds.add(membership.memory_id);
-        addTopologyEdge({
-          id: `topology:relationship:${membership.memory_id}`,
-          source: membership.memory_id,
-          target: roots.relationship,
-          relation: "belongs_to_relationship",
-          weight: finite(membership.confidence, 1),
-          confidence: finite(membership.confidence, 1),
-        });
-      }
-      for (const memory of memoryNodes) {
-        if (
-          relationshipMemoryIds.has(memory.id)
-          || (clean(memory.kind) !== "relationship" && clean(memory.stateFamily) !== "relationship")
-        ) continue;
-        addTopologyEdge({
-          id: `topology:relationship-state:${memory.id}`,
-          source: memory.id,
-          target: roots.relationship,
-          relation: "belongs_to_relationship",
-        });
-      }
-
-      const memberRoles = new Set(primaryRelationship
-        ? repository.database.prepare(`
-          SELECT binding.actor_role
-          FROM relationship_members AS member
-          JOIN actor_entity_bindings AS binding
-            ON binding.agent_id = member.agent_id
-           AND binding.entity_id = member.entity_id
-          WHERE member.agent_id = ? AND member.relationship_id = ?
-        `).all(normalizedAgentId, primaryRelationship.id).map((row) => clean(row.actor_role))
-        : []);
-      for (const actorRole of memberRoles) {
-        const rootId = actorRootByRole[actorRole];
-        if (!rootId || actorRole === "shared") continue;
-        addTopologyEdge({
-          id: `topology:relationship-member:${actorRole}`,
-          source: rootId,
-          target: roots.relationship,
-          relation: "member_of_relationship",
-          weight: 1,
-          confidence: 1,
-        });
+        for (const member of memberNodes) addTopologyEdge(membership.memory_id, member.id, 'about_subject', membership.confidence);
       }
     }
+    // This is a view of the owner's memory, not a claim about social affiliation.
+    for (const actor of actors.values()) if (!actor.isOwner) addTopologyEdge(actor.id, owner.id, 'remembered_by');
   }
   for (const node of nodes) {
     Object.assign(node, nodeVisualProfile(node));
@@ -665,7 +511,7 @@ export function loadStructuredMemoryGraph(repository, agentId) {
     const target = nodeById.get(edge.target);
     if (source) source.connectionCount += 1;
     if (target) target.connectionCount += 1;
-    if (edge.structural && source && target?.visualTier === "major") {
+    if (edge.structural && source && target?.visualTier === "major" && !source.containerIds.includes(target.id)) {
       source.containerIds.push(target.id);
       target.memberCount += 1;
     }

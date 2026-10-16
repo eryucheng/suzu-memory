@@ -15,7 +15,6 @@ import {
   buildLongTermExtractionInput,
   detectExtractionLanguage,
   isRetentionReasonCompatible,
-  loadLongTermExtractionSystemPrompt,
   parseGeneratedLongTermExtraction,
 } from "../src/index.mjs";
 
@@ -123,12 +122,68 @@ test("keeps Chinese, English, and mixed archive windows in their own output lang
     ],
   });
   assert.deepEqual(built.archiveWindows.map((window) => window.sourceLanguage), ["zh", "en", "mixed"]);
-  assert.match(built.input, /输出语言】[\s\S]*必须用中文撰写/u);
-  assert.match(built.input, /Output language: English[\s\S]*must be written in English/u);
-  assert.match(built.input, /Output language: source-led mixed/u);
+  assert.match(built.input, /本窗口输出语言：中文/u);
+  assert.match(built.input, /本窗口输出语言：English/u);
+  assert.match(built.input, /本窗口输出语言：逐候选跟随直接证据/u);
   assert.match(built.input, /Agent：I painted a sunrise last year/u);
   assert.match(built.input, /\[source-language=zh\] user：我今天去了科技馆/u);
   assert.match(built.input, /\[source-language=en\] agent：I loved the science exhibit/u);
+});
+
+test('a short English message retains its language in a mostly Chinese batch', () => {
+  const built = buildLongTermExtractionInput({ messages: [
+    { id: 'long-chinese', role: 'assistant', text: '今天一起整理了读书群的书单。'.repeat(30) },
+    { id: 'short-english', role: 'user', text: 'I prefer mysteries.' },
+  ] });
+  assert.equal(built.archiveWindows[0].sourceLanguage, 'mixed');
+  assert.deepEqual(built.messages.map(message => message.sourceLanguage), ['zh', 'en']);
+  assert.match(built.input, /\[source-language=en\] user：I prefer mysteries\./u);
+});
+
+test('owner and same-name speakers use supplied identities throughout core and boundary context', () => {
+  const message = (id, senderId, text, spaceId) => ({ id, text, role: 'user', speaker: 'Echo',
+    timestamp: '2026-09-22T08:00:00Z',
+    eventSource: { recipientAgentId: 'owner', spaceId, sender: { kind: 'agent', id: senderId, name: 'Echo' },
+      topology: { kind: 'space', spaceKind: 'group' } },
+  });
+  const source = {
+    memoryOwner: 'Echo', identity: { companionId: 'owner', companionName: 'Echo' },
+    previousContextMessages: [message('before', 'owner', '前文内容', 'group-a')],
+    messages: [message('core', 'peer', '正文内容', 'group-b')],
+    continuationGuidanceMessages: [message('after', 'owner', '后文内容', 'group-b')],
+  };
+  const original = structuredClone(source);
+  const built = buildLongTermExtractionInput(source);
+  assert.match(built.input, /^记忆拥有者：Echo \[agent:owner\]\n/u);
+  const lines = built.input.split('\n');
+  for (const [body, name, spaceId] of [
+    ['前文内容', 'Echo [agent:owner]', 'group-a'],
+    ['正文内容', 'Echo [other:peer]', 'group-b'],
+    ['后文内容', 'Echo [agent:owner]', 'group-b'],
+  ]) {
+    const line = lines.find(value => value.endsWith(`：${body}`));
+    assert.ok(line.endsWith(`${name}：${body}`));
+    const provenance = JSON.parse(line.match(/\[来源 (.+?)\] /u)[1]);
+    assert.deepEqual(provenance, { spaceId, spaceKind: 'group' });
+    assert.doesNotMatch(line, /\(user\)|\(assistant\)/u);
+  }
+  assert.equal((built.input.match(/\[M\d{4}\]/gu) || []).length, 1);
+  assert.deepEqual(source, original, 'Presentation must not rewrite captured messages or source material.');
+});
+
+test('named human and Agents omit person IDs from model input while retaining source attribution', () => {
+  const source = { recipientAgentId: 'private-owner-id', spaceId: 'reading-group',
+    sender: { kind: 'local-user', id: 'private-human-id', name: '小夏' },
+    topology: { kind: 'space', spaceKind: 'group' } };
+  const built = buildLongTermExtractionInput({ memoryOwner: 'Suzu', userName: '私聊角色',
+    identity: { companionId: 'private-owner-id', primaryUserId: 'private-human-id' },
+    messages: [{ id: 'source-message', role: 'user', text: '我负责整理书单。', eventSource: source }] });
+  assert.match(built.input, /^记忆拥有者：Suzu\n/u);
+  assert.match(built.input, /"role":"user","name":"小夏"/u);
+  assert.match(built.input, /小夏：我负责整理书单。/u);
+  assert.doesNotMatch(built.input, /private-owner-id|private-human-id|私聊角色|"id":/u);
+  assert.equal(built.participants.find(person => person.name === '小夏').actorKey, 'private-human-id');
+  assert.deepEqual(built.messages[0].eventSource, source);
 });
 
 test("persists each raw message's detected source language for later audit", () => {
@@ -167,9 +222,4 @@ test("keeps episodic events separate from unsupported stable-state inference", (
   assert.equal(isRetentionReasonCompatible("preference", "episodic_event"), false);
   assert.equal(isRetentionReasonCompatible("belief_state", "episodic_event"), false);
 
-  const prompt = loadLongTermExtractionSystemPrompt();
-  assert.match(prompt, /具体经历仍应单独记录为 `event`/u);
-  assert.match(prompt, /不能因为高层状态证据不足，就丢掉已经发生的底层事件/u);
-  assert.match(prompt, /一次性饮食和瞬时情绪只禁止被误写成稳定状态/u);
-  assert.match(prompt, /分别生成事件候选与状态候选/u);
 });

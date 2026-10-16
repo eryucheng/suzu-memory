@@ -14,6 +14,8 @@
     "@suzu-memory/runtime": "0.1.0",
     "@suzu-memory/usage-ledger": "0.1.0",
     "@suzu-memory/core": "0.1.0",
+    "@suzu-memory/embedding-indexer": "0.1.0",
+    "@suzu-memory/retriever": "0.1.0",
     "@suzu-memory/extraction": "0.1.0",
     "@suzu-memory/providers": "0.1.0"
   },

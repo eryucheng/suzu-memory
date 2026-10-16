@@ -1,3 +1,5 @@
+import { analysisSourceMaterial } from './source-material.mjs';
+import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -17,10 +19,6 @@ const DEFAULT_PROMPT_DIRECTORY = path.join(PACKAGE_ROOT, "resources");
 const CAPABILITY_MEMORY_KINDS = new Set(["fact", "derived_hypothesis"]);
 
 function clean(value) { return String(value ?? "").trim(); }
-function clip(value, maximum = 1200) {
-  const text = clean(value);
-  return text.length <= maximum ? text : `${text.slice(0, Math.max(0, maximum - 1))}…`;
-}
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))];
 }
@@ -41,7 +39,7 @@ function currentStateView(repository, agentId, subjectRole, subjectKey, canonica
     throw new Error("Capability canonicalKey currently resolves to a non-capability-compatible memory kind.");
   }
   return {
-    id: current.id, kind: current.kind, content: clip(current.content),
+    id: current.id, kind: current.kind, content: String(current.content ?? ""),
     subjectRole: current.subject_role, subjectKey: current.subject_key,
     canonicalKey: current.canonical_key, representationLayer: current.representation_layer,
     temporalState: current.temporal_state,
@@ -110,6 +108,7 @@ async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, ag
     });
     return "";
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return `费用流水写入失败：${error.message}`;
   }
 }
@@ -117,11 +116,12 @@ async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, ag
 async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
   const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8")
     .replace(/^\uFEFF/u, "").trim();
+  const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildCapabilityGenerationInput(snapshot, definition);
   let generation = null;
   try {
     generation = await generator({ input, systemPrompt, schema: definition.schema,
-      schemaName: definition.schemaName, stateFamily: "capability", analyzerRole: definition.role });
+      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}), stateFamily: "capability", analyzerRole: definition.role });
     const parsed = parseCapabilityGeneration(definition.role, generation?.output, { maximumAnalyses });
     const accepted = [];
     const rejected = [];
@@ -132,12 +132,14 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
         accepted.push(enforceAnalysisBoundary(definition.role, candidate, snapshot));
         seen.add(candidate.memoryId);
       } catch (error) {
+      assertEventSourceExecutionCurrent();
         rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
       }
     }
     return { definition, input, generation, analyses: accepted, rejected,
       status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" };
   } catch (error) {
+      assertEventSourceExecutionCurrent();
     return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message };
   }
 }
@@ -341,6 +343,7 @@ export async function evaluateCapabilityEvidence({
       modelCanChooseStateAction: false, oneResultCannotCreateStableCapability: true,
       dependenciesMustBePreserved: true },
   };
+  snapshotOptions.prepareStateSnapshot?.(snapshot);
   const snapshotLimit = Math.min(250_000, Math.max(4_000,
     Math.trunc(Number(snapshotOptions.maxSnapshotChars) || 64_000)));
   if (JSON.stringify(snapshot).length > snapshotLimit) {
@@ -364,14 +367,14 @@ export async function evaluateCapabilityEvidence({
     const warning = await appendAnalyzerUsage({ usageLedgerPath, generation: invocation.generation,
       definition: invocation.definition, agentId: clean(agentId), batchId });
     if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
       agentId: clean(agentId), batchId, stateFamily: "capability", analyzerRole: invocation.definition.role,
       subjectRole: snapshot.target.subjectRole, subjectKey: snapshot.target.subjectKey,
       canonicalKey: snapshot.target.canonicalKey,
       provider: clean(invocation.generation?.metadata?.provider) || "unreported",
       model: clean(invocation.generation?.model) || "unreported",
       promptVersion: invocation.definition.promptVersion, schemaVersion: invocation.definition.schemaName,
-      inputHash: createHash("sha256").update(invocation.input).digest("hex"), status: invocation.status,
+      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"), status: invocation.status,
       memoryIds: snapshot.memories.map((memory) => memory.id), sourceIds,
       output: invocation.generation?.output ?? {}, rejected: invocation.rejected,
       usage: invocation.generation?.usage || {},

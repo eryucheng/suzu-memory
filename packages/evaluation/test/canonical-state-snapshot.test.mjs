@@ -6,7 +6,7 @@ import { buildCanonicalStateEvidenceSnapshot } from "../src/index.mjs";
 
 const KEY = "user:value:careful-work";
 
-function setup({ withCurrent = false } = {}) {
+function setup({ withCurrent = false, currentContent = "用户重视把重要工作做仔细。" } = {}) {
   const database = openMemoryDatabase(":memory:");
   const repository = new MemoryRepository(database);
   let current = null;
@@ -16,7 +16,7 @@ function setup({ withCurrent = false } = {}) {
       agentId: "agent-test",
       kind: "derived_hypothesis",
       layer: "semantic",
-      content: "用户重视把重要工作做仔细。",
+      content: currentContent,
       subjectRole: "user",
       subjectKey: "user",
       canonicalKey: KEY,
@@ -44,6 +44,7 @@ function addObservation(repository, {
   effectiveDirection = claimedDirection,
   excludedReason = "",
   sourceContent = `原始证据 ${id}`,
+  memoryContent = `结构化证据 ${id}`,
   observedAt = "2026-07-10T12:00:00.000Z",
   memoryKind = "event",
   evidenceMode = "explicit",
@@ -63,7 +64,7 @@ function addObservation(repository, {
     agentId: "agent-test",
     kind: memoryKind,
     layer: memoryKind === "utterance" ? "evidence" : "episodic",
-    content: `结构化证据 ${id}`,
+    content: memoryContent,
     subjectRole: "user",
     subjectKey: "user",
     reality: "real",
@@ -286,4 +287,20 @@ test("treats only explicitly selected request observations as a virtual explicit
   assert.equal(unselectedView.memory.requestBoundExplicit, false);
   assert.equal(fixture.repository.getMemory(selected.memory.id).evidence_mode, "imported");
   fixture.database.close();
+});
+
+test("reviews complete long evidence and current state within the aggregate budget", (t) => {
+  const content = "先前经历的完整背景。".repeat(1000) + "最后说明：只在周末适用。";
+  const fixture = setup({ withCurrent: true, currentContent: content });
+  t.after(() => fixture.database.close());
+  const evidence = addObservation(fixture.repository, { id: "complete-long", sourceContent: content, memoryContent: content });
+  fixture.repository.upsertEdge({
+    agentId: "agent-test", fromMemoryId: fixture.current.id, toMemoryId: evidence.memory.id,
+    relation: "supported_by", direction: "directed", weight: 0.9, confidence: 0.9, provenance: "test",
+  });
+  const { snapshot } = build(fixture.repository);
+  assert.equal(snapshot.currentState.content, content);
+  assert.equal(snapshot.observations[0].memory.content, content);
+  assert.equal(snapshot.observations[0].sources[0].content, content);
+  assert.throws(() => build(fixture.repository, { maxSnapshotChars: 20_000 }), /complete 20000-character budget/);
 });
