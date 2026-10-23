@@ -168,6 +168,7 @@ export function buildPreferenceCanonicalReviewSnapshot({
     return { status: "skipped", reason: "no-qualified-directional-evidence", snapshot: null };
   }
   const preview = simulatePreferenceFormation({
+    timeZone: repository.timeZone,
     subjectRole: normalizedSubjectRole,
     subjectKey: normalizedSubjectKey,
     canonicalKey: normalizedCanonicalKey,

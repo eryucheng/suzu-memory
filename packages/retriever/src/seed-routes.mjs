@@ -1,5 +1,5 @@
-import { lexicalScore } from "./query.mjs";
-import { dateKeyInTimeZone } from '@suzu-memory/core';
+import { lexicalScore, prepareLexicalQuery, recallCorePhrases } from "./query.mjs";
+import { memoryCalendarDate } from './temporal-ranking.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -122,7 +122,7 @@ export function applySubjectConstraint(candidates, constraint) {
   return { candidates: values, rejectedMemoryIds };
 }
 
-function lexicalRoute(lexical, options) {
+export function lexicalRoute(lexical, options) {
   const magnitude = Math.min(
     1,
     lexical.score / Math.max(1, Number(options.strongLexicalScore) * 3),
@@ -242,13 +242,15 @@ export function buildOrdinarySeedCandidates({
   recallReactivationAdjustments = new Map(),
   naturalDecayAdjustments = new Map(),
   naturalDecayBypassMemoryIds = new Set(),
+  naturalDecaySpecificityByMemory = new Map(),
   affectiveAdjustments = new Map(),
+  preparedQuery = prepareLexicalQuery(query),
 }) {
   const values = [];
   for (const node of nodes) {
     if (!memoryAllowed(node, intent)) continue;
     const lexical = lexicalScore(
-      query,
+      preparedQuery,
       [node.event_date || "", node.title || "", node.content].filter(Boolean).join("\n"),
     );
     const bm25 = bm25Scores.get(node.id) || null;
@@ -328,6 +330,7 @@ export function buildOrdinarySeedCandidates({
           ...storedNaturalDecay,
           bypassed: true,
           bypassReason: "high-specificity-match",
+          specificity: naturalDecaySpecificityByMemory.get(node.id),
           scoreAdjustment: 0,
         })
       : storedNaturalDecay;
@@ -385,10 +388,8 @@ export function buildEpisodicEvidenceSeedCandidates({
   ...routes
 }) {
   const inTemporalRange = (node) => {
-    if (!temporal?.matched) return true;
-    const eventDate = clean(node.event_date)
-      || dateKeyInTimeZone(node.event_start, options.timeZone)
-      || dateKeyInTimeZone(node.recorded_at, options.timeZone);
+    if (!temporal?.matched || temporal.precision !== 'exact' || recallCorePhrases(temporal.remainingQuery).length) return true;
+    const eventDate = memoryCalendarDate(node, options.timeZone);
     return Boolean(
       eventDate
       && eventDate >= clean(temporal.startDate)

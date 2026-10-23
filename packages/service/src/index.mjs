@@ -46,6 +46,7 @@ import {
 import {
   normalizeRecallReactivationOptions,
   retrieveMemories,
+  closeRetrievalWorker,
 } from "@suzu-memory/retriever";
 import {
   resolveAgentDataRoot,
@@ -281,11 +282,13 @@ export class MemoryService {
     return this.paths.agentId;
   }
 
+  close() { return closeRetrievalWorker(this.paths.databasePath); }
+
   initialize() {
     fs.mkdirSync(this.paths.memoryRoot, { recursive: true });
     const database = openMemoryDatabase(this.paths.databasePath);
     try {
-      const repository = new MemoryRepository(database);
+      const repository = new MemoryRepository(database, { timeZone: this.defaults.retrieval.timeZone });
       recoverMemoryEventSourceCleanups(this, repository);
       const identityStructure = ensureCompanionRelationshipStructure({
         createPrimaryRelationship: this.defaults.createPrimaryRelationship,
@@ -343,7 +346,7 @@ export class MemoryService {
     this.ensureInitialized();
     const database = openMemoryDatabase(this.paths.databasePath, { readOnly });
     try {
-      const repository = new MemoryRepository(database);
+      const repository = new MemoryRepository(database, { timeZone: this.defaults.retrieval.timeZone });
       const result = withEventSourceExecution(repository, () => callback(repository, database), { sourceScope, signal });
       if (result && typeof result.then === "function") {
         return Promise.resolve(result).finally(() => closeDatabase(database));
@@ -763,6 +766,10 @@ export class MemoryService {
           inputBatches.push(result);
           if (!['processed', 'quarantined'].includes(result.status)) break;
         }
+      }
+      if (chunkPolicy?.maximumCoreCharacters != null && inputBatches.at(-1)?.status === 'waiting'
+        && !inputBatches.some(batch => ['processed', 'quarantined'].includes(batch.status))) {
+        return { status: 'waiting', inputBatches, failures, tasks: [] };
       }
       let semantic;
       try {
@@ -1429,6 +1436,7 @@ export class MemoryService {
         allowCrossWorld: Boolean(allowCrossWorld || requestedWorld.allowCrossWorld),
         options: retrievalOptions,
         sourceScope,
+        signal,
       });
       assertEventSourceExecutionCurrent();
       if ((!persistTrace && !reactivate) || !result.trace) return result;

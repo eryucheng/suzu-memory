@@ -58,7 +58,7 @@ function accumulate(repository, request, policy) {
     subjectKey: request.subject_key, evidenceGroupId: item.evidence_group_id, contextId: item.context_id,
     eventTime: item.observed_at, confidence: item.confidence, signal: item.signal }));
   const preview = simulatePreferenceFormation({ subjectRole: request.subject_role, subjectKey: request.subject_key,
-    canonicalKey: request.canonical_key, evidence, policy });
+    canonicalKey: request.canonical_key, evidence, policy, timeZone: repository.timeZone });
   let proposedLevel = LEVELS[preview.status];
   const current = repository.getCurrentCanonicalMemory({ agentId: request.agent_id, subjectRole: request.subject_role,
     subjectKey: request.subject_key, canonicalKey: request.canonical_key, stateFamily: 'preference', representationLayer: 'inferred' });

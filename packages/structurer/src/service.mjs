@@ -67,7 +67,7 @@ export function prepareStructureGeneration({
     nearbyContainerIds,
     ...snapshotOptions,
   });
-  if (!snapshot.currentMemories.length || !canProposeStructure(snapshot, candidatePolicy)) return { snapshot, request: null, reason: snapshot.currentMemories.length ? "no-possible-structure-operation" : "no-eligible-current-memories" };
+  if (!snapshot.currentMemories.length || !canProposeStructure(snapshot, { timeZone: repository.timeZone, ...candidatePolicy })) return { snapshot, request: null, reason: snapshot.currentMemories.length ? "no-possible-structure-operation" : "no-eligible-current-memories" };
   const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
   const input = buildStructureGenerationInput(snapshot);
   const request = {
@@ -126,7 +126,7 @@ export async function proposeStructuresForBatch({
   const rejected = [];
   for (const [index, candidate] of parsed.proposals.entries()) {
     try {
-      const guardedCandidate = enforceStructureCandidatePolicy(candidate, snapshot, candidatePolicy);
+      const guardedCandidate = enforceStructureCandidatePolicy(candidate, snapshot, { timeZone: repository.timeZone, ...candidatePolicy });
       const proposal = proposeMemoryStructure(repository, {
         ...guardedCandidate,
         agentId: normalizedAgentId,

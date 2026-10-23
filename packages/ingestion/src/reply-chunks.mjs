@@ -35,8 +35,71 @@ async function roundEnds(groups, resolveReply, maximum, reverse = false) {
   return ends.sort((a, b) => a - b);
 }
 
+const characters = rows => rows.reduce((sum, row) => sum + String(row.content?.text || '').length, 0);
+
+async function planLengthChunk({ pending, previous, resolveReply, measure, maximumCoreCharacters,
+  maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false }) {
+  for (const value of [maximumCoreCharacters, maximumRequestCharacters, maximumContextCharacters]) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Archive character limits must be positive integers.');
+  }
+  const groups = logicalGroups(pending);
+  if (!groups.length) return { status: pending.length ? 'blocked' : 'skipped',
+    reason: pending.length ? 'incomplete-logical-event' : 'no-pending-events',
+    inputEventIds: pending.length ? [pending[0].id] : [], eventsProcessed: 0 };
+  const total = characters(groups.flat());
+  if (!flush && !scanFull && total < maximumCoreCharacters) return {
+    status: 'waiting', reason: 'content-length', characters: total, maximumCoreCharacters, eventsProcessed: 0,
+  };
+  const ends = await roundEnds(groups, resolveReply, groups.length);
+  let count = 0, size = 0;
+  while (count < groups.length && (count === 0 || size + characters(groups[count]) <= maximumCoreCharacters)) {
+    size += characters(groups[count++]);
+  }
+  count = ends.filter(end => end <= count).at(-1) || count;
+  const followingEnd = ends.find(end => end > count);
+  // Waiting for an ordinary following round is bounded by the next batch's
+  // character budget. A long ongoing round cannot grow the waiting tail forever.
+  if (!flush && !scanFull && followingEnd === undefined && total < maximumCoreCharacters * 2) {
+    return { status: 'waiting', reason: 'following-round', characters: total, maximumCoreCharacters, eventsProcessed: 0 };
+  }
+  const historyStart = previous.findIndex(row => !row.metadata?.suzuMemoryFragment || row.metadata.suzuMemoryFragment.index === 1);
+  const history = logicalGroups(previous.slice(historyStart < 0 ? previous.length : historyStart));
+  const historyEnds = await roundEnds(history, resolveReply, 2, true);
+  let beforeGroups = historyEnds.length ? history.slice(historyEnds.at(-2) || 0, historyEnds.at(-1)) : [];
+  let afterGroups = groups.slice(count, followingEnd ?? groups.length);
+  // Read-only overlap is optional when a whole source message cannot fit. Core
+  // messages are never truncated or turned into duplicate evidence.
+  while (beforeGroups.length && characters(beforeGroups.flat()) > maximumContextCharacters) beforeGroups.shift();
+  while (afterGroups.length && characters(afterGroups.flat()) > maximumContextCharacters) afterGroups.pop();
+  let before = beforeGroups.flat(), after = afterGroups.flat();
+  const requestCharacters = (n, preceding = before, following = after) => measure({
+    events: groups.slice(0, n).flat(), previousContextEvents: preceding, continuationGuidanceEvents: following,
+  });
+  if (requestCharacters(count) > maximumRequestCharacters) after = [];
+  if (requestCharacters(count) > maximumRequestCharacters) before = [];
+  if (requestCharacters(count) > maximumRequestCharacters) {
+    let low = 0, high = count;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (requestCharacters(middle, [], []) <= maximumRequestCharacters) low = middle;
+      else high = middle - 1;
+    }
+    count = ends.filter(end => end <= low).at(-1) || low;
+    if (!count) return { status: 'blocked', reason: 'input-event-exceeds-character-limit',
+      inputEventIds: groups[0].map(row => row.id), maximumRequestCharacters,
+      estimatedRequestCharacters: requestCharacters(1, [], []), eventsProcessed: 0 };
+  }
+  return { status: 'ready', reason: flush ? 'flush' : 'content-length', events: groups.slice(0, count).flat(),
+    previousContextEvents: before, continuationGuidanceEvents: after,
+    coreCharacters: characters(groups.slice(0, count).flat()), maximumCoreCharacters,
+    estimatedRequestCharacters: requestCharacters(count), maximumRequestCharacters };
+}
+
 export async function planReplyChunk({ pending, previous = [], resolveReply, measure,
-  coreRounds = 5, maximumRequestTokens = 16_384, scanFull = false }) {
+  coreRounds = 5, maximumRequestTokens = 16_384, scanFull = false, maximumCoreCharacters = null,
+  maximumRequestCharacters, maximumContextCharacters, flush = false }) {
+  if (maximumCoreCharacters !== null) return planLengthChunk({ pending, previous, resolveReply, measure,
+    maximumCoreCharacters, maximumRequestCharacters, maximumContextCharacters, flush, scanFull });
   const groups = logicalGroups(pending);
   if (!groups.length) return { status: pending.length ? 'blocked' : 'skipped',
     reason: pending.length ? 'incomplete-logical-event' : 'no-pending-events',
@@ -96,7 +159,12 @@ export async function selectReplyChunk({ repository, agentId, identity, systemPr
     sourceOrder: true, descending: true, beforeSourceEvent: page.items[0], eligibleIds }).items
     .filter(row => row.processing_disposition !== 'quarantined').reverse() : [];
   return planReplyChunk({ pending: page.items, previous, scanFull: page.total > page.items.length,
-    ...policy, measure: selection => policy.estimateRequestTokens(buildCompanionExtractionRequest({
+    ...policy, measure: selection => {
+      const request = buildCompanionExtractionRequest({
       ...selection, identity, systemPrompt, timeZone,
-    }).request) });
+      }).request;
+      return policy.maximumCoreCharacters != null
+        ? String(request.input).length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100
+        : policy.estimateRequestTokens(request);
+    } });
 }

@@ -1,7 +1,7 @@
 import { stateAnalysisBudgetError } from "./request-budget.mjs";
 import { createHash } from "node:crypto";
 
-import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView } from "@suzu-memory/core";
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -24,11 +24,10 @@ function requireCompleteText(value, maximum, label) {
   return text;
 }
 
-function dayOf(value) {
+function dayOf(value, timeZone) {
   const text = clean(value);
   if (/^\d{4}-\d{2}-\d{2}$/u.test(text)) return text;
-  const timestamp = Date.parse(text);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString().slice(0, 10) : "";
+  return dateKeyInTimeZone(text, timeZone);
 }
 
 function stableSourceGroup(sourceIds) {
@@ -49,7 +48,7 @@ function episodeIdsForMemory(repository, agentId, memoryId, sourceView) {
     .sort();
 }
 
-function contextIdentity(memory, sources, episodeIds) {
+function contextIdentity(memory, sources, episodeIds, timeZone) {
   if (episodeIds.length) {
     const id = `episode:${episodeIds[0]}`;
     return { evidenceGroupId: id, contextId: id, contextBasis: "reviewed-episode" };
@@ -65,6 +64,7 @@ function contextIdentity(memory, sources, episodeIds) {
       || memory.event_start
       || sources.find((source) => source.occurred_at)?.occurred_at
       || sources.find((source) => source.known_at)?.known_at,
+    timeZone,
   );
   return {
     evidenceGroupId,
@@ -125,6 +125,7 @@ function roleView(role) {
 
 export function buildPreferenceEvidenceSnapshot({
   repository,
+  timeZone = repository?.timeZone ?? DEFAULT_MEMORY_TIME_ZONE,
   agentId,
   subjectRole,
   subjectKey,
@@ -208,7 +209,7 @@ export function buildPreferenceEvidenceSnapshot({
       }
     }
     const episodeIds = episodeIdsForMemory(repository, normalizedAgentId, memory.id, sourceView);
-    const identity = contextIdentity(memory, sources, episodeIds);
+    const identity = contextIdentity(memory, sources, episodeIds, timeZone);
     memories.push({
       id: memory.id,
       kind: memory.kind,

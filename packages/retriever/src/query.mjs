@@ -1,4 +1,4 @@
-import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from '@suzu-memory/core';
+export { resolveTemporalQuery } from './temporal-query.mjs';
 
 function normalize(value) {
   return String(value || "").normalize("NFKC").toLowerCase().replace(/\s+/gu, " ").trim();
@@ -6,278 +6,6 @@ function normalize(value) {
 
 function normalizedQueryKey(value) {
   return normalize(value).replace(/[\s，。！？、,.!?：:；;“”"'（）()【】\[\]]+/gu, "");
-}
-
-function validDateKey(year, month, day) {
-  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-  if (
-    Number.isNaN(date.getTime())
-    || date.getUTCFullYear() !== Number(year)
-    || date.getUTCMonth() + 1 !== Number(month)
-    || date.getUTCDate() !== Number(day)
-  ) return null;
-  return date.toISOString().slice(0, 10);
-}
-
-function localDateKey(now, timeZone) {
-  const date = now instanceof Date ? now : new Date(now);
-  if (Number.isNaN(date.getTime())) throw new Error("now 不是有效时间。");
-  return dateKeyInTimeZone(date, timeZone);
-}
-
-function calendarContextYear(text, match, today) {
-  const prefix = text.slice(0, match.index);
-  const suffix = text.slice(match.index + match[0].length);
-  const chinese = prefix.match(/(去年|今年|明年)\s*$/u);
-  const english = prefix.match(/\b(last|previous|this|current|next)\s+year\s+(?:(?:on|in|during)\s+)?$/iu)
-    || suffix.match(/^\s+(last|previous|this|current|next)\s+year\b/iu);
-  const qualifier = chinese?.[1] || english?.[1]?.toLowerCase();
-  if (!qualifier) return '';
-  const offset = ['去年', 'last', 'previous'].includes(qualifier) ? -1
-    : ['明年', 'next'].includes(qualifier) ? 1 : 0;
-  return Number(today.slice(0, 4)) + offset;
-}
-
-function recalledCalendarDate(today, month, day, explicitYear = '') {
-  if (explicitYear) return validDateKey(explicitYear, month, day);
-  const year = Number(today.slice(0, 4));
-  // A recall without a year refers to the latest occurrence on or before
-  // today. Eight years also covers leap-day gaps around non-leap centuries.
-  for (let offset = 0; offset <= 8; offset += 1) {
-    const date = validDateKey(year - offset, month, day);
-    if (date && date <= today) return date;
-  }
-  return null;
-}
-
-function addDateKeyDays(dateKey, days) {
-  const date = new Date(`${dateKey}T12:00:00.000Z`);
-  date.setUTCDate(date.getUTCDate() + Number(days));
-  return date.toISOString().slice(0, 10);
-}
-
-function mondayOfDateKey(dateKey) {
-  const date = new Date(`${dateKey}T12:00:00.000Z`);
-  return addDateKeyDays(dateKey, -((date.getUTCDay() + 6) % 7));
-}
-
-function monthRange(year, month) {
-  const startDate = validDateKey(year, month, 1);
-  if (!startDate) return null;
-  const nextMonth = new Date(Date.UTC(Number(year), Number(month), 1));
-  const endDate = addDateKeyDays(nextMonth.toISOString().slice(0, 10), -1);
-  return { startDate, endDate };
-}
-
-function offsetMonthRange(dateKey, offset) {
-  const date = new Date(`${dateKey}T12:00:00.000Z`);
-  date.setUTCMonth(date.getUTCMonth() + Number(offset), 1);
-  return monthRange(date.getUTCFullYear(), date.getUTCMonth() + 1);
-}
-
-function offsetYearRange(dateKey, offset) {
-  const year = Number(dateKey.slice(0, 4)) + Number(offset);
-  return {
-    startDate: `${year}-01-01`,
-    endDate: `${year}-12-31`,
-  };
-}
-
-const ENGLISH_MONTHS = Object.freeze({
-  january: 1,
-  february: 2,
-  march: 3,
-  april: 4,
-  may: 5,
-  june: 6,
-  july: 7,
-  august: 8,
-  september: 9,
-  october: 10,
-  november: 11,
-  december: 12,
-});
-
-const ENGLISH_WEEKDAYS = Object.freeze({
-  monday: 0,
-  tuesday: 1,
-  wednesday: 2,
-  thursday: 3,
-  friday: 4,
-  saturday: 5,
-  sunday: 6,
-});
-
-function chineseInteger(value) {
-  if (/^\d+$/u.test(value)) return Number(value);
-  const digits = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
-  if (value === "十") return 10;
-  const ten = value.indexOf("十");
-  if (ten >= 0) {
-    const tens = ten === 0 ? 1 : digits[value[ten - 1]];
-    const ones = ten === value.length - 1 ? 0 : digits[value[ten + 1]];
-    return Number.isFinite(tens) && Number.isFinite(ones) ? tens * 10 + ones : Number.NaN;
-  }
-  return digits[value] ?? Number.NaN;
-}
-
-function temporalResult(query, match, startDate, endDate = startDate, kind = "day") {
-  return {
-    matched: true,
-    kind,
-    expression: match[0],
-    startDate,
-    endDate,
-    remainingQuery: `${query.slice(0, match.index)} ${query.slice(match.index + match[0].length)}`
-      .replace(/\s+/gu, " ")
-      .trim(),
-  };
-}
-
-export function resolveTemporalQuery(query, now = new Date(), timeZone = DEFAULT_MEMORY_TIME_ZONE) {
-  const text = String(query || "");
-  const today = localDateKey(now, timeZone);
-  let match = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})[日号]?/u)
-    || text.match(/(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/u);
-  if (match) {
-    const date = validDateKey(match[1], match[2], match[3]);
-    if (date) return temporalResult(text, match, date);
-  }
-  match = text.match(/(\d{1,2})月(\d{1,2})[日号]/u);
-  if (match) {
-    const date = recalledCalendarDate(today, match[1], match[2], calendarContextYear(text, match, today));
-    if (date) return temporalResult(text, match, date);
-  }
-  const englishMonthNames = Object.keys(ENGLISH_MONTHS).join("|");
-  match = text.match(new RegExp(`\\b(${englishMonthNames})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?\\b`, "iu"))
-    || text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+of\\s+(${englishMonthNames})(?:,?\\s+(\\d{4}))?\\b`, "iu"));
-  if (match) {
-    const monthFirst = ENGLISH_MONTHS[String(match[1]).toLowerCase()];
-    const month = monthFirst || ENGLISH_MONTHS[String(match[2]).toLowerCase()];
-    const day = monthFirst ? match[2] : match[1];
-    const year = match[3] || calendarContextYear(text, match, today);
-    const date = recalledCalendarDate(today, month, day, year);
-    if (date) return temporalResult(text, match, date);
-  }
-  match = text.match(/(上上|上个|上|本|这|这个|下个|下)周末/u);
-  if (match) {
-    const offset = match[1].startsWith("上上") ? -2
-      : match[1].startsWith("上") ? -1
-        : match[1].startsWith("下") ? 1 : 0;
-    const saturday = addDateKeyDays(mondayOfDateKey(today), offset * 7 + 5);
-    return temporalResult(text, match, saturday, addDateKeyDays(saturday, 1), "range");
-  }
-  match = text.match(/(上上|上个|上|本|这|这个|下个|下)(?:周|星期|礼拜)([一二三四五六日天])/u);
-  if (match) {
-    const offset = match[1].startsWith("上上") ? -2
-      : match[1].startsWith("上") ? -1
-        : match[1].startsWith("下") ? 1 : 0;
-    const weekday = { 一: 0, 二: 1, 三: 2, 四: 3, 五: 4, 六: 5, 日: 6, 天: 6 }[match[2]];
-    return temporalResult(
-      text,
-      match,
-      addDateKeyDays(mondayOfDateKey(today), offset * 7 + weekday),
-    );
-  }
-  match = text.match(/(\d+|[一二两三四五六七八九十]+)天前/u);
-  if (match) {
-    const days = chineseInteger(match[1]);
-    if (Number.isFinite(days) && days > 0) {
-      return temporalResult(text, match, addDateKeyDays(today, -days));
-    }
-  }
-  match = text.match(/\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b/iu);
-  if (match) {
-    const amount = Number(match[1]);
-    if (Number.isFinite(amount) && amount > 0) {
-      const unit = match[2].toLowerCase();
-      if (/^month/u.test(unit)) {
-        const range = offsetMonthRange(today, -amount);
-        return temporalResult(text, match, range.startDate, range.endDate, "range");
-      }
-      if (/^year/u.test(unit)) {
-        const range = offsetYearRange(today, -amount);
-        return temporalResult(text, match, range.startDate, range.endDate, "range");
-      }
-      const days = /^week/u.test(unit) ? amount * 7 : amount;
-      return temporalResult(text, match, addDateKeyDays(today, -days));
-    }
-  }
-  match = text.match(/\b(last|previous|this|current|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/iu);
-  if (match) {
-    const period = match[1].toLowerCase();
-    const offset = ["last", "previous"].includes(period) ? -1 : period === "next" ? 1 : 0;
-    const weekday = ENGLISH_WEEKDAYS[match[2].toLowerCase()];
-    return temporalResult(
-      text,
-      match,
-      addDateKeyDays(mondayOfDateKey(today), offset * 7 + weekday),
-    );
-  }
-  match = text.match(/\b(last|previous|this|current|next)\s+(weekend|week|month|year)\b/iu);
-  if (match) {
-    const period = match[1].toLowerCase();
-    const offset = ["last", "previous"].includes(period) ? -1 : period === "next" ? 1 : 0;
-    const unit = match[2].toLowerCase();
-    if (unit === "weekend") {
-      const saturday = addDateKeyDays(mondayOfDateKey(today), offset * 7 + 5);
-      return temporalResult(text, match, saturday, addDateKeyDays(saturday, 1), "range");
-    }
-    if (unit === "week") {
-      const monday = addDateKeyDays(mondayOfDateKey(today), offset * 7);
-      return temporalResult(text, match, monday, addDateKeyDays(monday, 6), "range");
-    }
-    const range = unit === "month" ? offsetMonthRange(today, offset) : offsetYearRange(today, offset);
-    return temporalResult(text, match, range.startDate, range.endDate, "range");
-  }
-  match = text.match(new RegExp(`\\b(?:in|during)\\s+(${englishMonthNames})\\s+and\\s+(${englishMonthNames})(?:\\s+(\\d{4}))?\\b`, "iu"));
-  if (match) {
-    const firstMonth = ENGLISH_MONTHS[match[1].toLowerCase()];
-    const secondMonth = ENGLISH_MONTHS[match[2].toLowerCase()];
-    const firstDate = recalledCalendarDate(today, firstMonth, 1, match[3] || calendarContextYear(text, match, today));
-    const year = firstDate ? Number(firstDate.slice(0, 4)) : null;
-    const firstRange = firstDate && monthRange(year, firstMonth);
-    const secondRange = firstDate && monthRange(year + (secondMonth < firstMonth ? 1 : 0), secondMonth);
-    if (firstRange && secondRange) {
-      return temporalResult(text, match, firstRange.startDate, secondRange.endDate, "range");
-    }
-  }
-  match = text.match(new RegExp(`\\b(?:in|during)\\s+(${englishMonthNames})(?:\\s+(\\d{4}))?\\b`, "iu"));
-  if (match) {
-    const month = ENGLISH_MONTHS[match[1].toLowerCase()];
-    const date = recalledCalendarDate(today, month, 1, match[2] || calendarContextYear(text, match, today));
-    const range = date && monthRange(date.slice(0, 4), month);
-    if (range) return temporalResult(text, match, range.startDate, range.endDate, "range");
-  }
-  for (const [label, offset] of [
-    ["大前天", -3],
-    ["前天", -2],
-    ["昨天", -1],
-    ["今天", 0],
-    ["明天", 1],
-    ["后天", 2],
-    ["day before yesterday", -2],
-    ["day after tomorrow", 2],
-    ["yesterday", -1],
-    ["today", 0],
-    ["tomorrow", 1],
-  ]) {
-    const english = /^[a-z]/iu.test(label);
-    match = text.match(new RegExp(english ? `\\b${label}\\b` : label, english ? "iu" : "u"));
-    if (match) {
-      const prefix = text.slice(0, match.index);
-      if (english && /\b(?:after|before|by|since|until)\s*$/iu.test(prefix)) continue;
-      return temporalResult(text, match, addDateKeyDays(today, offset));
-    }
-  }
-  return {
-    matched: false,
-    kind: null,
-    expression: "",
-    startDate: null,
-    endDate: null,
-    remainingQuery: text,
-  };
 }
 
 function cleanActor(role, key, names = []) {
@@ -728,7 +456,7 @@ export function recallCorePhrases(query) {
   if (english) return [english];
   let text = normalize(query).replace(/[，。！？、,.!?：:；;“”"'（）()【】\[\]]+/gu, " ");
   for (const phrase of [
-    "做了些什么", "干了些什么", "做了什么", "干了什么", "发生了什么", "有什么事情",
+    "聊了些什么", "聊了什么", "聊过什么", "聊什么", "做了些什么", "干了些什么", "做了什么", "干了什么", "发生了什么", "有什么事情",
     "有什么事", "干啥了", "做啥了", "干什么", "做什么", "去了哪里", "去哪里了",
     "当时说了什么", "原话怎么说", "说过什么关于", "说过什么", "我是怎么说的", "我怎么说的", "怎么说的", "你为什么会觉得", "你为什么觉得", "为什么会觉得", "为什么觉得", "你为什么会认为", "你为什么认为", "为什么会认为", "为什么认为", "为什么会判断", "为什么判断", "为什么会说", "为什么说", "为什么会", "为什么", "为何", "怎么会",
     "有什么相反依据", "有什么相反证据", "有什么反证", "有什么反例", "相反依据", "相反证据", "反证", "反例", "有什么依据", "有什么证据", "依据是什么", "证据是什么", "怎么知道的", "怎么判断的", "怎么得出的", "凭什么", "依据", "证据",
@@ -744,7 +472,7 @@ export function recallCorePhrases(query) {
   ]) text = text.replaceAll(phrase, " ");
   return text.split(/\s+/u)
     .map((part) => part
-      .replace(/^(?:我|你|他|她|它|我们|你们|他们|还|曾经|到底)+(?:自己)?(?:的)?(?:有)?/u, "")
+      .replace(/^(?:我们|你们|他们|她们|它们|咱们|我|你|他|她|它|咱|还|曾经|到底)+(?:自己)?(?:的)?(?:有)?/u, "")
       .replace(/^(?:去过|去)/u, "")
       .replace(/(?:是什么|是|的|吗|呢|啊|呀|吧|了)+$/u, "")
       .trim())
@@ -787,10 +515,16 @@ export function lexicalTerms(value) {
   return [...terms];
 }
 
-export function lexicalScore(query, document) {
+export function prepareLexicalQuery(query) {
   const phrases = recallCorePhrases(query);
   const queryText = phrases.length ? phrases.join(" ") : query;
-  const queryTerms = lexicalTerms(queryText);
+  return Object.freeze({ queryTerms: Object.freeze(lexicalTerms(queryText)),
+    normalizedQuery: normalize(queryText).replace(/[^\p{L}\p{N}]+/gu, '') });
+}
+
+export function lexicalScore(query, document) {
+  const prepared = typeof query === 'object' && query !== null ? query : prepareLexicalQuery(query);
+  const { queryTerms, normalizedQuery } = prepared;
   const normalizedDocument = normalize(document).replace(/\s+/gu, "");
   let score = 0;
   let overlap = 0;
@@ -801,7 +535,6 @@ export function lexicalScore(query, document) {
     matchedTerms.push(term);
     score += Math.max(1, Array.from(term).length - 1);
   }
-  const normalizedQuery = normalize(queryText).replace(/[^\p{L}\p{N}]+/gu, "");
   const exactPhrase = normalizedQuery.length >= 2 && normalizedDocument.includes(normalizedQuery);
   if (exactPhrase) score += 8;
   return { score, overlap, exactPhrase, queryTerms, matchedTerms };

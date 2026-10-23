@@ -258,6 +258,7 @@ export function mergePreferenceSpecialistEvidence(repository, {
   });
   const eligibleLabels = candidates.filter((item) => !item.preGate).map((item) => item.label);
   const preview = policy ? simulatePreferenceFormation({
+    timeZone: repository.timeZone,
     subjectRole: evaluation.snapshot.target.subjectRole,
     subjectKey: evaluation.snapshot.target.subjectKey,
     canonicalKey: evaluation.snapshot.target.canonicalKey,

@@ -72,3 +72,58 @@ test('token split within a run counts its final bubble only in the later batch',
   assert.equal(next.status, 'waiting');
   assert.equal(next.completedRounds, 5);
 });
+
+const chars = selection => Object.values(selection).flat().reduce((sum, row) => sum + row.content.text.length, 0);
+const lengthPlan = options => plan({ maximumCoreCharacters: 80, maximumContextCharacters: 80,
+  maximumRequestCharacters: 240, measure: chars, ...options });
+
+test('character batching waits for length and one following completed round', async () => {
+  const first = rounds(1, 1);
+  assert.equal((await lengthPlan({ pending: first })).reason, 'content-length');
+  const two = rounds(1, 2);
+  const size = chars({ events: two });
+  assert.equal((await lengthPlan({ pending: two, maximumCoreCharacters: size })).reason, 'following-round');
+  const result = await lengthPlan({ pending: rounds(1, 3), maximumCoreCharacters: size });
+  assert.deepEqual(ids(result.events), ids(two));
+  assert.deepEqual(ids(result.continuationGuidanceEvents), ids(rounds(3, 3)));
+  assert.equal(result.previousContextEvents.length, 0);
+  const next = await lengthPlan({ pending: rounds(3, 5), previous: two, maximumCoreCharacters: size });
+  assert.deepEqual(ids(next.previousContextEvents), ids(rounds(2, 2)));
+  assert.deepEqual(ids(next.events), ids(rounds(3, 4)));
+  assert.deepEqual(ids(next.continuationGuidanceEvents), ids(rounds(5, 5)));
+});
+
+test('flush processes short tails and large backlogs stay in bounded non-overlapping batches', async () => {
+  const all = rounds(1, 20), archived = [], seen = [];
+  let pending = all;
+  while (pending.length) {
+    const result = await lengthPlan({ pending, previous: archived.slice(-12), flush: true });
+    assert.equal(result.status, 'ready');
+    assert.ok(result.coreCharacters <= 80);
+    assert.ok(result.estimatedRequestCharacters <= 240);
+    seen.push(...ids(result.events)); archived.push(...result.events);
+    pending = pending.slice(result.events.length);
+  }
+  assert.deepEqual(seen, ids(all));
+  assert.equal(new Set(seen).size, all.length);
+  assert.equal((await lengthPlan({ pending: rounds(1, 1), flush: true })).status, 'ready');
+});
+
+test('an unfinished following round cannot grow the waiting tail without bound', async () => {
+  const result = await lengthPlan({ pending: rounds(1, 6), resolveReply: () => null });
+  assert.equal(result.status, 'ready');
+  assert.ok(result.coreCharacters <= 80);
+});
+
+test('character request guard includes context and retains an oversized complete source for review', async () => {
+  const result = await lengthPlan({ pending: rounds(3, 8), previous: rounds(1, 2), maximumRequestCharacters: 60 });
+  assert.equal(result.status, 'ready');
+  assert.ok(result.estimatedRequestCharacters <= 60);
+  const source = [{ id: 'huge', content: { text: '全文'.repeat(100) } }];
+  const blocked = await lengthPlan({ pending: source, flush: true, resolveReply: () => null });
+  assert.equal(blocked.status, 'ready'); // Larger than core target, still fits the whole-request cap.
+  const rejected = await lengthPlan({ pending: source, maximumRequestCharacters: 100, flush: true, resolveReply: () => null });
+  assert.equal(rejected.status, 'blocked');
+  assert.equal(rejected.reason, 'input-event-exceeds-character-limit');
+  assert.equal(source[0].content.text.length, 200);
+});

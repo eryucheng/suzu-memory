@@ -1,4 +1,5 @@
 import { eventSourceError } from './event-source-contract.mjs';
+import { removeSearchRows } from './search-index.mjs';
 import { getEventSourceCleanup, advanceEventSourceCleanup, advanceEventSourceEpoch } from './event-source-state.mjs';
 
 const quote = value => `"${value.replaceAll('"', '""')}"`;
@@ -168,7 +169,7 @@ export function cleanEventSourceDatabase(repository, { agentId, id }) {
     for (const node of nodes.filter(node => memoryIds.has(node.id))) {
       database.prepare(`UPDATE memory_nodes SET title='',content='',canonical_key='',perspective='',subject_key='',
         status='deleted',metadata_json='{"eventSourceErased":true}',updated_at=? WHERE id=? AND agent_id=?`).run(new Date().toISOString(), node.id, agentId);
-      database.prepare('DELETE FROM memory_fts WHERE memory_id=? AND agent_id=?').run(node.id, agentId);
+      removeSearchRows(database, node.id);
     }
     for (const row of erasedSources) {
       database.prepare(`UPDATE source_records SET source_locator='',speaker='',content='',lifecycle='retracted',

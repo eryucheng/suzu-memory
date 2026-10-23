@@ -2,6 +2,7 @@ import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
   createEventSourceView,
   DEFAULT_MEMORY_TIME_ZONE,
+  dateKeyInTimeZone,
   withEventSourceExecution,
   MemoryRepository,
   openMemoryDatabase,
@@ -16,6 +17,7 @@ import {
   isGenericQuery,
   lexicalScore,
   planVectorQuery,
+  prepareLexicalQuery,
   recallCorePhrases,
   resolveQuerySubject,
   resolveTemporalQuery,
@@ -25,11 +27,15 @@ import {
   buildEpisodicEvidenceSeedCandidates,
   buildOrdinarySeedCandidates,
   buildSubjectConstraint,
+  lexicalRoute,
   seedRoutingAudit,
 } from "./seed-routes.mjs";
 import {
   collectBm25SeedScores,
 } from "./bm25-route.mjs";
+import { memoryCalendarDate, rankTemporalCandidates, temporalOverviewCandidates } from './temporal-ranking.mjs';
+import { prefilterCandidateIds } from './candidate-prefilter.mjs';
+import { createNodeReader } from './node-reader.mjs';
 import {
   appliedPlasticityAudit,
   edgeRelationUtilityAdjustment,
@@ -54,6 +60,7 @@ import {
 
 export const DEFAULT_RETRIEVAL_OPTIONS = Object.freeze({
   timeZone: DEFAULT_MEMORY_TIME_ZONE,
+  temporalWeight: 0.35,
   maximumCandidates: 20,
   maximumReturnedCandidates: 5,
   includeCandidateContext: false,
@@ -206,21 +213,6 @@ function dot(left, right) {
   let value = 0;
   for (let index = 0; index < left.length; index += 1) value += left[index] * right[index];
   return value;
-}
-
-function loadNodes(database, agentId, statuses = ["active"]) {
-  const normalizedStatuses = [...new Set(statuses.map(clean).filter(Boolean))];
-  if (!normalizedStatuses.length) return [];
-  return database.prepare(`
-    SELECT * FROM memory_nodes
-    WHERE agent_id = ? AND status IN (${normalizedStatuses.map(() => "?").join(", ")})
-    ORDER BY recorded_at DESC
-  `).all(agentId, ...normalizedStatuses).map((row) => ({
-    ...row,
-    confidence: Number(row.confidence),
-    importance: Number(row.importance),
-    metadata: parseJson(row.metadata_json, {}),
-  }));
 }
 
 function isProvisionalNode(node) {
@@ -383,17 +375,18 @@ function temporalCandidates({
   entityScores = new Map(),
   naturalDecayAdjustments = new Map(),
   recallReactivationAdjustments = new Map(),
+  preparedQuery = prepareLexicalQuery(query),
 }) {
-  const candidates = nodes.filter((node) => (
-    node.kind === "event"
-    && node.event_date
-    && node.event_date >= temporal.startDate
-    && node.event_date <= temporal.endDate
-  ));
   const topic = recallCorePhrases(query).join(" ");
+  const candidates = nodes.filter((node) => (
+    !['utterance', 'topic', 'reflection'].includes(node.kind)
+    && (topic || ['event', 'episode'].includes(node.kind))
+    && memoryCalendarDate(node, options.timeZone) >= temporal.startDate
+    && memoryCalendarDate(node, options.timeZone) <= temporal.endDate
+  ));
   return candidates.map((node) => {
     const lexical = topic
-      ? lexicalScore(topic, `${node.title || ""}\n${node.content}`)
+      ? lexicalScore(preparedQuery, `${node.title || ""}\n${node.content}`)
       : { score: 0, overlap: 0, exactPhrase: false, queryTerms: [], matchedTerms: [] };
     const entityScore = Number(entityScores.get(node.id) || 0);
     const subjectMatched = Boolean(
@@ -428,7 +421,8 @@ function temporalCandidates({
         })
       : storedNaturalDecay;
     const recallReactivation = recallReactivationAdjustments.get(node.id) || null;
-    const baseScore = topic ? lexical.score : 1;
+    const lexicalContribution = Number(lexicalRoute(lexical, options)?.contribution || 0);
+    const baseScore = topic ? lexicalContribution : 1;
     const score = Math.max(
       0,
       baseScore
@@ -450,7 +444,7 @@ function temporalCandidates({
         independentlyAdmissible: false,
         rawScore: lexical.score,
         normalizedScore: Math.min(1, lexical.score / 12),
-        contribution: lexical.score,
+        contribution: lexicalContribution,
       });
     }
     if (entityScore > 0) {
@@ -477,7 +471,7 @@ function temporalCandidates({
       routeMatches,
       routeContributions: {
         temporal: topic ? 0 : 1,
-        ...(topic ? { lexical: lexical.score } : {}),
+        ...(topic ? { lexical: lexicalContribution } : {}),
         ...(entityScore > 0 ? { entity: 0 } : {}),
         "recall-reactivation": Number(recallReactivation?.scoreAdjustment || 0),
         "natural-decay": Number(naturalDecay?.scoreAdjustment || 0),
@@ -486,7 +480,7 @@ function temporalCandidates({
   }).filter((item) => !topic || item.lexical.overlap > 0 || item.lexical.exactPhrase)
     .sort((left, right) => (
       right.score - left.score
-      || left.node.event_date.localeCompare(right.node.event_date)
+      || memoryCalendarDate(left.node, options.timeZone).localeCompare(memoryCalendarDate(right.node, options.timeZone))
       || right.node.importance - left.node.importance
     ));
 }
@@ -939,7 +933,11 @@ function formatPrimary(primary, evidence, options, {
       options.maximumContextChars,
     );
   }
-  const time = structuredStateNode(primary) && primary.valid_from
+  const time = options.showRecallDate && structuredStateNode(primary) && memoryCalendarDate(primary, options.timeZone)
+    ? `状态记录日期：${memoryCalendarDate(primary, options.timeZone)}${primary.valid_from
+      ? `；状态生效时间：${timestampLabel(primary.valid_from, options.timeZone)}${primary.valid_to
+        ? ` 至 ${timestampLabel(primary.valid_to, options.timeZone)}` : ''}` : ''}`
+    : structuredStateNode(primary) && primary.valid_from
     ? `状态生效时间：${timestampLabel(primary.valid_from, options.timeZone)}${primary.valid_to
       ? ` 至 ${timestampLabel(primary.valid_to, options.timeZone)}`
       : ""}`
@@ -2030,6 +2028,8 @@ async function vectorScoresInExecution({
   usageLedgerPath,
   now,
   eligibleMemoryIds = null,
+  embeddingCache = true,
+  embeddingCacheMaxBytes,
 }) {
   if (typeof embeddingProvider !== "function") {
     return { status: "disabled", scores: new Map(), usageRecorded: false };
@@ -2050,6 +2050,8 @@ async function vectorScoresInExecution({
   }
   const embeddings = repository.listEmbeddings(agentId, response.model, {
     includeArchived: true,
+    cache: embeddingCache,
+    cacheMaxBytes: embeddingCacheMaxBytes,
   }).filter((embedding) => (
     !eligibleMemoryIds || eligibleMemoryIds.has(embedding.memory_id)
   ));
@@ -2103,8 +2105,10 @@ export async function retrieveMemories({
   world = {},
   allowCrossWorld = false,
   sourceScope = null,
+  signal = null,
   options: overrides = {},
 } = {}) {
+  signal?.throwIfAborted();
   const normalizedAgentId = clean(agentId);
   const normalizedQuery = clean(query);
   if (!normalizedAgentId) throw new Error("retrieveMemories 需要 agentId。");
@@ -2134,7 +2138,14 @@ export async function retrieveMemories({
     sourceTraceId: clean(anchorSelection?.sourceTraceId),
   } : null;
   const temporal = resolveTemporalQuery(normalizedQuery, executionTime, options.timeZone);
-  const intent = temporal.matched ? "event" : classifyRecallIntent(normalizedQuery);
+  options.today = dateKeyInTimeZone(executionTime, options.timeZone);
+  const exactTemporal = temporal.matched && temporal.precision === 'exact';
+  const topicQuery = temporal.matched ? recallCorePhrases(temporal.remainingQuery).join(' ') : normalizedQuery;
+  const temporalOverview = temporal.matched && !topicQuery;
+  const softTemporal = temporal.matched && (!exactTemporal || !temporalOverview);
+  const retrievalQuery = temporal.matched ? topicQuery : normalizedQuery;
+  const preparedQuery = prepareLexicalQuery(retrievalQuery);
+  const intent = temporalOverview ? 'event' : classifyRecallIntent(normalizedQuery);
   const representationIntent = classifyRepresentationIntent(normalizedQuery);
   const relationshipIntent = classifyRelationshipQueryIntent(normalizedQuery);
   const lifecycleIntent = classifyLifecycleCompletionIntent(normalizedQuery);
@@ -2217,10 +2228,15 @@ export async function retrieveMemories({
       policy: affectivePolicy,
     });
     const affectiveAdjustments = affectiveAdjustmentState.adjustments;
-    const activeNodes = loadNodes(database, normalizedAgentId, ["active"])
+    const nodeReader = createNodeReader(database, normalizedAgentId, options);
+    if (nodeReader.stats.deferred && !sourceReadTransaction) {
+      database.exec('BEGIN');
+      sourceReadTransaction = true;
+    }
+    const activeNodes = nodeReader.load(["active"])
       .filter(node => !sourceView || sourceView.allows(node))
       .filter((node) => nodeMatchesWorldScope(node, worldScope));
-    const historicalStateNodes = loadNodes(database, normalizedAgentId, ["superseded", "disputed"])
+    const historicalStateNodes = nodeReader.load(["superseded", "disputed"])
       .filter(node => !sourceView || sourceView.allows(node))
       .filter((node) => nodeMatchesWorldScope(node, worldScope));
     const provisionalNodes = loadPendingProvisionalNodes(repository, normalizedAgentId)
@@ -2278,9 +2294,15 @@ export async function retrieveMemories({
         }],
         routeContributions: { continuation: 1 },
       }));
-    const entitySeeds = entitySeedScores(repository, normalizedAgentId, normalizedQuery, {
+    const entitySeeds = entitySeedScores(repository, normalizedAgentId, retrievalQuery, {
       eligibleMemoryIds,
     });
+    const naturalDecaySpecificityByMemory = exactTemporal && !temporalOverview && naturalDecayPolicy.enabled
+      ? new Map(temporalCandidates({ nodes, temporal, query: temporal.remainingQuery, preparedQuery, options,
+          subjectConstraint, entityScores: entitySeeds.scores }).filter(candidate =>
+            Object.values(candidate.specificity).every(Boolean)).map(candidate => [candidate.node.id, candidate.specificity]))
+      : new Map();
+    const naturalDecayBypassMemoryIds = new Set(naturalDecaySpecificityByMemory.keys());
     let vector = { status: "not-run", scores: new Map() };
     let bm25 = {
       status: "not-run",
@@ -2301,7 +2323,8 @@ export async function retrieveMemories({
     let executedRoutes = [];
     let routeStatus = {};
     let ordinaryRoute = false;
-    if (temporal.matched) {
+    let candidateNodes = nodes;
+    if (exactTemporal && temporalOverview) {
       const hasTopic = recallCorePhrases(temporal.remainingQuery).length > 0;
       plannedRoutes = ["temporal", ...(hasTopic ? ["lexical"] : [])];
       executedRoutes = [...plannedRoutes];
@@ -2309,6 +2332,7 @@ export async function retrieveMemories({
         nodes,
         temporal,
         query: temporal.remainingQuery,
+        preparedQuery,
         options,
         subjectConstraint,
         entityScores: entitySeeds.scores,
@@ -2319,6 +2343,12 @@ export async function retrieveMemories({
         temporal: candidates.length ? "matched" : "no-match",
         ...(hasTopic ? { lexical: candidates.length ? "matched" : "no-match" } : {}),
       };
+    } else if (temporalOverview && !anchorCandidates.length) {
+      plannedRoutes = ['temporal'];
+      executedRoutes = ['temporal'];
+      candidates = temporalOverviewCandidates(nodes.filter(node => node.kind !== 'utterance'), temporal,
+        { ...options, today: dateKeyInTimeZone(executionTime, options.timeZone) });
+      routeStatus = { temporal: candidates.length ? 'matched' : 'no-match' };
     } else if (anchorCandidates.length) {
       plannedRoutes = ["continuation"];
       executedRoutes = ["continuation"];
@@ -2331,12 +2361,13 @@ export async function retrieveMemories({
         "lexical",
         "bm25",
         "entity",
+        ...(temporal.coreWindow ? ["temporal"] : []),
         ...(typeof embeddingProvider === "function" ? ["vector"] : []),
       ];
       bm25 = collectBm25SeedScores({
         repository,
         agentId: normalizedAgentId,
-        query: normalizedQuery,
+        query: retrievalQuery,
         maximumQueries: options.maximumBm25Queries,
         maximumResultsPerQuery: options.maximumBm25ResultsPerQuery,
         worldId: worldScope.allowCrossWorld ? "" : worldScope.id,
@@ -2346,20 +2377,29 @@ export async function retrieveMemories({
         "lexical",
         ...(bm25.status === "ready" ? ["bm25"] : []),
         "entity",
+        ...(temporal.coreWindow ? ["temporal"] : []),
         ...(typeof embeddingProvider === "function" ? ["vector"] : []),
       ];
       vector = await vectorScores({
         repository,
         agentId: normalizedAgentId,
-        query: normalizedQuery,
+        query: retrievalQuery,
         embeddingProvider,
         usageLedgerPath,
         now: executionTime,
         eligibleMemoryIds,
+        embeddingCache: options.embeddingCache !== false,
+        embeddingCacheMaxBytes: options.embeddingCacheMaxBytes,
       });
+      signal?.throwIfAborted();
+      const coarseIds = prefilterCandidateIds(database, normalizedAgentId, preparedQuery,
+        { bm25Scores: bm25.scores, vectorScores: vector.scores, entityScores: entitySeeds.scores }, options, nodes.length);
+      if (coarseIds) candidateNodes = nodes.filter(node => isProvisionalNode(node) || coarseIds.has(node.id));
+      nodeReader.hydrate(candidateNodes);
       candidates = buildOrdinarySeedCandidates({
-        nodes,
-        query: normalizedQuery,
+        nodes: candidateNodes,
+        preparedQuery,
+        query: retrievalQuery,
         intent,
         bm25Scores: bm25.scores,
         vectorScores: vector.scores,
@@ -2370,11 +2410,14 @@ export async function retrieveMemories({
         accessibilityAdjustments,
         recallReactivationAdjustments,
         naturalDecayAdjustments,
+        naturalDecayBypassMemoryIds,
+        naturalDecaySpecificityByMemory,
         affectiveAdjustments,
       });
       convergenceCandidates = buildOrdinarySeedCandidates({
-        nodes,
-        query: normalizedQuery,
+        nodes: candidateNodes,
+        preparedQuery,
+        query: retrievalQuery,
         intent,
         bm25Scores: bm25.scores,
         vectorScores: vector.scores,
@@ -2386,6 +2429,8 @@ export async function retrieveMemories({
         accessibilityAdjustments,
         recallReactivationAdjustments,
         naturalDecayAdjustments,
+        naturalDecayBypassMemoryIds,
+        naturalDecaySpecificityByMemory,
         affectiveAdjustments,
       });
       routeStatus = {
@@ -2401,6 +2446,7 @@ export async function retrieveMemories({
         } : {}),
       };
     }
+    signal?.throwIfAborted();
     candidates = applyProvisionalCandidatePolicy(candidates, options);
     convergenceCandidates = applyProvisionalCandidatePolicy(
       convergenceCandidates,
@@ -2438,7 +2484,12 @@ export async function retrieveMemories({
     convergenceCandidates = convergenceSubjectResult.candidates;
     let episodicCandidates = [];
     let episodicSubjectResult = { candidates: [], rejectedMemoryIds: [] };
-    if (!anchorCandidates.length && intent !== "utterance") {
+    if ((temporalOverview || (exactTemporal && !topicQuery)) && !anchorCandidates.length) {
+      const rawOverview = temporalOverviewCandidates(nodes.filter(node => node.kind === 'utterance'), temporal,
+        { ...options, today: dateKeyInTimeZone(executionTime, options.timeZone) });
+      episodicSubjectResult = applySubjectConstraint(rawOverview, subjectConstraint);
+      episodicCandidates = episodicSubjectResult.candidates;
+    } else if (!anchorCandidates.length && intent !== "utterance") {
       const episodicQuery = clean(temporal.matched ? temporal.remainingQuery : normalizedQuery)
         || normalizedQuery;
       if (bm25.status === "not-run") {
@@ -2461,11 +2512,14 @@ export async function retrieveMemories({
           usageLedgerPath,
           now: executionTime,
           eligibleMemoryIds,
+          embeddingCache: options.embeddingCache !== false,
+          embeddingCacheMaxBytes: options.embeddingCacheMaxBytes,
         });
       }
       const rawEpisodicCandidates = buildEpisodicEvidenceSeedCandidates({
-          nodes,
+          nodes: candidateNodes,
           query: episodicQuery,
+          preparedQuery,
           temporal,
           bm25Scores: bm25.scores,
           vectorScores: vector.scores,
@@ -2483,12 +2537,24 @@ export async function retrieveMemories({
         stateBoundedEpisodicCandidates,
         subjectConstraint,
       );
-      episodicCandidates = episodicSubjectResult.candidates.slice(
+      episodicCandidates = rankTemporalCandidates(episodicSubjectResult.candidates, temporal, options).slice(
         0,
         Math.max(0, Math.trunc(Number(options.maximumEpisodicCandidates) || 0)),
       );
     }
-    if (ordinaryRoute) {
+    if (softTemporal && !anchorCandidates.length) {
+      candidates = rankTemporalCandidates(candidates, temporal, { ...options, topicless: temporalOverview });
+      convergenceCandidates = rankTemporalCandidates(convergenceCandidates, temporal, options);
+      if (temporal.ordering === 'latest') {
+        const latest = rankTemporalCandidates([...candidates, ...episodicCandidates], temporal, options)[0];
+        candidates = latest && latest.node.kind !== 'utterance' ? [latest] : [];
+        episodicCandidates = latest?.node.kind === 'utterance' ? [latest] : [];
+        convergenceCandidates = [];
+      }
+      if (temporal.coreWindow) routeStatus.temporal = [...candidates, ...episodicCandidates].some(candidate => candidate.temporalRanking?.timeScore > 0)
+        ? 'matched' : 'no-match';
+    }
+    if (ordinaryRoute || temporalOverview) {
       candidates = candidates.slice(0, Math.max(0, Number(options.maximumCandidates)));
       convergenceCandidates = convergenceCandidates.slice(0, Math.max(
         0,
@@ -2528,8 +2594,12 @@ export async function retrieveMemories({
             && relationshipStateCategory(candidate) === relationshipIntent
           )),
         ];
+    const rankedTemporalCandidates = temporal.matched && !anchorCandidates.length
+      ? (softTemporal ? rankTemporalCandidates(fuseCandidateLanes(relationshipSelectionCandidates, episodicCandidates, Number.MAX_SAFE_INTEGER), temporal,
+          { ...options, topicless: temporalOverview })
+        : fuseCandidateLanes(relationshipSelectionCandidates, episodicCandidates, Number.MAX_SAFE_INTEGER)) : null;
     const primaryRankedCandidate = selectPrimaryCandidate(
-      relationshipSelectionCandidates,
+      rankedTemporalCandidates || relationshipSelectionCandidates,
       chainIntent,
       representationIntent,
       subjectQuery,
@@ -2599,7 +2669,7 @@ export async function retrieveMemories({
         recallIntent: intent,
         chainIntent,
         resultStatus: "no-match",
-        retrievalMode: temporal.matched
+        retrievalMode: exactTemporal && temporalOverview
           ? "date-filter"
           : requestedAnchorIds.length ? "continuation"
           : vector.status === "ready" ? "hybrid" : "lexical",
@@ -2736,7 +2806,13 @@ export async function retrieveMemories({
           options,
       });
     let chain;
-    if (primaryIsProvisional || primary.kind === "utterance") {
+    if (temporal.ordering === 'latest' && !anchorCandidates.length) {
+      chain = { nodes: [primary], paths: [], activation: null };
+    } else if (temporalOverview && !anchorCandidates.length) {
+      chain = { nodes: rankTemporalCandidates([...candidates, ...episodicCandidates], temporal,
+        { ...options, topicless: true }).slice(0, Math.max(1, Number(options.maximumChainMemories))).map(c => c.node),
+        paths: [], activation: null };
+    } else if (primaryIsProvisional || primary.kind === "utterance") {
       chain = {
         nodes: [primary],
         paths: [],
@@ -2817,6 +2893,7 @@ export async function retrieveMemories({
     );
     const formatOptions = {
       ...options,
+      showRecallDate: softTemporal && !anchorCandidates.length,
       maximumContextChars: available,
       sourceAuthoritiesByMemoryId,
     };
@@ -2851,14 +2928,17 @@ export async function retrieveMemories({
       sectionTruncationApplied: requiredTextChars > budgetedTextChars,
       safetyTruncationApplied: budgetedTextChars > available,
     };
-    const returnedCandidates = fuseCandidateLanes(
+    const returnedCandidates = softTemporal && !anchorCandidates.length
+      ? rankTemporalCandidates(fuseCandidateLanes(candidates, episodicCandidates, Number.MAX_SAFE_INTEGER), temporal, { ...options, topicless: temporalOverview })
+          .slice(0, temporal.ordering === 'latest' ? 1 : options.maximumReturnedCandidates)
+      : fuseCandidateLanes(
       candidates,
       episodicCandidates,
       options.maximumReturnedCandidates,
     );
     const retrievalMode = primary.kind === "utterance"
       ? vector.status === "ready" ? "episodic-hybrid" : "episodic-lexical"
-      : temporal.matched
+      : exactTemporal && temporalOverview
       ? "date-filter"
       : anchorCandidates.length ? "continuation"
       : vector.status === "ready" ? "hybrid"
@@ -3033,7 +3113,7 @@ export async function retrieveMemories({
         ...(options.includeCandidateContext ? {
           recallContext: joinBoundedSections([
             `记忆状态：${candidate.node.status}；现实范围：${candidate.node.reality || 'unknown'}；时间性质：${candidate.node.temporal_state || 'unknown'}。`,
-            formatPrimary(candidate.node, [], { ...options, maximumContextChars: 1100 }),
+            formatPrimary(candidate.node, [], { ...options, showRecallDate: softTemporal && !anchorCandidates.length, maximumContextChars: 1100 }),
           ], 1200),
           ...(sourceView ? { eventSources: sourceView.sourcesFor([candidate.node.id]) } : {}),
         } : {}),
@@ -3045,6 +3125,7 @@ export async function retrieveMemories({
           reasonCodes: [...(candidate.node.provisional_reason_codes || [])],
         } : null,
         score: candidate.score,
+        ...(candidate.temporalRanking ? { temporalRanking: candidate.temporalRanking } : {}),
         retrievalLane: candidate.retrievalLane,
         laneRank: candidate.laneRank,
         lexicalScore: candidate.lexical.score,

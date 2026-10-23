@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from './calendar-time.mjs';
+import { normalizedSearchDocument, removeSearchRows } from './search-index.mjs';
+import { cachedEmbeddingRows } from './embedding-cache.mjs';
 import { eventContinuityFingerprint, invalidateEventContinuity } from './event-continuity-policy.mjs';
 import { guardSourceEpoch, advanceEventSourceEpoch } from './event-source-state.mjs';
 import { currentEventSourceExecution, executionEventSourceView } from './event-source-execution.mjs';
@@ -784,7 +787,8 @@ function nodeSnapshot(node) {
 }
 
 export class MemoryRepository {
-  constructor(database) {
+  constructor(database, { timeZone = DEFAULT_MEMORY_TIME_ZONE } = {}) {
+    this.timeZone = timeZone;
     this.sourceEpoch = guardSourceEpoch(database, () => currentEventSourceExecution()?.signal?.throwIfAborted());
     this.database = this.sourceEpoch.database;
     this.transactionDepth = 0;
@@ -2936,8 +2940,8 @@ export class MemoryRepository {
       .filter(validTimestamp);
     const calendarDates = memories.flatMap((memory) => [
       clean(memory.event_date),
-      validTimestamp(memory.event_start) ? new Date(memory.event_start).toISOString().slice(0, 10) : "",
-      validTimestamp(memory.event_end) ? new Date(memory.event_end).toISOString().slice(0, 10) : "",
+      dateKeyInTimeZone(memory.event_start, this.timeZone),
+      dateKeyInTimeZone(memory.event_end, this.timeZone),
     ]).filter(validIsoDate);
     const eventDate = calendarDates.sort()[0] || null;
     const eventStart = exactStarts.sort()[0] || null;
@@ -11177,7 +11181,15 @@ export class MemoryRepository {
 
   listEmbeddings(agentId, model, {
     includeArchived = false,
+    cache = false,
+    cacheMaxBytes,
   } = {}) {
+    const read = () => this.readEmbeddingRows(agentId, model, { includeArchived });
+    return cache ? cachedEmbeddingRows(this.database, JSON.stringify([agentId, model, includeArchived]), read,
+      { maximumBytes: cacheMaxBytes }) : read();
+  }
+
+  readEmbeddingRows(agentId, model, { includeArchived }) {
     const statusClause = includeArchived
       ? "node.status <> 'deleted'"
       : "node.status = 'active'";
@@ -11338,9 +11350,23 @@ export class MemoryRepository {
   }
 
   syncSearch(memoryId) {
+    // SAVEPOINT also nests inside a transaction opened directly by a host.
+    this.database.exec('SAVEPOINT memory_search_sync');
+    try {
+      const result = this.syncSearchEntry(memoryId);
+      this.database.exec('RELEASE memory_search_sync');
+      return result;
+    } catch (error) {
+      this.database.exec('ROLLBACK TO memory_search_sync');
+      this.database.exec('RELEASE memory_search_sync');
+      throw error;
+    }
+  }
+
+  syncSearchEntry(memoryId) {
     const memory = this.getMemory(memoryId);
     if (!memory) return;
-    this.database.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(memoryId);
+    removeSearchRows(this.database, memoryId);
     if (memory.status === "deleted") return;
     const retrievalContext = this.getCurrentMemoryRetrievalContext(memoryId);
     const indexedContent = [
@@ -11348,10 +11374,14 @@ export class MemoryRepository {
       retrievalContext?.context_text,
       ...(retrievalContext?.queryTerms || []),
     ].map(clean).filter(Boolean).join("\n");
-    this.database.prepare(`
+    const inserted = this.database.prepare(`
       INSERT INTO memory_fts (memory_id, agent_id, title, content)
       VALUES (?, ?, ?, ?)
     `).run(memory.id, memory.agent_id, memory.title, indexedContent);
+    if (this.database.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_fts_rows'").get()) {
+      this.database.prepare(`INSERT INTO memory_fts_rows(fts_rowid,memory_id,agent_id,lexical_text) VALUES(?,?,?,?)`)
+        .run(inserted.lastInsertRowid, memory.id, memory.agent_id, normalizedSearchDocument(`${memory.title}\n${memory.content}`));
+    }
   }
 
   search(agentId, query, {

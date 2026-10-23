@@ -306,7 +306,8 @@ test("resolves English relative day offsets and calendar ranges", () => {
     new Date("2023-03-25T18:26:00+08:00"),
     "Asia/Shanghai",
   );
-  assert.equal(daysAgo.startDate, "2023-03-15");
+  assert.equal(daysAgo.precision, 'approximate');
+  assert.deepEqual(daysAgo.coreWindow, { startDate: '2023-03-14', endDate: '2023-03-16' });
 
   const lastWeek = resolveTemporalQuery(
     "Where did I attend the religious activity last week?",
@@ -1513,7 +1514,7 @@ test("resolves English participant names, question intent, and long relative tim
   );
   assert.deepEqual(
     { kind: yearsAgo.kind, startDate: yearsAgo.startDate, endDate: yearsAgo.endDate },
-    { kind: "range", startDate: "2022-01-01", endDate: "2022-12-31" },
+    { kind: "range", startDate: "2022-06-23", endDate: "2022-09-21" },
   );
 });
 
@@ -1940,6 +1941,7 @@ test("uses structured event participants without rejecting incomplete multi-pers
     content: "Agent和用户上周一起看了江边烟花。",
     subjectRole: "agent",
     subjectKey: "agent-test",
+    eventDate: '2026-10-15',
   });
   repository.upsertMemoryRole({
     memoryId: linked.id,
@@ -1956,6 +1958,7 @@ test("uses structured event participants without rejecting incomplete multi-pers
     content: "Agent和用户后来还看了另一场烟花。",
     subjectRole: "agent",
     subjectKey: "agent-test",
+    eventDate: '2026-10-16',
   });
   database.close();
 
@@ -1963,6 +1966,7 @@ test("uses structured event participants without rejecting incomplete multi-pers
     databasePath,
     agentId: "agent-test",
     query: "我上周看过江边烟花吗",
+    now: new Date('2026-10-23T12:00:00+08:00'),
   });
   assert.equal(result.status, "ready");
   assert.equal(result.fragments[0].memoryId, linked.id);

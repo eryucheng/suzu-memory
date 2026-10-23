@@ -241,6 +241,7 @@ export async function evaluatePreferenceEvidenceTarget({
     }
   }
   const preview = simulatePreferenceFormation({
+    timeZone: repository.timeZone,
     subjectRole: snapshot.target.subjectRole,
     subjectKey: snapshot.target.subjectKey,
     canonicalKey: snapshot.target.canonicalKey,

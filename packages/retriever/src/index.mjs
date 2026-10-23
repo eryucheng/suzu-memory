@@ -9,6 +9,7 @@ export {
   lexicalScore,
   lexicalTerms,
   planVectorQuery,
+  prepareLexicalQuery,
   recallCorePhrases,
   resolveContinuationAnchors,
   resolveQuerySubject,
@@ -17,8 +18,8 @@ export {
 
 export {
   DEFAULT_RETRIEVAL_OPTIONS,
-  retrieveMemories,
 } from "./retriever.mjs";
+export { retrieveMemories, closeRetrievalWorker, closeRetrievalWorkers } from './worker-dispatch.mjs';
 
 export {
   collectBm25SeedScores,

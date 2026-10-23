@@ -2,6 +2,7 @@ import {
   PREFERENCE_EVIDENCE_ENUMS,
   PREFERENCE_EVIDENCE_SIGNALS,
 } from "./preference-contract.mjs";
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from '@suzu-memory/core';
 
 const SCORED_SIGNALS = Object.freeze([
   "active_choice",
@@ -152,11 +153,10 @@ function normalizePolicy(policy) {
   };
 }
 
-function dayOf(value) {
+function dayOf(value, timeZone) {
   const text = clean(value);
   if (/^\d{4}-\d{2}-\d{2}$/u.test(text)) return text;
-  const timestamp = Date.parse(text);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString().slice(0, 10) : "";
+  return dateKeyInTimeZone(text, timeZone);
 }
 
 function behaviorGate(item) {
@@ -194,7 +194,7 @@ function behaviorGate(item) {
   return "";
 }
 
-function normalizeEvidence(evidence, subjectRole, subjectKey, minimumConfidence) {
+function normalizeEvidence(evidence, subjectRole, subjectKey, minimumConfidence, timeZone) {
   if (!Array.isArray(evidence)) throw new Error("preference evidence must be an array.");
   const seen = new Set();
   return evidence.map((item, index) => {
@@ -226,7 +226,7 @@ function normalizeEvidence(evidence, subjectRole, subjectKey, minimumConfidence)
       subjectKey: evidenceSubjectKey,
       evidenceGroupId,
       contextId,
-      day: dayOf(item?.eventTime ?? item?.knownAt),
+      day: dayOf(item?.eventTime ?? item?.knownAt, timeZone),
       confidence,
       agency: enumValue(item?.agency, `evidence[${index}].agency`, PREFERENCE_EVIDENCE_ENUMS.agency),
       constraint: enumValue(item?.constraint, `evidence[${index}].constraint`, PREFERENCE_EVIDENCE_ENUMS.constraint),
@@ -318,6 +318,7 @@ function setSize(items, field) {
 }
 
 export function simulatePreferenceFormation({
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
   subjectRole,
   subjectKey,
   canonicalKey,
@@ -337,6 +338,7 @@ export function simulatePreferenceFormation({
     normalizedSubjectRole,
     normalizedSubjectKey,
     normalizedPolicy.minimumConfidence,
+    timeZone,
   );
   const explicitSupport = normalizedEvidence.some((item) => (
     item.signal === "explicit_preference" && !item.ignoredReason

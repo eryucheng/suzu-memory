@@ -138,7 +138,8 @@ export async function processPendingCompanionEvents({
         validateLogicalEvent: () => ({ code: 'INPUT_EVENT_CHUNK_LIMIT',
           message: 'The complete input event cannot fit the extraction chunk; original content is retained for review.',
           details: { reason: chunk.reason, maximumRequestTokens: chunkPolicy.maximumRequestTokens,
-            estimatedRequestTokens: chunk.estimatedRequestTokens } }),
+            estimatedRequestTokens: chunk.estimatedRequestTokens, maximumRequestCharacters: chunk.maximumRequestCharacters,
+            estimatedRequestCharacters: chunk.estimatedRequestCharacters } }),
       });
       return { status: 'quarantined', reason: chunk.reason, eventsProcessed: 0, quarantined: review.quarantined };
     }
@@ -331,7 +332,9 @@ export async function processPendingCompanionEvents({
   return {
     status: "processed",
     ...(chunk ? { chunk: { reason: chunk.reason, estimatedRequestTokens: chunk.estimatedRequestTokens,
-      maximumRequestTokens: chunk.maximumRequestTokens } } : {}),
+      maximumRequestTokens: chunk.maximumRequestTokens, coreCharacters: chunk.coreCharacters,
+      maximumCoreCharacters: chunk.maximumCoreCharacters, estimatedRequestCharacters: chunk.estimatedRequestCharacters,
+      maximumRequestCharacters: chunk.maximumRequestCharacters } } : {}),
     batchId: claimed.batch.id,
     eventsProcessed: claimed.events.length,
     quarantined: claimed.quarantined || [],

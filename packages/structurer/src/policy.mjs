@@ -1,25 +1,24 @@
-import { memoryWorldsCompatible } from '@suzu-memory/core';
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, memoryWorldsCompatible } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
 }
 
-function datePart(value) {
+function datePart(value, timeZone) {
   const text = clean(value);
   if (/^\d{4}-\d{2}-\d{2}$/u.test(text)) return text;
-  const timestamp = Date.parse(text);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString().slice(0, 10) : "";
+  return dateKeyInTimeZone(text, timeZone);
 }
 
-function temporalEvidence(memory) {
-  return datePart(memory.eventDate) || datePart(memory.eventStart) || datePart(memory.knownAt);
+function temporalEvidence(memory, timeZone) {
+  return datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone) || datePart(memory.knownAt, timeZone);
 }
 
-function deriveEpisodeBoundary(members) {
+function deriveEpisodeBoundary(members, timeZone) {
   const dates = members.flatMap((memory) => [
-    datePart(memory.eventDate),
-    datePart(memory.eventStart),
-    datePart(memory.eventEnd),
+    datePart(memory.eventDate, timeZone),
+    datePart(memory.eventStart, timeZone),
+    datePart(memory.eventEnd, timeZone),
   ]).filter(Boolean).sort();
   const starts = members.map((memory) => clean(memory.eventStart))
     .filter((value) => Number.isFinite(Date.parse(value)))
@@ -38,18 +37,20 @@ function deriveEpisodeBoundary(members) {
 }
 
 export function canProposeStructure(snapshot, {
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
   minimumTopicEvidenceDates = 2,
   minimumEpisodeTimedMembers = 2,
 } = {}) {
   const memories = snapshot.currentMemories;
   if (snapshot.candidateContainers.some(container => memories.some(memory => !container.memberIds.includes(memory.id)))) return true;
-  const timed = memories.filter(memory => datePart(memory.eventDate) || datePart(memory.eventStart));
+  const timed = memories.filter(memory => datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone));
   if (timed.length >= Math.max(2, Math.trunc(Number(minimumEpisodeTimedMembers) || 2))) return true;
-  return new Set(memories.map(temporalEvidence).filter(Boolean)).size
+  return new Set(memories.map(memory => temporalEvidence(memory, timeZone)).filter(Boolean)).size
     >= Math.max(2, Math.trunc(Number(minimumTopicEvidenceDates) || 2));
 }
 
 export function enforceStructureCandidatePolicy(candidate, snapshot, {
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
   minimumTopicEvidenceDates = 2,
   minimumEpisodeTimedMembers = 2,
   requiredTriggerMemoryIds = [],
@@ -110,7 +111,7 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   const members = memberIds.map((id) => currentById.get(id));
   if (kind === "episode") {
     const timedMembers = members.filter((memory) => (
-      datePart(memory.eventDate) || datePart(memory.eventStart)
+      datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone)
     ));
     const minimum = Math.max(2, Math.trunc(Number(minimumEpisodeTimedMembers) || 2));
     if (timedMembers.length < minimum) {
@@ -119,11 +120,11 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
     return enforceRetrospectiveParticipation({
       ...candidate,
       memberIds,
-      ...deriveEpisodeBoundary(timedMembers),
+      ...deriveEpisodeBoundary(timedMembers, timeZone),
     });
   }
   if (kind === "topic") {
-    const evidenceDates = new Set(members.map(temporalEvidence).filter(Boolean));
+    const evidenceDates = new Set(members.map(memory => temporalEvidence(memory, timeZone)).filter(Boolean));
     const minimum = Math.max(2, Math.trunc(Number(minimumTopicEvidenceDates) || 2));
     if (evidenceDates.size < minimum) {
       throw new Error(`Topic creation requires evidence from at least ${minimum} distinct dates.`);

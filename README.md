@@ -145,6 +145,9 @@ Suzu Memory 用十二类认识组织人物材料，区分本人表达与基于�
 
 - **宿主接入**：[基础示例](examples/basic-host/basic-host.mjs)演示完整调用，[聊天宿主示例](examples/chat-host/chat-turn.mjs)演示轮次适配。
 - **事件与召回合同**：[Event 来源契约](docs/event-source-contracts.md)说明事件范围、Agent 经历、来源校验、检索选项与清理接口。
+- **时间召回**：[日期、模糊时间与排序窗口](docs/temporal-recall.md)说明时区、解析精度、窗口边界与时间权重。
+- **输入分批**：[内容长度、前后文与尾批处理](docs/input-batching.md)说明如何累计对话后分批抽取，以及压缩时的收尾调用。
+- **检索执行**：[线程、候选预筛与索引缓存](docs/retrieval-execution.md)说明执行选项、索引迁移与资源释放。
 - **服务能力**：[服务入口](packages/service/src/index.mjs)提供事件追加、维护、检索、审核、备份与恢复。
 - **界面接入**：[审核台页面](packages/console/web/index.html)用于查看候选与运行状态，[可视化数据接口](packages/visualization/src/brain-layout.mjs)提供结构化网络、人物归属和三维布局。
 

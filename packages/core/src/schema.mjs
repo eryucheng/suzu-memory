@@ -1,5 +1,6 @@
 import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
-export const SCHEMA_VERSION = 44;
+import { backfillSearchRows } from './search-index.mjs';
+export const SCHEMA_VERSION = 45;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2276,5 +2277,30 @@ export const MIGRATIONS = Object.freeze([
       CREATE INDEX memory_recall_reactivation_receipts_agent_time
         ON memory_recall_reactivation_receipts(agent_id, created_at DESC);
     `,
+  },
+  {
+    version: 45, name: 'search-rowids-and-retrieval-revision',
+    apply(database) {
+      database.exec(`
+        CREATE TABLE memory_fts_rows (
+          fts_rowid INTEGER PRIMARY KEY,
+          memory_id TEXT NOT NULL REFERENCES memory_nodes(id) ON DELETE CASCADE,
+          agent_id TEXT NOT NULL,
+          lexical_text TEXT
+        ) STRICT;
+        CREATE INDEX memory_fts_rows_memory ON memory_fts_rows(memory_id);
+        CREATE INDEX memory_fts_rows_agent ON memory_fts_rows(agent_id);
+        INSERT INTO memory_meta(key,value) VALUES('retrieval-database-id',lower(hex(randomblob(16)))),('retrieval-revision','0');
+        CREATE TRIGGER memory_lexical_text_invalidate AFTER UPDATE OF title,content ON memory_nodes
+        BEGIN UPDATE memory_fts_rows SET lexical_text=NULL WHERE memory_id=NEW.id; END;
+      `);
+      for (const table of ['memory_nodes', 'memory_embeddings']) {
+        for (const operation of ['INSERT', 'UPDATE', 'DELETE']) database.exec(`
+          CREATE TRIGGER retrieval_revision_${table}_${operation.toLowerCase()} AFTER ${operation} ON ${table}
+          BEGIN UPDATE memory_meta SET value=lower(hex(randomblob(16))) WHERE key='retrieval-revision'; END;
+        `);
+      }
+      backfillSearchRows(database);
+    },
   },
 ]);

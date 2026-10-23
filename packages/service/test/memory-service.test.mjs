@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   MemoryRepository,
+  SCHEMA_VERSION,
   memoryRetrievalContextSourceHash,
   openMemoryDatabase,
   proposeMemoryStructure,
@@ -232,7 +233,7 @@ test("receipt migration preserves existing activation state", async () => {
   const previous = service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum"));
   service.withRepository((_repository, database) => database.exec("DROP TABLE memory_recall_reactivation_receipts; DELETE FROM schema_migrations WHERE version=44"));
   const migrated = createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId });
-  assert.equal(migrated.info().database.schemaVersion, 44);
+  assert.equal(migrated.info().database.schemaVersion, SCHEMA_VERSION);
   assert.deepEqual(migrated.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")), previous);
   const reapplication = migrated.withRepository(repository => repository.applyRecallReactivation({ agentId: service.agentId,
     traceId: recalled.trace.id, policy: service.defaults.retrieval.recallReactivation }));

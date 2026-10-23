@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createMemoryService, validateMemoryExtractionOutput, inspectDatabaseBackup } from '../src/index.mjs';
-import { getEventSourceCleanup, openMemoryDatabase, MemoryRepository } from '@suzu-memory/core';
+import { getEventSourceCleanup, openMemoryDatabase, MemoryRepository, SCHEMA_VERSION } from '@suzu-memory/core';
 import { DatabaseSync } from 'node:sqlite';
 import { MIGRATIONS } from '../../core/src/schema.mjs';
 
@@ -119,7 +119,7 @@ test('schema v41 upgrade preserves legacy rows and erases the shipped Lives rece
   assert.equal(hidden.fragments.length, 0, 'An old incomplete envelope does not become valid v2 evidence through migration.');
   memory.eraseEventSources({ id: 'legacy-clear', scope: { ...sourceScope, clears: [{ spaceId: 'direct-a', throughSequence: 1 }] } });
   assert.ok(!dump(memory).includes('LEGACY_ERASE'));
-  assert.equal(memory.info().database.schemaVersion, 44);
+  assert.equal(memory.info().database.schemaVersion, SCHEMA_VERSION);
 });
 
 test('direct provenance with another local user retains the actual counterpart instead of the default identity', async t => {
@@ -267,8 +267,10 @@ test('committed fence rejects extraction and embedding late writes and lets newe
   assert.equal(memory.withRepository(repository => repository.listEmbeddings(memory.agentId, 'test-vector')).length, 0);
 });
 
-test('search crossing a clear cannot persist late provider diagnostic bodies or return stale material', async t => {
-  const { memory } = fixture(t);
+for (const execution of ['inline', 'worker']) test(`search crossing a clear cannot persist late provider diagnostic bodies or return stale material (${execution})`, async t => {
+  let memory;
+  t.after(() => memory?.close());
+  ({ memory } = fixture(t));
   memory.appendEventSources({ scope: scope(), events: [event('old', 1, 'LEDGER_ERASE_青柠密码')] });
   await archive(memory);
   fs.mkdirSync(path.dirname(memory.paths.usageLedgerPath), { recursive: true });
@@ -277,7 +279,7 @@ test('search crossing a clear cannot persist late provider diagnostic bodies or 
   let start, release;
   const started = new Promise(resolve => { start = resolve; });
   const waiting = new Promise(resolve => { release = resolve; });
-  const search = memory.search('青柠密码', { now: timestamp, sourceScope: scope(), embeddingProvider: async () => {
+  const search = memory.search('青柠密码', { now: timestamp, sourceScope: scope(), options: { execution, sqlPrefilterThreshold: 1 }, embeddingProvider: async () => {
     start(); await waiting;
     return { model: 'test-model', vector: [1, 0], usage: { inputTokens: 10 }, metadata: { echo: 'LEDGER_ERASE_青柠密码' } };
   } });
@@ -296,8 +298,10 @@ test('search crossing a clear cannot persist late provider diagnostic bodies or 
   assert.ok(!dump(memory).includes('LEDGER_ERASE'));
 });
 
-test('candidate and final evidence use one SQLite snapshot while a newer Event is archived concurrently', async t => {
-  const { memory } = fixture(t);
+for (const execution of ['inline', 'worker']) test(`candidate and final evidence use one SQLite snapshot while a newer Event is archived concurrently (${execution})`, async t => {
+  let memory;
+  t.after(() => memory?.close());
+  ({ memory } = fixture(t));
   memory.appendEventSources({ scope: scope(2), events: [event('old', 1, 'SNAPSHOT_OLD 我去了雪山博物馆。')] });
   await archive(memory);
   const existing = memory.listMemories().items[0];
@@ -305,6 +309,7 @@ test('candidate and final evidence use one SQLite snapshot while a newer Event i
   const started = new Promise(resolve => { start = resolve; });
   const waiting = new Promise(resolve => { release = resolve; });
   const pending = memory.search('雪山博物馆', { sourceScope: scope(2), persistTrace: false, now: timestamp,
+    options: { execution, sqlPrefilterThreshold: 1 },
     embeddingProvider: async () => { start(); await waiting; return { model: 'test-vector', vector: [1, 0] }; } });
   await started;
   memory.appendEventSources({ scope: scope(20), events: [event('future', 9, 'SNAPSHOT_FUTURE 雪山博物馆的新细节。')] });
