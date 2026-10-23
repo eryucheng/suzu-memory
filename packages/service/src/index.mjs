@@ -663,6 +663,7 @@ export class MemoryService {
       archiveWindows,
       usageLedgerPath: this.paths.usageLedgerPath,
       systemPrompt,
+      timeZone: this.defaults.retrieval.timeZone,
       now: validDate(now, "event processing now"),
       memoriesOverride,
     }), { sourceScope, signal });

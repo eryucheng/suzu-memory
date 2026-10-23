@@ -1,4 +1,5 @@
 import { lexicalScore } from "./query.mjs";
+import { dateKeyInTimeZone } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -380,13 +381,14 @@ export function buildEpisodicEvidenceSeedCandidates({
   nodes,
   query,
   temporal = null,
-  ...options
+  options = {},
+  ...routes
 }) {
   const inTemporalRange = (node) => {
     if (!temporal?.matched) return true;
     const eventDate = clean(node.event_date)
-      || clean(node.event_start).slice(0, 10)
-      || clean(node.recorded_at).slice(0, 10);
+      || dateKeyInTimeZone(node.event_start, options.timeZone)
+      || dateKeyInTimeZone(node.recorded_at, options.timeZone);
     return Boolean(
       eventDate
       && eventDate >= clean(temporal.startDate)
@@ -394,7 +396,8 @@ export function buildEpisodicEvidenceSeedCandidates({
     );
   };
   return buildOrdinarySeedCandidates({
-    ...options,
+    ...routes,
+    options,
     nodes: (Array.isArray(nodes) ? nodes : []).filter((node) => (
       node.kind === "utterance" && inTemporalRange(node)
     )),

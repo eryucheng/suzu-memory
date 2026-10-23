@@ -1,6 +1,7 @@
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
   createEventSourceView,
+  DEFAULT_MEMORY_TIME_ZONE,
   withEventSourceExecution,
   MemoryRepository,
   openMemoryDatabase,
@@ -52,7 +53,7 @@ import {
 } from "./recall-reactivation.mjs";
 
 export const DEFAULT_RETRIEVAL_OPTIONS = Object.freeze({
-  timeZone: "Asia/Shanghai",
+  timeZone: DEFAULT_MEMORY_TIME_ZONE,
   maximumCandidates: 20,
   maximumReturnedCandidates: 5,
   includeCandidateContext: false,

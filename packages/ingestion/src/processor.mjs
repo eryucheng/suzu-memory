@@ -85,6 +85,7 @@ async function rawEvidenceFallback({
   archiveWindows,
   identity,
   systemPrompt,
+  timeZone,
 }) {
   return generateCompanionEventBatch({
     events: claimed.events,
@@ -94,6 +95,7 @@ async function rawEvidenceFallback({
     identity,
     memoriesOverride: [],
     systemPrompt,
+    timeZone,
   });
 }
 
@@ -111,6 +113,7 @@ export async function processPendingCompanionEvents({
   archiveWindows = [],
   usageLedgerPath = "",
   systemPrompt = "",
+  timeZone,
   memoriesOverride = null,
   chunkPolicy = null,
   now = new Date(),
@@ -128,7 +131,7 @@ export async function processPendingCompanionEvents({
   });
   let chunk = null;
   if (chunkPolicy) {
-    chunk = await selectReplyChunk({ repository, agentId, identity: normalizedIdentity, systemPrompt, policy: chunkPolicy });
+    chunk = await selectReplyChunk({ repository, agentId, identity: normalizedIdentity, systemPrompt, timeZone, policy: chunkPolicy });
     if (chunk.status === 'blocked') {
       const review = repository.claimPendingInputEvents(agentId, { candidateEventIds: chunk.inputEventIds,
         maximumEvents: 500, maximumContentCharacters: 10_000_000, createdAt: completedAt,
@@ -192,6 +195,7 @@ export async function processPendingCompanionEvents({
       generator,
       memoriesOverride,
       systemPrompt,
+      timeZone,
     });
   } catch (error) {
     assertEventSourceExecutionCurrent();
@@ -227,6 +231,7 @@ export async function processPendingCompanionEvents({
       archiveWindows,
       identity: normalizedIdentity,
       systemPrompt,
+      timeZone,
     });
   }
 

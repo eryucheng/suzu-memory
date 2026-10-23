@@ -67,6 +67,22 @@ test('named extraction preserves its narrative in storage, embeddings, presentat
   assert.equal(memory.getMemory(saved.id).memory.content, content);
 });
 
+test('the service uses its retrieval timezone for extraction while retaining UTC source instants', async t => {
+  const memory = fixture(t, { retrieval: { timeZone: 'America/Los_Angeles' } });
+  const source = { ...event(1, 'agent-b', 'Mio', '今天聊了灯塔博物馆。'), occurredAt: '2026-08-04T03:30:00.000Z' };
+  memory.appendEventSources({ scope, events: [source] });
+  const { request } = await process(memory, []);
+  assert.match(request.input, /America\/Los_Angeles/);
+  assert.match(request.input, /2026-08-03T20:30:00\.000-07:00/);
+  const utterances = memory.listMemories({ kinds: ['utterance'] }).items;
+  assert.equal(utterances.length, 1);
+  assert.equal(utterances[0].event_start, source.occurredAt);
+  const recalled = await memory.search('昨天聊了灯塔博物馆', { sourceScope: scope,
+    now: '2026-08-04T19:00:00Z', persistTrace: false });
+  assert.equal(recalled.status, 'ready');
+  assert.ok(recalled.candidates.some(candidate => candidate.memoryId === utterances[0].id));
+});
+
 test('legacy owner-only input preserves the absence of a human through extraction and archive', async t => {
   const memory = fixture(t, { primaryUserId: '', userName: '' });
   memory.appendEvents([{ protocolVersion: 1, eventId: 'owner-only', spaceId: agentId, eventType: 'conversation.turn',

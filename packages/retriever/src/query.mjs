@@ -1,3 +1,5 @@
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from '@suzu-memory/core';
+
 function normalize(value) {
   return String(value || "").normalize("NFKC").toLowerCase().replace(/\s+/gu, " ").trim();
 }
@@ -20,18 +22,32 @@ function validDateKey(year, month, day) {
 function localDateKey(now, timeZone) {
   const date = now instanceof Date ? now : new Date(now);
   if (Number.isNaN(date.getTime())) throw new Error("now 不是有效时间。");
-  try {
-    const parts = new Intl.DateTimeFormat("zh-CN", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).formatToParts(date);
-    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-    return validDateKey(values.year, values.month, values.day);
-  } catch {
-    return date.toISOString().slice(0, 10);
+  return dateKeyInTimeZone(date, timeZone);
+}
+
+function calendarContextYear(text, match, today) {
+  const prefix = text.slice(0, match.index);
+  const suffix = text.slice(match.index + match[0].length);
+  const chinese = prefix.match(/(去年|今年|明年)\s*$/u);
+  const english = prefix.match(/\b(last|previous|this|current|next)\s+year\s+(?:(?:on|in|during)\s+)?$/iu)
+    || suffix.match(/^\s+(last|previous|this|current|next)\s+year\b/iu);
+  const qualifier = chinese?.[1] || english?.[1]?.toLowerCase();
+  if (!qualifier) return '';
+  const offset = ['去年', 'last', 'previous'].includes(qualifier) ? -1
+    : ['明年', 'next'].includes(qualifier) ? 1 : 0;
+  return Number(today.slice(0, 4)) + offset;
+}
+
+function recalledCalendarDate(today, month, day, explicitYear = '') {
+  if (explicitYear) return validDateKey(explicitYear, month, day);
+  const year = Number(today.slice(0, 4));
+  // A recall without a year refers to the latest occurrence on or before
+  // today. Eight years also covers leap-day gaps around non-leap centuries.
+  for (let offset = 0; offset <= 8; offset += 1) {
+    const date = validDateKey(year - offset, month, day);
+    if (date && date <= today) return date;
   }
+  return null;
 }
 
 function addDateKeyDays(dateKey, days) {
@@ -118,7 +134,7 @@ function temporalResult(query, match, startDate, endDate = startDate, kind = "da
   };
 }
 
-export function resolveTemporalQuery(query, now = new Date(), timeZone = "Asia/Shanghai") {
+export function resolveTemporalQuery(query, now = new Date(), timeZone = DEFAULT_MEMORY_TIME_ZONE) {
   const text = String(query || "");
   const today = localDateKey(now, timeZone);
   let match = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})[日号]?/u)
@@ -129,7 +145,7 @@ export function resolveTemporalQuery(query, now = new Date(), timeZone = "Asia/S
   }
   match = text.match(/(\d{1,2})月(\d{1,2})[日号]/u);
   if (match) {
-    const date = validDateKey(today.slice(0, 4), match[1], match[2]);
+    const date = recalledCalendarDate(today, match[1], match[2], calendarContextYear(text, match, today));
     if (date) return temporalResult(text, match, date);
   }
   const englishMonthNames = Object.keys(ENGLISH_MONTHS).join("|");
@@ -139,8 +155,8 @@ export function resolveTemporalQuery(query, now = new Date(), timeZone = "Asia/S
     const monthFirst = ENGLISH_MONTHS[String(match[1]).toLowerCase()];
     const month = monthFirst || ENGLISH_MONTHS[String(match[2]).toLowerCase()];
     const day = monthFirst ? match[2] : match[1];
-    const year = match[3] || today.slice(0, 4);
-    const date = validDateKey(year, month, day);
+    const year = match[3] || calendarContextYear(text, match, today);
+    const date = recalledCalendarDate(today, month, day, year);
     if (date) return temporalResult(text, match, date);
   }
   match = text.match(/(上上|上个|上|本|这|这个|下个|下)周末/u);
@@ -216,18 +232,21 @@ export function resolveTemporalQuery(query, now = new Date(), timeZone = "Asia/S
   }
   match = text.match(new RegExp(`\\b(?:in|during)\\s+(${englishMonthNames})\\s+and\\s+(${englishMonthNames})(?:\\s+(\\d{4}))?\\b`, "iu"));
   if (match) {
-    const year = match[3] || today.slice(0, 4);
     const firstMonth = ENGLISH_MONTHS[match[1].toLowerCase()];
     const secondMonth = ENGLISH_MONTHS[match[2].toLowerCase()];
-    const firstRange = monthRange(year, firstMonth);
-    const secondRange = monthRange(Number(year) + (secondMonth < firstMonth ? 1 : 0), secondMonth);
+    const firstDate = recalledCalendarDate(today, firstMonth, 1, match[3] || calendarContextYear(text, match, today));
+    const year = firstDate ? Number(firstDate.slice(0, 4)) : null;
+    const firstRange = firstDate && monthRange(year, firstMonth);
+    const secondRange = firstDate && monthRange(year + (secondMonth < firstMonth ? 1 : 0), secondMonth);
     if (firstRange && secondRange) {
       return temporalResult(text, match, firstRange.startDate, secondRange.endDate, "range");
     }
   }
   match = text.match(new RegExp(`\\b(?:in|during)\\s+(${englishMonthNames})(?:\\s+(\\d{4}))?\\b`, "iu"));
   if (match) {
-    const range = monthRange(match[2] || today.slice(0, 4), ENGLISH_MONTHS[match[1].toLowerCase()]);
+    const month = ENGLISH_MONTHS[match[1].toLowerCase()];
+    const date = recalledCalendarDate(today, month, 1, match[2] || calendarContextYear(text, match, today));
+    const range = date && monthRange(date.slice(0, 4), month);
     if (range) return temporalResult(text, match, range.startDate, range.endDate, "range");
   }
   for (const [label, offset] of [

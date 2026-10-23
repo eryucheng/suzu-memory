@@ -1,5 +1,6 @@
 import {
   DIRECT_INGESTION_MEMORY_KINDS,
+  DEFAULT_MEMORY_TIME_ZONE,
   EVIDENCE_MODES,
   MEMORY_ACTOR_ROLES,
   MEMORY_STATE_FAMILIES,
@@ -10,6 +11,7 @@ import {
   TEMPORAL_STATES,
   isMemoryKindAllowedForStateFamily,
   isStatefulMemoryKind,
+  timestampInTimeZone,
 } from "@suzu-memory/core";
 import { buildExtractionParticipants } from './participant-identity.mjs';
 
@@ -197,6 +199,7 @@ function formatMessages(messages, {
   limit = Number.POSITIVE_INFINITY,
   language = "unknown",
   participants = [],
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
 } = {}) {
   return messages.slice(0, limit).map((message) => {
     const source = message.eventSource;
@@ -204,7 +207,7 @@ function formatMessages(messages, {
     const participant = matches.length === 1 ? matches[0]
       : matches.find(candidate => candidate.actorRole === message.speakerIdentity?.actorRole);
     const context = source ? { spaceId: source.spaceId, spaceKind: source.topology?.spaceKind || source.topology?.kind } : null;
-    return `${includeRefs ? `[${message.memoryRef}] ` : ""}[${message.timestamp || ""}] ${
+    return `${includeRefs ? `[${message.memoryRef}] ` : ""}[${timestampInTimeZone(message.timestamp, timeZone) || message.timestamp || ""}] ${
       message.worldFrame ? `[world=${message.worldFrame}:${message.worldId || "primary"}] ` : ""
     }${language === "mixed" && message.sourceLanguage && message.sourceLanguage !== "unknown"
       ? `[source-language=${message.sourceLanguage}] ` : ""
@@ -212,7 +215,7 @@ function formatMessages(messages, {
       ? `[同一原始事件已完整重组，共${message.logicalEvent.fragmentCount}段] `
       : ""
     }${context ? `[来源 ${JSON.stringify(context)}] ${participant?.name || source.sender.name || source.sender.kind}` : roleLabel(message.role, language)}${
-      source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${message.knownAt}]` : ''
+      source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${timestampInTimeZone(message.knownAt, timeZone) || message.knownAt}]` : ''
     }：${message.text}`;
   }).join("\n\n");
 }
@@ -345,6 +348,7 @@ export function buildLongTermExtractionInput({
   memoryOwner = "记忆拥有者",
   userName = "对方",
   identity = {},
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
 }) {
   const sourceWindows = Array.isArray(archiveWindows) && archiveWindows.length
     ? archiveWindows
@@ -390,21 +394,25 @@ export function buildLongTermExtractionInput({
   const owner = participants.find(participant => participant.actorRole === 'agent');
   const parts = [
     `记忆拥有者：${owner?.name || memoryOwner}`,
+    `时间基准时区：${timeZone}。消息时间按该时区显示并带 UTC 偏移；相对日期以对应消息的当地日期为准。`,
     '记忆以拥有者的经历为中心；标题和正文叙述使用人物完整姓名，包括拥有者。原消息与引语中的人称按实际说话者解释。',
     '【程序提供的人物身份】',
     JSON.stringify(participants.map(({ actorRole, name }) => ({ role: actorRole, name }))),
   ];
   for (const window of standardizedWindows) {
     const previousContext = formatMessages(window.previousContextMessages, {
+      timeZone,
       language: window.sourceLanguage,
       participants,
     });
     const conversation = formatMessages(window.messages, {
+      timeZone,
       includeRefs: true,
       language: window.sourceLanguage,
       participants,
     });
     const continuationGuidance = formatMessages(window.continuationGuidanceMessages, {
+      timeZone,
       language: window.sourceLanguage,
       participants,
     });

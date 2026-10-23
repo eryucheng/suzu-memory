@@ -301,6 +301,7 @@ export function buildCompanionExtractionRequest({
   archiveWindows = [],
   identity,
   systemPrompt = "",
+  timeZone,
 }) {
   const semanticWindows = companionArchiveWindows(events, archiveWindows, identity);
   const previousContextMessages = semanticWindows.length
@@ -317,6 +318,7 @@ export function buildCompanionExtractionRequest({
     memoryOwner: identity.companionName,
     userName: identity.primaryUserName,
     identity,
+    timeZone,
   });
   return { built, request: {
     input: built.input,
@@ -328,9 +330,9 @@ export function buildCompanionExtractionRequest({
 
 export async function generateCompanionEventBatch({ events, previousContextEvents = [],
   continuationGuidanceEvents = [], archiveWindows = [], identity, generator,
-  memoriesOverride = null, systemPrompt = '' }) {
+  memoriesOverride = null, systemPrompt = '', timeZone }) {
   const { built, request: generationRequest } = buildCompanionExtractionRequest({ events,
-    previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt });
+    previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt, timeZone });
   if (Array.isArray(memoriesOverride)) {
     return {
       participants: built.participants,

@@ -89,7 +89,7 @@ export async function planReplyChunk({ pending, previous = [], resolveReply, mea
     estimatedRequestTokens: requestTokens(count), maximumRequestTokens };
 }
 
-export async function selectReplyChunk({ repository, agentId, identity, systemPrompt, policy }) {
+export async function selectReplyChunk({ repository, agentId, identity, systemPrompt, timeZone, policy }) {
   const eligibleIds = executionEventSourceView(repository, agentId)?.inputIds ?? null;
   const page = repository.listInputEvents(agentId, { statuses: ['pending'], limit: 500, sourceOrder: true, eligibleIds });
   const previous = page.items.length ? repository.listInputEvents(agentId, { statuses: ['archived'], limit: 500,
@@ -97,6 +97,6 @@ export async function selectReplyChunk({ repository, agentId, identity, systemPr
     .filter(row => row.processing_disposition !== 'quarantined').reverse() : [];
   return planReplyChunk({ pending: page.items, previous, scanFull: page.total > page.items.length,
     ...policy, measure: selection => policy.estimateRequestTokens(buildCompanionExtractionRequest({
-      ...selection, identity, systemPrompt,
+      ...selection, identity, systemPrompt, timeZone,
     }).request) });
 }
