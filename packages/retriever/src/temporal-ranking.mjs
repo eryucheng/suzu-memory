@@ -12,6 +12,7 @@ function calendarDate(value, timeZone) {
 }
 
 export function memoryCalendarDate(node, timeZone) {
+  if (node.metadata?.sourceTimeKnown === false) return '';
   if (node.kind === 'utterance') return calendarDate(node.event_start || node.recorded_at, timeZone);
   if (isState(node)) return calendarDate(node.known_at || node.valid_from, timeZone);
   const eventDate = calendarDate(node.event_date || node.event_start, timeZone);

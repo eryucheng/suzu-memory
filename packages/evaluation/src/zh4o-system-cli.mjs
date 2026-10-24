@@ -1,217 +1,129 @@
 #!/usr/bin/env node
-
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { randomUUID } from 'node:crypto';
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-
-import {
-  createProvidersFromMemoryConfig,
-  loadMemoryConfig,
-} from "@suzu-memory/config";
-
-import {
-  loadZh4oDataset,
-  zh4oDatasetSha256,
-} from "./zh4o-contract.mjs";
+import { loadMemoryConfig, validateMemoryProviderConfig } from "@suzu-memory/config";
+import { loadZh4oDataset, zh4oDatasetSha256 } from "./zh4o-contract.mjs";
 import { runZh4oMemorySystemBenchmark } from "./zh4o-system.mjs";
+import { readEvaluationCodeRevision } from './code-revision.mjs';
 
 export function memoryZh4oSystemUsage() {
-  return "node packages/evaluation/src/zh4o-system-cli.mjs --dataset <zh4o-data.json> --config <memory.config.json> --work-dir <专用评测目录> [--start-sample <0-27>] [--max-samples <样本数>] [--max-questions-per-sample <题数>] [--candidate-k <默认9>] [--maximum-events <每批消息数>] [--maximum-content-characters <每批字符数>] [--maximum-context-characters <作答上下文字符数>] [--maximum-semantic-passes <维护轮数>] [--embedding-interval-ms <0-10000>] [--without-embedding] [--retain-sample-databases] [--resume-sample-databases] [--output <report.json>] [--dry-run]";
+  return "node packages/evaluation/src/zh4o-system-cli.mjs --dataset <zh4o-data.json> --config <memory.config.json> --work-dir <评测目录> [--resume <report或pending文件>] [--dry-run] [--retrieval-only] [--no-control] [--without-embedding] [--source-diagnostics] [--start-sample <0起>] [--max-samples <数量>] [--max-questions-per-sample <数量>] [--candidate-k <显式覆盖返回数>] [--maximum-context-characters <显式覆盖上下文长度>] [--maximum-drain-passes <收尾保护上限>] [--embedding-interval-ms <间隔>] [--output <report.json>]";
 }
 
-function clean(value) {
-  return String(value ?? "").trim();
-}
+const switches = new Set(["dry-run", "retrieval-only", "no-control", "without-embedding", "source-diagnostics"]);
+const values = new Set(["dataset", "config", "work-dir", "output", "resume", "start-sample", "max-samples",
+  "max-questions-per-sample", "candidate-k", "maximum-context-characters", "maximum-drain-passes", "embedding-interval-ms"]);
 
 function parseArgs(args) {
-  const options = {};
-  for (let index = 0; index < args.length; index += 1) {
+  const result = {};
+  for (let index = 0; index < args.length; index++) {
     const token = args[index];
-    if (["--help", "-h"].includes(token)) {
-      options.help = true;
-      continue;
-    }
-    if ([
-      "--dry-run",
-      "--without-embedding",
-      "--retain-sample-databases",
-      "--resume-sample-databases",
-    ].includes(token)) {
-      options[token.slice(2)] = true;
-      continue;
-    }
-    if (!token.startsWith("--")) throw new Error(`不支持位置参数：${token}。`);
-    const value = args[index + 1];
-    if (!value || value.startsWith("--")) throw new Error(`选项 ${token} 缺少值。`);
-    const key = token.slice(2);
-    if (![
-      "dataset",
-      "config",
-      "work-dir",
-      "output",
-      "start-sample",
-      "max-samples",
-      "max-questions-per-sample",
-      "candidate-k",
-      "embedding-interval-ms",
-      "maximum-events",
-      "maximum-content-characters",
-      "maximum-context-characters",
-      "maximum-semantic-passes",
-    ].includes(key)) throw new Error(`不支持选项 ${token}。`);
-    options[key] = value;
-    index += 1;
+    if (["--help", "-h"].includes(token)) { result.help = true; continue; }
+    const name = token.startsWith("--") ? token.slice(2) : "";
+    if (switches.has(name)) { result[name] = true; continue; }
+    if (!values.has(name)) throw new Error(`不支持选项 ${token}。`);
+    const value = args[++index];
+    if (!value || value.startsWith("--")) throw new Error(`${token} 缺少值。`);
+    result[name] = value;
   }
-  return options;
+  return result;
 }
 
-function integer(value, fallback, label, { minimum = Number.MIN_SAFE_INTEGER } = {}) {
+function integer(value, fallback, label, minimum = 1) {
   if (value === undefined) return fallback;
-  const number = Number(value);
-  if (!Number.isInteger(number) || number < minimum) throw new Error(`${label} 必须是大于等于 ${minimum} 的整数。`);
-  return number;
+  const selected = Number(value);
+  if (!Number.isSafeInteger(selected) || selected < minimum) throw new Error(`${label} 必须是大于等于 ${minimum} 的整数。`);
+  return selected;
 }
 
-function detectCodeRevision(repositoryRoot = path.resolve(import.meta.dirname, "../../..")) {
-  try {
-    return {
-      commit: execFileSync("git", ["rev-parse", "HEAD"], {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5_000,
-      }).trim(),
-      dirty: Boolean(execFileSync("git", ["status", "--short", "--untracked-files=normal"], {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5_000,
-      }).trim()),
-    };
-  } catch {
-    return { commit: "", dirty: null };
-  }
-}
-
-function emit(value, stdout = process.stdout) {
-  stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function progressPrinter(event) {
-  if (event.completed !== event.total && event.completed % 20 !== 0) return;
-  process.stderr.write(`${JSON.stringify({
-    phase: event.phase,
-    sample: event.sample,
-    samples: event.samples,
-    completed: event.completed,
-    total: event.total,
-    category: event.row?.category,
-    status: event.row?.status,
-    candidates: event.row?.candidateCount,
-    correct: event.row?.correct,
-  })}\n`);
-}
-
-export async function runMemoryZh4oSystemCli({
-  args = process.argv.slice(2),
-  environment = process.env,
-  fetchImpl = globalThis.fetch,
-  stdout = process.stdout,
-} = {}) {
+export async function runMemoryZh4oSystemCli({ args = process.argv.slice(2), environment = process.env,
+  fetchImpl = globalThis.fetch, stdout = process.stdout, stderr = process.stderr } = {}) {
   const options = parseArgs(args);
-  if (options.help) {
-    const usage = memoryZh4oSystemUsage();
-    stdout.write(`${usage}\n`);
-    return { status: "help", usage };
-  }
-  if (!options.dataset) throw new Error(memoryZh4oSystemUsage());
-  const datasetPath = path.resolve(options.dataset);
-  if (!fs.existsSync(datasetPath)) throw new Error(`ZH-4O 数据集不存在：${datasetPath}`);
-  if (options["dry-run"]) {
-    const samples = loadZh4oDataset(datasetPath);
-    const result = {
-      status: "validated",
-      task: "zh4o-roleplay-memory-multiple-choice",
-      datasetPath,
-      datasetSha256: zh4oDatasetSha256(datasetPath),
-      samples: samples.length,
-      sessions: samples.reduce((sum, item) => sum + item.sessions.length, 0),
-      turns: samples.reduce((sum, item) => (
-        sum + item.sessions.reduce((inner, session) => inner + session.turns.length, 0)
-      ), 0),
-      questions: samples.reduce((sum, item) => sum + item.questions.length, 0),
-      note: "dry-run 只校验公开 ZH-4O 数据契约，不建库、不调用 Provider。",
-    };
-    emit(result);
-    return result;
-  }
-  if (!options.config || !options["work-dir"]) throw new Error(memoryZh4oSystemUsage());
+  if (options.help) { const usage = memoryZh4oSystemUsage(); stdout.write(`${usage}\n`); return { status: "help", usage }; }
+  if (!options.dataset || !options.config) throw new Error(memoryZh4oSystemUsage());
   const config = loadMemoryConfig(path.resolve(options.config));
-  const providers = createProvidersFromMemoryConfig(config, { environment, fetchImpl });
-  if (typeof providers.generator !== "function") {
-    throw new Error("完整 ZH-4O 评测的 config 必须配置 generation provider。 ");
+  const capabilities = validateMemoryProviderConfig(config, { environment, requireGeneration: true, embedding: !options["without-embedding"] });
+  const datasetPath = path.resolve(options.dataset);
+  const samples = loadZh4oDataset(datasetPath);
+  const runOptions = {
+    datasetPath, config, environment, fetchImpl,
+    startSample: integer(options["start-sample"], 0, "--start-sample", 0),
+    maximumSamples: integer(options["max-samples"], Number.MAX_SAFE_INTEGER, "--max-samples"),
+    maximumQuestionsPerSample: integer(options["max-questions-per-sample"], Number.MAX_SAFE_INTEGER, "--max-questions-per-sample"),
+    candidateK: integer(options["candidate-k"], undefined, "--candidate-k"),
+    maximumContextCharacters: integer(options["maximum-context-characters"], undefined, "--maximum-context-characters"),
+    maximumDrainPasses: integer(options["maximum-drain-passes"], 1000, "--maximum-drain-passes"),
+    embeddingRequestIntervalMs: integer(options["embedding-interval-ms"], 0, "--embedding-interval-ms", 0),
+    withoutEmbedding: Boolean(options["without-embedding"]), retrievalOnly: Boolean(options["retrieval-only"]),
+    control: options["no-control"] ? "none" : "no-memory", includeSourceDiagnostics: Boolean(options["source-diagnostics"]),
+  };
+  if (runOptions.startSample >= samples.length) throw new Error("样本起点超出数据集范围。");
+  if (options["dry-run"]) {
+    const selected = samples.slice(runOptions.startSample, runOptions.startSample + runOptions.maximumSamples);
+    const questions = selected.reduce((sum, sample) => sum + Math.min(sample.questions.length, runOptions.maximumQuestionsPerSample), 0);
+    const result = { status: "validated", datasetSha256: zh4oDatasetSha256(datasetPath),
+      samples: selected.length, questions, generationModel: config.providers.generation.model,
+      embeddingModel: capabilities.embedding ? config.providers.embedding.model : null,
+      ingestion: config.defaults.ingestion, retrieval: config.defaults.retrieval,
+      retrievalOverrides: { candidateK: runOptions.candidateK, maximumContextCharacters: runOptions.maximumContextCharacters },
+      answerRequests: questions * (runOptions.control === "no-memory" ? 2 : 1),
+      note: "已检查配置结构、所需密钥是否已设置及数据格式；未建库、未调用模型。答题请求数不含记忆整理。" };
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`); return result;
   }
-  const report = await runZh4oMemorySystemBenchmark({
-    datasetPath,
-    workDirectory: path.resolve(options["work-dir"]),
-    startSample: integer(options["start-sample"], 0, "--start-sample", { minimum: 0 }),
-    maximumSamples: integer(options["max-samples"], Number.MAX_SAFE_INTEGER, "--max-samples", { minimum: 1 }),
-    maximumQuestionsPerSample: integer(
-      options["max-questions-per-sample"],
-      Number.MAX_SAFE_INTEGER,
-      "--max-questions-per-sample",
-      { minimum: 1 },
-    ),
-    candidateK: integer(options["candidate-k"], 9, "--candidate-k", { minimum: 1 }),
-    maximumEvents: integer(options["maximum-events"], 50, "--maximum-events", { minimum: 1 }),
-    maximumContentCharacters: integer(
-      options["maximum-content-characters"],
-      24_000,
-      "--maximum-content-characters",
-      { minimum: 1_000 },
-    ),
-    maximumContextCharacters: integer(
-      options["maximum-context-characters"],
-      24_000,
-      "--maximum-context-characters",
-      { minimum: 1_000 },
-    ),
-    maximumSemanticPasses: integer(
-      options["maximum-semantic-passes"],
-      100,
-      "--maximum-semantic-passes",
-      { minimum: 0 },
-    ),
-    embeddingRequestIntervalMs: integer(
-      options["embedding-interval-ms"],
-      0,
-      "--embedding-interval-ms",
-      { minimum: 0 },
-    ),
-    generator: providers.generator,
-    structureGenerator: providers.structureGenerator,
-    retrievalContextGenerator: providers.retrievalContextGenerator,
-    answerGenerator: providers.generator,
-    embeddingProvider: options["without-embedding"] ? null : providers.embedding,
-    retainSampleDatabases: Boolean(options["retain-sample-databases"]),
-    resumeSampleDatabases: Boolean(options["resume-sample-databases"]),
-    codeRevision: detectCodeRevision(),
-    onProgress: progressPrinter,
-  });
-  if (options.output) {
-    const outputPath = path.resolve(options.output);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-    report.outputPath = outputPath;
+  if (!options["work-dir"]) throw new Error(memoryZh4oSystemUsage());
+  const workDirectory = path.resolve(options["work-dir"]);
+  const resumeReport = options.resume ? JSON.parse(fs.readFileSync(path.resolve(options.resume), 'utf8')) : null;
+  const reportName = runOptions.retrievalOnly ? `report.retrieval-${Date.now()}.json` : "report.json";
+  const outputPath = path.resolve(options.output || path.join(workDirectory, reportName));
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  if (fs.existsSync(outputPath)) {
+    if (!fs.statSync(outputPath).isFile()) throw new Error('Report output must be a file, not a directory.');
+    fs.accessSync(outputPath, fs.constants.W_OK);
   }
-  emit(report, stdout);
-  return report;
+  const stagedPath = `${outputPath}.${randomUUID()}.pending`;
+  fs.closeSync(fs.openSync(stagedPath, 'wx', 0o600));
+  let completeReport = false, hasCheckpoint = false;
+  const writingPath = `${stagedPath}.writing`;
+  const saveCheckpoint = report => {
+    try {
+      const descriptor = fs.openSync(writingPath, 'wx', 0o600);
+      try { fs.writeFileSync(descriptor, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(descriptor); }
+      finally { fs.closeSync(descriptor); }
+      fs.renameSync(writingPath, stagedPath);
+      hasCheckpoint = true;
+    } finally { fs.rmSync(writingPath, { force: true }); }
+  };
+  try {
+    const report = await runZh4oMemorySystemBenchmark({ ...runOptions, workDirectory, codeRevision: readEvaluationCodeRevision(),
+      resumeReport, onCheckpoint: saveCheckpoint,
+      onProgress: event => { if (event.completed === event.total || event.completed % 20 === 0) stderr.write(`${JSON.stringify({
+        phase: event.phase, sampleId: event.sampleId, completed: event.completed, total: event.total,
+        status: event.row?.status, correct: event.row?.correct,
+      })}\n`); } });
+    saveCheckpoint(report);
+    completeReport = true;
+    fs.renameSync(stagedPath, outputPath);
+    stdout.write(`${JSON.stringify({ status: report.status, report: outputPath, scores: report.scores,
+      controls: report.controls, degradedSamples: report.diagnostics.degradedSamples }, null, 2)}\n`);
+    return report;
+  } catch (error) {
+    if (completeReport && fs.existsSync(stagedPath)) {
+      throw new Error(`Report could not be moved to its destination; the complete report is retained at ${stagedPath}.`, { cause: error });
+    }
+    if (hasCheckpoint && fs.existsSync(stagedPath)) {
+      throw new Error(`Evaluation interrupted; the last complete checkpoint is retained at ${stagedPath}.`, { cause: error });
+    }
+    throw error;
+  } finally {
+    if (!hasCheckpoint) fs.rmSync(stagedPath, { force: true });
+    fs.rmSync(writingPath, { force: true });
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  runMemoryZh4oSystemCli().catch((error) => {
-    process.stderr.write(`错误：${error.message}\n`);
-    process.exitCode = 1;
-  });
+  runMemoryZh4oSystemCli().then(report => {
+    if (['aborted', 'incomplete', 'completed-with-failures'].includes(report.status)) process.exitCode = 1;
+  }).catch(error => { process.stderr.write(`错误：${error.message}\n`); process.exitCode = 1; });
 }

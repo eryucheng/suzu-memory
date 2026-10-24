@@ -1273,10 +1273,15 @@ export class MemoryRepository {
     }
     if (beforeSourceEvent !== null) {
       const source = beforeSourceEvent.metadata?.eventSource || {};
-      clauses.push(`(${sourceSequence}, COALESCE(json_extract(metadata_json, '$.eventSource.commitSequence'), 0),
-        COALESCE(json_extract(metadata_json, '$.suzuMemoryFragment.index'), 0), external_id) < (?, ?, ?, ?)`);
-      parameters.push(source.observation?.commitSequence ?? source.commitSequence ?? 0,
-        source.commitSequence ?? 0, beforeSourceEvent.metadata?.suzuMemoryFragment?.index || 0, beforeSourceEvent.external_id);
+      if (!beforeSourceEvent.metadata?.eventSource) {
+        clauses.push('(occurred_at, external_id) < (?, ?)');
+        parameters.push(beforeSourceEvent.occurred_at, beforeSourceEvent.external_id);
+      } else {
+        clauses.push(`(${sourceSequence}, COALESCE(json_extract(metadata_json, '$.eventSource.commitSequence'), 0),
+          COALESCE(json_extract(metadata_json, '$.suzuMemoryFragment.index'), 0), external_id) < (?, ?, ?, ?)`);
+        parameters.push(source.observation?.commitSequence ?? source.commitSequence ?? 0,
+          source.commitSequence ?? 0, beforeSourceEvent.metadata?.suzuMemoryFragment?.index || 0, beforeSourceEvent.external_id);
+      }
     }
     if (selectedStatuses.length) {
       clauses.push(`status IN (${selectedStatuses.map(() => "?").join(", ")})`);
@@ -9635,12 +9640,8 @@ export class MemoryRepository {
     };
   }
 
-  getMemoryDetail(agentId, memoryId) {
-    const memory = this.getMemory(memoryId);
-    if (!memory || memory.agent_id !== clean(agentId)) return null;
-    return {
-      memory,
-      sources: this.database.prepare(`
+  listMemorySources(memoryId) {
+    return this.database.prepare(`
         SELECT source.*, link.relation, link.authority,
                link.source_trust, link.evidence_strength,
                link.provenance AS evidence_provenance,
@@ -9650,7 +9651,15 @@ export class MemoryRepository {
         JOIN source_records AS source ON source.id = link.source_id
         WHERE link.memory_id = ?
         ORDER BY source.occurred_at ASC, source.recorded_at ASC
-      `).all(memoryId).map(normalizeEvidenceSource),
+      `).all(memoryId).map(normalizeEvidenceSource);
+  }
+
+  getMemoryDetail(agentId, memoryId) {
+    const memory = this.getMemory(memoryId);
+    if (!memory || memory.agent_id !== clean(agentId)) return null;
+    return {
+      memory,
+      sources: this.listMemorySources(memoryId),
       roles: this.listMemoryRoles(memoryId),
       actorEntities: this.listMemoryActorEntities(memoryId),
       entities: this.listMemoryEntities(memoryId),

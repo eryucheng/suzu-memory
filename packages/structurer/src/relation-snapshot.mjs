@@ -1,5 +1,5 @@
 import { memoryBudgetError } from "./budgeted-parts.mjs";
-import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, eventSourceMaterial } from "@suzu-memory/core";
+import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, eventSourceMaterial, modelCalendarFields } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -67,9 +67,7 @@ export function buildRelationSnapshot({
         sourceRecords.set(source.id, {
           id: source.id,
           sourceKind: source.source_kind,
-          occurredAt: source.occurred_at,
-          knownAt: source.known_at,
-          recordedAt: source.recorded_at,
+          ...modelCalendarFields(source, ['occurredAt', 'knownAt', 'recordedAt']),
           speaker: source.speaker,
           content: completeText(source.content, sourceCharLimit, `Source ${source.id}`),
         });
@@ -87,10 +85,7 @@ export function buildRelationSnapshot({
       worldId: memory.world_id,
       worldFrame: memory.world_frame,
       temporalState: memory.temporal_state,
-      eventDate: memory.event_date,
-      eventStart: memory.event_start,
-      eventEnd: memory.event_end,
-      knownAt: memory.known_at,
+      ...modelCalendarFields(memory, ['eventDate', 'eventStart', 'eventEnd', 'knownAt'], sources),
       sourceIds: sources.map((source) => source.id),
       sourcesTruncated: false,
     });

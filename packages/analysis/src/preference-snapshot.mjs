@@ -1,7 +1,7 @@
 import { stateAnalysisBudgetError } from "./request-budget.mjs";
 import { createHash } from "node:crypto";
 
-import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView } from "@suzu-memory/core";
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, modelCalendarFields } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -59,11 +59,12 @@ function contextIdentity(memory, sources, episodeIds, timeZone) {
   if (spaces.length === 1) {
     return { evidenceGroupId, contextId: `space:${spaces[0]}`, contextBasis: "interaction-space" };
   }
+  const memoryTime = modelCalendarFields(memory, ['eventDate', 'eventStart'], sources);
+  const sourceTimes = sources.map(source => modelCalendarFields(source, ['occurredAt', 'knownAt']));
   const contextDay = dayOf(
-    memory.event_date
-      || memory.event_start
-      || sources.find((source) => source.occurred_at)?.occurred_at
-      || sources.find((source) => source.known_at)?.known_at,
+    memoryTime.eventDate || memoryTime.eventStart
+      || sourceTimes.find(source => source.occurredAt)?.occurredAt
+      || sourceTimes.find(source => source.knownAt)?.knownAt,
     timeZone,
   );
   return {
@@ -200,9 +201,7 @@ export function buildPreferenceEvidenceSnapshot({
         sourceRecords.set(source.id, {
           id: source.id,
           sourceKind: source.source_kind,
-          occurredAt: source.occurred_at,
-          knownAt: source.known_at,
-          recordedAt: source.recorded_at,
+          ...modelCalendarFields(source, ['occurredAt', 'knownAt', 'recordedAt']),
           speaker: source.speaker,
           content: requireCompleteText(source.content, sourceCharLimit, `Source ${source.id}`),
         });
@@ -221,10 +220,7 @@ export function buildPreferenceEvidenceSnapshot({
       evidenceMode: memory.evidence_mode,
       // An utterance's archival time is not the validity of the state it expresses.
       ...(requestBoundUtterance ? {} : { temporalState: memory.temporal_state }),
-      eventDate: memory.event_date,
-      eventStart: memory.event_start,
-      eventEnd: memory.event_end,
-      knownAt: memory.known_at,
+      ...modelCalendarFields(memory, ['eventDate', 'eventStart', 'eventEnd', 'knownAt'], sources),
       actorRoles: detail.roles.map(roleView),
       sourceIds: sources.map((source) => source.id),
       sourcesTruncated: false,

@@ -28,6 +28,12 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+function sourceTimeMetadata(generated, referenced) {
+  return !generated.eventDate && !generated.eventStart && !generated.eventEnd
+    && referenced.some(item => item.message.sourceMetadata?.sourceTimeKnown === false)
+    ? { sourceTimeKnown: false } : {};
+}
+
 function sourceLanguage(value) {
   const normalized = clean(value).toLowerCase();
   return ["zh", "en", "mixed", "unknown"].includes(normalized)
@@ -345,6 +351,7 @@ function storeProvisionalImpression({
     actorRoles,
     metadata: {
       provisional: true,
+      ...sourceTimeMetadata(generated, referenced),
       reviewState: "pending",
       epistemicStatus: "agent_impression",
       epistemicHolderRole: "agent",
@@ -589,6 +596,7 @@ export function archiveLongTermEvidence({
         actorRoles: utteranceIdentity.actorRoles,
         metadata: {
           sourceKind: message.sourceKind,
+          ...(message.sourceMetadata?.sourceTimeKnown === false ? { sourceTimeKnown: false } : {}),
           speaker: message.speaker,
           extractionBatchId: batchId,
           archiveWindowId: clean(message.archiveWindowId),
@@ -797,6 +805,7 @@ export function archiveLongTermEvidence({
         }),
         metadata: {
           subjectName: generated.subjectName,
+          ...sourceTimeMetadata(generated, referenced),
           retentionReason: generated.retentionReason,
           sourceRefs: generated.sourceRefs,
           inputEventTypes: [...new Set(referenced.map((item) => clean(item.message.sourceKind))

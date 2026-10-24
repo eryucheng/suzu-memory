@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { readEvaluationCodeRevision } from '../src/code-revision.mjs';
+
+test('code identity distinguishes two uncommitted implementations and includes new source files', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'evaluation-revision-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const git = args => execFileSync('git', args, { cwd: root, windowsHide: true, stdio: 'pipe' });
+  git(['init', '--quiet']);
+  const module = path.join(root, 'packages/example/src/main.mjs');
+  fs.mkdirSync(path.dirname(module), { recursive: true });
+  fs.writeFileSync(module, 'export const value = 1;\n');
+  git(['add', '.']);
+  git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Fixture']);
+  const read = () => readEvaluationCodeRevision({ repositoryRoot: root });
+  const clean = read();
+  assert.equal(clean.dirty, false);
+  assert.match(clean.workingTreeHash, /^[a-f0-9]{64}$/);
+  fs.writeFileSync(module, 'export const value = 2;\n');
+  const first = read();
+  fs.writeFileSync(module, 'export const value = 3;\n');
+  const second = read();
+  assert.equal(first.commit, second.commit);
+  assert.equal(first.dirty, true);
+  assert.equal(second.dirty, true);
+  assert.notEqual(first.workingTreeHash, second.workingTreeHash);
+  git(['add', '.']);
+  assert.equal(second.workingTreeHash, read().workingTreeHash);
+  fs.writeFileSync(path.join(path.dirname(module), 'new.mjs'), 'export const added = true;\n');
+  assert.notEqual(second.workingTreeHash, read().workingTreeHash);
+});

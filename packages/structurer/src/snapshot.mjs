@@ -4,6 +4,7 @@ import {
   DIRECT_INGESTION_MEMORY_KINDS,
   executionEventSourceView,
   eventSourceMaterial,
+  modelCalendarFields,
 } from "@suzu-memory/core";
 
 function clean(value) {
@@ -57,10 +58,8 @@ function memoryView(repository, memory, maximumContentChars) {
     worldId: memory.world_id,
     worldFrame: memory.world_frame,
     temporalState: memory.temporal_state,
-    eventDate: memory.event_date,
-    eventStart: memory.event_start,
-    eventEnd: memory.event_end,
-    knownAt: memory.known_at,
+    ...modelCalendarFields(memory, ['eventDate', 'eventStart', 'eventEnd', 'knownAt'],
+      repository.listMemorySources(memory.id)),
     confidence: Number(memory.confidence),
     importance: Number(memory.importance),
     actorRoles: actorView(repository, memory.id),

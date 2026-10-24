@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { assertEventSourceExecutionCurrent } from "./event-source-execution.mjs";
+import { modelCalendarFields } from './calendar-time.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -264,6 +265,7 @@ function materializeState(repository, proposal, evidence) {
     actorRoles: actorRoles(proposal),
     metadata: {
       reportedStateProposalId: proposal.id,
+      ...modelCalendarFields(evidence.detail.memory, [], evidence.detail.sources),
       reportedStateAction: proposal.action,
       reportedStateReviewVersion: proposal.review_version,
       reportedStateInputHash: proposal.input_hash,
@@ -387,6 +389,7 @@ export function materializeReportedStateProposal(repository, { agentId, proposal
       actorRoles: actorRoles({ ...proposal, proposed_kind: proposal.proposed_kind || previous?.kind }, { provisional: true }),
       metadata: {
         provisional: true, reviewState: "pending", epistemicStatus: "reported_state",
+        ...modelCalendarFields(evidence.detail.memory, [], evidence.detail.sources),
         reportedStateProposalId: proposal.id, reportedStateAction: proposal.action,
         reportedStatePreviousMemoryId: proposal.previousMemoryId,
         reportedStateDraft: proposal.draft,

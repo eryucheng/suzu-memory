@@ -1,4 +1,4 @@
-import { executionEventSourceView, eventSourceMaterial, assertEventSourceExecutionCurrent, memoryWorldsCompatible, recordEventContinuityReview } from '@suzu-memory/core';
+import { executionEventSourceView, eventSourceMaterial, assertEventSourceExecutionCurrent, memoryWorldsCompatible, recordEventContinuityReview, modelCalendarFields } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
 import { lexicalScore } from '@suzu-memory/retriever';
 import { appendUsageEvent } from '@suzu-memory/usage-ledger';
@@ -26,12 +26,13 @@ function view(repository, memory) {
   const detail = repository.getMemoryDetail(memory.agent_id, memory.id);
   return { id: memory.id, title: memory.title, content: memory.content, canonicalKey: memory.canonical_key,
     reality: memory.reality, worldId: memory.world_id, worldFrame: memory.world_frame,
-    temporalState: memory.temporal_state, eventStart: memory.event_start, eventEnd: memory.event_end,
+    temporalState: memory.temporal_state,
     evidenceMode: memory.evidence_mode,
-    eventDate: memory.event_date, knownAt: memory.known_at,
+    ...modelCalendarFields(memory, ['eventDate', 'eventStart', 'eventEnd', 'knownAt'], detail.sources),
     subjectRole: memory.subject_role, subjectKey: memory.subject_key,
     actorRoles: detail.roles.map(role => ({ role: role.role, actorRole: role.actor_role, actorKey: role.actor_key })),
-    sources: detail.sources.map(source => ({ id: source.id, speaker: source.speaker, content: source.content, occurredAt: source.occurred_at })),
+    sources: detail.sources.map(source => ({ id: source.id, speaker: source.speaker, content: source.content,
+      ...modelCalendarFields(source, ['occurredAt']) })),
   };
 }
 

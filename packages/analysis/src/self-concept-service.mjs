@@ -1,3 +1,4 @@
+import { modelCalendarFields } from '@suzu-memory/core';
 import { analysisSourceMaterial } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
@@ -27,7 +28,7 @@ function currentStateView(repository, agentId, subjectRole, subjectKey, canonica
   return { id: current.id, kind: current.kind, content: String(current.content ?? ""), subjectRole: current.subject_role,
     subjectKey: current.subject_key, canonicalKey: current.canonical_key,
     representationLayer: current.representation_layer, temporalState: current.temporal_state,
-    knownAt: current.known_at, validFrom: current.valid_from, validTo: current.valid_to };
+    ...modelCalendarFields(current, ['knownAt', 'validFrom', 'validTo'], repository.listMemorySources(current.id)) };
 }
 function targetHasRole(memory, target, allowedRoles, { allowPrimary = true } = {}) {
   if (allowPrimary && memory.subjectRole === target.subjectRole && memory.subjectKey === target.subjectKey) return true;

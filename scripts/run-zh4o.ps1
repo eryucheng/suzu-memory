@@ -3,102 +3,52 @@ param(
   [string]$ConfigPath = ".\suzu-memory.local.json",
   [string]$DatasetPath = ".\runtime\benchmarks\zh4o\moom-official-v1\data.json",
   [string]$WorkDirectory = "",
-  [int]$CandidateK = 9,
-  [int]$MaximumEvents = 50,
-  [int]$MaximumContentCharacters = 24000,
-  [int]$MaximumContextCharacters = 24000,
-  [int]$MaximumSemanticPasses = 100,
-  [int]$EmbeddingIntervalMs = 50,
+  [string]$OutputPath = "",
+  [string]$ResumeReport = "",
+  [int]$StartSample = 0,
+  [int]$MaximumSamples,
+  [int]$MaximumQuestionsPerSample,
+  [int]$CandidateK,
+  [int]$MaximumContextCharacters,
+  [int]$MaximumDrainPasses,
+  [int]$EmbeddingIntervalMs,
+  [switch]$RetrievalOnly,
+  [switch]$WithoutEmbedding,
+  [switch]$NoControl,
+  [switch]$SourceDiagnostics,
   [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
-$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-Set-Location $repositoryRoot
-
-function Resolve-RequiredPath([string]$PathValue, [string]$Label) {
-  if ([string]::IsNullOrWhiteSpace($PathValue) -or -not (Test-Path -LiteralPath $PathValue)) {
-    throw "$Label was not found: $PathValue"
-  }
-  return (Resolve-Path -LiteralPath $PathValue).Path
+$repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$configResolved = (Resolve-Path -LiteralPath $ConfigPath).Path
+$datasetResolved = (Resolve-Path -LiteralPath $DatasetPath).Path
+if (($RetrievalOnly -or ![string]::IsNullOrWhiteSpace($ResumeReport)) -and [string]::IsNullOrWhiteSpace($WorkDirectory)) {
+  throw "RetrievalOnly and ResumeReport require the existing WorkDirectory."
 }
-
-$configPathResolved = Resolve-RequiredPath $ConfigPath "Memory configuration"
-$datasetPathResolved = Resolve-RequiredPath $DatasetPath "ZH-4O dataset"
-$benchmarkConfig = ([System.IO.File]::ReadAllText($configPathResolved).TrimStart([char]0xFEFF) | ConvertFrom-Json)
-$generation = $benchmarkConfig.providers.generation
-$embedding = $benchmarkConfig.providers.embedding
-
-if (-not $DryRun) {
-  foreach ($environmentName in @($generation.apiKeyEnv, $embedding.apiKeyEnv) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) {
-    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($environmentName))) {
-      throw "Required environment variable is empty: $environmentName"
-    }
-  }
-}
-
 if ([string]::IsNullOrWhiteSpace($WorkDirectory)) {
-  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  $WorkDirectory = ".\runtime\benchmarks\zh4o\runs\$stamp"
+  $WorkDirectory = Join-Path $repositoryRoot ("runtime\benchmarks\zh4o\runs\" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 }
-New-Item -ItemType Directory -Force -Path $WorkDirectory | Out-Null
-$workDirectoryResolved = (Resolve-Path -LiteralPath $WorkDirectory).Path
-
-$runManifest = [ordered]@{
-  schemaVersion = 1
-  runner = "scripts/run-zh4o.ps1"
-  createdAt = (Get-Date).ToUniversalTime().ToString("o")
-  dataset = [ordered]@{
-    path = $datasetPathResolved
-    sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $datasetPathResolved).Hash.ToLowerInvariant()
-  }
-  config = [ordered]@{
-    sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $configPathResolved).Hash.ToLowerInvariant()
-    generation = [ordered]@{
-      type = $generation.type
-      name = $generation.name
-      baseUrl = $generation.baseUrl
-      endpoint = $generation.endpoint
-      model = $generation.model
-      structuredOutputMode = $generation.structuredOutputMode
-      maxOutputTokens = $generation.maxOutputTokens
-    }
-    embedding = [ordered]@{
-      type = $embedding.type
-      name = $embedding.name
-      baseUrl = $embedding.baseUrl
-      endpoint = $embedding.endpoint
-      model = $embedding.model
-      dimensions = $embedding.dimensions
-    }
-  }
-  parameters = [ordered]@{
-    candidateK = $CandidateK
-    maximumEvents = $MaximumEvents
-    maximumContentCharacters = $MaximumContentCharacters
-    maximumContextCharacters = $MaximumContextCharacters
-    maximumSemanticPasses = $MaximumSemanticPasses
-    embeddingIntervalMs = $EmbeddingIntervalMs
-    dryRun = [bool]$DryRun
-  }
+$workResolved = [System.IO.Path]::GetFullPath($WorkDirectory)
+$arguments = @("packages/evaluation/src/zh4o-system-cli.mjs", "--config", $configResolved,
+  "--dataset", $datasetResolved, "--work-dir", $workResolved, "--start-sample", [string]$StartSample)
+if (![string]::IsNullOrWhiteSpace($OutputPath)) { $arguments += @("--output", [System.IO.Path]::GetFullPath($OutputPath)) }
+if (![string]::IsNullOrWhiteSpace($ResumeReport)) { $arguments += @("--resume", (Resolve-Path -LiteralPath $ResumeReport).Path) }
+$optionalValues = @{
+  MaximumSamples = "max-samples"; MaximumQuestionsPerSample = "max-questions-per-sample"
+  CandidateK = "candidate-k"; MaximumContextCharacters = "maximum-context-characters"
+  MaximumDrainPasses = "maximum-drain-passes"; EmbeddingIntervalMs = "embedding-interval-ms"
 }
-$runManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $workDirectoryResolved "run-manifest.json") -Encoding utf8
-
-$arguments = @(
-  ".\packages\evaluation\src\zh4o-system-cli.mjs",
-  "--dataset", $datasetPathResolved,
-  "--config", $configPathResolved,
-  "--work-dir", $workDirectoryResolved,
-  "--candidate-k", $CandidateK,
-  "--maximum-events", $MaximumEvents,
-  "--maximum-content-characters", $MaximumContentCharacters,
-  "--maximum-context-characters", $MaximumContextCharacters,
-  "--maximum-semantic-passes", $MaximumSemanticPasses,
-  "--embedding-interval-ms", $EmbeddingIntervalMs,
-  "--output", (Join-Path $workDirectoryResolved "report.json")
-)
-if ($DryRun) { $arguments += "--dry-run" }
-
-Write-Host "ZH-4O run directory: $workDirectoryResolved"
-& node @arguments
-exit $LASTEXITCODE
+foreach ($name in $optionalValues.Keys) {
+  if ($PSBoundParameters.ContainsKey($name)) { $arguments += @("--" + $optionalValues[$name], [string]$PSBoundParameters[$name]) }
+}
+foreach ($entry in @(@("retrieval-only", $RetrievalOnly), @("without-embedding", $WithoutEmbedding),
+  @("no-control", $NoControl), @("source-diagnostics", $SourceDiagnostics), @("dry-run", $DryRun))) {
+  if ($entry[1]) { $arguments += "--" + $entry[0] }
+}
+Push-Location $repositoryRoot
+try {
+  & node @arguments
+  $exitCode = $LASTEXITCODE
+} finally { Pop-Location }
+exit $exitCode

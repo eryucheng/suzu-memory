@@ -847,12 +847,13 @@ function selectDialogueEvidence(primary, expanded, maximum) {
 function formatUtterance(node, options) {
   const speaker = node.metadata?.speaker
     || (node.subject_role === "agent" ? "我" : "对方");
-  return `[${timestampLabel(node.event_start || node.recorded_at, options.timeZone)}] ${speaker}：${boundedText(node.content, options.maximumMessageChars)}`;
+  const time = node.metadata?.sourceTimeKnown === false ? "时间未知" : timestampLabel(node.event_start || node.recorded_at, options.timeZone);
+  return `[${time}] ${speaker}：${boundedText(node.content, options.maximumMessageChars)}`;
 }
 
 function formatEvidenceMemory(node, options) {
   if (node.kind === "utterance") return formatUtterance(node, options);
-  const time = node.event_date
+  const time = node.metadata?.sourceTimeKnown === false ? "时间未知" : node.event_date
     || timestampLabel(node.event_start || node.recorded_at, options.timeZone);
   const kind = node.kind === "event" ? "事件"
     : node.kind === "fact" ? "事实记录"
@@ -933,7 +934,8 @@ function formatPrimary(primary, evidence, options, {
       options.maximumContextChars,
     );
   }
-  const time = options.showRecallDate && structuredStateNode(primary) && memoryCalendarDate(primary, options.timeZone)
+  const time = primary.metadata?.sourceTimeKnown === false ? "时间未知"
+    : options.showRecallDate && structuredStateNode(primary) && memoryCalendarDate(primary, options.timeZone)
     ? `状态记录日期：${memoryCalendarDate(primary, options.timeZone)}${primary.valid_from
       ? `；状态生效时间：${timestampLabel(primary.valid_from, options.timeZone)}${primary.valid_to
         ? ` 至 ${timestampLabel(primary.valid_to, options.timeZone)}` : ''}` : ''}`
@@ -1404,7 +1406,7 @@ function formatCausalChain(primary, nodes, options, direction = "backward") {
   const related = nodes.filter((node) => node.id !== primary.id);
   if (!related.length) return formatPrimary(primary, [], options);
   const limit = Math.max(80, Math.floor(options.maximumContextChars / (related.length + 1)));
-  const time = (node) => node.event_date
+  const time = (node) => node.metadata?.sourceTimeKnown === false ? "时间未知" : node.event_date
     || timestampLabel(node.event_start || node.recorded_at, options.timeZone);
   if (direction === "forward") {
     return joinBoundedSections([
@@ -1951,7 +1953,7 @@ function formatRecallText({
     const ordered = [...chain.nodes].sort((left, right) =>
       String(right.known_at || right.recorded_at).localeCompare(String(left.known_at || left.recorded_at)));
     const sections = ordered.map(node => {
-      const time = timestampLabel(node.known_at || node.recorded_at, options.timeZone);
+      const time = node.metadata?.sourceTimeKnown === false ? "时间未知" : timestampLabel(node.known_at || node.recorded_at, options.timeZone);
       if (!node.metadata?.reportedStateProposalId || !isProvisionalNode(node)) {
         return `[${time}] 记录：${node.content}`;
       }

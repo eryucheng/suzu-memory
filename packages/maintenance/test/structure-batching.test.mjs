@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
-import { runImmediateMemoryMaintenance, runSemanticMemoryMaintenance } from "../src/index.mjs";
+import { runImmediateMemoryMaintenance, runSemanticMemoryMaintenance, inspectMaintenance } from "../src/index.mjs";
 import { planMemoryConsolidation } from "@suzu-memory/structurer";
 import { claimAccumulatedStructureTasks } from "../src/structure-batching.mjs";
 
@@ -53,6 +53,26 @@ test("nineteen memories wait without generation or attempts, the twentieth is gr
   f.seed(39);
   await f.run();
   assert.equal(f.calls.length, 2);
+});
+
+test('maintenance inspection shares the structure threshold without claiming or modifying tasks', async t => {
+  const f = fixture(t);
+  for (let index = 0; index < 19; index++) f.seed(index);
+  const snapshot = () => JSON.stringify(f.database.prepare('SELECT * FROM memory_maintenance_tasks ORDER BY id').all());
+  const before = snapshot();
+  const waiting = inspectMaintenance({ repository: f.repository, agentId: 'owner', limit: 1 });
+  assert.equal(waiting.tasks.length, 1);
+  assert.equal(waiting.structureQueue.accumulatingTaskCount, 19);
+  assert.equal(waiting.structureQueue.pendingMemoryCount, 19);
+  assert.equal(snapshot(), before);
+  const lowerThreshold = inspectMaintenance({ repository: f.repository, agentId: 'owner', limit: 1, minimumStructureMemories: 19 });
+  assert.equal(lowerThreshold.structureQueue.accumulatingTaskCount, 0);
+  assert.equal(snapshot(), before);
+  f.seed(19);
+  assert.equal(inspectMaintenance({ repository: f.repository, agentId: 'owner', limit: 1 }).structureQueue.accumulatingTaskCount, 0);
+  await f.run();
+  assert.equal(f.calls.length, 1);
+  assert.equal(inspectMaintenance({ repository: f.repository, agentId: 'owner', limit: 1 }).structureQueue.pendingMemoryCount, 0);
 });
 
 test("duplicates, deleted memories and other Agents do not inflate a batch", async t => {

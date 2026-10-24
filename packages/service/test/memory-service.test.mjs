@@ -123,6 +123,35 @@ test("service initializes schema and identity roots only once before ordinary re
   assert.equal(initializeCalls, 2);
 });
 
+test('read-only service opens existing data without identity writes and rejects writes through repository callbacks', async t => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'read-only-test' };
+  const writer = createMemoryService({ ...options, defaults: { relationshipLabel: 'original' } });
+  writer.initialize();
+  seedMemory(writer);
+  const reader = createMemoryService({ ...options, readOnly: true, defaults: { relationshipLabel: 'query-label' } });
+  t.after(async () => { await reader.close(); await writer.close(); fs.rmSync(options.dataRoot, { recursive: true, force: true }); });
+  assert.equal(reader.initialize().identityStructure, null);
+  assert.throws(() => reader.backupDatabase(), /Read-only memory service/);
+  assert.throws(() => reader.restoreDatabaseBackup('missing', { confirmAgentId: reader.agentId }), /Read-only memory service/);
+  assert.throws(() => reader.importDatabaseAsAgent('missing', { confirmAgentId: reader.agentId }), /Read-only memory service/);
+  assert.throws(() => reader.withRepository((_repository, db) => db.exec("UPDATE memory_nodes SET content='overwritten'")), /readonly|read.only/i);
+  await assert.rejects(reader.search('科技馆'), /Read-only memory service/);
+  const result = await reader.search('科技馆', { persistTrace: false, reactivate: false });
+  assert.equal(result.status, 'ready');
+  assert.equal(reader.listRetrievalTraces().length, 0);
+  assert.equal(reader.withRepository(repository => repository.listRelationships(reader.agentId)[0].label), 'original');
+  assert.equal(reader.getMemory('event-museum').memory.content, '用户上周六去了科技馆，并参观了机器人展。');
+});
+
+test('read-only initialization does not create a missing database', () => {
+  const dataRoot = temporaryDirectory();
+  try {
+    const reader = createMemoryService({ dataRoot, agentId: 'missing', readOnly: true });
+    assert.throws(() => reader.initialize(), /unable to open|cannot open/i);
+    assert.equal(fs.existsSync(reader.paths.databasePath), false);
+  } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
+});
+
 test("service reuses repository editing, deletion, restoration and provenance detail", () => {
   const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
   service.initialize();

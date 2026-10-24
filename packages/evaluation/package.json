@@ -13,6 +13,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@suzu-memory/host-adapter": "0.1.0",
     "@suzu-memory/analysis": "0.1.0",
     "@suzu-memory/runtime": "0.1.0",
     "@suzu-memory/usage-ledger": "0.1.0",
@@ -20,7 +21,6 @@
     "@suzu-memory/config": "0.1.0",
     "@suzu-memory/embedding-indexer": "0.1.0",
     "@suzu-memory/extraction": "0.1.0",
-    "@suzu-memory/ingestion": "0.1.0",
     "@suzu-memory/providers": "0.1.0",
     "@suzu-memory/retriever": "0.1.0",
     "@suzu-memory/service": "0.1.0"

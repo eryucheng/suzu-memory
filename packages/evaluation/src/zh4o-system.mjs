@@ -3,12 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { createMemoryService } from "@suzu-memory/service";
+import { createMemoryServiceFromConfig, loadMemoryConfig, normalizeMemoryConfig, validateMemoryProviderConfig } from "@suzu-memory/config";
+import { createChatHostMemoryAdapter, buildConversationTurnEvents } from "@suzu-memory/host-adapter";
 import { calculateCost } from "@suzu-memory/usage-ledger";
-import {
-  createConversationArchiveWindows,
-  packConversationArchiveWindows,
-} from "@suzu-memory/ingestion";
+import { readEvaluationCodeRevision, evaluationPreparationKey } from './code-revision.mjs';
+import { questionFailure, runQuestionOperation, mergeUsageSummaries } from './zh4o-execution.mjs';
+
 
 import {
   ZH4O_CONTRACT_VERSION,
@@ -22,24 +22,21 @@ import {
   captureBenchmarkEmbeddingUsage as captureEmbeddingUsage,
   cleanBenchmarkValue as clean,
   createEmbeddingRequestGate,
-  drainBenchmarkSemanticMaintenance,
   meanBenchmarkValues as mean,
   summarizeBenchmarkEmbeddingUsage as summarizeEmbeddingUsage,
 } from "./retrieval-benchmark-utils.mjs";
 
-export const ZH4O_SYSTEM_PROTOCOL_VERSION = "suzu-zh4o-memory-system-v3";
-export const ZH4O_EVENT_FORMAT_VERSION = "zh4o-roleplay-conversation-event-v1";
-export const ZH4O_ANSWER_SCHEMA_NAME = "zh4o-multiple-choice-answer-v1";
+export const ZH4O_SYSTEM_PROTOCOL_VERSION = "suzu-zh4o-memory-system-v6";
+export const ZH4O_EVENT_FORMAT_VERSION = "zh4o-host-conversation-event-v2";
+export const ZH4O_ANSWER_SCHEMA_NAME = "zh4o-multiple-choice-answer-v2";
 export const ZH4O_ANSWER_SCHEMA = Object.freeze({
   type: "object",
   additionalProperties: false,
   required: ["choice"],
   properties: {
-    choice: { type: "string", enum: ["A", "B", "C", "D", "E"] },
+    choice: { type: "string", enum: ["A", "B", "C", "D"] },
   },
 });
-
-const NON_STRUCTURED_RETRIEVAL_MEMORY_KINDS = new Set(["utterance", "topic_or_episode"]);
 
 function stableHash(value) {
   return createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
@@ -47,12 +44,6 @@ function stableHash(value) {
 
 function unique(values) {
   return [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))];
-}
-
-function safeRemoveSqlite(databasePath) {
-  for (const selected of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
-    fs.rmSync(selected, { force: true });
-  }
 }
 
 function copyGeneratorCapabilities(source, target) {
@@ -65,15 +56,12 @@ function copyGeneratorCapabilities(source, target) {
 function captureGenerationUsage(generator, phase, records) {
   if (typeof generator !== "function") return null;
   const wrapped = async (request) => {
-    const response = await generator(request);
-    records.push({
-      phase,
-      schemaName: clean(request?.schemaName),
-      model: clean(response?.model),
-      provider: clean(response?.metadata?.provider),
-      usage: { ...(response?.usage || {}) },
-    });
-    return response;
+    let response;
+    try { response = await generator(request); return response; }
+    finally {
+      records.push({ phase, schemaName: clean(request?.schemaName), failed: !response,
+        model: clean(response?.model), provider: clean(response?.metadata?.provider), usage: { ...(response?.usage || {}) } });
+    }
   };
   return copyGeneratorCapabilities(generator, wrapped);
 }
@@ -87,11 +75,13 @@ function summarizeGenerationUsage(records, timestamp) {
       if (Number.isFinite(Number(value))) numericUsage[key] = (numericUsage[key] || 0) + Number(value);
     }
     const priced = calculateCost({ model: record.model, timestamp, usage: record.usage });
-    if (priced.amountCny === null) unknownPrice = true;
+    if (priced.amountCny === null || record.failed) unknownPrice = true;
     else amountCny += priced.amountCny;
   }
   return {
     requests: records.length,
+    failedRequests: records.filter(record => record.failed).length,
+    requestUnit: "generator-invocations; provider transport retries are not separate invocations",
     byPhase: Object.fromEntries(unique(records.map((record) => record.phase)).map((phase) => [
       phase,
       records.filter((record) => record.phase === phase).length,
@@ -115,79 +105,39 @@ function summarizeGenerationUsage(records, timestamp) {
  * the answering model as a real-world date.
  */
 export function createZh4oEventPlan(conversation, datasetSha256 = "") {
-  if (!conversation) throw new Error("构造 ZH-4O 事件计划需要 conversation。");
   const agentId = zh4oAgentId(conversation.sampleId, datasetSha256);
   const primaryUserId = `zh4o-user-${stableHash(conversation.sampleId).slice(0, 16)}`;
   const world = { id: "zh4o-roleplay", frame: "fictional" };
-  const eventIdToDialogueId = new Map();
-  const sessions = [];
-  const events = [];
+  const identity = { spaceId: agentId, primaryUserId, primaryUserName: conversation.speakerA,
+    companionId: agentId, companionName: conversation.speakerB,
+    defaultWorldId: world.id, defaultWorldFrame: world.frame };
+  const sessions = [], events = [], eventIdToDialogueId = new Map();
   for (const session of conversation.sessions) {
-    const memoryWindowId = `zh4o-window-${stableHash(
-      `${datasetSha256}\0${conversation.sampleId}\0${session.ordinal}`,
-    ).slice(0, 24)}`;
-    const sessionEvents = [];
-    let unitOrdinal = -1;
-    for (let turnOrdinal = 0; turnOrdinal < session.turns.length; turnOrdinal += 1) {
-      const turn = session.turns[turnOrdinal];
-      const content = clean(turn.text);
-      if (!content) continue;
-      const role = turn.speaker === conversation.speakerA ? "user" : "companion";
-      if (role === "user" || unitOrdinal < 0) unitOrdinal += 1;
-      const occurredAt = new Date(session.sequenceDate.getTime() + turnOrdinal).toISOString();
-      const eventId = `zh4o-event-${stableHash(
-        `${datasetSha256}\0${conversation.sampleId}\0${turn.dialogueId}`,
-      ).slice(0, 32)}`;
-      const actor = role === "user"
-        ? { role: "user", id: primaryUserId, name: conversation.speakerA }
-        : { role: "companion", id: agentId, name: conversation.speakerB };
-      const event = {
-        protocolVersion: 1,
-        eventId,
-        spaceId: agentId,
-        eventType: "conversation.turn",
-        occurredAt,
-        knownAt: occurredAt,
-        recordedAt: occurredAt,
-        actor,
-        participants: [
-          { role: "user", id: primaryUserId, name: conversation.speakerA },
-          { role: "companion", id: agentId, name: conversation.speakerB },
-        ],
-        world,
-        content: { text: content },
-        source: {
-          kind: "zh4o-roleplay-conversation",
-          locator: `zh4o://event/${stableHash(eventId).slice(0, 24)}`,
-        },
-        metadata: {
-          benchmark: "ZH-4O",
-          formatVersion: ZH4O_EVENT_FORMAT_VERSION,
-          sourceSessionId: session.sessionId,
-          sourceSessionOrdinal: session.ordinal,
-          sourceDateText: session.sourceDateText,
-          sourceTimeKnown: false,
-          scenario: "roleplay",
-          timelineOrder: "synthetic-only",
-          turnOrdinal,
-          memoryWindow: {
-            id: memoryWindowId,
-            unitId: `${memoryWindowId}:turn:${String(unitOrdinal + 1).padStart(6, "0")}`,
-            ordinal: turnOrdinal,
-          },
-        },
-      };
-      events.push(event);
-      sessionEvents.push(event);
-      eventIdToDialogueId.set(eventId, turn.dialogueId);
+    const replies = [];
+    for (let index = 0; index < session.turns.length;) {
+      const first = session.turns[index], selected = [first];
+      if (first.speaker === conversation.speakerA && session.turns[index + 1]?.speaker === conversation.speakerB) {
+        selected.push(session.turns[index + 1]);
+      }
+      const message = (turn, offset) => ({ id: turn.dialogueId, text: turn.text,
+        occurredAt: new Date(session.sequenceDate.getTime() + index + offset).toISOString(),
+        metadata: { zh4oDialogueId: turn.dialogueId, sourceSessionOrdinal: session.ordinal,
+          sourceTimeKnown: false, timelineOrder: "synthetic-only" } });
+      const reply = { sessionId: session.sessionId, turnId: `${session.sessionId}:${index}`,
+        world, metadata: { benchmark: "ZH-4O", formatVersion: ZH4O_EVENT_FORMAT_VERSION,
+          sourceTimeKnown: false, timelineOrder: "synthetic-only" },
+        ...(first.speaker === conversation.speakerA ? { userMessage: message(first, 0) }
+          : { assistantMessage: message(first, 0) }),
+        ...(selected.length === 2 ? { assistantMessage: message(selected[1], 1) } : {}) };
+      reply.recordedAt = reply.assistantMessage?.occurredAt || reply.userMessage.occurredAt;
+      replies.push(reply);
+      const built = buildConversationTurnEvents({ ...reply, identity, hostId: "zh4o", sourceKind: "zh4o-roleplay-conversation" });
+      for (const event of built) { events.push(event); eventIdToDialogueId.set(event.eventId, event.metadata.zh4oDialogueId); }
+      index += selected.length;
     }
-    sessions.push({
-      sessionOrdinal: session.ordinal,
-      memoryWindowId,
-      events: sessionEvents,
-    });
+    sessions.push({ sessionId: session.sessionId, replies });
   }
-  return { agentId, primaryUserId, world, events, sessions, eventIdToDialogueId };
+  return { agentId, primaryUserId, world, identity, sessions, events, eventIdToDialogueId };
 }
 
 export function assertZh4oEventsHaveNoGoldLabels({ conversation, plan } = {}) {
@@ -226,96 +176,6 @@ function sourceDialogueIds(detail, inputEventIdToDialogueId) {
     }
   }
   return unique(dialogueIds);
-}
-
-function listAllMemories(service, statuses = ["active"]) {
-  const memories = [];
-  let offset = 0;
-  while (true) {
-    const page = service.listMemories({ statuses, limit: 500, offset });
-    memories.push(...page.items);
-    offset += page.items.length;
-    if (!page.items.length || memories.length >= page.total) return memories;
-  }
-}
-
-function memoryDialogueMap(service, memories, inputEventIdToDialogueId) {
-  return new Map(memories.map((memory) => [
-    memory.id,
-    sourceDialogueIds(service.getMemory(memory.id), inputEventIdToDialogueId),
-  ]));
-}
-
-async function drainInputEvents(service, options) {
-  const batches = [];
-  const retryErrors = [];
-  for (let index = 0; index < 10_000; index += 1) {
-    let result;
-    try {
-      result = await service.processPendingEvents(options);
-    } catch (error) {
-      const failure = nonFatalStageError(error);
-      retryErrors.push(failure);
-      // A normal input-processing failure records an attempt and returns the
-      // events to pending.  The next service call either retries the same
-      // batch or, after its bounded retry policy is exhausted, archives the
-      // raw evidence and routes enrichment to human review.  The benchmark
-      // must exercise that lifecycle instead of silently dropping the pack.
-      if (failure.code === "INPUT_BATCH_LEASE_LOST" || retryErrors.length >= 3) {
-        return {
-          batches,
-          retryErrors,
-          complete: false,
-          terminal: {
-            status: failure.code === "INPUT_BATCH_LEASE_LOST"
-              ? "lease-lost"
-              : "retry-limit-reached",
-            reason: failure.message,
-            error: failure,
-          },
-        };
-      }
-      continue;
-    }
-    if (result.status === "skipped") return {
-      batches,
-      retryErrors,
-      complete: true,
-      terminal: result,
-    };
-    batches.push(result);
-    if (result.status !== "processed") {
-      return { batches, retryErrors, complete: false, terminal: result };
-    }
-  }
-  return {
-    batches,
-    retryErrors,
-    complete: false,
-    terminal: { status: "pass-limit-reached", reason: "input-processing-pass-limit" },
-  };
-}
-
-async function drainEmbeddingMaintenance(service, embeddingProvider) {
-  if (typeof embeddingProvider !== "function") {
-    return [{ status: "disabled", reason: "embedding-provider-not-configured", selected: 0 }];
-  }
-  const passes = [];
-  for (let index = 0; index < 100; index += 1) {
-    const result = await service.runEmbeddingMaintenance({
-      maximumTasks: 100,
-      batchSize: 10,
-      embeddingProvider,
-    });
-    passes.push(result);
-    if (["empty", "disabled"].includes(result.status)) return passes;
-  }
-  passes.push({
-    status: "pass-limit-reached",
-    selected: 0,
-    error: "ZH-4O embedding maintenance still had work after 100 bounded passes.",
-  });
-  return passes;
 }
 
 function dialogueIndex(conversation) {
@@ -447,8 +307,8 @@ export function buildZh4oAnswerRequest({ question, context } = {}) {
   return {
     systemPrompt: [
       "你正在回答一题中文角色扮演长期记忆单选题。",
-      "只能依据用户提供的召回对话片段作答，不能补充片段外的设定或常识猜测。",
-      "题目中已经列出 A 到 E 选项。必须选择且只选择其中一个字母。",
+      "依据提供的记忆材料回答题目；材料缺失时仍需从题目给出的选项中选择一个。",
+      "题目中已经列出 A 到 D 选项。必须选择且只选择其中一个字母。",
       "不要解释、不要复述题目、不要输出思考过程。",
     ].join("\n"),
     input: [
@@ -461,16 +321,8 @@ export function buildZh4oAnswerRequest({ question, context } = {}) {
 }
 
 function normalizeChoice(value) {
-  const direct = clean(value).toUpperCase();
-  if (/^[A-E]$/u.test(direct)) return direct;
-  const match = /(?:答案|选项|choice)?\s*[：:：]?\s*([A-E])(?:\s|$|[。.!！,，])/iu.exec(direct);
-  return match ? match[1].toUpperCase() : "";
-}
-
-function sampleDatabasePath(workDirectory, agentId) {
-  const directory = path.join(workDirectory, "samples");
-  fs.mkdirSync(directory, { recursive: true });
-  return path.join(directory, `${agentId}.db`);
+  const choice = clean(value).toUpperCase();
+  return /^[A-D]$/u.test(choice) ? choice : "";
 }
 
 function postHocEvidenceAudit(question, context, candidateDialogueIds = []) {
@@ -487,6 +339,8 @@ function postHocEvidenceAudit(question, context, candidateDialogueIds = []) {
   }
   const contextBlocks = Array.isArray(context?.candidateBlocks) ? context.candidateBlocks : [];
   const usedDialogueIds = new Set(context?.usedDialogueIds || []);
+  const fragmentSources = new Set(context?.sourceDialogueIds || []);
+  const fragmentSourceGoldEvidenceDialogueIds = goldEvidenceDialogueIds.filter(id => fragmentSources.has(id));
   const candidateGoldEvidenceDialogueIds = goldEvidenceDialogueIds.filter((dialogueId) => (
     candidateRanksByDialogueId.has(dialogueId)
   ));
@@ -503,26 +357,30 @@ function postHocEvidenceAudit(question, context, candidateDialogueIds = []) {
       dialogueId,
       candidateRanks,
       contextCandidateRanks,
+      associatedWithFragment: fragmentSources.has(dialogueId),
       includedInAnswerContext,
       status: includedInAnswerContext
-        ? "included-in-answer-context"
-        : candidateRanks.length
-          ? "candidate-not-in-answer-context"
-          : "not-in-candidate-pool",
+        ? "verbatim-in-answer-context"
+        : fragmentSources.has(dialogueId)
+          ? "fragment-source-without-verbatim-text"
+          : candidateRanks.length
+            ? "candidate-not-in-answer-context"
+            : "not-in-candidate-pool",
     };
   });
   const goldEvidenceRetrievalOutcome = !goldEvidenceDialogueIds.length
     ? "unannotated"
     : recalledGoldEvidenceDialogueIds.length === goldEvidenceDialogueIds.length
-      ? "all-gold-in-answer-context"
+      ? "all-gold-verbatim-in-answer-context"
       : recalledGoldEvidenceDialogueIds.length
-        ? "partial-gold-in-answer-context"
+        ? "partial-gold-verbatim-in-answer-context"
         : candidateGoldEvidenceDialogueIds.length
           ? "gold-in-candidate-pool-not-answer-context"
           : "gold-not-in-candidate-pool";
   return {
     goldEvidenceDialogueIds,
     candidateGoldEvidenceDialogueIds,
+    fragmentSourceGoldEvidenceDialogueIds,
     recalledGoldEvidenceDialogueIds,
     candidateGoldEvidenceQuestionHit: goldEvidenceDialogueIds.length
       ? candidateGoldEvidenceDialogueIds.length > 0
@@ -539,15 +397,6 @@ function postHocEvidenceAudit(question, context, candidateDialogueIds = []) {
     goldEvidenceRetrievalOutcome,
     goldEvidenceDiagnostics,
   };
-}
-
-function diagnosticAnswerOutput(value) {
-  if (value === undefined) return null;
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    return clean(value) || null;
-  }
 }
 
 function diagnosticCandidateRows(retrieval, candidateDialogueIds, context, goldEvidenceDialogueIds) {
@@ -592,6 +441,7 @@ function diagnosticCandidateRows(retrieval, candidateDialogueIds, context, goldE
       contextAssembly: contextBlock ? {
         status: clean(contextBlock.status),
         emittedDialogueIds: [...(contextBlock.emittedDialogueIds || [])],
+        associatedDialogueIds: [...(contextBlock.associatedDialogueIds || [])],
       } : {
         status: "not-provided",
         emittedDialogueIds: [],
@@ -633,10 +483,11 @@ function diagnosticRetrievalSnapshot(retrieval, candidateDialogueIds, context, e
   };
 }
 
-function summarizeRows(rows) {
-  const completed = rows.filter((row) => row.status === "completed");
-  const failed = rows.filter((row) => row.status === "failed");
-  const annotatedEvidenceRows = completed.filter((row) => row.goldEvidenceDialogueIds?.length);
+export function summarizeZh4oRows(rows) {
+  const completed = rows.filter((row) => row.status === "completed" && row.scoringEligible !== false);
+  const failed = rows.filter((row) => row.status === "failed" && row.scoringEligible !== false);
+  const eligible = [...completed, ...failed];
+  const annotatedEvidenceRows = eligible.filter((row) => row.goldEvidenceDialogueIds?.length);
   const goldEvidenceTurns = annotatedEvidenceRows.reduce(
     (sum, row) => sum + row.goldEvidenceDialogueIds.length,
     0,
@@ -671,23 +522,26 @@ function summarizeRows(rows) {
   const incorrectWithGoldInContext = annotatedEvidenceRows.filter((row) => (
     row.goldEvidenceQuestionHit && !row.correct
   )).length;
-  const officialAccuracy = completed.length
-    ? completed.reduce((sum, row) => sum + Number(row.correct), 0) / completed.length
+  const officialAccuracy = eligible.length
+    ? completed.reduce((sum, row) => sum + Number(row.correct), 0) / eligible.length
     : null;
-  const validChoiceRows = completed.filter((row) => row.answerFormat === "choice");
+  const validChoiceRows = eligible.filter((row) => row.answerFormat === "choice");
+  const completedChoiceRows = completed.filter((row) => row.answerFormat === "choice");
+  const isCorrect = row => row.status === 'completed' && Boolean(row.correct);
   const validChoiceAccuracy = validChoiceRows.length
-    ? validChoiceRows.reduce((sum, row) => sum + Number(row.correct), 0) / validChoiceRows.length
+    ? validChoiceRows.filter(isCorrect).length / validChoiceRows.length
     : null;
-  const byCategory = Object.fromEntries([...new Set(completed.map((row) => row.category))]
+  const byCategory = Object.fromEntries([...new Set(validChoiceRows.map((row) => row.category))]
     .sort((left, right) => left - right)
     .map((category) => {
-      const selected = completed.filter((row) => row.category === category);
+      const selected = validChoiceRows.filter((row) => row.category === category);
       const categoryAccuracy = selected.length
-        ? selected.reduce((sum, row) => sum + Number(row.correct), 0) / selected.length
+        ? selected.filter(isCorrect).length / selected.length
         : null;
       return [category, {
         questions: selected.length,
-        correct: selected.reduce((sum, row) => sum + Number(row.correct), 0),
+        correct: selected.filter(isCorrect).length,
+        failures: selected.filter(row => row.status === 'failed').length,
         exactChoiceAccuracy: categoryAccuracy,
         exactChoiceAccuracyPercent: categoryAccuracy === null ? null : categoryAccuracy * 100,
       }];
@@ -696,15 +550,18 @@ function summarizeRows(rows) {
     attempted: rows.length,
     completed: completed.length,
     failures: failed.length,
+    eligibleQuestions: eligible.length,
+    failureRate: eligible.length ? failed.length / eligible.length : null,
+    excluded: rows.filter(row => row.status === "excluded" || row.scoringEligible === false).length,
     correct: completed.reduce((sum, row) => sum + Number(row.correct), 0),
-    // The upstream scorer includes every non-empty gold value, including the
-    // one malformed non-choice value currently published in ZH-4O. Preserve
-    // that result for reproducibility, while also exposing the meaningful
-    // valid-choice subset for model/system diagnosis.
     officialDatasetAccuracy: officialAccuracy,
     officialDatasetAccuracyPercent: officialAccuracy === null ? null : officialAccuracy * 100,
     validChoiceQuestions: validChoiceRows.length,
-    validChoiceCorrect: validChoiceRows.reduce((sum, row) => sum + Number(row.correct), 0),
+    validChoiceCorrect: validChoiceRows.filter(isCorrect).length,
+    validChoiceCompletedQuestions: completedChoiceRows.length,
+    validChoiceFailures: validChoiceRows.filter(row => row.status === 'failed').length,
+    completedChoiceAccuracy: completedChoiceRows.length
+      ? completedChoiceRows.filter(isCorrect).length / completedChoiceRows.length : null,
     exactChoiceAccuracy: validChoiceAccuracy,
     exactChoiceAccuracyPercent: validChoiceAccuracy === null ? null : validChoiceAccuracy * 100,
     byCategory,
@@ -713,10 +570,13 @@ function summarizeRows(rows) {
         ? mean(completed.map((row) => Number(row.context?.contextCharacters || 0)))
         : null,
       truncated: completed.filter((row) => row.context?.contextTruncated).length,
-      empty: completed.filter((row) => !row.context?.usedDialogueIds?.length).length,
+      empty: completed.filter((row) => !row.context?.recallCharacters).length,
     },
     evidenceAudit: {
+      policy: "verbatim source-text presence in the emitted recall; not a measure of semantic summary coverage",
       annotatedQuestions: annotatedEvidenceRows.length,
+      fragmentSourceQuestionHits: annotatedEvidenceRows.filter(row => row.fragmentSourceGoldEvidenceDialogueIds?.length).length,
+      fragmentSourceGoldEvidenceTurns: annotatedEvidenceRows.reduce((sum, row) => sum + (row.fragmentSourceGoldEvidenceDialogueIds?.length || 0), 0),
       candidatePoolQuestionHits: candidateEvidenceQuestionHits,
       candidatePoolQuestionHitRate: annotatedEvidenceRows.length
         ? candidateEvidenceQuestionHits / annotatedEvidenceRows.length
@@ -745,491 +605,380 @@ function summarizeRows(rows) {
 }
 
 function nonFatalStageError(error) {
-  return {
-    message: clean(error?.message) || "unknown error",
-    code: clean(error?.code),
-  };
+  return questionFailure(error);
 }
 
-/**
- * Full ZH-4O memory-system benchmark.  It deliberately does not use the
- * dataset's observation/session_summary/event_summary/qa.evidence fields:
- * only raw role-play dialogue enters memory before the later QA stage.
- */
-export async function runZh4oMemorySystemBenchmark({
-  datasetPath,
-  workDirectory,
-  startSample = 0,
-  maximumSamples = Number.MAX_SAFE_INTEGER,
-  maximumQuestionsPerSample = Number.MAX_SAFE_INTEGER,
-  candidateK = 9,
-  maximumContextCharacters = 24_000,
-  generator,
-  structureGenerator = generator,
-  retrievalContextGenerator = generator,
-  answerGenerator = generator,
-  embeddingProvider = null,
-  embeddingRequestIntervalMs = 0,
-  maximumEvents = 50,
-  maximumContentCharacters = 24_000,
-  maximumSemanticPasses = 100,
-  codeRevision = {},
-  retainSampleDatabases = false,
-  resumeSampleDatabases = false,
-  onProgress = null,
-} = {}) {
-  if (typeof generator !== "function") throw new Error("ZH-4O 完整评测需要 generation provider。 ");
-  if (typeof answerGenerator !== "function") throw new Error("ZH-4O 完整评测需要 answer generator。 ");
-  const normalizedDatasetPath = path.resolve(clean(datasetPath));
-  const normalizedWorkDirectory = path.resolve(clean(workDirectory));
-  if (!clean(datasetPath) || !fs.existsSync(normalizedDatasetPath)) {
-    throw new Error(`ZH-4O 数据集不存在：${normalizedDatasetPath}`);
+
+function positiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive integer.`);
+  return value;
+}
+
+export function summarizeZh4oControls(results, mode) {
+  const paired = results.filter(row => row.scoringEligible && row.status === "completed"
+    && row.control?.status === "completed" && row.answerFormat === "choice");
+  return { mode, pairedQuestions: paired.length,
+    failedQuestions: results.filter(row => row.scoringEligible && row.control?.status === 'failed').length,
+    memoryAccuracy: paired.length ? mean(paired.map(row => Number(row.correct))) : null,
+    noMemoryAccuracy: paired.length ? mean(paired.map(row => Number(row.control.correct))) : null,
+    memoryOnlyCorrect: paired.filter(row => row.correct && !row.control.correct).length,
+    controlOnlyCorrect: paired.filter(row => !row.correct && row.control.correct).length };
+}
+
+function inputRows(service) {
+  const rows = [];
+  for (let offset = 0;; offset += 500) {
+    const page = service.listInputEvents({ statuses: [], offset, limit: 500 });
+    rows.push(...page.items);
+    if (offset + page.items.length >= page.total || !page.items.length) return rows;
   }
-  if (!clean(workDirectory)) throw new Error("ZH-4O 完整评测需要 workDirectory。 ");
-  fs.mkdirSync(normalizedWorkDirectory, { recursive: true });
+}
 
-  const allSamples = loadZh4oDataset(normalizedDatasetPath);
-  const datasetSha256 = zh4oDatasetSha256(normalizedDatasetPath);
-  const selectedStart = boundedInteger(startSample, 0, { minimum: 0, maximum: allSamples.length });
-  const selectedMaximum = boundedInteger(maximumSamples, allSamples.length, {
-    minimum: 1,
-    maximum: allSamples.length,
+function materializedContext(retrieval, dialogueIdsFor, dialogueById) {
+  const context = String(retrieval.context || "");
+  const recallText = (retrieval.fragments || []).map(fragment => String(fragment.text || ""))
+    .filter(text => text && context.includes(text)).join("\n");
+  const ids = new Set((retrieval.fragments || []).flatMap(fragment => [
+    fragment.memoryId, ...(fragment.memoryIds || []), ...(fragment.evidenceIds || []),
+  ]).filter(Boolean));
+  const sourceDialogueIds = unique([...ids].flatMap(dialogueIdsFor));
+  const usedDialogueIds = sourceDialogueIds.filter(id => {
+    const text = dialogueById.get(id)?.text;
+    return text && recallText.includes(text);
   });
-  const selectedSamples = allSamples.slice(selectedStart, selectedStart + selectedMaximum);
-  if (!selectedSamples.length) throw new Error("ZH-4O 选定范围没有样本。 ");
-  const selectedQuestionLimit = boundedInteger(maximumQuestionsPerSample, Number.MAX_SAFE_INTEGER, {
-    minimum: 1,
-    maximum: Number.MAX_SAFE_INTEGER,
+  const visible = new Set(usedDialogueIds);
+  const candidateBlocks = (retrieval.candidates || []).map((candidate, index) => {
+    const associatedDialogueIds = ids.has(candidate.memoryId) ? dialogueIdsFor(candidate.memoryId) : [];
+    const emittedDialogueIds = associatedDialogueIds.filter(id => visible.has(id));
+    return { rank: index + 1, status: emittedDialogueIds.length ? "included"
+      : associatedDialogueIds.length ? "fragment-source-only" : "not-materialized",
+      associatedDialogueIds, emittedDialogueIds };
   });
-  const selectedCandidateK = boundedInteger(candidateK, 9, { minimum: 1, maximum: 1_000 });
-  const selectedContextCharacters = boundedInteger(maximumContextCharacters, 24_000, {
-    minimum: 1_000,
-    maximum: 1_000_000,
-  });
-  const selectedMaximumEvents = boundedInteger(maximumEvents, 50, { minimum: 1, maximum: 500 });
-  const selectedMaximumContentCharacters = boundedInteger(maximumContentCharacters, 24_000, {
-    minimum: 1_000,
-    maximum: 1_000_000,
-  });
+  const budget = retrieval.trace?.metadata?.outputBudget;
+  return { context, contextCharacters: context.length, recallCharacters: recallText.length,
+    contextTruncated: Boolean(budget?.sectionTruncationApplied || budget?.safetyTruncationApplied),
+    usedDialogueIds, sourceDialogueIds, candidateBlocks,
+    provenancePolicy: "sourceDialogueIds are fragment associations; usedDialogueIds require full verbatim source text in the emitted recall" };
+}
 
-  const generationUsageRecords = [];
-  const embeddingUsageRecords = [];
-  const embeddingGate = createEmbeddingRequestGate(embeddingRequestIntervalMs);
-  const extractionGenerator = captureGenerationUsage(generator, "extraction", generationUsageRecords);
-  const semanticStructureGenerator = captureGenerationUsage(
-    structureGenerator,
-    "semantic-structure",
-    generationUsageRecords,
-  );
-  const semanticContextGenerator = captureGenerationUsage(
-    retrievalContextGenerator,
-    "semantic-retrieval-context",
-    generationUsageRecords,
-  );
-  const scoredAnswerGenerator = captureGenerationUsage(answerGenerator, "answer", generationUsageRecords);
-  const indexEmbeddingProvider = captureEmbeddingUsage(
-    embeddingProvider,
-    "index",
-    embeddingUsageRecords,
-    embeddingGate,
-  );
-  const queryEmbeddingProvider = captureEmbeddingUsage(
-    embeddingProvider,
-    "query",
-    embeddingUsageRecords,
-    embeddingGate,
-  );
+function embeddingIndexIdentity(provider) {
+  if (!provider) return null;
+  const { type, baseUrl, model, dimensions, extraBody, extraHeaders } = provider;
+  return { model, dimensions, requestConfigSha256: stableHash(JSON.stringify({
+    type, baseUrl, endpoint: provider.endpoint || 'embeddings', model, dimensions, extraBody, extraHeaders,
+  })) };
+}
 
-  const startedAt = new Date();
-  const startedPerformance = performance.now();
-  const results = [];
-  const samples = [];
-  const retainedDatabases = [];
-  for (let sampleIndex = 0; sampleIndex < selectedSamples.length; sampleIndex += 1) {
-    const conversation = selectedSamples[sampleIndex];
+/** Replay through the configured public service and host lifecycle. No QA labels enter ingestion. */
+export async function runZh4oMemorySystemBenchmark({
+  datasetPath, workDirectory, config, environment = process.env, fetchImpl = globalThis.fetch,
+  startSample = 0, maximumSamples = Number.MAX_SAFE_INTEGER, maximumQuestionsPerSample = Number.MAX_SAFE_INTEGER,
+  candidateK, maximumContextCharacters, maximumDrainPasses = 1000, embeddingRequestIntervalMs = 0,
+  withoutEmbedding = false, retrievalOnly = false, control = "no-memory", includeSourceDiagnostics = false,
+  codeRevision = readEvaluationCodeRevision(), onProgress = null, onCheckpoint = null, resumeReport = null,
+} = {}) {
+  if (!config) throw new Error("ZH-4O requires the real Memory config.");
+  const normalizedConfig = typeof config === "string" ? loadMemoryConfig(config) : normalizeMemoryConfig(config);
+  validateMemoryProviderConfig(normalizedConfig, { environment, requireGeneration: true, embedding: !withoutEmbedding });
+  if (!datasetPath || !fs.existsSync(datasetPath)) throw new Error("ZH-4O dataset does not exist.");
+  if (!workDirectory) throw new Error("ZH-4O requires a dedicated work directory.");
+  if (!["no-memory", "none"].includes(control)) throw new Error("control must be no-memory or none.");
+  positiveInteger(maximumDrainPasses, "maximumDrainPasses");
+  if (candidateK !== undefined) positiveInteger(candidateK, "candidateK");
+  if (maximumContextCharacters !== undefined) positiveInteger(maximumContextCharacters, "maximumContextCharacters");
+  const allSamples = loadZh4oDataset(datasetPath), datasetSha256 = zh4oDatasetSha256(datasetPath);
+  const selectedStart = Number(startSample);
+  if (!Number.isSafeInteger(selectedStart) || selectedStart < 0) throw new Error("Invalid sample start.");
+  positiveInteger(maximumSamples, "maximumSamples"); positiveInteger(maximumQuestionsPerSample, "maximumQuestionsPerSample");
+  const selectedSamples = allSamples.slice(selectedStart, selectedStart + maximumSamples);
+  if (!selectedSamples.length) throw new Error("No samples selected.");
+  const work = path.resolve(workDirectory);
+  const preparation = { configSha256: stableHash(JSON.stringify(normalizedConfig)),
+    codeRevision: { ...codeRevision }, withoutEmbedding: Boolean(withoutEmbedding) };
+  evaluationPreparationKey(preparation);
+  const questionsById = new Map(selectedSamples.flatMap(sample => sample.questions.slice(0, maximumQuestionsPerSample)
+    .map(question => [question.questionId, { ...question, sampleId: sample.sampleId }])));
+  const identity = stableHash(JSON.stringify({ datasetSha256, work, preparation, retrievalOnly, control,
+    candidateK, maximumContextCharacters, maximumDrainPasses, embeddingRequestIntervalMs, includeSourceDiagnostics,
+    questions: [...questionsById.keys()] }));
+  if (resumeReport && (resumeReport.protocol?.version !== ZH4O_SYSTEM_PROTOCOL_VERSION
+    || resumeReport.run?.identity !== identity || !Array.isArray(resumeReport.results) || !Array.isArray(resumeReport.samples))) {
+    throw new Error('Checkpoint does not match this dataset, selection, work directory, configuration or code.');
+  }
+  const previousSamples = new Map();
+  const previousQuestions = new Set();
+  for (const sample of resumeReport?.samples || []) {
+    if (!selectedSamples.some(selected => selected.sampleId === sample.sampleId) || previousSamples.has(sample.sampleId)) {
+      throw new Error('Checkpoint has unknown or duplicate samples.');
+    }
+    evaluationPreparationKey(sample.preparation);
+    previousSamples.set(sample.sampleId, structuredClone(sample));
+  }
+  for (const row of resumeReport?.results || []) {
+    const question = questionsById.get(row.questionId);
+    if (!question || row.sampleId !== question.sampleId || !previousSamples.has(row.sampleId)
+      || previousQuestions.has(row.questionId) || !['completed', 'failed', 'excluded'].includes(row.status)
+      || row.answerFormat !== question.answerFormat || row.expectedChoice !== question.answer || row.category !== question.category
+      || row.scoringEligible !== (row.status !== 'excluded' && !previousSamples.get(row.sampleId).memorySystemDegraded)
+      || (row.status === 'completed' && (!normalizeChoice(row.prediction) || row.correct !== (row.prediction === question.answer)))
+      || (row.control?.status === 'completed' && (!normalizeChoice(row.control.prediction)
+        || row.control.correct !== (row.control.prediction === question.answer)))) {
+      throw new Error('Checkpoint has invalid or duplicate question results.');
+    }
+    previousQuestions.add(row.questionId);
+  }
+  const preparedSamples = selectedSamples.map(conversation => {
     const plan = createZh4oEventPlan(conversation, datasetSha256);
     assertZh4oEventsHaveNoGoldLabels({ conversation, plan });
-    const databasePath = sampleDatabasePath(normalizedWorkDirectory, plan.agentId);
-    const databaseResumed = Boolean(resumeSampleDatabases && fs.existsSync(databasePath));
-    const usageLedgerPath = path.join(normalizedWorkDirectory, "usage", `${plan.agentId}.jsonl`);
-    fs.mkdirSync(path.dirname(usageLedgerPath), { recursive: true });
-    if (!databaseResumed) {
-      safeRemoveSqlite(databasePath);
-      fs.rmSync(usageLedgerPath, { force: true });
-    }
-    const service = createMemoryService({
-      dataRoot: normalizedWorkDirectory,
-      agentId: plan.agentId,
-      databasePath,
-      usageLedgerPath,
-      providers: {
-        generator: extractionGenerator,
-        structureGenerator: semanticStructureGenerator,
-        retrievalContextGenerator: semanticContextGenerator,
-        embedding: indexEmbeddingProvider,
-      },
-      defaults: {
-        memoryOwner: conversation.speakerB,
-        userName: conversation.speakerA,
-        primaryUserId: plan.primaryUserId,
-        companionId: plan.agentId,
-        relationshipLabel: "relationship",
-        ingestion: {
-          maximumEventCharacters: Math.min(12_000, selectedMaximumContentCharacters),
-          maximumBatchCharacters: selectedMaximumContentCharacters,
-        },
-      },
-    });
-    const inputEventIdToDialogueId = new Map();
-    const inputBatches = [];
-    const processingErrors = [];
-    const inputProcessingRetries = [];
-    const archiveWindows = plan.sessions.flatMap((sessionPlan) => createConversationArchiveWindows(sessionPlan, {
-      maximumEvents: selectedMaximumEvents,
-      maximumContentCharacters: selectedMaximumContentCharacters,
-    }));
-    const archiveWindowPacks = packConversationArchiveWindows(archiveWindows, {
-      maximumEvents: selectedMaximumEvents,
-      maximumContentCharacters: selectedMaximumContentCharacters,
-    });
-    for (const pack of archiveWindowPacks) {
-      const coreEvents = pack.windows.flatMap((window) => window.coreEvents);
-      const appendResult = service.appendEvents(coreEvents);
-      for (const [eventId, dialogueId] of internalEventDialogueMap(appendResult, plan.eventIdToDialogueId)) {
-        inputEventIdToDialogueId.set(eventId, dialogueId);
+    const sampleRoot = path.join(work, "samples", plan.agentId), manifestPath = path.join(sampleRoot, "benchmark.json");
+    const reuse = retrievalOnly || Boolean(resumeReport && fs.existsSync(manifestPath));
+    const service = createMemoryServiceFromConfig(normalizedConfig, { environment, fetchImpl,
+      overrides: { dataRoot: sampleRoot, agentId: plan.agentId, readOnly: reuse,
+        defaults: { memoryOwner: conversation.speakerB, userName: conversation.speakerA,
+          primaryUserId: plan.primaryUserId, companionId: plan.agentId } } });
+    let saved = null;
+    if (reuse) {
+      if (!fs.existsSync(service.paths.databasePath) || !fs.existsSync(manifestPath)) throw new Error("No retained sample database/manifest; import the sample first.");
+      saved = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (saved.protocol !== ZH4O_SYSTEM_PROTOCOL_VERSION || saved.datasetSha256 !== datasetSha256 || saved.sampleId !== conversation.sampleId) {
+        throw new Error("Retained database does not match this dataset and evaluation protocol.");
       }
-      try {
-        const processing = await drainInputEvents(service, {
-          maximumEvents: Math.max(selectedMaximumEvents, appendResult.events.length),
-          maximumContentCharacters: Math.max(selectedMaximumContentCharacters, pack.characters),
-          candidateEventIds: appendResult.events.map((event) => event.id),
-          archiveWindows: pack.windows.map((window) => ({
-            id: window.id,
-            continuityId: window.memoryWindowId,
-            coreEventIds: window.coreEvents.map((event) => event.eventId),
-            previousContextEvents: window.previousContextEvents,
-            continuationGuidanceEvents: window.continuationGuidanceEvents,
-          })),
-          generator: extractionGenerator,
-          now: conversation.questionDate,
-        });
-        inputBatches.push(...processing.batches);
-        if (processing.retryErrors.length) {
-          inputProcessingRetries.push({
-            archiveWindowIds: pack.windows.map((window) => window.id),
-            errors: processing.retryErrors,
-          });
-        }
-        if (!processing.complete) processingErrors.push({
-          kind: "input-processing-incomplete",
-          terminal: processing.terminal,
-        });
-      } catch (error) {
-        processingErrors.push({ kind: "input-processing-error", ...nonFatalStageError(error) });
+      evaluationPreparationKey(saved.preparation);
+      if (previousSamples.has(conversation.sampleId)
+        && (evaluationPreparationKey(previousSamples.get(conversation.sampleId).preparation) !== evaluationPreparationKey(saved.preparation)
+          || previousSamples.get(conversation.sampleId).databasePath !== service.paths.databasePath
+          || (saved.degraded && !previousSamples.get(conversation.sampleId).memorySystemDegraded))) {
+        throw new Error('Checkpoint memory preparation differs from the retained database.');
       }
-    }
-    let semanticMaintenance = null;
-    try {
-      semanticMaintenance = await drainBenchmarkSemanticMaintenance({
-        service,
-        options: {
-          generator: extractionGenerator,
-          structureGenerator: semanticStructureGenerator,
-          retrievalContextGenerator: semanticContextGenerator,
-          now: conversation.questionDate,
-        },
-        maximumPasses: boundedInteger(maximumSemanticPasses, 100, { minimum: 0, maximum: 100_000 }),
-      });
-    } catch (error) {
-      semanticMaintenance = { complete: false, passes: [], failures: { total: 1 }, error: nonFatalStageError(error) };
-    }
-    let embeddingPasses = [];
-    try {
-      embeddingPasses = await drainEmbeddingMaintenance(service, indexEmbeddingProvider);
-    } catch (error) {
-      embeddingPasses = [{ status: "failed", error: nonFatalStageError(error) }];
-    }
-
-    const formalStructured = listAllMemories(service, ["active", "superseded", "disputed"])
-      .filter((memory) => !NON_STRUCTURED_RETRIEVAL_MEMORY_KINDS.has(memory.kind));
-    const provisionalStructured = listAllMemories(service, ["archived"])
-      .filter((memory) => (
-        memory.layer === "provisional"
-        && memory.metadata?.provisional === true
-        && memory.metadata?.reviewState === "pending"
-        && !NON_STRUCTURED_RETRIEVAL_MEMORY_KINDS.has(memory.kind)
-      ));
-    const episodicEvidence = listAllMemories(service, ["active"])
-      .filter((memory) => memory.kind === "utterance");
-    const recallableMemories = [...formalStructured, ...provisionalStructured, ...episodicEvidence];
-    const recallableMemoryToDialogueIds = memoryDialogueMap(
-      service,
-      recallableMemories,
-      inputEventIdToDialogueId,
-    );
-    const sourceTurns = dialogueIndex(conversation);
-    const questions = conversation.questions.slice(0, selectedQuestionLimit);
-    let sampleQuestionFailures = 0;
-    for (let questionIndex = 0; questionIndex < questions.length; questionIndex += 1) {
-      const question = questions[questionIndex];
-      const retrievalQuery = buildZh4oRetrievalQuery(question);
-      const retrievalStarted = performance.now();
-      let retrieval;
-      let context;
-      let candidateDialogueIds = [];
-      let evidenceAudit = postHocEvidenceAudit(question, null);
-      let retrievalLatencyMs = null;
-      let contextAssemblyLatencyMs = null;
-      let answerLatencyMs = null;
-      let failureStage = "retrieval";
-      try {
-        retrieval = await service.search(retrievalQuery, {
-          now: conversation.questionDate,
-          queryPerspective: {
-            speakerRole: "user",
-            speakerKey: plan.primaryUserId,
-            speakerNames: [conversation.speakerA],
-            addresseeRole: "agent",
-            addresseeKey: plan.agentId,
-            addresseeNames: [conversation.speakerB],
-          },
-          world: plan.world,
-          options: {
-            maximumCandidates: selectedCandidateK,
-            maximumEpisodicCandidates: selectedCandidateK,
-            maximumReturnedCandidates: selectedCandidateK,
-          },
-          embeddingProvider: queryEmbeddingProvider,
-          persistTrace: false,
-        });
-        retrievalLatencyMs = performance.now() - retrievalStarted;
-        failureStage = "context-assembly";
-        const contextAssemblyStarted = performance.now();
-        candidateDialogueIds = (retrieval.candidates || []).map((candidate) => (
-          recallableMemoryToDialogueIds.get(candidate.memoryId)
-          || sourceDialogueIds(service.getMemory(candidate.memoryId), inputEventIdToDialogueId)
-        ));
-        context = buildZh4oRetrievedContext({
-          conversation,
-          dialogueById: sourceTurns,
-          candidateDialogueIds,
-          candidateLimit: selectedCandidateK,
-          maximumContextCharacters: selectedContextCharacters,
-        });
-        contextAssemblyLatencyMs = performance.now() - contextAssemblyStarted;
-        evidenceAudit = postHocEvidenceAudit(question, context, candidateDialogueIds);
-        failureStage = "answer";
-        const answerStarted = performance.now();
-        const answerRequest = buildZh4oAnswerRequest({ question, context: context.context });
-        const response = await scoredAnswerGenerator(answerRequest);
-        answerLatencyMs = performance.now() - answerStarted;
-        const prediction = normalizeChoice(response?.output?.choice ?? response?.output);
-        const correct = prediction === question.answer;
-        results.push({
-          status: "completed",
-          sampleId: conversation.sampleId,
-          questionId: question.questionId,
-          category: question.category,
-          retrievalQuery,
-          expectedChoice: question.answer,
-          answerFormat: question.answerFormat,
-          prediction,
-          correct,
-          candidateCount: retrieval.candidates?.length || 0,
-          retrievalStatus: retrieval.status,
-          retrievalMode: retrieval.retrievalMode || "",
-          vectorStatus: retrieval.vector?.status || "disabled",
-          latencyMs: performance.now() - retrievalStarted,
-          retrievalLatencyMs,
-          contextAssemblyLatencyMs,
-          answerLatencyMs,
-          context,
-          retrievalDiagnostics: diagnosticRetrievalSnapshot(
-            retrieval,
-            candidateDialogueIds,
-            context,
-            evidenceAudit,
-          ),
-          answerDiagnostics: {
-            rawOutput: diagnosticAnswerOutput(response?.output),
-            model: clean(response?.model),
-            provider: clean(response?.metadata?.provider),
-            usage: diagnosticAnswerOutput(response?.usage) || {},
-          },
-          ...evidenceAudit,
-        });
-      } catch (error) {
-        sampleQuestionFailures += 1;
-        results.push({
-          status: "failed",
-          sampleId: conversation.sampleId,
-          questionId: question.questionId,
-          category: question.category,
-          retrievalQuery,
-          expectedChoice: question.answer,
-          answerFormat: question.answerFormat,
-          candidateCount: retrieval?.candidates?.length || 0,
-          retrievalStatus: retrieval?.status || "failed",
-          latencyMs: performance.now() - retrievalStarted,
-          retrievalLatencyMs,
-          contextAssemblyLatencyMs,
-          answerLatencyMs,
-          context: context || null,
-          retrievalDiagnostics: retrieval
-            ? diagnosticRetrievalSnapshot(
-              retrieval,
-              candidateDialogueIds,
-              context,
-              evidenceAudit,
-            )
-            : null,
-          ...evidenceAudit,
-          failureStage,
-          error: nonFatalStageError(error),
-        });
+      if (!withoutEmbedding && JSON.stringify(saved.embedding) !== JSON.stringify(embeddingIndexIdentity(normalizedConfig.providers.embedding))) {
+        throw new Error("Retained embedding configuration differs; retrieval-only cannot rebuild the index.");
       }
-      if (typeof onProgress === "function") {
-        onProgress({
-          phase: "question",
-          sample: sampleIndex + 1,
-          samples: selectedSamples.length,
-          completed: questionIndex + 1,
-          total: questions.length,
-          row: results.at(-1),
-        });
-      }
+    } else if (previousSamples.has(conversation.sampleId) || fs.existsSync(service.paths.databasePath) || fs.existsSync(manifestPath)) {
+      throw new Error("Sample database exists; use a new work directory or --retrieval-only.");
     }
-    const embeddingMaintenanceFailures = embeddingPasses.filter((pass) => (
-      ["failed", "partial-failure", "pass-limit-reached"].includes(pass.status)
-    ));
-    const inputGenerationDegradedBatches = inputBatches.filter((batch) => (
-      Boolean(batch.generationDiagnostics?.degraded)
-    ));
-    samples.push({
-      sampleId: conversation.sampleId,
-      sessions: conversation.sessions.length,
-      inputEvents: plan.events.length,
-      archiveWindows: archiveWindows.length,
-      archiveWindowPacks: archiveWindowPacks.length,
-      inputBatches: inputBatches.length,
-      inputProcessingErrors: processingErrors,
-      inputProcessingRetries,
-      inputGenerationDegradedBatches: inputGenerationDegradedBatches.length,
-      databaseLifecycle: databaseResumed ? "resumed" : "created",
-      semanticPasses: semanticMaintenance.passes?.length || 0,
-      semanticPendingBefore: semanticMaintenance.pendingBefore ?? null,
-      semanticPendingAfter: semanticMaintenance.pendingAfter ?? null,
-      semanticMaintenanceComplete: Boolean(semanticMaintenance.complete),
-      semanticMaintenanceFailures: semanticMaintenance.failures || { total: 0 },
-      embeddingPasses: embeddingPasses.length,
-      embeddingMaintenanceFailures,
-      activeStructuredMemories: formalStructured.filter((memory) => memory.status === "active").length,
-      provisionalStructuredMemories: provisionalStructured.length,
-      episodicEvidenceMemories: episodicEvidence.length,
-      recallableMemories: recallableMemories.length,
-      questionFailures: sampleQuestionFailures,
-      memorySystemDegraded: processingErrors.length > 0
-        || inputGenerationDegradedBatches.length > 0
-        || !semanticMaintenance.complete
-        || Number(semanticMaintenance.failures?.total || 0) > 0
-        || embeddingMaintenanceFailures.length > 0,
-    });
-    if (retainSampleDatabases) retainedDatabases.push(databasePath);
-    else {
-      safeRemoveSqlite(databasePath);
-      fs.rmSync(usageLedgerPath, { force: true });
-    }
+    return { conversation, plan, sampleRoot, manifestPath, service, saved, reuse };
+  });
+  fs.mkdirSync(work, { recursive: true });
+  const startedAt = resumeReport?.run.startedAt || new Date().toISOString(), started = performance.now();
+  const results = structuredClone(resumeReport?.results || []), samples = [...previousSamples.values()];
+  const generationUsageRecords = [], embeddingUsageRecords = [];
+  const embeddingGate = createEmbeddingRequestGate(embeddingRequestIntervalMs);
+  const retryDelayMs = Math.max(0, Number(normalizedConfig.providers.generation.transportRetryDelayMs ?? 500));
+  let abort = null, failureStreak = { key: '', count: 0 };
+  function reportSnapshot(running = false) {
+    const scoredRows = results.filter(row => row.scoringEligible && row.status === 'completed');
+    const finishedAt = new Date().toISOString();
+    const degradedSamples = samples.filter(sample => sample.memorySystemDegraded).length;
+    const failedQuestions = results.filter(row => row.status === 'failed').length;
+    return { status: abort ? 'aborted' : running ? 'running' : degradedSamples ? 'incomplete'
+      : failedQuestions ? 'completed-with-failures' : 'completed',
+      protocol: { name: 'ZH-4O configured host lifecycle', version: ZH4O_SYSTEM_PROTOCOL_VERSION,
+        contractVersion: ZH4O_CONTRACT_VERSION, qaEvaluated: true, task: 'memory-system-e2e-multiple-choice',
+        sourceDataIngested: 'roleplay-conversation-only', messageRolesIngested: ['user', 'assistant'],
+        excludedDatasetFields: ['observation', 'session_summary', 'event_summary', 'qa.answer', 'qa.evidence'],
+        answerContext: 'beforeReply.memoryContext.content', recallReadOnly: true,
+        sourceReplayPolicy: 'diagnostic-only', scheduling: 'configured-character-threshold-plus-following-round; session-end-flush',
+        evidencePolicy: 'post-hoc fragment-source associations and verified verbatim source text in the emitted recall; semantic summary coverage is not inferred',
+        qualityScorePolicy: 'A-D gold only; question failures count as incorrect; malformed gold retained in the reference all-gold metric',
+        questionFailurePolicy: 'count provider transport attempts toward an evaluator retry budget of three; retain failed questions; abort on fatal or three consecutive same-stage infrastructure failures',
+        comparisonNotice: "Provider/config-specific host replay; not a reproduction of a paper's model settings or a measurement of interactive chat latency.",
+        degradedSamplePolicy: 'memory-preparation-failures-excluded-from-all-quality-scores' },
+      dataset: { path: path.resolve(datasetPath), sha256: datasetSha256, totalSamples: allSamples.length,
+        selectedStart, selectedSamples: selectedSamples.length, selectedQuestions: questionsById.size,
+        selectedNonChoiceGoldQuestions: [...questionsById.values()].filter(question => question.answerFormat !== 'choice').length },
+      database: { workDirectory: work, retention: 'sample-databases-retained', sampleDatabases: samples.map(sample => sample.databasePath) },
+      run: { identity, codeRevision, startedAt, finishedAt, durationMs: Number(resumeReport?.run.durationMs || 0) + performance.now() - started,
+        retrievalOnly, overrides: { candidateK, maximumContextCharacters, withoutEmbedding },
+        control, maximumDrainPasses, configSha256: preparation.configSha256,
+        resumptions: Number(resumeReport?.run.resumptions || 0) + Number(Boolean(resumeReport)), abort,
+        embeddingEnabled: !withoutEmbedding && Boolean(normalizedConfig.providers.embedding),
+        generationUsage: mergeUsageSummaries(resumeReport?.run.generationUsage, summarizeGenerationUsage(generationUsageRecords, finishedAt)),
+        embeddingUsage: mergeUsageSummaries(resumeReport?.run.embeddingUsage, summarizeEmbeddingUsage(embeddingUsageRecords, finishedAt)) },
+      scores: summarizeZh4oRows(results), controls: summarizeZh4oControls(results, control),
+      diagnostics: { degradedSamples, failedQuestions, notRunQuestions: questionsById.size - results.length,
+        meanLatencyMs: mean(scoredRows.map(row => row.latencyMs)),
+        p50LatencyMs: percentile(scoredRows.map(row => row.latencyMs), 0.5),
+        p95LatencyMs: percentile(scoredRows.map(row => row.latencyMs), 0.95) },
+      samples: structuredClone(samples), results: structuredClone(results) };
   }
-  const finishedAt = new Date();
-  const summary = summarizeRows(results);
-  const latencyValues = results.filter((row) => row.status === "completed").map((row) => row.latencyMs);
-  return {
-    protocol: {
-      name: "ZH-4O complete memory-system multiple-choice evaluation",
-      version: ZH4O_SYSTEM_PROTOCOL_VERSION,
-      contractVersion: ZH4O_CONTRACT_VERSION,
-      task: "memory-system-e2e-multiple-choice",
-      qaEvaluated: true,
-      sourceDataIngested: "roleplay-conversation-only",
-      excludedDatasetFields: ["observation", "session_summary", "event_summary", "qa.answer", "qa.evidence"],
-      goldEvidencePolicy: "post-hoc retrieval audit only; never passed to memory input, retrieval, or answer generation",
-      messageRolesIngested: ["user", "assistant"],
-      answerMetric: "exact-choice-letter",
-      upstreamMalformedGoldPolicy: "preserve-and-report-separately",
-      officialHarnessReference: {
-        project: "MOOM ZH-4O",
-        publishedRetrievalSeedTopK: 10,
-      },
-      comparisonNotice: "This run uses its configured providers and is not a directly comparable reproduction of the paper's Qwen3-8B table.",
-    },
-    dataset: {
-      path: normalizedDatasetPath,
-      sha256: datasetSha256,
-      totalSamples: allSamples.length,
-      totalQuestions: allSamples.reduce((sum, sample) => sum + sample.questions.length, 0),
-      selectedStart,
-      selectedSamples: selectedSamples.length,
-      selectedQuestions: results.length,
-      totalNonChoiceGoldQuestions: allSamples.reduce((sum, sample) => (
-        sum + sample.questions.filter((question) => question.answerFormat !== "choice").length
-      ), 0),
-      selectedNonChoiceGoldQuestions: selectedSamples.reduce((sum, sample) => (
-        sum + sample.questions.slice(0, selectedQuestionLimit)
-          .filter((question) => question.answerFormat !== "choice").length
-      ), 0),
-    },
-    database: {
-      workDirectory: normalizedWorkDirectory,
-      retention: retainSampleDatabases ? "sample-databases-retained" : "sample-databases-removed",
-      sampleDatabases: retainedDatabases,
-    },
-    run: {
-      codeRevision: {
-        commit: clean(codeRevision?.commit),
-        dirty: typeof codeRevision?.dirty === "boolean" ? codeRevision.dirty : null,
-      },
-      startedAt: startedAt.toISOString(),
-      finishedAt: finishedAt.toISOString(),
-      durationMs: performance.now() - startedPerformance,
-      candidateK: selectedCandidateK,
-      maximumContextCharacters: selectedContextCharacters,
-      maximumEvents: selectedMaximumEvents,
-      maximumContentCharacters: selectedMaximumContentCharacters,
-      generationUsage: summarizeGenerationUsage(generationUsageRecords, finishedAt.toISOString()),
-      embeddingEnabled: Boolean(embeddingProvider),
-      embeddingRequestIntervalMs: Math.max(0, Math.trunc(Number(embeddingRequestIntervalMs) || 0)),
-      embeddingUsage: summarizeEmbeddingUsage(embeddingUsageRecords, finishedAt.toISOString()),
-    },
-    scores: summary,
-    diagnostics: {
-      emptyRetrievals: results.filter((row) => row.status === "completed" && row.candidateCount === 0).length,
-      failedQuestions: results.filter((row) => row.status === "failed").length,
-      failuresByStage: Object.fromEntries(
-        [...new Set(results.filter((row) => row.status === "failed").map((row) => (
-          clean(row.failureStage) || "unknown"
-        )))]
-          .sort()
-          .map((stage) => [
-            stage,
-            results.filter((row) => row.status === "failed" && (clean(row.failureStage) || "unknown") === stage).length,
-          ]),
-      ),
-      degradedSamples: samples.filter((sample) => sample.memorySystemDegraded).length,
-      meanLatencyMs: mean(latencyValues),
-      p50LatencyMs: percentile(latencyValues, 0.5),
-      p95LatencyMs: percentile(latencyValues, 0.95),
-      maximumLatencyMs: latencyValues.length ? Math.max(...latencyValues) : null,
-      meanRetrievalLatencyMs: mean(results
-        .filter((row) => Number.isFinite(Number(row.retrievalLatencyMs)))
-        .map((row) => Number(row.retrievalLatencyMs))),
-      meanContextAssemblyLatencyMs: mean(results
-        .filter((row) => Number.isFinite(Number(row.contextAssemblyLatencyMs)))
-        .map((row) => Number(row.contextAssemblyLatencyMs))),
-      meanAnswerLatencyMs: mean(results
-        .filter((row) => Number.isFinite(Number(row.answerLatencyMs)))
-        .map((row) => Number(row.answerLatencyMs))),
-    },
-    samples,
-    results,
-  };
+  const checkpoint = async () => { if (onCheckpoint) await onCheckpoint(reportSnapshot(true)); };
+  for (const { conversation, plan, sampleRoot, manifestPath, service, saved, reuse } of preparedSamples) {
+    if (abort) break;
+    const questions = conversation.questions.slice(0, maximumQuestionsPerSample);
+    if (questions.every(question => previousQuestions.has(question.questionId))) continue;
+    let phase = "memory";
+    const configured = service.providers;
+    service.providers = Object.freeze({
+      ...configured,
+      generator: captureGenerationUsage(configured.generator, "memory", generationUsageRecords),
+      structureGenerator: captureGenerationUsage(configured.structureGenerator, "structure", generationUsageRecords),
+      retrievalContextGenerator: captureGenerationUsage(configured.retrievalContextGenerator, "retrieval-context", generationUsageRecords),
+      embedding: withoutEmbedding ? null : captureEmbeddingUsage(configured.embedding, () => phase, embeddingUsageRecords, embeddingGate),
+    });
+    const answer = captureGenerationUsage(configured.generator, "answer", generationUsageRecords);
+    const controlAnswer = captureGenerationUsage(configured.generator, "control", generationUsageRecords);
+    const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "zh4o", identity: plan.identity,
+      sourceKind: "zh4o-roleplay-conversation", archiveMode: "length" });
+    const sample = previousSamples.get(conversation.sampleId) || { sampleId: conversation.sampleId,
+      inputEvents: plan.events.length, imported: 0, memorySystemDegraded: false, preparationErrors: [],
+      maintenanceCalls: 0, maintenanceFailures: [], inputBatches: [], effectiveDefaults: service.defaults,
+      preparation: saved?.preparation || preparation, databasePath: service.paths.databasePath };
+    if (!previousSamples.has(conversation.sampleId)) samples.push(sample);
+    const passes = [], preparationErrors = sample.preparationErrors;
+    let memoryPrepared = false;
+    let finalProgress = null, degraded = false, imported = 0, maintenanceFailures = [];
+    try {
+      if (reuse) {
+        degraded = saved.degraded === true;
+        maintenanceFailures = saved.maintenance?.failures || [];
+        finalProgress = await adapter.pendingWork();
+      } else {
+        service.initialize();
+        for (const session of plan.sessions) {
+          let pendingCharacters = 0;
+          for (const reply of session.replies) {
+            const appended = await adapter.afterReply(reply);
+            imported += appended.archive.inserted;
+            pendingCharacters += appended.events.reduce((sum, event) => sum + event.content.text.length, 0);
+            if (pendingCharacters < service.defaults.ingestion.maximumCoreCharacters) continue;
+            const pass = await adapter.onIdle({ sessionId: session.sessionId, now: conversation.questionDate });
+            passes.push(pass);
+            const pending = service.listInputEvents({ statuses: ["pending"], hostId: "zh4o", sessionId: session.sessionId, limit: 500 });
+            pendingCharacters = pending.items.reduce((sum, row) => sum + String(row.content?.text || "").length, 0);
+          }
+        }
+        let stagnant = 0, previous = "";
+        for (let n = 0; n < maximumDrainPasses; n++) {
+          const pass = await adapter.onSessionEnd({ now: conversation.questionDate });
+          passes.push(pass); finalProgress = pass.progress;
+          if (finalProgress?.total === 0) break;
+          const fingerprint = JSON.stringify(finalProgress);
+          stagnant = fingerprint === previous ? stagnant + 1 : 0; previous = fingerprint;
+          if (stagnant >= 3) break;
+        }
+        maintenanceFailures = passes.filter(pass => pass.failures?.length
+          || ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(pass.status))
+          .map(pass => ({ status: pass.status, failures: pass.failures || [], maintenance: pass.maintenance }));
+        degraded = !finalProgress || finalProgress.total > 0 || finalProgress.failures > 0 || maintenanceFailures.length > 0
+          || passes.some(pass => pass.input?.some(input => input.batches?.some(batch =>
+            batch.status === "quarantined" || batch.generationDiagnostics?.degraded)));
+        fs.mkdirSync(sampleRoot, { recursive: true });
+        fs.writeFileSync(manifestPath, JSON.stringify({ protocol: ZH4O_SYSTEM_PROTOCOL_VERSION, datasetSha256,
+          sampleId: conversation.sampleId, degraded, defaults: service.defaults,
+          preparation,
+          embedding: withoutEmbedding ? null : embeddingIndexIdentity(normalizedConfig.providers.embedding),
+          maintenance: { finalProgress, passes: passes.length, failures: maintenanceFailures } }, null, 2));
+      }
+      degraded ||= !finalProgress || finalProgress.total > 0 || finalProgress.failures > 0;
+      const stored = inputRows(service);
+      const inputMap = internalEventDialogueMap({ events: stored }, plan.eventIdToDialogueId);
+      if (inputMap.size !== stored.length || unique([...inputMap.values()]).length !== plan.events.length) {
+        throw new Error("Retained input provenance is incomplete; sample cannot be scored.");
+      }
+      Object.assign(sample, { imported: reuse ? sample.imported : imported, memorySystemDegraded: degraded,
+        finalProgress, maintenanceCalls: reuse ? sample.maintenanceCalls : passes.length, maintenanceFailures,
+        inputBatches: reuse ? sample.inputBatches : passes.flatMap(pass => pass.input || []).flatMap(input => input.batches || []) });
+      memoryPrepared = true;
+      const sources = new Map();
+      const dialogueIdsFor = id => {
+        if (!sources.has(id)) sources.set(id, sourceDialogueIds(service.getMemory(id), inputMap));
+        return sources.get(id);
+      };
+      const dialogueById = dialogueIndex(conversation);
+      phase = "query";
+      await checkpoint();
+      for (const question of questions) {
+        if (previousQuestions.has(question.questionId)) continue;
+        const row = { sampleId: conversation.sampleId, questionId: question.questionId, category: question.category,
+          expectedChoice: question.answer, answerFormat: question.answerFormat,
+          retrievalQuery: buildZh4oRetrievalQuery(question), scoringEligible: !degraded,
+          ...postHocEvidenceAudit(question, null), attempts: {} };
+        const questionStarted = performance.now();
+        let questionStage = 'retrieval';
+        if (degraded) Object.assign(row, { status: "excluded", reason: "memory-preparation-degraded" });
+        else try {
+          const options = {};
+          if (candidateK !== undefined) options.maximumReturnedCandidates = candidateK;
+          if (maximumContextCharacters !== undefined) options.maximumContextChars = maximumContextCharacters;
+          const prepared = await runQuestionOperation(async () => {
+            const prepared = await adapter.beforeReply({ sessionId: "evaluation", turnId: question.questionId,
+              userText: row.retrievalQuery, userOccurredAt: conversation.questionDate, world: plan.world,
+              recall: { enabled: true, readOnly: true, options } });
+            if (prepared.status === 'degraded') throw Object.assign(new Error(prepared.memoryDiagnostics?.message || 'Read-only recall degraded.'),
+              { code: prepared.memoryDiagnostics?.code, name: prepared.memoryDiagnostics?.name || 'Error' });
+            if (prepared.retrieval.vector?.warning) throw new Error(prepared.retrieval.vector.warning);
+            return prepared;
+          }, { delayMs: retryDelayMs, onAttempts: attempts => { row.attempts.retrieval = attempts; } });
+          row.retrievalLatencyMs = performance.now() - questionStarted;
+          const retrieval = prepared.retrieval;
+          questionStage = 'context';
+          const candidateDialogueIds = (retrieval.candidates || []).map(candidate => dialogueIdsFor(candidate.memoryId));
+          const context = materializedContext(retrieval, dialogueIdsFor, dialogueById);
+          if (context.context !== prepared.memoryContext.content) throw Object.assign(new Error('Host context differs from retrieval context.'),
+            { code: 'ZH4O_CONTEXT_MISMATCH' });
+          const audit = postHocEvidenceAudit(question, context, candidateDialogueIds);
+          Object.assign(row, { candidateCount: retrieval.candidates?.length || 0, retrievalStatus: retrieval.status,
+            retrievalMode: retrieval.retrievalMode, vectorStatus: retrieval.vector?.status || 'disabled', context, ...audit,
+            retrievalDiagnostics: diagnosticRetrievalSnapshot(retrieval, candidateDialogueIds, context, audit) });
+          if (includeSourceDiagnostics) row.sourceReplayDiagnostic = buildZh4oRetrievedContext({ conversation,
+            dialogueById, candidateDialogueIds });
+          questionStage = 'answer';
+          const answerStarted = performance.now();
+          let response;
+          try {
+            response = await runQuestionOperation(() => answer(buildZh4oAnswerRequest({ question, context: prepared.memoryContext.content })),
+              { delayMs: retryDelayMs, onAttempts: attempts => { row.attempts.answer = attempts; } });
+          } finally { row.answerLatencyMs = performance.now() - answerStarted; }
+          row.answerDiagnostics = { rawOutput: response.output, model: response.model, usage: response.usage };
+          const prediction = normalizeChoice(response?.output?.choice);
+          if (!prediction) throw Object.assign(new Error('Answer must be exactly A, B, C or D.'), { code: 'ZH4O_INVALID_CHOICE' });
+          Object.assign(row, { status: 'completed', prediction, correct: prediction === question.answer });
+          if (control === "no-memory") {
+            try {
+              const baseline = await runQuestionOperation(() => controlAnswer(buildZh4oAnswerRequest({ question, context: '' })),
+                { delayMs: retryDelayMs, onAttempts: attempts => { row.attempts.control = attempts; } });
+              const choice = normalizeChoice(baseline?.output?.choice);
+              if (!choice) throw Object.assign(new Error('Control answer must be exactly A, B, C or D.'), { code: 'ZH4O_INVALID_CHOICE' });
+              row.control = { prediction: choice, correct: choice === question.answer, status: 'completed' };
+            } catch (error) { row.control = { status: "failed", error: nonFatalStageError(error) }; }
+          }
+        } catch (error) {
+          Object.assign(row, { status: 'failed', correct: false, failureStage: questionStage, error: nonFatalStageError(error) });
+        }
+        row.latencyMs = performance.now() - questionStarted;
+        results.push(row);
+        if (row.status === 'failed' && row.error.infrastructure) {
+          const key = `${row.failureStage}:${row.error.kind}`;
+          failureStreak = { key, count: failureStreak.key === key ? failureStreak.count + 1 : 1 };
+          if (row.error.fatal || failureStreak.count >= 3) abort = {
+            reason: row.error.fatal ? 'fatal-infrastructure-error' : 'repeated-infrastructure-error',
+            sampleId: row.sampleId, questionId: row.questionId, stage: row.failureStage,
+            consecutiveFailures: failureStreak.count, error: row.error };
+        } else failureStreak = { key: '', count: 0 };
+        if (onProgress) await onProgress({ phase: 'question', completed: results.filter(item => item.sampleId === conversation.sampleId).length,
+          total: questions.length, sampleId: conversation.sampleId, row });
+        await checkpoint();
+        if (abort) break;
+      }
+    } catch (error) {
+      if (memoryPrepared) abort ||= { reason: 'evaluation-interrupted', sampleId: conversation.sampleId, error: nonFatalStageError(error) };
+      else {
+        degraded = true; preparationErrors.push(nonFatalStageError(error));
+        sample.memorySystemDegraded = true;
+        for (const question of questions) {
+          if (results.some(row => row.questionId === question.questionId)) continue;
+          results.push({ status: 'excluded', scoringEligible: false, sampleId: conversation.sampleId, questionId: question.questionId,
+            expectedChoice: question.answer, answerFormat: question.answerFormat, category: question.category, reason: 'sample-preparation-failed' });
+        }
+      }
+    } finally {
+      if (degraded) results.filter(row => row.sampleId === conversation.sampleId).forEach(row => { row.scoringEligible = false; });
+      try { await service.close(); }
+      catch (error) { abort ||= { reason: 'sample-close-failed', sampleId: conversation.sampleId, error: nonFatalStageError(error) }; }
+    }
+    if (!memoryPrepared) Object.assign(sample, { imported, finalProgress, maintenanceCalls: passes.length, maintenanceFailures,
+      inputBatches: passes.flatMap(pass => pass.input || []).flatMap(input => input.batches || []) });
+    await checkpoint();
+  }
+  return reportSnapshot();
 }

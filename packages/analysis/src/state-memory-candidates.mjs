@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible } from '@suzu-memory/core';
+import { executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible, modelCalendarFields } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
 import { lexicalScore } from '@suzu-memory/retriever';
 
@@ -28,8 +28,8 @@ function candidateView(repository, memory) {
     subjectRole: memory.subject_role, subjectKey: memory.subject_key,
     canonicalKey: memory.canonical_key, representationLayer: memory.representation_layer,
     temporalState: memory.temporal_state, statePhase: memory.state_phase,
-    knownAt: memory.known_at, validFrom: memory.valid_from, validTo: memory.valid_to,
-    eventDate: memory.event_date, eventStart: memory.event_start, worldFrame: memory.world_frame,
+    ...modelCalendarFields(memory, ['knownAt', 'validFrom', 'validTo', 'eventDate', 'eventStart'], detail.sources),
+    worldFrame: memory.world_frame,
     reviewState: memory.layer === 'provisional' ? 'pending' : 'accepted',
     evidenceOnly: memory.metadata?.stateAnalysisDraft === true,
     roles: detail.roles.map(role => ({ role: role.role, actorRole: role.actor_role, actorKey: role.actor_key })),
@@ -82,6 +82,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
   ].map(item => [item.memory.id, item])).values()];
   const candidates = selected.map(({ memory, earlierRequest }) => ({ ...candidateView(repository, memory),
     canonicalKey: earlierRequest?.canonical_key || memory.canonical_key }));
+  const validityById = new Map(selected.map(({ memory }) => [memory.id, memory.valid_to]));
   const newCanonicalKey = `state-${createHash('sha256').update(request.id).digest('hex').slice(0, 24)}`;
   Object.assign(request, repository.bindStateAnalysisTarget({ agentId: request.agent_id, requestId: request.id,
     canonicalKey: newCanonicalKey, metadata: { semanticMemoryId: draft.id,
@@ -109,7 +110,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
         const memory = repository.getMemory(selected.id);
         if (!memory || memory.status === 'deleted' || memory.content !== selected.content
           || memory.title !== selected.title || memory.state_phase !== selected.statePhase
-          || memory.valid_to !== selected.validTo
+          || memory.valid_to !== validityById.get(selected.id)
           || (sourceView && !sourceView.allows(memory))) throw new Error('State identity candidate changed during analysis.');
       }
       context.selected = selected;

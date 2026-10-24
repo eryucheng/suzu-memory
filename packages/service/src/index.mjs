@@ -32,6 +32,7 @@ import {
 import { syncMemoryEmbeddings } from "@suzu-memory/embedding-indexer";
 import {
   appendCompanionEvents,
+  DEFAULT_LENGTH_ARCHIVE_POLICY,
   processPendingCompanionEvents,
   reviseCompanionEvent,
 } from "@suzu-memory/ingestion";
@@ -230,6 +231,7 @@ export class MemoryService {
     usageLedgerPath = "",
     providers = {},
     defaults = {},
+    readOnly = false,
   } = {}) {
     this.paths = resolveMemoryServicePaths({
       dataRoot,
@@ -240,6 +242,7 @@ export class MemoryService {
       usageLedgerPath,
     });
     this.initialized = false;
+    this.readOnly = Boolean(readOnly);
     this.providers = Object.freeze({
       generator: providers.generator || null,
       structureGenerator: providers.structureGenerator || providers.generator || null,
@@ -267,6 +270,7 @@ export class MemoryService {
       defaultWorldId: clean(defaults.defaultWorldId) || "relationship",
       defaultWorldFrame: clean(defaults.defaultWorldFrame) || "relational",
       ingestion: Object.freeze({
+        ...Object.fromEntries(Object.entries(DEFAULT_LENGTH_ARCHIVE_POLICY).map(([key, fallback]) => [key, defaults.ingestion?.[key] ?? fallback])),
         maximumEventCharacters,
         maximumBatchCharacters,
         leaseSeconds: Math.min(
@@ -285,12 +289,12 @@ export class MemoryService {
   close() { return closeRetrievalWorker(this.paths.databasePath); }
 
   initialize() {
-    fs.mkdirSync(this.paths.memoryRoot, { recursive: true });
-    const database = openMemoryDatabase(this.paths.databasePath);
+    if (!this.readOnly) fs.mkdirSync(this.paths.memoryRoot, { recursive: true });
+    const database = openMemoryDatabase(this.paths.databasePath, { readOnly: this.readOnly });
     try {
       const repository = new MemoryRepository(database, { timeZone: this.defaults.retrieval.timeZone });
-      recoverMemoryEventSourceCleanups(this, repository);
-      const identityStructure = ensureCompanionRelationshipStructure({
+      if (!this.readOnly) recoverMemoryEventSourceCleanups(this, repository);
+      const identityStructure = this.readOnly ? null : ensureCompanionRelationshipStructure({
         createPrimaryRelationship: this.defaults.createPrimaryRelationship,
         repository,
         agentId: this.agentId,
@@ -302,7 +306,7 @@ export class MemoryService {
         worldId: this.defaults.defaultWorldId,
         worldFrame: this.defaults.defaultWorldFrame,
       });
-      const pendingStructureMaterialization = materializePendingMemoryStructureProposals(
+      const pendingStructureMaterialization = this.readOnly ? null : materializePendingMemoryStructureProposals(
         repository,
         { agentId: this.agentId },
       );
@@ -317,12 +321,12 @@ export class MemoryService {
         databasePath: this.paths.databasePath,
         usageLedgerPath: this.paths.usageLedgerPath,
         memoryCount: memories.total,
-        pendingStructureMaterialization: {
+        pendingStructureMaterialization: pendingStructureMaterialization && {
           materialized: pendingStructureMaterialization.materialized.length,
           alreadyMaterialized: pendingStructureMaterialization.skipped.length,
           failed: pendingStructureMaterialization.failed,
         },
-        identityStructure: {
+        identityStructure: identityStructure && {
           userEntityId: identityStructure.user?.id || '',
           companionEntityId: identityStructure.companion.id,
           relationshipId: identityStructure.relationship?.id || '',
@@ -344,7 +348,7 @@ export class MemoryService {
   withRepository(callback, { readOnly = false, sourceScope = null, signal = null } = {}) {
     if (typeof callback !== "function") throw new Error("withRepository requires a callback.");
     this.ensureInitialized();
-    const database = openMemoryDatabase(this.paths.databasePath, { readOnly });
+    const database = openMemoryDatabase(this.paths.databasePath, { readOnly: this.readOnly || readOnly });
     try {
       const repository = new MemoryRepository(database, { timeZone: this.defaults.retrieval.timeZone });
       const result = withEventSourceExecution(repository, () => callback(repository, database), { sourceScope, signal });
@@ -377,6 +381,7 @@ export class MemoryService {
   }
 
   backupDatabase({ destinationPath = "", overwrite = false, now = new Date() } = {}) {
+    if (this.readOnly) throw new Error('Read-only memory service cannot create database backups.');
     this.ensureInitialized();
     const timestamp = validDate(now, "database backup now");
     const selectedPath = clean(destinationPath)
@@ -408,6 +413,7 @@ export class MemoryService {
     confirmAgentId = "",
     now = new Date(),
   } = {}) {
+    if (this.readOnly) throw new Error('Read-only memory service cannot restore database backups.');
     if (clean(confirmAgentId) !== this.agentId) {
       const error = new Error(`Database restore requires confirmAgentId=${this.agentId}.`);
       error.code = "RESTORE_CONFIRMATION_REQUIRED";
@@ -431,6 +437,7 @@ export class MemoryService {
     confirmAgentId = "",
     now = new Date(),
   } = {}) {
+    if (this.readOnly) throw new Error('Read-only memory service cannot import databases.');
     if (clean(confirmAgentId) !== this.agentId) {
       const error = new Error(`Database import requires confirmAgentId=${this.agentId}.`);
       error.code = "IMPORT_CONFIRMATION_REQUIRED";
@@ -672,12 +679,13 @@ export class MemoryService {
     }), { sourceScope, signal });
   }
 
-  maintenanceStatus({ limit = 100 } = {}) {
+  maintenanceStatus({ limit = 100, minimumStructureMemories = DEFAULT_MINIMUM_STRUCTURE_MEMORIES } = {}) {
     return this.withRepository((repository) => {
       const maintenance = inspectMaintenance({
         repository,
         agentId: this.agentId,
         limit,
+        minimumStructureMemories,
       });
       return {
         ...maintenance,
@@ -1379,6 +1387,9 @@ export class MemoryService {
     sourceScope = null,
     signal = null,
   } = {}) {
+    if (this.readOnly && (persistTrace || reactivate)) {
+      throw new Error('Read-only memory service requires trace persistence and reactivation to be disabled.');
+    }
     return this.withRepository(async () => {
       const text = clean(query);
       if (!text) throw new Error("search requires query.");
@@ -1418,8 +1429,7 @@ export class MemoryService {
       const recallReactivationPolicy = normalizeRecallReactivationOptions(
         retrievalOptions.recallReactivation,
       );
-      this.initialize();
-      if (sourceScope) sourceScope = this.withRepository(repository => assertEventSourceScope(repository, sourceScope, this.agentId));
+      if (sourceScope) sourceScope = this.withRepository(repository => assertEventSourceScope(repository, sourceScope, this.agentId), { readOnly: true });
       const scopedEmbeddingProvider = embeddingProvider && Object.assign(
         text => embeddingProvider(text, { signal }), embeddingProvider);
       const result = await retrieveMemories({
@@ -1464,7 +1474,7 @@ export class MemoryService {
           reactivation: persisted.reactivation,
         },
       };
-    }, { sourceScope, signal });
+    }, { sourceScope, signal, readOnly: !persistTrace && !reactivate });
   }
 
   reactivateRecall({ activationId, memoryIds = [], options = {}, now = new Date(), sourceScope = null, signal = null } = {}) {

@@ -1,5 +1,10 @@
 import { executionEventSourceView } from '@suzu-memory/core';
 import { buildCompanionExtractionRequest } from './processing-stages.mjs';
+import { logicalArchiveEventId } from './archive-windows.mjs';
+
+export const DEFAULT_LENGTH_ARCHIVE_POLICY = Object.freeze({
+  maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
+});
 
 const sourceOf = row => row.metadata?.eventSource || {};
 
@@ -26,7 +31,7 @@ async function roundEnds(groups, resolveReply, maximum, reverse = false) {
     const index = reverse ? groups.length - step - 1 : step;
     const row = groups[index].at(-1);
     const reply = await resolveReply(row);
-    if (reply?.complete && sourceOf(row).eventId === reply.lastEventId && !seen.has(reply.id)) {
+    if (reply?.complete && (sourceOf(row).eventId || logicalArchiveEventId(row)) === reply.lastEventId && !seen.has(reply.id)) {
       seen.add(reply.id);
       ends.push(index + 1);
       if (ends.length >= maximum) break;
@@ -154,9 +159,10 @@ export async function planReplyChunk({ pending, previous = [], resolveReply, mea
 
 export async function selectReplyChunk({ repository, agentId, identity, systemPrompt, timeZone, policy }) {
   const eligibleIds = executionEventSourceView(repository, agentId)?.inputIds ?? null;
-  const page = repository.listInputEvents(agentId, { statuses: ['pending'], limit: 500, sourceOrder: true, eligibleIds });
+  const scope = { hostId: policy.hostId, sessionId: policy.sessionId, sourceOrder: !policy.hostId, eligibleIds };
+  const page = repository.listInputEvents(agentId, { ...scope, statuses: ['pending'], limit: 500 });
   const previous = page.items.length ? repository.listInputEvents(agentId, { statuses: ['archived'], limit: 500,
-    sourceOrder: true, descending: true, beforeSourceEvent: page.items[0], eligibleIds }).items
+    ...scope, descending: true, beforeSourceEvent: page.items[0] }).items
     .filter(row => row.processing_disposition !== 'quarantined').reverse() : [];
   return planReplyChunk({ pending: page.items, previous, scanFull: page.total > page.items.length,
     ...policy, measure: selection => {

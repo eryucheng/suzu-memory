@@ -10,7 +10,7 @@ export const ZH4O_CONTRACT_VERSION = "zh4o-moom-official-source-v2";
 export const ZH4O_SOURCE_URL = "https://github.com/cows21/MOOM-Roleplay-Dialogue";
 
 const SESSION_PATTERN = /^session_(\d+)$/u;
-const CHOICE_PATTERN = /^[A-E]$/u;
+const CHOICE_PATTERN = /^[A-D]$/u;
 
 function clean(value) {
   return String(value ?? "").trim();

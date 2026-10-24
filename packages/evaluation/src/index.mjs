@@ -180,6 +180,7 @@ export {
   memoryZh4oSystemUsage,
   runMemoryZh4oSystemCli,
 } from "./zh4o-system-cli.mjs";
+export { aggregateZh4oReports } from "./zh4o-summary.mjs";
 
 export {
   RHELM_CHUNKING_VERSION,

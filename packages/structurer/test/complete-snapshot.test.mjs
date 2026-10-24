@@ -61,6 +61,33 @@ test("relation generation receives complete evidence including its final causal 
   assert.throws(() => buildRelationSnapshot({ ...args, maxSnapshotChars: 4000 }), /4000-character privacy budget/);
 });
 
+test('organization snapshots suppress synthetic source dates while retaining explicit event dates', t => {
+  const args = fixture(t);
+  const sourceReads = [], listSources = args.repository.listMemorySources.bind(args.repository);
+  args.repository.listMemorySources = id => { sourceReads.push(id); return listSources(id); };
+  for (const id of args.memoryIds) {
+    args.repository.database.prepare('UPDATE memory_nodes SET event_start=?, known_at=?, metadata_json=? WHERE id=?')
+      .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), id);
+    for (const source of args.repository.listMemorySources(id)) args.repository.database.prepare(
+      'UPDATE source_records SET occurred_at=?, known_at=?, metadata_json=? WHERE id=?')
+      .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), source.id);
+  }
+  sourceReads.length = 0;
+  const structure = buildStructureSnapshot(args);
+  assert.deepEqual(sourceReads, args.memoryIds);
+  sourceReads.length = 0;
+  const relation = buildRelationSnapshot(args);
+  assert.deepEqual(sourceReads, args.memoryIds);
+  assert.doesNotMatch(JSON.stringify(structure), /2000-01-02/);
+  assert.doesNotMatch(JSON.stringify(relation), /2000-01-02/);
+  assert.equal(structure.currentMemories[0].sourceTimeKnown, false);
+  args.repository.database.prepare('UPDATE memory_nodes SET event_date=?, event_start=NULL, metadata_json=? WHERE id=?')
+    .run('2025-12-25', '{}', args.memoryIds[0]);
+  const dated = buildStructureSnapshot(args).currentMemories.find(memory => memory.id === args.memoryIds[0]);
+  assert.equal(dated.eventDate, '2025-12-25');
+  assert.equal(dated.knownAt, null);
+});
+
 test("selected memory and container member lists are complete or explicitly rejected", (t) => {
   const args = fixture(t, { count: 41, sources: 0 });
   const topic = args.repository.upsertTopic({ agentId: args.agentId, title: "看展", content: "多次看展的经历。" });

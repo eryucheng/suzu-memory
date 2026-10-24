@@ -7,6 +7,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@suzu-memory/ingestion": "0.1.0",
     "@suzu-memory/core": "0.1.0",
     "@suzu-memory/providers": "0.1.0",
     "@suzu-memory/service": "0.1.0"

@@ -11,6 +11,9 @@
     "defaultWorldId": "relationship",
     "defaultWorldFrame": "relational",
     "ingestion": {
+      "maximumCoreCharacters": 12000,
+      "maximumContextCharacters": 12000,
+      "maximumRequestCharacters": 64000,
       "maximumEventCharacters": 12000,
       "maximumBatchCharacters": 48000,
       "leaseSeconds": 1800

@@ -1,3 +1,4 @@
+import { modelCalendarFields } from '@suzu-memory/core';
 import { analysisSourceMaterial } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
@@ -29,8 +30,7 @@ function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey,
   if (!new Set(["belief_state", "derived_hypothesis"]).has(current.kind)) throw new Error("Affective canonicalKey resolves to a non-affective-compatible memory kind.");
   return { id: current.id, kind: current.kind, content: String(current.content ?? ""), subjectRole: current.subject_role,
     subjectKey: current.subject_key, canonicalKey: current.canonical_key, temporalState: current.temporal_state,
-    representationLayer: current.representation_layer, knownAt: current.known_at,
-    validFrom: current.valid_from, validTo: current.valid_to };
+    representationLayer: current.representation_layer, ...modelCalendarFields(current, ['knownAt', 'validFrom', 'validTo'], repository.listMemorySources(current.id)) };
 }
 function hasRole(memory, target, roles, primary = true) { return (primary && memory.subjectRole === target.subjectRole
   && memory.subjectKey === target.subjectKey) || memory.actorRoles.some((r) => roles.has(r.role)

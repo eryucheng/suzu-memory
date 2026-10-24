@@ -129,6 +129,28 @@ function setupRequest({
   return { database, repository, source, memory, request };
 }
 
+for (const family of ['preference', 'goal']) test(`untrusted calendar times never enter ${family} analysis and survive state materialization as unknown`, async t => {
+  const f = setupRequest({ stateFamily: family, targetLabel: family === 'goal' ? '周六整理书单' : '解谜游戏',
+    content: family === 'goal' ? '我答应周六九点整理小说书单。' : '我一直很喜欢解谜游戏。' });
+  t.after(() => f.database.close());
+  f.database.prepare("UPDATE source_records SET occurred_at=?, known_at=?, metadata_json=? WHERE id=?")
+    .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), f.source.id);
+  f.database.prepare("UPDATE memory_nodes SET event_start=?, known_at=?, metadata_json=? WHERE id=?")
+    .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), f.memory.id);
+  const calls = [];
+  const base = family === 'goal' ? combinedGoalGenerator(f, []) : directPreferenceGenerator(f);
+  const generator = Object.assign(async request => {
+    calls.push(request);
+    assert.doesNotMatch(request.input, /2000-01-02/);
+    return base(request);
+  }, { supportsCombinedStateAnalysis: family === 'goal' });
+  const result = await processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test', requestId: f.request.id, generator });
+  assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
+  assert.ok(calls.length > 0);
+  const accepted = resolveReportedStateProposal(f.repository, { agentId: 'agent-test', proposalId: result.proposal.id, action: 'accept' });
+  assert.equal(accepted.memory.metadata.sourceTimeKnown, false);
+});
+
 for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`early state embedding and candidate matching: ${scenario}`, async t => {
   const first = setupRequest({ stateFamily: 'goal', targetLabel: '周六整理书单', content: '我答应周六九点整理小说书单。' });
   t.after(() => first.database.close());
@@ -250,6 +272,26 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
     context.resolve({ resolution: 'matched', candidateId: old.id, rationale: '原计划的后续进展。' });
     assert.equal(context.selected.id, accepted.memory.id);
     assert.equal(context.selected.statePhase, 'active');
+  }
+});
+
+test('hiding a synthetic validity date preserves storage concurrency checks for historical state candidates', async t => {
+  for (const changed of [false, true]) {
+    const f = setupRequest({ stateFamily: 'goal', targetLabel: '周六整理书单', content: '我答应周六九点整理小说书单。' });
+    t.after(() => f.database.close());
+    const old = f.repository.upsertMemory({ id: 'old-plan', agentId: 'agent-test', kind: 'plan', layer: 'semantic',
+      status: 'superseded', content: '我答应周六九点整理小说书单。', subjectRole: 'user', subjectKey: 'user',
+      stateFamily: 'goal', representationLayer: 'reported', canonicalKey: 'old-target', reality: 'real',
+      evidenceMode: 'explicit', statePhase: 'completed', temporalState: 'historical',
+      validTo: '2000-01-02T12:00:00Z', metadata: { sourceTimeKnown: false } });
+    f.repository.linkSource(old.id, f.source.id, 'evidence');
+    const embeddingProvider = Object.assign(async () => ({ model: 'test-embedding', vector: [1, 0] }), { model: 'test-embedding', dimensions: 2 });
+    const context = await prepareStateMemoryCandidates({ repository: f.repository, request: f.request, embeddingProvider });
+    assert.equal(context.candidates.find(candidate => candidate.id === old.id).validTo, null);
+    if (changed) f.database.prepare('UPDATE memory_nodes SET valid_to=? WHERE id=?').run('2000-01-03T12:00:00Z', old.id);
+    const resolve = () => context.resolve({ resolution: 'matched', candidateId: old.id, rationale: '同一目标的历史记录。' });
+    if (changed) assert.throws(resolve, /candidate changed during analysis/);
+    else assert.doesNotThrow(resolve);
   }
 });
 
@@ -898,7 +940,7 @@ for (const [stateFamily, kind, targetSpec] of [
     counterpartLabel: "Suzu", direction: "holder_to_counterpart" }],
   ["affective_association", "belief_state", { triggerRole: "other", triggerKey: "place:museum", triggerLabel: "博物馆" }],
 ]) {
-  test(`${stateFamily} receives complete source evidence and current state at the model boundary`, async (t) => {
+  for (const untrusted of [false, true]) test(`${stateFamily} receives complete evidence and current state (untrusted time=${untrusted})`, async (t) => {
     const content = "讨论中的背景。".repeat(1600) + "最后更正：我已经取消了，前面的打算不再有效。";
     const previous = "旧状态的适用背景。".repeat(600) + "但仅适用于休假期间。";
     const fixture = setupRequest({ stateFamily, targetSpec, content });
@@ -910,6 +952,12 @@ for (const [stateFamily, kind, targetSpec] of [
       representationLayer: "reported", reality: "real", evidenceMode: "explicit",
       temporalState: "current", knownAt: "2026-07-01T08:00:00.000Z",
     });
+    if (untrusted) {
+      fixture.database.prepare("UPDATE source_records SET occurred_at=?, known_at=?, metadata_json=? WHERE id=?")
+        .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), fixture.source.id);
+      fixture.database.prepare("UPDATE memory_nodes SET event_start=?, known_at=?, metadata_json=? WHERE id IN (?, ?)")
+        .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), fixture.memory.id, `current-${stateFamily}`);
+    }
     const snapshots = [];
     await processStateAnalysisRequest({
       repository: fixture.repository, agentId: "agent-test", requestId: fixture.request.id,
@@ -924,6 +972,12 @@ for (const [stateFamily, kind, targetSpec] of [
       assert.equal(snapshot.memories[0].content, content);
       assert.equal(snapshot.sourceRecords[0].content, content);
       assert.equal(snapshot.currentState.content, previous);
+      if (untrusted) {
+        assert.doesNotMatch(JSON.stringify(snapshot), /2000-01-02/);
+        assert.equal(snapshot.currentState.knownAt, null);
+        assert.equal(snapshot.sourceRecords[0].occurredAt, null);
+        assert.equal(snapshot.memories[0].contextBasis, 'unknown');
+      }
     }
   });
 }

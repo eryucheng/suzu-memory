@@ -1,3 +1,4 @@
+import { modelCalendarFields } from '@suzu-memory/core';
 import { analysisSourceMaterial } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
@@ -65,9 +66,7 @@ function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey,
     canonicalKey: current.canonical_key,
     representationLayer: current.representation_layer,
     temporalState: current.temporal_state,
-    knownAt: current.known_at,
-    validFrom: current.valid_from,
-    validTo: current.valid_to,
+    ...modelCalendarFields(current, ['knownAt', 'validFrom', 'validTo'], repository.listMemorySources(current.id)),
   };
 }
 

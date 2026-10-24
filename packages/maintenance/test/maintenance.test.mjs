@@ -20,6 +20,34 @@ function fixture() {
   return { database, repository: new MemoryRepository(database) };
 }
 
+test("maintenance counts describe all pending work even when diagnostic pages contain one item", () => {
+  const { database, repository } = fixture();
+  try {
+    const source = repository.upsertSource({ agentId: AGENT_ID, sourceKind: "test", externalId: "source",
+      occurredAt: "2026-10-23T00:00:00Z", speaker: "User", content: "喜欢阅读。" });
+    const memory = repository.upsertMemory({ id: "evidence", agentId: AGENT_ID, kind: "utterance", layer: "evidence",
+      content: "喜欢阅读。", subjectRole: "user", subjectKey: "user" });
+    repository.linkSource(memory.id, source.id, "verbatim");
+    for (let index = 0; index < 3; index++) {
+      repository.recordStateAnalysisRequest({ agentId: AGENT_ID, batchId: "batch", candidateIndex: index,
+        stateFamily: "preference", subjectRole: "user", subjectKey: "user", canonicalKey: `preference:${index}`,
+        targetLabel: `阅读${index}`, representationLayer: "reported", evidenceMode: "explicit",
+        memoryIds: [memory.id], sourceIds: [source.id] });
+      repository.enqueueMaintenanceTask({ agentId: AGENT_ID, lane: "semantic", taskType: "retrieval-context", payload: { index } });
+    }
+    const status = inspectMaintenance({ repository, agentId: AGENT_ID, limit: 1 });
+    assert.equal(status.tasks.length, 1);
+    assert.equal(status.taskCounts["semantic:retrieval-context:pending"], 3);
+    assert.equal(status.stateAnalysisRequests.items.length, 1);
+    assert.equal(status.pendingStateAnalysisRequests, 3);
+    const claimed = repository.claimMaintenanceTasks({ agentId: AGENT_ID, lane: 'semantic', workerId: 'test-progress', maximumTasks: 1 });
+    repository.finishMaintenanceTask({ agentId: AGENT_ID, taskId: claimed.tasks[0].id, workerId: claimed.workerId });
+    const after = inspectMaintenance({ repository, agentId: AGENT_ID, limit: 1 });
+    assert.equal(after.taskCounts['semantic:retrieval-context:completed'], 1);
+    assert.equal(after.taskCounts['semantic:retrieval-context:pending'], 2);
+  } finally { database.close(); }
+});
+
 function seedMemory(repository, id, content = "这件事") {
   return repository.upsertMemory({
     id,

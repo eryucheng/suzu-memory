@@ -9,6 +9,7 @@ import {
   createProvidersFromMemoryConfig,
   loadMemoryConfig,
   normalizeMemoryConfig,
+  validateMemoryProviderConfig,
 } from "../src/index.mjs";
 
 function temporaryDirectory() {
@@ -28,6 +29,7 @@ test("config resolves portable paths relative to its own file", () => {
   assert.equal(config.agentId, "companion-test");
   assert.equal(config.sourcePath, configPath);
   assert.deepEqual(config.defaults.ingestion, {
+    maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
     maximumEventCharacters: 12_000,
     maximumBatchCharacters: 48_000,
     leaseSeconds: 1800,
@@ -47,6 +49,7 @@ test("config validates and exposes ingestion safety budgets", () => {
     },
   });
   assert.deepEqual(config.defaults.ingestion, {
+    maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
     maximumEventCharacters: 8_000,
     maximumBatchCharacters: 32_000,
     leaseSeconds: 900,
@@ -310,4 +313,31 @@ test("configured service does not require provider secrets for local inspection"
     },
   }, { environment: {} });
   assert.equal(service.info().status, "ready");
+});
+
+test("instance identity and data overrides preserve configured engine settings and isolate explicit paths", async t => {
+  const root = temporaryDirectory(), isolated = path.join(root, "sample");
+  const service = createMemoryServiceFromConfig({ agentId: "original", dataRoot: root,
+    databasePath: path.join(root, "production.db"), usageLedgerPath: path.join(root, "production.jsonl"),
+    defaults: { relationshipLabel: "configured", ingestion: { maximumCoreCharacters: 2300 },
+      retrieval: { timeZone: "America/Los_Angeles", maximumReturnedCandidates: 7 } },
+  }, { overrides: { agentId: "sample", dataRoot: isolated, defaults: { memoryOwner: "Sample" } } });
+  t.after(() => service.close());
+  service.initialize();
+  assert.equal(service.defaults.relationshipLabel, "configured");
+  assert.equal(service.defaults.ingestion.maximumCoreCharacters, 2300);
+  assert.equal(service.defaults.retrieval.maximumReturnedCandidates, 7);
+  assert.equal(service.defaults.retrieval.timeZone, "America/Los_Angeles");
+  assert.ok(service.paths.databasePath.startsWith(isolated + path.sep));
+  assert.ok(service.paths.usageLedgerPath.startsWith(isolated + path.sep));
+  assert.equal(fs.existsSync(path.join(root, "production.db")), false);
+});
+
+test("provider preflight validates credentials without contacting the configured endpoints", () => {
+  const config = normalizeMemoryConfig({ agentId: "test", providers: {
+    generation: { baseUrl: "https://model.invalid", model: "configured", apiKeyEnv: "REQUIRED_KEY" },
+  } });
+  assert.throws(() => validateMemoryProviderConfig(config, { environment: {}, requireGeneration: true }), /REQUIRED_KEY/);
+  assert.deepEqual(validateMemoryProviderConfig(config, { environment: { REQUIRED_KEY: "fixture" }, requireGeneration: true }),
+    { generation: true, embedding: false });
 });

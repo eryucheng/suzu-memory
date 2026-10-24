@@ -7,6 +7,7 @@ import {
 } from "@suzu-memory/providers";
 import { WORLD_FRAMES } from "@suzu-memory/core";
 import { createMemoryService } from "@suzu-memory/service";
+import { DEFAULT_LENGTH_ARCHIVE_POLICY } from "@suzu-memory/ingestion";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -138,6 +139,9 @@ export function normalizeMemoryConfig(value, {
     ? normalizeProvider(providers.intervention, "intervention")
     : generationProvider;
   const normalizedIngestion = Object.freeze({
+    ...Object.fromEntries(Object.entries(DEFAULT_LENGTH_ARCHIVE_POLICY).map(([key, fallback]) => [
+      key, finiteInteger(ingestion[key], fallback, 1, 10_000_000, `defaults.ingestion.${key}`),
+    ])),
     maximumEventCharacters: finiteInteger(
       ingestion.maximumEventCharacters,
       12_000,
@@ -239,6 +243,16 @@ function secret(provider, environment, label) {
   return value;
 }
 
+export function validateMemoryProviderConfig(config, {
+  environment = process.env, requireGeneration = false, embedding = true,
+} = {}) {
+  if (requireGeneration && !config.providers.generation) throw new Error("Generation provider is required.");
+  for (const kind of ["generation", ...(embedding ? ["embedding"] : [])]) {
+    if (config.providers[kind]) secret(config.providers[kind], environment, kind);
+  }
+  return { generation: Boolean(config.providers.generation), embedding: embedding && Boolean(config.providers.embedding) };
+}
+
 export function createProvidersFromMemoryConfig(config, {
   environment = process.env,
   fetchImpl = globalThis.fetch,
@@ -321,6 +335,10 @@ export function createMemoryServiceFromConfig(configOrPath, {
   const selectedOverrides = Object.fromEntries(
     Object.entries(overrides).filter(([, value]) => value !== undefined && value !== null && value !== ""),
   );
+  const instanceDefaults = selectedOverrides.defaults || {};
+  const isolatedPaths = selectedOverrides.dataRoot ? {
+    projectRoot: "", databasePath: "", usageLedgerPath: "",
+  } : {};
   return createMemoryService({
     dataRoot: config.dataRoot,
     projectRoot: config.projectRoot,
@@ -329,6 +347,12 @@ export function createMemoryServiceFromConfig(configOrPath, {
     usageLedgerPath: config.usageLedgerPath,
     defaults: config.defaults,
     providers,
+    ...isolatedPaths,
     ...selectedOverrides,
+    defaults: {
+      ...config.defaults, ...instanceDefaults,
+      ingestion: { ...config.defaults.ingestion, ...instanceDefaults.ingestion },
+      retrieval: { ...config.defaults.retrieval, ...instanceDefaults.retrieval },
+    },
   });
 }

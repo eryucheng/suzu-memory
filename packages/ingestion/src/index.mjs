@@ -10,6 +10,7 @@ export {
 } from "./protocol.mjs";
 
 export { processPendingCompanionEvents } from "./processor.mjs";
+export { DEFAULT_LENGTH_ARCHIVE_POLICY } from "./reply-chunks.mjs";
 
 export {
   archiveMemoryWindowId,

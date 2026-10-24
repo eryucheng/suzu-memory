@@ -93,6 +93,99 @@ function fakeMemory() {
   };
 }
 
+test("read-only recall leaves feedback and session bindings untouched, including failure and skip", async () => {
+  const memory = fakeMemory();
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: "test", identity: IDENTITY });
+  const request = { sessionId: "readonly", turnId: "q1", userText: "之前去过哪里？", recall: { enabled: true, readOnly: true } };
+  const result = await adapter.beforeReply(request);
+  assert.equal(result.memoryContext.content, "用户之前去过科技馆。");
+  assert.deepEqual(memory.calls.map(call => call[0]), ["search"]);
+  assert.equal(memory.calls[0][2].persistTrace, false);
+  assert.equal(memory.calls[0][2].reactivate, false);
+  memory.calls.length = 0;
+  memory.search = async () => { throw new Error("unavailable"); };
+  assert.equal((await adapter.beforeReply(request)).status, "degraded");
+  assert.deepEqual(memory.calls, []);
+  assert.equal((await adapter.beforeReply({ ...request, recall: { enabled: false, readOnly: true } })).status, "skipped");
+  assert.deepEqual(memory.calls, []);
+});
+
+test('pending work excludes unavailable providers and accumulating structures while retaining actual failures', async () => {
+  const memory = fakeMemory();
+  memory.providers = { generator() {}, structureGenerator() {}, retrievalContextGenerator: null, embedding: null };
+  memory.maintenanceStatus = async () => ({ taskCounts: {
+    'semantic:event-continuity:pending': 2,
+    'semantic:structure-proposal:pending': 3,
+    'semantic:structure-proposal:failed': 1,
+    'semantic:retrieval-context:pending': 4,
+    'embedding:memory-embedding:pending': 5,
+  }, structureQueue: { accumulatingTaskCount: 3 } });
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
+  const progress = await adapter.pendingWork();
+  assert.equal(progress.pending.tasks, 4); // Disabled retrieval contexts still need the formal skip/cleanup pass.
+  assert.equal(progress.failures, 1);
+  assert.equal(progress.deferred.tasks, 10);
+  memory.providers.embedding = () => {};
+  const withVectors = await adapter.pendingWork();
+  assert.equal(withVectors.pending.tasks, 11);
+  assert.equal(withVectors.deferred.tasks, 3);
+});
+
+test('progress changes when completed work is replaced by equally many new tasks', async () => {
+  const memory = fakeMemory();
+  memory.providers = { retrievalContextGenerator: null };
+  let completed = 0;
+  memory.maintenanceStatus = async () => ({ taskCounts: {
+    'semantic:retrieval-context:pending': 1, 'semantic:retrieval-context:completed': completed,
+  } });
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
+  const first = await adapter.pendingWork();
+  completed++;
+  const second = await adapter.pendingWork();
+  assert.equal(first.total, second.total);
+  assert.equal(second.completed.tasks, 1);
+  assert.notEqual(JSON.stringify(first), JSON.stringify(second));
+});
+
+test('length maintenance releases drained sessions instead of repeating a pass for each old session', async () => {
+  const memory = fakeMemory();
+  memory.maintenanceStatus = async () => ({});
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY, archiveMode: 'length' });
+  for (const sessionId of ['one', 'two']) await adapter.afterReply({ sessionId, turnId: '1',
+    userMessage: { text: '消息' }, assistantMessage: { text: '回复' } });
+  await adapter.onSessionEnd();
+  memory.calls.length = 0;
+  await adapter.onSessionEnd();
+  assert.equal(memory.calls.filter(call => call[0] === 'maintenance').length, 1);
+});
+
+test('length maintenance retains failures from an earlier session when the last session succeeds', async () => {
+  const memory = fakeMemory();
+  memory.maintenanceStatus = async () => ({});
+  memory.runMaintenance = async options => options.chunkPolicy.sessionId === 'one'
+    ? { status: 'completed-with-failures', failures: [], semantic: { status: 'completed-with-failures', error: 'materialization failed' } }
+    : { status: 'completed', failures: [] };
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY, archiveMode: 'length' });
+  for (const sessionId of ['one', 'two']) await adapter.afterReply({ sessionId, turnId: '1', assistantMessage: { text: '回复' } });
+  const result = await adapter.onSessionEnd();
+  assert.equal(result.maintenance.status, 'completed');
+  assert.equal(result.progress.total, 0);
+  assert.equal(result.status, 'completed-with-failures');
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.failures[0].sessionId, 'one');
+  assert.equal(result.failures[0].result.semantic.error, 'materialization failed');
+});
+
+test("single-sided host messages preserve their real role without synthesizing a partner", async () => {
+  const memory = fakeMemory();
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: "test", identity: IDENTITY });
+  const assistant = await adapter.afterReply({ sessionId: "odd", turnId: "0", assistantMessage: { id: "a0", text: "先开口。" } });
+  const user = await adapter.afterReply({ sessionId: "odd", turnId: "1", userMessage: { id: "u0", text: "最后一句。" } });
+  assert.deepEqual(assistant.events.map(event => event.actor.role), ["companion"]);
+  assert.deepEqual(user.events.map(event => event.actor.role), ["user"]);
+  assert.equal(memory.calls.filter(call => call[0] === "response").length, 1);
+});
+
 test("adapter exposes one host-neutral before/after reply lifecycle", async () => {
   const memory = fakeMemory();
   const adapter = createChatHostMemoryAdapter({
@@ -201,7 +294,7 @@ test("turn event ids are deterministic and host-scoped", () => {
   assert.equal(first[0].metadata.memoryWindow.unitId, first[1].metadata.memoryWindow.unitId);
 });
 
-test("host idle maintenance uses the same archive windows as the benchmark planner", async () => {
+test("host window maintenance preserves the shared archive boundaries", async () => {
   const memory = fakeMemory();
   const adapter = createChatHostMemoryAdapter({ memory, hostId: "codex", identity: IDENTITY });
   const stored = [

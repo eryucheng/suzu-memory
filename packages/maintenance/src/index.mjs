@@ -1,6 +1,6 @@
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { randomUUID } from "node:crypto";
-import { claimAccumulatedStructureTasks, deferSmallConsolidationRuns,
+import { claimAccumulatedStructureTasks, inspectAccumulatedStructureTasks, deferSmallConsolidationRuns,
   DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
 export { DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
 
@@ -968,7 +968,8 @@ export async function runSemanticMemoryMaintenance({
   };
 }
 
-export function inspectMaintenance({ repository, agentId, limit = 100 } = {}) {
+export function inspectMaintenance({ repository, agentId, limit = 100,
+  minimumStructureMemories = DEFAULT_MINIMUM_STRUCTURE_MEMORIES } = {}) {
   if (!repository || !clean(agentId)) {
     throw new Error("Inspecting maintenance requires repository and agentId.");
   }
@@ -984,41 +985,49 @@ export function inspectMaintenance({ repository, agentId, limit = 100 } = {}) {
     FROM memory_maintenance_tasks
     WHERE agent_id = ? AND status IN ('pending', 'running')
   `).get(normalizedAgentId)?.count || 0);
-  const summarize = (items) => items.reduce((counts, item) => {
-    const key = `${item.lane}:${item.task_type}:${item.status}`;
-    counts[key] = (counts[key] || 0) + 1;
-    return counts;
-  }, {});
+  const taskCounts = Object.fromEntries(repository.database.prepare(`
+    SELECT lane, task_type, status, COUNT(*) AS count FROM memory_maintenance_tasks
+    WHERE agent_id = ?
+    GROUP BY lane, task_type, status
+  `).all(normalizedAgentId).map(row => [`${row.lane}:${row.task_type}:${row.status}`, row.count]));
+  const structureQueue = taskCounts['semantic:structure-proposal:pending'] || taskCounts['semantic:structure-proposal:running']
+    ? inspectAccumulatedStructureTasks({ repository, agentId: normalizedAgentId,
+      minimumMemories: boundedInteger(minimumStructureMemories, DEFAULT_MINIMUM_STRUCTURE_MEMORIES, 2, 100, 'minimumStructureMemories') })
+    : { accumulatingTaskCount: 0, pendingMemoryCount: 0 };
   const stateRequests = repository.listStateAnalysisRequests(normalizedAgentId, {
     statuses: ["pending", "blocked", "failed"],
     limit: maximum,
   });
+  const stateTotals = Object.fromEntries(repository.database.prepare(`
+    SELECT status, COUNT(*) AS count FROM memory_state_analysis_requests WHERE agent_id = ? GROUP BY status
+  `).all(normalizedAgentId).map(row => [row.status, row.count]));
   const stateRequestCounts = Object.fromEntries(
     ["pending", "blocked", "failed"].map((status) => [
       status,
-      stateRequests.filter((request) => request.status === status).length,
+      Number(stateTotals[status] || 0),
     ]),
   );
-  const consolidationRuns = repository.listConsolidationRuns(normalizedAgentId, {
-    statuses: ["planned", "running", "failed"],
-    limit: maximum,
-    order: "asc",
-  });
+  const consolidationTotals = Object.fromEntries(repository.database.prepare(`
+    SELECT status, COUNT(*) AS count FROM memory_consolidation_runs WHERE agent_id = ? GROUP BY status
+  `).all(normalizedAgentId).map(row => [row.status, row.count]));
   return {
     status: "ready",
-    taskCounts: summarize(tasks),
+    taskCounts,
+    structureQueue,
     runnableTaskCount,
     tasks,
     pendingStateAnalysisRequests: stateRequestCounts.pending,
     stateAnalysisRequests: {
       ...stateRequestCounts,
-      total: stateRequests.length,
+      completed: Number(stateTotals.completed || 0),
+      total: Object.values(stateRequestCounts).reduce((sum, count) => sum + count, 0),
       items: stateRequests,
     },
     consolidationRuns: {
-      planned: consolidationRuns.filter((run) => run.status === "planned").length,
-      running: consolidationRuns.filter((run) => run.status === "running").length,
-      failed: consolidationRuns.filter((run) => run.status === "failed").length,
+      completed: Number(consolidationTotals.completed || 0),
+      planned: Number(consolidationTotals.planned || 0),
+      running: Number(consolidationTotals.running || 0),
+      failed: Number(consolidationTotals.failed || 0),
     },
   };
 }

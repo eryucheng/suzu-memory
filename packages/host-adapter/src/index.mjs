@@ -4,6 +4,8 @@ import {
   groupConversationEventsByArchiveWindow,
   packConversationArchiveWindows,
   toProcessingArchiveWindows,
+  DEFAULT_LENGTH_ARCHIVE_POLICY,
+  logicalArchiveEventId,
 } from "@suzu-memory/ingestion";
 
 export {
@@ -229,9 +231,10 @@ export function buildConversationTurnEvents({
     recordedAt: normalizedRecordedAt,
     retrievalTraceId,
   };
+  if (!userMessage && !assistantMessage) throw new Error("At least one conversation message is required.");
   return Object.freeze([
-    Object.freeze(eventForMessage({ ...common, role: "user", message: userMessage })),
-    Object.freeze(eventForMessage({ ...common, role: "companion", message: assistantMessage })),
+    ...(userMessage ? [Object.freeze(eventForMessage({ ...common, role: "user", message: userMessage }))] : []),
+    ...(assistantMessage ? [Object.freeze(eventForMessage({ ...common, role: "companion", message: assistantMessage }))] : []),
   ]);
 }
 
@@ -355,6 +358,7 @@ export class ChatHostMemoryAdapter {
     identity,
     sourceKind = "chat-host",
     interventionPolicy = null,
+    archiveMode = "windows",
   } = {}) {
     this.memory = assertMemoryClient(memory);
     this.hostId = required(hostId, "hostId");
@@ -362,6 +366,8 @@ export class ChatHostMemoryAdapter {
     this.sourceKind = clean(sourceKind) || "chat-host";
     this.interventionPolicy = normalizeInterventionPolicy(interventionPolicy);
     this.pendingSessionIds = new Set();
+    if (!["windows", "length"].includes(archiveMode)) throw new Error("Unknown archive mode.");
+    this.archiveMode = archiveMode;
   }
 
   async beforeReply({
@@ -380,6 +386,7 @@ export class ChatHostMemoryAdapter {
     const normalizedUserText = required(userText, "userText");
     const now = timestamp(userOccurredAt, "userOccurredAt");
     const recallOptions = plainObject(recall);
+    const readOnly = recallOptions.readOnly === true;
     let interventionDecision = null;
     const autoIntervention = clean(recallOptions.mode).toLowerCase() === "auto";
     if (autoIntervention && typeof recallOptions.enabled !== "boolean") {
@@ -390,7 +397,7 @@ export class ChatHostMemoryAdapter {
     let stage = "reward-observation";
     let previousResponseFeedback = null;
     try {
-      previousResponseFeedback = await this.memory.bindRewardObservation({
+      if (!readOnly) previousResponseFeedback = await this.memory.bindRewardObservation({
         sessionId: scopedSessionId,
         feedbackText: normalizedUserText,
         metadata: {
@@ -419,7 +426,7 @@ export class ChatHostMemoryAdapter {
         : interventionDecision?.action !== "skip";
       if (!recallEnabled) {
         stage = "session-head";
-        await this.memory.setRetrievalSessionHead({
+        if (!readOnly) await this.memory.setRetrievalSessionHead({
           sessionId: scopedSessionId,
           traceId: "",
           now,
@@ -464,8 +471,8 @@ export class ChatHostMemoryAdapter {
         },
         allowCrossWorld: Boolean(world?.allowCrossWorld),
         options: recallOptions.options,
-        persistTrace: true,
-        reactivate: true,
+        persistTrace: !readOnly,
+        reactivate: !readOnly,
       });
       const selectedCount = Array.isArray(retrieval?.trace?.selectedIds)
         ? retrieval.trace.selectedIds.length
@@ -474,7 +481,7 @@ export class ChatHostMemoryAdapter {
         ? clean(retrieval?.trace?.id)
         : "";
       stage = "session-head";
-      await this.memory.setRetrievalSessionHead({
+      if (!readOnly) await this.memory.setRetrievalSessionHead({
         sessionId: scopedSessionId,
         traceId,
         now,
@@ -500,7 +507,7 @@ export class ChatHostMemoryAdapter {
         memoryDiagnostics: null,
       };
     } catch (error) {
-      await this.memory.setRetrievalSessionHead({
+      if (!readOnly) await this.memory.setRetrievalSessionHead({
         sessionId: scopedSessionId,
         traceId: "",
         now,
@@ -547,7 +554,7 @@ export class ChatHostMemoryAdapter {
     });
     const archive = await this.memory.appendEvents(events);
     this.pendingSessionIds.add(normalizedSessionId);
-    const retrievalUsage = await this.memory.bindRetrievalUsageResponse({
+    const retrievalUsage = assistantMessage ? await this.memory.bindRetrievalUsageResponse({
       sessionId: scopedSessionId,
       responseText: required(assistantMessage?.text, "assistantMessage.text"),
       metadata: {
@@ -557,7 +564,7 @@ export class ChatHostMemoryAdapter {
         turnId: required(turnId, "turnId"),
       },
       now: assistantMessage?.occurredAt || recordedAt,
-    });
+    }) : null;
     return {
       status: "archived",
       sessionId: normalizedSessionId,
@@ -594,9 +601,7 @@ export class ChatHostMemoryAdapter {
 
   /**
    * Converts one persisted host session into the shared archive-window plan
-   * before semantic maintenance runs. This is intentionally the same planner
-   * used by the benchmark importers; the benchmark does not get a stronger
-   * splitting or boundary-context algorithm than a real chat host.
+   * before semantic maintenance runs in the window-based host mode.
    */
   async processSessionArchiveWindows({
     sessionId,
@@ -679,7 +684,43 @@ export class ChatHostMemoryAdapter {
     };
   }
 
-  async onIdle({ sessionId = "", processInputEvents = true, ...options } = {}) {
+  async pendingWork({ sessionId = "", minimumStructureMemories } = {}) {
+    if (typeof this.memory.maintenanceStatus !== "function") return null;
+    const status = await this.memory.maintenanceStatus({ limit: 1, minimumStructureMemories });
+    const providers = this.memory.providers || {};
+    const input = await this.memory.listInputEvents({ statuses: ["pending", "processing"], hostId: this.hostId, sessionId, limit: 1 });
+    let tasks = 0, failedTasks = 0, deferredTasks = 0, completedTasks = 0;
+    for (const [key, count] of Object.entries(status.taskCounts || {})) {
+      const [lane, type, state] = key.split(":");
+      const supported = lane === "embedding" && type === "memory-embedding" ? typeof providers.embedding === "function"
+        : type === "event-continuity" ? typeof providers.generator === "function" && typeof providers.embedding === "function"
+        : type === "retrieval-context" ? typeof providers.retrievalContextGenerator === "function" || providers.retrievalContextGenerator === null
+        : type === "structure-proposal" && typeof providers.structureGenerator === "function";
+      if (!supported) {
+        if (["pending", "running"].includes(state)) deferredTasks += Number(count);
+        continue;
+      }
+      if (["pending", "running"].includes(state)) {
+        const accumulating = type === "structure-proposal" && state === "pending"
+          ? Number(status.structureQueue?.accumulatingTaskCount || 0) : 0;
+        tasks += Number(count) - accumulating;
+        deferredTasks += accumulating;
+      }
+      if (state === "failed") failedTasks += Number(count);
+      if (state === "completed") completedTasks += Number(count);
+    }
+    const pending = { inputEvents: input.total, tasks,
+      stateRequests: providers.generator ? Number(status.pendingStateAnalysisRequests || 0) : 0,
+      consolidation: providers.structureGenerator ? Number(status.consolidationRuns?.planned || 0) + Number(status.consolidationRuns?.running || 0) : 0 };
+    const failures = failedTasks + (providers.generator ? Number(status.stateAnalysisRequests?.failed || 0) + Number(status.stateAnalysisRequests?.blocked || 0) : 0)
+      + (providers.structureGenerator ? Number(status.consolidationRuns?.failed || 0) : 0);
+    return { pending, total: Object.values(pending).reduce((sum, count) => sum + count, 0), failures,
+      completed: { tasks: completedTasks, stateRequests: Number(status.stateAnalysisRequests?.completed || 0),
+        consolidation: Number(status.consolidationRuns?.completed || 0) },
+      deferred: { tasks: deferredTasks } };
+  }
+
+  async onIdle({ sessionId = "", processInputEvents = true, flush = false, ...options } = {}) {
     const explicitSessionId = clean(sessionId);
     const recovered = processInputEvents
       ? await this.memory.recoverProcessingEvents({ now: options.now || new Date() })
@@ -690,6 +731,29 @@ export class ChatHostMemoryAdapter {
     const sessionIds = explicitSessionId
       ? [explicitSessionId]
       : [...new Set([...this.pendingSessionIds, ...persistedSessionIds])];
+    if (this.archiveMode === "length") {
+      const reports = [];
+      for (const pendingSessionId of processInputEvents && sessionIds.length ? sessionIds : [""]) {
+        const chunkPolicy = { ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...this.memory.defaults?.ingestion,
+          hostId: this.hostId, sessionId: pendingSessionId, flush,
+          resolveReply: row => row.metadata?.host?.role === "companion" ? {
+            id: row.metadata.host.turnId, complete: true, lastEventId: logicalArchiveEventId(row),
+          } : null };
+        reports.push({ sessionId: pendingSessionId, result: await this.memory.runMaintenance({
+          ...options, processInputEvents: processInputEvents && Boolean(pendingSessionId), chunkPolicy,
+        }) });
+      }
+      const progress = await this.pendingWork({ minimumStructureMemories: options.minimumStructureMemories });
+      if (progress?.pending.inputEvents === 0) this.pendingSessionIds.clear();
+      const failures = reports.flatMap(report => report.result.failures?.length
+        ? report.result.failures.map(failure => ({ ...failure, sessionId: report.sessionId }))
+        : ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(report.result.status)
+          ? [{ sessionId: report.sessionId, status: report.result.status, result: report.result }] : []);
+      return { status: failures.length || progress?.failures
+        ? "completed-with-failures" : "completed",
+        input: reports.map(report => ({ sessionId: report.sessionId, batches: report.result.semantic?.inputBatches || [] })),
+        maintenance: reports.at(-1)?.result, recovered, failures, progress };
+    }
     const input = [];
     const inputFailures = [];
     if (processInputEvents) {
@@ -721,19 +785,21 @@ export class ChatHostMemoryAdapter {
       processInputEvents: false,
     });
     const maintenanceFailed = ["failed", "completed-with-failures"].includes(clean(maintenance?.status));
+    const progress = await this.pendingWork({ minimumStructureMemories: options.minimumStructureMemories });
     return {
-      status: inputFailures.length || maintenanceFailed ? "completed-with-failures" : "completed",
+      status: inputFailures.length || maintenanceFailed || progress?.failures ? "completed-with-failures" : "completed",
       input: processInputEvents
         ? input
         : [{ status: "skipped", reason: "host-input-processing-disabled" }],
       recovered,
       failures: inputFailures,
       maintenance,
+      progress,
     };
   }
 
   onSessionEnd(options = {}) {
-    return this.onIdle(options);
+    return this.onIdle({ ...options, flush: true });
   }
 }
 
