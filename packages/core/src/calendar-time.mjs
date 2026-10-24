@@ -58,6 +58,6 @@ export function dateKeyInTimeZone(value, timeZone = DEFAULT_MEMORY_TIME_ZONE) {
 export function timestampInTimeZone(value, timeZone = DEFAULT_MEMORY_TIME_ZONE) {
   const parts = calendarParts(value, timeZone);
   if (!parts) return '';
-  const offset = parts.timeZoneName === 'GMT' ? 'Z' : parts.timeZoneName.replace(/^GMT/u, '');
+  const offset = /^GMT(?:[+-]00:00)?$/u.test(parts.timeZoneName) ? 'Z' : parts.timeZoneName.replace(/^GMT/u, '');
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${parts.fractionalSecond}${offset}`;
 }

@@ -19,6 +19,27 @@ test('calendar formatting preserves instants with explicit fractional-hour and d
   assert.equal(dateKeyInTimeZone(value, 'invalid-zone'), '2026-12-31');
 });
 
+test('zero UTC offsets use Z across Intl timezone-name variants', async t => {
+  const OriginalDateTimeFormat = Intl.DateTimeFormat;
+  for (const timezoneName of ['GMT', 'GMT+00:00', 'GMT-00:00']) {
+    await t.test(timezoneName, async t => {
+      t.mock.method(Intl, 'DateTimeFormat', function (...args) {
+        const formatter = new OriginalDateTimeFormat(...args);
+        return {
+          formatToParts(value) {
+            return formatter.formatToParts(value).map(part => part.type === 'timeZoneName'
+              ? { ...part, value: timezoneName } : part);
+          },
+        };
+      });
+      const moduleUrl = new URL(`../src/calendar-time.mjs?offset=${encodeURIComponent(timezoneName)}`, import.meta.url);
+      const { timestampInTimeZone } = await import(moduleUrl.href);
+      const value = '2026-12-31T23:30:00.123Z';
+      assert.equal(timestampInTimeZone(value, 'UTC'), value);
+    });
+  }
+});
+
 test('formatting many evidence timestamps reuses one timezone formatter', t => {
   const original = Intl.DateTimeFormat;
   let constructions = 0;
