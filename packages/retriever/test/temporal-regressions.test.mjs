@@ -8,8 +8,8 @@ import { planVectorQuery, recallCorePhrases, resolveTemporalQuery, retrieveMemor
 
 test('plural pronouns are removed as whole words for lexical and vector queries', () => {
   for (const pronoun of ['我们', '你们', '他们', '她们', '它们', '咱们']) {
-    assert.deepEqual(recallCorePhrases(`${pronoun}聊过猫吗`), ['聊过猫']);
-    assert.equal(planVectorQuery(`${pronoun}聊过猫吗`).text, '聊过猫');
+    assert.deepEqual(recallCorePhrases(`${pronoun}聊过猫吗`), ['猫']);
+    assert.equal(planVectorQuery(`${pronoun}聊过猫吗`).text, '猫');
   }
 });
 

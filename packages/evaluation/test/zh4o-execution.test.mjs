@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { questionFailure, runQuestionOperation, mergeUsageSummaries } from '../src/zh4o-execution.mjs';
+import { questionFailure, runQuestionOperation, mergeUsageSummaries, memoryPreparationDiagnostics, summarizeMemoryPreparation } from '../src/zh4o-execution.mjs';
 import { summarizeZh4oRows } from '../src/zh4o-system.mjs';
 
 test('question classification separates transient transport failures, fatal credentials and deterministic assertions', () => {
@@ -82,4 +82,36 @@ test('resumed usage preserves prior costs, failures and provider attribution', (
   assert.equal(merged.usage.prompt_tokens, 30);
   assert.equal(previous.requests, 5);
   assert.equal(mergeUsageSummaries({ ...previous, estimatedCostCny: null }, current).estimatedCostCny, null);
+});
+
+test('memory quality diagnostics retain counts without classifying quarantine, raw fallback or stalled work as outages', () => {
+  const diagnostics = memoryPreparationDiagnostics({
+    passes: [{ status: 'completed-with-failures', failures: [{ error: { code: 'INVALID_RESPONSE', message: 'invalid model response' } }],
+      input: [{ batches: [{ generationDiagnostics: { degraded: true } }] }] }],
+    inputEvents: [{ processing_disposition: 'quarantined' }],
+    finalProgress: { total: 2, failures: 3 }, expectedEvents: 4, mappedEvents: 3,
+  });
+  assert.deepEqual(diagnostics, { quarantinedMessages: 1, archiveOnlyBatches: 1, failedMaintenancePasses: 1,
+    pendingWork: 2, failedWork: 3, missingInputEvents: 1, infrastructureFailures: [] });
+  assert.equal(summarizeMemoryPreparation([{ memoryDiagnostics: diagnostics }, { memoryDiagnostics: diagnostics }]).quarantinedMessages, 2);
+});
+
+for (const error of [
+  { message: 'HTTP 503 unavailable' }, { message: 'quota exceeded', status: 402 },
+  { message: 'socket closed', code: 'ECONNRESET' }, { message: 'request timed out', name: 'AbortError' },
+  { errorMessage: 'HTTP 401 invalid key', errorCode: 'PROVIDER_FAILURE' },
+]) test(`preparation reuses infrastructure classification: ${error.code || error.errorCode || error.message}`, () => {
+  const diagnostics = memoryPreparationDiagnostics({ passes: [{ maintenance: { semantic: { failures: [{ error }] } } }] });
+  assert.equal(diagnostics.infrastructureFailures.length, 1);
+  assert.equal(diagnostics.infrastructureFailures[0].infrastructure, true);
+});
+
+test('nested maintenance result strings retain infrastructure classification and quarantine counts deduplicate fragments', () => {
+  const diagnostics = memoryPreparationDiagnostics({
+    passes: [{ maintenance: { semantic: { stateAnalysis: { results: [{ error: 'HTTP 503 unavailable' }] } } } }],
+    inputEvents: [1, 2].map(id => ({ id, processing_disposition: 'quarantined',
+      metadata: { suzuMemoryFragment: { parentEventId: 'original-message' } } })),
+  });
+  assert.equal(diagnostics.infrastructureFailures[0].status, 503);
+  assert.equal(diagnostics.quarantinedMessages, 1);
 });

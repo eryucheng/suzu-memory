@@ -462,8 +462,9 @@ for (const advancing of [true, false]) test(`final drain distinguishes completed
   });
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none', maximumDrainPasses: 10 });
   assert.equal(calls, advancing ? 7 : 4);
-  assert.equal(report.diagnostics.degradedSamples, advancing ? 0 : 1);
-  assert.ok(report.results.every(row => row.status === (advancing ? 'completed' : 'excluded')));
+  assert.equal(report.diagnostics.degradedSamples, 0);
+  assert.ok(report.results.every(row => row.status === 'completed' && row.scoringEligible));
+  assert.equal(report.diagnostics.memoryPreparation.pendingWork, advancing ? 0 : 1);
 });
 
 test('an interrupted progress callback retains eligible completed answers in an aborted run', async t => {
@@ -578,7 +579,7 @@ test('nonempty event continuity receives no synthetic calendar dates at the mode
     if (tool?.name !== 'memory-event-continuity-v1') return base(url, options);
     const input = JSON.parse(body.messages[1].content);
     continuityInputs.push(input);
-    const output = { matches: input.events.map(({ memory }) => ({ memoryId: memory.id, resolution: 'new',
+    const output = { matches: input.events.map(({ memoryId }) => ({ memoryId, resolution: 'new',
       candidateId: '', relation: '', evidenceSourceIds: [], rationale: '原文记录了另一件事。' })) };
     return Response.json({ model: body.model, choices: [{ message: { tool_calls: [{ type: 'function',
       function: { name: tool.name, arguments: JSON.stringify(output) } }] } }], usage: { prompt_tokens: 10, completion_tokens: 10 } });
@@ -588,8 +589,9 @@ test('nonempty event continuity receives no synthetic calendar dates at the mode
   assert.ok(continuityInputs.length > 0);
   for (const input of continuityInputs) {
     assert.doesNotMatch(JSON.stringify(input), /2000-01-02/);
-    assert.equal(input.events[0].memory.sourceTimeKnown, false);
-    assert.equal(input.events[0].memory.sources[0].occurredAt, null);
+    const memory = input.memories.find(item => item.id === input.events[0].memoryId);
+    assert.equal(memory.sourceTimeKnown, false);
+    assert.equal(memory.sources[0].occurredAt, null);
   }
 });
 
@@ -608,7 +610,7 @@ test("persistent extraction failure retains original input but excludes every qu
   assert.ok(!f.requests.some(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
 });
 
-for (const stage of ['runSemanticMaintenance', 'runEmbeddingMaintenance']) test(`a reported ${stage} failure excludes an empty queue and remains in retained diagnostics`, async t => {
+for (const stage of ['runSemanticMaintenance', 'runEmbeddingMaintenance']) test(`an application ${stage} failure stays scored and remains in retained diagnostics`, async t => {
   const f = fixture(t);
   const original = MemoryService.prototype[stage];
   t.mock.method(MemoryService.prototype, stage, async function (options) {
@@ -617,18 +619,18 @@ for (const stage of ['runSemanticMaintenance', 'runEmbeddingMaintenance']) test(
   });
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none' });
   assert.equal(report.samples[0].finalProgress.total, 0);
-  assert.equal(report.diagnostics.degradedSamples, 1);
-  assert.equal(report.scores.completed, 0);
+  assert.equal(report.diagnostics.degradedSamples, 0);
+  assert.equal(report.scores.completed, 2);
   assert.ok(report.samples[0].maintenanceFailures.length > 0);
   assert.match(JSON.stringify(report.samples[0].maintenanceFailures), /FIXTURE_MAINTENANCE_FAILURE/);
-  assert.ok(!f.requests.some(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
+  assert.ok(f.requests.some(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
   const plan = createZh4oEventPlan(loadZh4oDataset(f.datasetPath)[0], report.dataset.sha256);
   const manifest = JSON.parse(fs.readFileSync(path.join(f.options.workDirectory, 'samples', plan.agentId, 'benchmark.json'), 'utf8'));
-  assert.equal(manifest.degraded, true);
+  assert.equal(manifest.degraded, false);
   const failures = JSON.parse(JSON.stringify(report.samples[0].maintenanceFailures));
   assert.deepEqual(manifest.maintenance.failures, failures);
   const rerun = await runZh4oMemorySystemBenchmark({ ...f.options, retrievalOnly: true, control: 'none' });
-  assert.equal(rerun.diagnostics.degradedSamples, 1);
+  assert.equal(rerun.diagnostics.degradedSamples, 0);
   assert.deepEqual(rerun.samples[0].maintenanceFailures, failures);
 });
 
@@ -637,6 +639,208 @@ test("preflight rejects missing configured credentials before creating a run or 
   await assert.rejects(runZh4oMemorySystemBenchmark({ ...f.options, environment: {} }), /TEST_MEMORY_KEY/);
   assert.equal(f.requests.length, 0);
   assert.equal(fs.existsSync(f.options.workDirectory), false);
+});
+
+test('rebuilding one sample replaces only its database and answers, retaining other samples and total costs', async t => {
+  const f = fixture(t);
+  const dataset = JSON.parse(fs.readFileSync(f.datasetPath, 'utf8'));
+  dataset.push({ ...structuredClone(dataset[0]), sample_id: 'other' });
+  fs.writeFileSync(f.datasetPath, JSON.stringify(dataset));
+  const options = { ...f.options, control: 'none' };
+  const first = await runZh4oMemorySystemBenchmark(options);
+  const untouched = first.samples.find(sample => sample.sampleId === 'other');
+  const before = databaseSnapshot(untouched.databasePath);
+  const original = first.samples.find(sample => sample.sampleId === 'fixture');
+  const originalData = databaseSnapshot(original.databasePath);
+  const rebuilt = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: first, rebuildSample: 'fixture' });
+  assert.equal(rebuilt.results.length, first.results.length);
+  assert.deepEqual(rebuilt.results.filter(row => row.sampleId === 'other'), first.results.filter(row => row.sampleId === 'other'));
+  assert.deepEqual(rebuilt.samples.find(sample => sample.sampleId === 'other'), untouched);
+  assert.equal(databaseSnapshot(untouched.databasePath), before);
+  const current = rebuilt.samples.find(sample => sample.sampleId === 'fixture');
+  assert.notEqual(current.preparationId, original.preparationId);
+  assert.equal(current.rebuildPending, undefined);
+  assert.equal(rebuilt.run.rebuilds.length, 1);
+  const backup = rebuilt.run.rebuilds[0].backupPath;
+  const plan = createZh4oEventPlan(loadZh4oDataset(f.datasetPath)[0], first.dataset.sha256);
+  const relativeDatabase = path.relative(path.join(options.workDirectory, 'samples', plan.agentId), original.databasePath);
+  assert.equal(databaseSnapshot(path.join(backup, relativeDatabase)), originalData);
+  assert.ok(rebuilt.run.generationUsage.requests > first.run.generationUsage.requests);
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, resumeReport: first }), /preparation differs/);
+});
+
+test('an interrupted rebuild checkpoint clears old answers before moving data and can be retried explicitly', async t => {
+  const f = fixture(t), options = { ...f.options, control: 'none' };
+  const first = await runZh4oMemorySystemBenchmark(options);
+  const before = databaseSnapshot(first.samples[0].databasePath);
+  let pending;
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, resumeReport: first, rebuildSample: 'fixture',
+    onCheckpoint(report) { pending = structuredClone(report); throw new Error('interrupted before moving data'); } }), /interrupted/);
+  assert.equal(pending.results.length, 0);
+  assert.equal(pending.samples[0].rebuildPending, true);
+  assert.equal(databaseSnapshot(first.samples[0].databasePath), before);
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, resumeReport: pending }), /unfinished rebuild/);
+  const rebuilt = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: pending, rebuildSample: 'fixture' });
+  assert.equal(rebuilt.status, 'completed');
+  assert.equal(rebuilt.results.length, first.results.length);
+  assert.notEqual(rebuilt.samples[0].preparationId, first.samples[0].preparationId);
+});
+
+test('rebuild validation rejects unknown IDs and incompatible options before changing retained data', async t => {
+  const f = fixture(t), options = { ...f.options, control: 'none' };
+  const first = await runZh4oMemorySystemBenchmark(options);
+  const before = databaseSnapshot(first.samples[0].databasePath), requests = f.requests.length;
+  for (const extra of [{ rebuildSample: '../outside', resumeReport: first }, { rebuildSample: 'fixture' },
+    { rebuildSample: 'fixture', resumeReport: first, retrievalOnly: true }]) {
+    await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, ...extra }), /Rebuild sample|rebuildSample/);
+  }
+  assert.equal(f.requests.length, requests);
+  assert.equal(databaseSnapshot(first.samples[0].databasePath), before);
+});
+
+test('full conversation controls receive every source turn without recall truncation or gold labels', async t => {
+  const f = fixture(t, { session_1: [
+    { speaker: '赵齐', dia_id: 'S1:1', text: '我喜欢苹果味汽水。' + '甲'.repeat(5000) },
+    { speaker: '白羽岚', dia_id: 'S1:2', text: '原文末尾确认。' + '乙'.repeat(1000) },
+  ], session_2: [{ speaker: '赵齐', dia_id: 'S2:1', text: '第二次会话的完整尾句。' }] });
+  const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'both' });
+  const controls = f.requests.filter(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME
+    && request.body.messages[1].content.includes('会话 1：'));
+  assert.equal(controls.length, 2);
+  const source = loadZh4oDataset(f.datasetPath)[0];
+  for (const request of controls) {
+    const input = request.body.messages[1].content;
+    let cursor = -1;
+    for (const turn of source.sessions.flatMap(session => session.turns)) {
+      const next = input.indexOf(`${turn.speaker}：${turn.text}`, cursor + 1);
+      assert.ok(next > cursor); cursor = next;
+    }
+    assert.doesNotMatch(input, /PRIVATE_GOLD_MUST_NOT_LEAK|2000-01-0|coleção/);
+  }
+  assert.ok(report.samples[0].fullContextCharacters > f.config.defaults.retrieval.maximumContextChars);
+  assert.equal(report.controls.fullContextQuestions, 1);
+  assert.equal(report.controls.fullContextAccuracy, 1);
+  assert.equal(report.run.generationUsage.byPhase['full-context-control'], 2);
+  assert.ok(report.results.every(row => row.control && row.fullContextControl));
+});
+
+test('full-context failures count as incorrect only in that control group', async t => {
+  const f = fixture(t);
+  const run = questionFixture(f, 2, ({ body, ordinal }) => body.messages[1].content.includes('会话 1：') && ordinal === 1
+    ? Response.json({ error: { message: 'temporarily unavailable' } }, { status: 503 }) : undefined);
+  const report = await runZh4oMemorySystemBenchmark({ ...run.options, control: 'both' });
+  assert.equal(report.scores.exactChoiceAccuracy, 1);
+  assert.equal(report.controls.fullContextQuestions, 2);
+  assert.equal(report.controls.fullContextFailedQuestions, 1);
+  assert.equal(report.controls.fullContextAccuracy, 0.5);
+  assert.equal(report.results[0].status, 'completed');
+  assert.equal(report.results[0].control.status, 'completed');
+  assert.equal(report.results[0].fullContextControl.status, 'failed');
+});
+
+test('control groups still answer independently when the main memory answer fails', async t => {
+  const f = fixture(t);
+  const run = questionFixture(f, 1, ({ control, body }) => answerResponse(
+    control || body.messages[1].content.includes('会话 1：') ? 'B' : 'invalid'));
+  const report = await runZh4oMemorySystemBenchmark({ ...run.options, control: 'both' });
+  assert.equal(report.results[0].status, 'failed');
+  assert.equal(report.results[0].control.status, 'completed');
+  assert.equal(report.results[0].fullContextControl.status, 'completed');
+  assert.equal(report.scores.exactChoiceAccuracy, 0);
+  assert.equal(report.controls.noMemoryStrictAccuracy, 1);
+  assert.equal(report.controls.fullContextAccuracy, 1);
+  assert.equal(report.controls.pairedQuestions, 0);
+  assert.equal(report.controls.fullContextPairedQuestions, 0);
+});
+
+test('quarantined over-budget input remains in the scored sample and its diagnostic count', async t => {
+  const f = fixture(t, { session_1: [{ speaker: '赵齐', dia_id: 'S1:1', text: '苹果味汽水'.padEnd(70000, '甲') }] });
+  const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none' });
+  assert.equal(report.diagnostics.degradedSamples, 0);
+  assert.equal(report.diagnostics.memoryPreparation.quarantinedMessages, 1);
+  assert.equal(report.scores.completed, 2);
+  assert.ok(report.results.every(row => row.scoringEligible));
+});
+
+test('invalid extraction output falls back to raw evidence but remains scored', async t => {
+  const f = fixture(t);
+  const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none', fetchImpl: (url, options) => {
+    const tool = JSON.parse(options.body).tools?.[0]?.function;
+    if (!tool?.name.includes('extraction')) return f.fetchImpl(url, options);
+    return Response.json({ model: 'configured-model', choices: [{ message: { tool_calls: [{ type: 'function',
+      function: { name: tool.name, arguments: JSON.stringify({ memories: 'invalid' }) } }] } }] });
+  } });
+  assert.equal(report.diagnostics.degradedSamples, 0);
+  assert.equal(report.diagnostics.memoryPreparation.archiveOnlyBatches, 2);
+  assert.equal(report.scores.completed, 2);
+  assert.ok(report.results.every(row => row.scoringEligible));
+});
+
+test('single-sample rebuild accepts a damaged manifest and missing database without reusing stale answers', async t => {
+  const f = fixture(t), options = { ...f.options, control: 'none' };
+  const first = await runZh4oMemorySystemBenchmark(options);
+  const plan = createZh4oEventPlan(loadZh4oDataset(f.datasetPath)[0], first.dataset.sha256);
+  const manifest = path.join(options.workDirectory, 'samples', plan.agentId, 'benchmark.json');
+  fs.writeFileSync(manifest, '{damaged');
+  fs.rmSync(first.samples[0].databasePath);
+  const rebuilt = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: first, rebuildSample: 'fixture' });
+  assert.equal(rebuilt.status, 'completed');
+  assert.equal(rebuilt.results.length, first.results.length);
+  assert.notEqual(rebuilt.samples[0].preparationId, first.samples[0].preparationId);
+});
+
+test('preparation is checkpointed before database initialization or provider calls and an interrupted entry can be rebuilt', async t => {
+  const f = fixture(t), options = { ...f.options, control: 'none' };
+  let checkpoint;
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, onCheckpoint(report) {
+    checkpoint = structuredClone(report);
+    assert.equal(fs.existsSync(report.samples[0].databasePath), false);
+    throw new Error('interrupt before initialization');
+  } }), /interrupt before initialization/);
+  assert.equal(f.requests.length, 0);
+  assert.equal(checkpoint.samples[0].preparationPending, true);
+  assert.equal(checkpoint.results.length, 0);
+  const rebuilt = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: checkpoint, rebuildSample: 'fixture' });
+  assert.equal(rebuilt.status, 'completed');
+  assert.equal(rebuilt.results.length, 2);
+  assert.equal(rebuilt.samples[0].preparationPending, undefined);
+});
+
+test('an unregistered partial sample can be explicitly rebuilt while the completed sample remains unchanged', async t => {
+  const f = fixture(t);
+  const dataset = JSON.parse(fs.readFileSync(f.datasetPath, 'utf8'));
+  dataset.push({ ...structuredClone(dataset[0]), sample_id: 'other' });
+  fs.writeFileSync(f.datasetPath, JSON.stringify(dataset));
+  const options = { ...f.options, control: 'none' };
+  let beforeSecond;
+  const full = await runZh4oMemorySystemBenchmark({ ...options, onCheckpoint(report) {
+    if (report.samples.length === 1 && report.results.length === 2) beforeSecond = structuredClone(report);
+  } });
+  const firstData = databaseSnapshot(full.samples[0].databasePath);
+  const plan = createZh4oEventPlan(loadZh4oDataset(f.datasetPath)[1], full.dataset.sha256);
+  fs.rmSync(path.join(options.workDirectory, 'samples', plan.agentId, 'benchmark.json'));
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, resumeReport: beforeSecond }), /Sample database exists/);
+  const repaired = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: beforeSecond, rebuildSample: 'other' });
+  assert.equal(repaired.status, 'completed');
+  assert.equal(repaired.results.length, 4);
+  assert.deepEqual(repaired.results.filter(row => row.sampleId === 'fixture'), beforeSecond.results);
+  assert.equal(databaseSnapshot(full.samples[0].databasePath), firstData);
+  assert.ok(fs.existsSync(repaired.run.rebuilds[0].backupPath));
+});
+
+test('a completed database can resume from its earlier preparation checkpoint without importing again', async t => {
+  const f = fixture(t), options = { ...f.options, control: 'none' };
+  let preparing;
+  await assert.rejects(runZh4oMemorySystemBenchmark({ ...options, onCheckpoint(report) {
+    if (report.samples[0].preparationPending) preparing = structuredClone(report);
+    else throw new Error('interrupt after preparation');
+  } }), /interrupt after preparation/);
+  assert.ok(preparing);
+  const extractionBefore = f.requests.filter(request => request.tool.name.includes('extraction')).length;
+  const resumed = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: preparing });
+  assert.equal(resumed.status, 'completed');
+  assert.equal(resumed.samples[0].preparationPending, undefined);
+  assert.equal(f.requests.filter(request => request.tool.name.includes('extraction')).length, extractionBefore);
 });
 
 test('missing code identity fails before creating a benchmark database or contacting a provider', async t => {

@@ -793,6 +793,7 @@ export class MemoryService {
           minimumStructureMemories,
           maximumStateRequests,
           maximumConsolidationRuns,
+          maximumRequestCharacters: this.defaults.ingestion.maximumRequestCharacters,
         }));
       } catch (error) {
         signal?.throwIfAborted();

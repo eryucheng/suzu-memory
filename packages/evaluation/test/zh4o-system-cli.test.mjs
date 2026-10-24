@@ -185,6 +185,31 @@ test("removed extraction tuning switches fail explicitly instead of recreating a
   await assert.rejects(runMemoryZh4oSystemCli({ args: ["--maximum-events", "50"] }), /不支持选项/);
 });
 
+test('CLI full-context controls and single-sample rebuild use the same retained run', async t => {
+  const f = fixture(t);
+  const args = [...f.liveArgs, '--full-context-control'];
+  const dry = await runMemoryZh4oSystemCli({ ...f.simulatedRun, args: [...args, '--dry-run'] });
+  assert.equal(dry.answerRequests, 3);
+  assert.equal(dry.control, 'both');
+  const first = await runMemoryZh4oSystemCli({ ...f.simulatedRun, args });
+  assert.equal(first.results[0].fullContextControl.status, 'completed');
+  const rebuilt = await runMemoryZh4oSystemCli({ ...f.simulatedRun,
+    args: [...args, '--resume', path.join(f.runDirectory, 'report.json'), '--rebuild-sample', 'cli'] });
+  assert.equal(rebuilt.results.length, 1);
+  assert.notEqual(rebuilt.samples[0].preparationId, first.samples[0].preparationId);
+  assert.equal(rebuilt.results[0].fullContextControl.status, 'completed');
+  assert.equal(rebuilt.run.rebuilds.length, 1);
+});
+
+test('CLI refuses rebuild without resume and conflicting control flags before creating data', async t => {
+  const f = fixture(t);
+  for (const extra of [['--rebuild-sample', 'cli'], ['--full-context-control', '--no-control'],
+    ['--resume', 'not-read.json', '--rebuild-sample', 'cli', '--retrieval-only']]) {
+    await assert.rejects(runMemoryZh4oSystemCli({ ...f.simulatedRun, args: [...f.liveArgs, ...extra] }), /cannot be combined|requires --resume/);
+  }
+  assert.equal(fs.existsSync(f.runDirectory), false);
+});
+
 for (const argument of ["--help", "-h"]) {
   test(`ZH-4O CLI ${argument} returns usage without requiring a dataset`, async () => {
     const output = outputSink();

@@ -99,7 +99,7 @@ function crossRoleConflict(explicitSignal, behaviorSignalValue, sharing) {
   return "";
 }
 
-function prerequisiteGate({ object, timeScope, signal, conflict }) {
+function prerequisiteGate({ object, timeScope, signal, conflict, contextId }) {
   if (!object) return { qualification: "unresolved", reason: "missing-object-grounding" };
   if (object.targetMatch === "none") {
     return { qualification: "excluded", reason: "object-does-not-match-target" };
@@ -118,6 +118,9 @@ function prerequisiteGate({ object, timeScope, signal, conflict }) {
     return { qualification: "unresolved", reason: "explicit-expression-time-unknown" };
   }
   if (conflict) return { qualification: "unresolved", reason: conflict };
+  if (!signal.startsWith("explicit_") && !clean(contextId)) {
+    return { qualification: "unresolved", reason: "missing-behavior-context" };
+  }
   return null;
 }
 
@@ -151,7 +154,7 @@ function buildMergedCandidates(evaluation) {
     const selected = selectSignal({ explicit, behavior, sharing, timeScope });
     if (!selected.signal) return [];
     const conflict = crossRoleConflict(selected.explicitSignal, selected.behaviorSignal, sharing);
-    const preGate = prerequisiteGate({ object, timeScope, signal: selected.signal, conflict });
+    const preGate = prerequisiteGate({ object, timeScope, signal: selected.signal, conflict, contextId: memory.contextId });
     const sourceIds = [...new Set(
       [object, explicit, behavior, sharing, timeScope]
         .filter(Boolean)

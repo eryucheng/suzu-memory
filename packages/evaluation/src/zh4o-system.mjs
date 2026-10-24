@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -7,7 +7,7 @@ import { createMemoryServiceFromConfig, loadMemoryConfig, normalizeMemoryConfig,
 import { createChatHostMemoryAdapter, buildConversationTurnEvents } from "@suzu-memory/host-adapter";
 import { calculateCost } from "@suzu-memory/usage-ledger";
 import { readEvaluationCodeRevision, evaluationPreparationKey } from './code-revision.mjs';
-import { questionFailure, runQuestionOperation, mergeUsageSummaries } from './zh4o-execution.mjs';
+import { questionFailure, runQuestionOperation, mergeUsageSummaries, memoryPreparationDiagnostics, summarizeMemoryPreparation } from './zh4o-execution.mjs';
 
 
 import {
@@ -26,7 +26,7 @@ import {
   summarizeBenchmarkEmbeddingUsage as summarizeEmbeddingUsage,
 } from "./retrieval-benchmark-utils.mjs";
 
-export const ZH4O_SYSTEM_PROTOCOL_VERSION = "suzu-zh4o-memory-system-v6";
+export const ZH4O_SYSTEM_PROTOCOL_VERSION = "suzu-zh4o-memory-system-v7";
 export const ZH4O_EVENT_FORMAT_VERSION = "zh4o-host-conversation-event-v2";
 export const ZH4O_ANSWER_SCHEMA_NAME = "zh4o-multiple-choice-answer-v2";
 export const ZH4O_ANSWER_SCHEMA = Object.freeze({
@@ -617,12 +617,27 @@ function positiveInteger(value, label) {
 export function summarizeZh4oControls(results, mode) {
   const paired = results.filter(row => row.scoringEligible && row.status === "completed"
     && row.control?.status === "completed" && row.answerFormat === "choice");
+  const full = results.filter(row => row.scoringEligible && row.status === 'completed'
+    && row.fullContextControl?.status === 'completed' && row.answerFormat === 'choice');
+  const fullAttempted = results.filter(row => row.scoringEligible && row.answerFormat === 'choice'
+    && ['completed', 'failed'].includes(row.fullContextControl?.status));
+  const noMemoryAttempted = results.filter(row => row.scoringEligible && row.answerFormat === 'choice'
+    && ['completed', 'failed'].includes(row.control?.status));
   return { mode, pairedQuestions: paired.length,
     failedQuestions: results.filter(row => row.scoringEligible && row.control?.status === 'failed').length,
     memoryAccuracy: paired.length ? mean(paired.map(row => Number(row.correct))) : null,
     noMemoryAccuracy: paired.length ? mean(paired.map(row => Number(row.control.correct))) : null,
+    noMemoryQuestions: noMemoryAttempted.length,
+    noMemoryStrictAccuracy: noMemoryAttempted.length ? mean(noMemoryAttempted.map(row => Number(row.control.correct === true))) : null,
     memoryOnlyCorrect: paired.filter(row => row.correct && !row.control.correct).length,
-    controlOnlyCorrect: paired.filter(row => !row.correct && row.control.correct).length };
+    controlOnlyCorrect: paired.filter(row => !row.correct && row.control.correct).length,
+    fullContextPairedQuestions: full.length,
+    fullContextFailedQuestions: results.filter(row => row.scoringEligible && row.fullContextControl?.status === 'failed').length,
+    fullContextQuestions: fullAttempted.length,
+    fullContextAccuracy: fullAttempted.length ? mean(fullAttempted.map(row => Number(row.fullContextControl.correct === true))) : null,
+    fullContextMemoryAccuracy: full.length ? mean(full.map(row => Number(row.correct))) : null,
+    memoryOnlyCorrectVsFullContext: full.filter(row => row.correct && !row.fullContextControl.correct).length,
+    fullContextOnlyCorrect: full.filter(row => !row.correct && row.fullContextControl.correct).length };
 }
 
 function inputRows(service) {
@@ -675,14 +690,17 @@ export async function runZh4oMemorySystemBenchmark({
   startSample = 0, maximumSamples = Number.MAX_SAFE_INTEGER, maximumQuestionsPerSample = Number.MAX_SAFE_INTEGER,
   candidateK, maximumContextCharacters, maximumDrainPasses = 1000, embeddingRequestIntervalMs = 0,
   withoutEmbedding = false, retrievalOnly = false, control = "no-memory", includeSourceDiagnostics = false,
-  codeRevision = readEvaluationCodeRevision(), onProgress = null, onCheckpoint = null, resumeReport = null,
+  codeRevision = readEvaluationCodeRevision(), onProgress = null, onCheckpoint = null, resumeReport = null, rebuildSample = null,
 } = {}) {
   if (!config) throw new Error("ZH-4O requires the real Memory config.");
   const normalizedConfig = typeof config === "string" ? loadMemoryConfig(config) : normalizeMemoryConfig(config);
   validateMemoryProviderConfig(normalizedConfig, { environment, requireGeneration: true, embedding: !withoutEmbedding });
   if (!datasetPath || !fs.existsSync(datasetPath)) throw new Error("ZH-4O dataset does not exist.");
   if (!workDirectory) throw new Error("ZH-4O requires a dedicated work directory.");
-  if (!["no-memory", "none"].includes(control)) throw new Error("control must be no-memory or none.");
+  if (!["no-memory", "both", "none"].includes(control)) throw new Error("control must be no-memory, both or none.");
+  if (rebuildSample !== null && (typeof rebuildSample !== 'string' || !rebuildSample.trim() || !resumeReport || retrievalOnly)) {
+    throw new Error('rebuildSample requires a sample ID, --resume and writable preparation; do not combine with --retrieval-only.');
+  }
   positiveInteger(maximumDrainPasses, "maximumDrainPasses");
   if (candidateK !== undefined) positiveInteger(candidateK, "candidateK");
   if (maximumContextCharacters !== undefined) positiveInteger(maximumContextCharacters, "maximumContextCharacters");
@@ -714,6 +732,12 @@ export async function runZh4oMemorySystemBenchmark({
     evaluationPreparationKey(sample.preparation);
     previousSamples.set(sample.sampleId, structuredClone(sample));
   }
+  if (rebuildSample !== null && !selectedSamples.some(sample => sample.sampleId === rebuildSample)) {
+    throw new Error('Rebuild sample must be present in the selected dataset.');
+  }
+  if ([...previousSamples.values()].some(sample => sample.rebuildPending && sample.sampleId !== rebuildSample)) {
+    throw new Error('Checkpoint contains an unfinished rebuild; repeat --rebuild-sample with that sample ID.');
+  }
   for (const row of resumeReport?.results || []) {
     const question = questionsById.get(row.questionId);
     if (!question || row.sampleId !== question.sampleId || !previousSamples.has(row.sampleId)
@@ -722,7 +746,9 @@ export async function runZh4oMemorySystemBenchmark({
       || row.scoringEligible !== (row.status !== 'excluded' && !previousSamples.get(row.sampleId).memorySystemDegraded)
       || (row.status === 'completed' && (!normalizeChoice(row.prediction) || row.correct !== (row.prediction === question.answer)))
       || (row.control?.status === 'completed' && (!normalizeChoice(row.control.prediction)
-        || row.control.correct !== (row.control.prediction === question.answer)))) {
+        || row.control.correct !== (row.control.prediction === question.answer)))
+      || (row.fullContextControl?.status === 'completed' && (!normalizeChoice(row.fullContextControl.prediction)
+        || row.fullContextControl.correct !== (row.fullContextControl.prediction === question.answer)))) {
       throw new Error('Checkpoint has invalid or duplicate question results.');
     }
     previousQuestions.add(row.questionId);
@@ -731,36 +757,51 @@ export async function runZh4oMemorySystemBenchmark({
     const plan = createZh4oEventPlan(conversation, datasetSha256);
     assertZh4oEventsHaveNoGoldLabels({ conversation, plan });
     const sampleRoot = path.join(work, "samples", plan.agentId), manifestPath = path.join(sampleRoot, "benchmark.json");
-    const reuse = retrievalOnly || Boolean(resumeReport && fs.existsSync(manifestPath));
+    const rebuild = conversation.sampleId === rebuildSample;
+    const reuse = !rebuild && (retrievalOnly || Boolean(resumeReport && fs.existsSync(manifestPath)));
     const service = createMemoryServiceFromConfig(normalizedConfig, { environment, fetchImpl,
       overrides: { dataRoot: sampleRoot, agentId: plan.agentId, readOnly: reuse,
         defaults: { memoryOwner: conversation.speakerB, userName: conversation.speakerA,
           primaryUserId: plan.primaryUserId, companionId: plan.agentId } } });
+    if (rebuild && !previousSamples.has(conversation.sampleId) && !fs.existsSync(sampleRoot)) {
+      throw new Error('Rebuild sample has neither a checkpoint entry nor a retained sample directory.');
+    }
     let saved = null;
     if (reuse) {
       if (!fs.existsSync(service.paths.databasePath) || !fs.existsSync(manifestPath)) throw new Error("No retained sample database/manifest; import the sample first.");
       saved = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-      if (saved.protocol !== ZH4O_SYSTEM_PROTOCOL_VERSION || saved.datasetSha256 !== datasetSha256 || saved.sampleId !== conversation.sampleId) {
+      if (saved.protocol !== ZH4O_SYSTEM_PROTOCOL_VERSION || saved.datasetSha256 !== datasetSha256 || saved.sampleId !== conversation.sampleId
+        || typeof saved.preparationId !== 'string' || !saved.preparationId) {
         throw new Error("Retained database does not match this dataset and evaluation protocol.");
       }
       evaluationPreparationKey(saved.preparation);
       if (previousSamples.has(conversation.sampleId)
         && (evaluationPreparationKey(previousSamples.get(conversation.sampleId).preparation) !== evaluationPreparationKey(saved.preparation)
           || previousSamples.get(conversation.sampleId).databasePath !== service.paths.databasePath
+          || previousSamples.get(conversation.sampleId).preparationId !== saved.preparationId
           || (saved.degraded && !previousSamples.get(conversation.sampleId).memorySystemDegraded))) {
         throw new Error('Checkpoint memory preparation differs from the retained database.');
       }
       if (!withoutEmbedding && JSON.stringify(saved.embedding) !== JSON.stringify(embeddingIndexIdentity(normalizedConfig.providers.embedding))) {
         throw new Error("Retained embedding configuration differs; retrieval-only cannot rebuild the index.");
       }
-    } else if (previousSamples.has(conversation.sampleId) || fs.existsSync(service.paths.databasePath) || fs.existsSync(manifestPath)) {
+    } else if (!rebuild && (previousSamples.has(conversation.sampleId) || fs.existsSync(service.paths.databasePath) || fs.existsSync(manifestPath))) {
       throw new Error("Sample database exists; use a new work directory or --retrieval-only.");
     }
-    return { conversation, plan, sampleRoot, manifestPath, service, saved, reuse };
+    return { conversation, plan, sampleRoot, manifestPath, service, saved, reuse, rebuild };
   });
   fs.mkdirSync(work, { recursive: true });
   const startedAt = resumeReport?.run.startedAt || new Date().toISOString(), started = performance.now();
-  const results = structuredClone(resumeReport?.results || []), samples = [...previousSamples.values()];
+  const results = structuredClone(resumeReport?.results || []).filter(row => row.sampleId !== rebuildSample);
+  const rebuilds = structuredClone(resumeReport?.run.rebuilds || []);
+  if (rebuildSample !== null) {
+    const target = preparedSamples.find(sample => sample.rebuild);
+    previousSamples.set(rebuildSample, { sampleId: rebuildSample, inputEvents: target.plan.events.length,
+      imported: 0, memorySystemDegraded: false, preparationErrors: [], maintenanceCalls: 0,
+      maintenanceFailures: [], inputBatches: [], preparation, databasePath: target.service.paths.databasePath, rebuildPending: true });
+    for (const [id, question] of questionsById) if (question.sampleId === rebuildSample) previousQuestions.delete(id);
+  }
+  const samples = [...previousSamples.values()];
   const generationUsageRecords = [], embeddingUsageRecords = [];
   const embeddingGate = createEmbeddingRequestGate(embeddingRequestIntervalMs);
   const retryDelayMs = Math.max(0, Number(normalizedConfig.providers.generation.transportRetryDelayMs ?? 500));
@@ -782,7 +823,8 @@ export async function runZh4oMemorySystemBenchmark({
         qualityScorePolicy: 'A-D gold only; question failures count as incorrect; malformed gold retained in the reference all-gold metric',
         questionFailurePolicy: 'count provider transport attempts toward an evaluator retry budget of three; retain failed questions; abort on fatal or three consecutive same-stage infrastructure failures',
         comparisonNotice: "Provider/config-specific host replay; not a reproduction of a paper's model settings or a measurement of interactive chat latency.",
-        degradedSamplePolicy: 'memory-preparation-failures-excluded-from-all-quality-scores' },
+        degradedSamplePolicy: 'only-infrastructure-failures-during-memory-preparation-excluded; memory-quality-failures-remain-scored',
+        fullContextControlPolicy: control === 'both' ? 'all source conversation turns in original order; no truncation; no QA labels or synthetic dates' : 'disabled' },
       dataset: { path: path.resolve(datasetPath), sha256: datasetSha256, totalSamples: allSamples.length,
         selectedStart, selectedSamples: selectedSamples.length, selectedQuestions: questionsById.size,
         selectedNonChoiceGoldQuestions: [...questionsById.values()].filter(question => question.answerFormat !== 'choice').length },
@@ -790,18 +832,35 @@ export async function runZh4oMemorySystemBenchmark({
       run: { identity, codeRevision, startedAt, finishedAt, durationMs: Number(resumeReport?.run.durationMs || 0) + performance.now() - started,
         retrievalOnly, overrides: { candidateK, maximumContextCharacters, withoutEmbedding },
         control, maximumDrainPasses, configSha256: preparation.configSha256,
-        resumptions: Number(resumeReport?.run.resumptions || 0) + Number(Boolean(resumeReport)), abort,
+        resumptions: Number(resumeReport?.run.resumptions || 0) + Number(Boolean(resumeReport)), rebuilds, abort,
         embeddingEnabled: !withoutEmbedding && Boolean(normalizedConfig.providers.embedding),
         generationUsage: mergeUsageSummaries(resumeReport?.run.generationUsage, summarizeGenerationUsage(generationUsageRecords, finishedAt)),
         embeddingUsage: mergeUsageSummaries(resumeReport?.run.embeddingUsage, summarizeEmbeddingUsage(embeddingUsageRecords, finishedAt)) },
       scores: summarizeZh4oRows(results), controls: summarizeZh4oControls(results, control),
       diagnostics: { degradedSamples, failedQuestions, notRunQuestions: questionsById.size - results.length,
+        memoryPreparation: summarizeMemoryPreparation(samples),
         meanLatencyMs: mean(scoredRows.map(row => row.latencyMs)),
         p50LatencyMs: percentile(scoredRows.map(row => row.latencyMs), 0.5),
         p95LatencyMs: percentile(scoredRows.map(row => row.latencyMs), 0.95) },
       samples: structuredClone(samples), results: structuredClone(results) };
   }
   const checkpoint = async () => { if (onCheckpoint) await onCheckpoint(reportSnapshot(true)); };
+  if (rebuildSample !== null) {
+    const target = preparedSamples.find(sample => sample.rebuild);
+    // The path is derived from the dataset hash, never from the user-supplied sample ID.
+    for (const directory of [path.join(work, 'samples'), target.sampleRoot]) {
+      if (fs.existsSync(directory) && fs.lstatSync(directory).isSymbolicLink()) throw new Error('Rebuild refuses a linked sample directory.');
+    }
+    const backupRoot = path.join(work, 'rebuild-backups');
+    if (fs.existsSync(backupRoot) && fs.lstatSync(backupRoot).isSymbolicLink()) throw new Error('Rebuild refuses a linked backup directory.');
+    const backupPath = path.join(backupRoot, `${target.plan.agentId}-${randomUUID()}`);
+    rebuilds.push({ sampleId: rebuildSample, backupPath, requestedAt: new Date().toISOString() });
+    await checkpoint();
+    if (fs.existsSync(target.sampleRoot)) {
+      fs.mkdirSync(backupRoot, { recursive: true });
+      fs.renameSync(target.sampleRoot, backupPath);
+    }
+  }
   for (const { conversation, plan, sampleRoot, manifestPath, service, saved, reuse } of preparedSamples) {
     if (abort) break;
     const questions = conversation.questions.slice(0, maximumQuestionsPerSample);
@@ -817,21 +876,34 @@ export async function runZh4oMemorySystemBenchmark({
     });
     const answer = captureGenerationUsage(configured.generator, "answer", generationUsageRecords);
     const controlAnswer = captureGenerationUsage(configured.generator, "control", generationUsageRecords);
+    const fullContextAnswer = captureGenerationUsage(configured.generator, 'full-context-control', generationUsageRecords);
+    const fullContext = control === 'both' ? [
+      `角色扮演对话参与者：${conversation.speakerA} 与 ${conversation.speakerB}。`,
+      ...conversation.sessions.flatMap(session => [`\n会话 ${session.ordinal}：`, ...session.turns.map(turn => `${turn.speaker}：${turn.text}`)]),
+    ].join('\n') : '';
     const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "zh4o", identity: plan.identity,
       sourceKind: "zh4o-roleplay-conversation", archiveMode: "length" });
     const sample = previousSamples.get(conversation.sampleId) || { sampleId: conversation.sampleId,
       inputEvents: plan.events.length, imported: 0, memorySystemDegraded: false, preparationErrors: [],
       maintenanceCalls: 0, maintenanceFailures: [], inputBatches: [], effectiveDefaults: service.defaults,
       preparation: saved?.preparation || preparation, databasePath: service.paths.databasePath };
+    sample.preparationId ||= saved?.preparationId || randomUUID();
+    sample.effectiveDefaults = service.defaults;
+    if (control === 'both') sample.fullContextCharacters = fullContext.length;
     if (!previousSamples.has(conversation.sampleId)) samples.push(sample);
     const passes = [], preparationErrors = sample.preparationErrors;
     let memoryPrepared = false;
     let finalProgress = null, degraded = false, imported = 0, maintenanceFailures = [];
+    if (!reuse) {
+      sample.preparationPending = true;
+      await checkpoint();
+    }
     try {
       if (reuse) {
         degraded = saved.degraded === true;
         maintenanceFailures = saved.maintenance?.failures || [];
         finalProgress = await adapter.pendingWork();
+        sample.memoryDiagnostics = saved.memoryDiagnostics;
       } else {
         service.initialize();
         for (const session of plan.sessions) {
@@ -859,25 +931,25 @@ export async function runZh4oMemorySystemBenchmark({
         maintenanceFailures = passes.filter(pass => pass.failures?.length
           || ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(pass.status))
           .map(pass => ({ status: pass.status, failures: pass.failures || [], maintenance: pass.maintenance }));
-        degraded = !finalProgress || finalProgress.total > 0 || finalProgress.failures > 0 || maintenanceFailures.length > 0
-          || passes.some(pass => pass.input?.some(input => input.batches?.some(batch =>
-            batch.status === "quarantined" || batch.generationDiagnostics?.degraded)));
-        fs.mkdirSync(sampleRoot, { recursive: true });
-        fs.writeFileSync(manifestPath, JSON.stringify({ protocol: ZH4O_SYSTEM_PROTOCOL_VERSION, datasetSha256,
-          sampleId: conversation.sampleId, degraded, defaults: service.defaults,
-          preparation,
-          embedding: withoutEmbedding ? null : embeddingIndexIdentity(normalizedConfig.providers.embedding),
-          maintenance: { finalProgress, passes: passes.length, failures: maintenanceFailures } }, null, 2));
       }
-      degraded ||= !finalProgress || finalProgress.total > 0 || finalProgress.failures > 0;
       const stored = inputRows(service);
       const inputMap = internalEventDialogueMap({ events: stored }, plan.eventIdToDialogueId);
-      if (inputMap.size !== stored.length || unique([...inputMap.values()]).length !== plan.events.length) {
-        throw new Error("Retained input provenance is incomplete; sample cannot be scored.");
+      if (!reuse) {
+        sample.memoryDiagnostics = memoryPreparationDiagnostics({ passes, inputEvents: stored, finalProgress,
+          expectedEvents: plan.events.length, mappedEvents: unique([...inputMap.values()]).length });
+        degraded = sample.memoryDiagnostics.infrastructureFailures.length > 0;
+        fs.mkdirSync(sampleRoot, { recursive: true });
+        fs.writeFileSync(manifestPath, JSON.stringify({ protocol: ZH4O_SYSTEM_PROTOCOL_VERSION, datasetSha256,
+          sampleId: conversation.sampleId, preparationId: sample.preparationId, degraded, defaults: service.defaults,
+          preparation, memoryDiagnostics: sample.memoryDiagnostics,
+          embedding: withoutEmbedding ? null : embeddingIndexIdentity(normalizedConfig.providers.embedding),
+          maintenance: { finalProgress, passes: passes.length, failures: maintenanceFailures } }, null, 2));
       }
       Object.assign(sample, { imported: reuse ? sample.imported : imported, memorySystemDegraded: degraded,
         finalProgress, maintenanceCalls: reuse ? sample.maintenanceCalls : passes.length, maintenanceFailures,
         inputBatches: reuse ? sample.inputBatches : passes.flatMap(pass => pass.input || []).flatMap(input => input.batches || []) });
+      delete sample.rebuildPending;
+      delete sample.preparationPending;
       memoryPrepared = true;
       const sources = new Map();
       const dialogueIdsFor = id => {
@@ -933,19 +1005,24 @@ export async function runZh4oMemorySystemBenchmark({
           const prediction = normalizeChoice(response?.output?.choice);
           if (!prediction) throw Object.assign(new Error('Answer must be exactly A, B, C or D.'), { code: 'ZH4O_INVALID_CHOICE' });
           Object.assign(row, { status: 'completed', prediction, correct: prediction === question.answer });
-          if (control === "no-memory") {
-            try {
-              const baseline = await runQuestionOperation(() => controlAnswer(buildZh4oAnswerRequest({ question, context: '' })),
-                { delayMs: retryDelayMs, onAttempts: attempts => { row.attempts.control = attempts; } });
-              const choice = normalizeChoice(baseline?.output?.choice);
-              if (!choice) throw Object.assign(new Error('Control answer must be exactly A, B, C or D.'), { code: 'ZH4O_INVALID_CHOICE' });
-              row.control = { prediction: choice, correct: choice === question.answer, status: 'completed' };
-            } catch (error) { row.control = { status: "failed", error: nonFatalStageError(error) }; }
-          }
         } catch (error) {
           Object.assign(row, { status: 'failed', correct: false, failureStage: questionStage, error: nonFatalStageError(error) });
         }
         row.latencyMs = performance.now() - questionStarted;
+        if (!degraded && !row.error?.fatal) for (const [field, generator, context] of [
+          ...(control !== 'none' ? [['control', controlAnswer, '']] : []),
+          ...(control === 'both' ? [['fullContextControl', fullContextAnswer, fullContext]] : []),
+        ]) {
+          const controlStarted = performance.now();
+          try {
+            const baseline = await runQuestionOperation(() => generator(buildZh4oAnswerRequest({ question, context })),
+              { delayMs: retryDelayMs, onAttempts: attempts => { row.attempts[field] = attempts; } });
+            const choice = normalizeChoice(baseline?.output?.choice);
+            if (!choice) throw Object.assign(new Error('Control answer must be exactly A, B, C or D.'), { code: 'ZH4O_INVALID_CHOICE' });
+            row[field] = { prediction: choice, correct: choice === question.answer, status: 'completed', contextCharacters: context.length };
+          } catch (error) { row[field] = { status: 'failed', error: nonFatalStageError(error), contextCharacters: context.length }; }
+          row[field].latencyMs = performance.now() - controlStarted;
+        }
         results.push(row);
         if (row.status === 'failed' && row.error.infrastructure) {
           const key = `${row.failureStage}:${row.error.kind}`;
@@ -963,12 +1040,15 @@ export async function runZh4oMemorySystemBenchmark({
     } catch (error) {
       if (memoryPrepared) abort ||= { reason: 'evaluation-interrupted', sampleId: conversation.sampleId, error: nonFatalStageError(error) };
       else {
-        degraded = true; preparationErrors.push(nonFatalStageError(error));
-        sample.memorySystemDegraded = true;
+        const failure = nonFatalStageError(error);
+        degraded = failure.infrastructure; preparationErrors.push(failure);
+        sample.memorySystemDegraded = degraded;
         for (const question of questions) {
           if (results.some(row => row.questionId === question.questionId)) continue;
-          results.push({ status: 'excluded', scoringEligible: false, sampleId: conversation.sampleId, questionId: question.questionId,
-            expectedChoice: question.answer, answerFormat: question.answerFormat, category: question.category, reason: 'sample-preparation-failed' });
+          results.push({ status: degraded ? 'excluded' : 'failed', scoringEligible: !degraded, correct: false,
+            sampleId: conversation.sampleId, questionId: question.questionId,
+            expectedChoice: question.answer, answerFormat: question.answerFormat, category: question.category,
+            failureStage: 'preparation', error: failure, reason: degraded ? 'sample-preparation-infrastructure-failed' : 'sample-preparation-failed' });
         }
       }
     } finally {

@@ -9,12 +9,12 @@ import { runZh4oMemorySystemBenchmark } from "./zh4o-system.mjs";
 import { readEvaluationCodeRevision } from './code-revision.mjs';
 
 export function memoryZh4oSystemUsage() {
-  return "node packages/evaluation/src/zh4o-system-cli.mjs --dataset <zh4o-data.json> --config <memory.config.json> --work-dir <评测目录> [--resume <report或pending文件>] [--dry-run] [--retrieval-only] [--no-control] [--without-embedding] [--source-diagnostics] [--start-sample <0起>] [--max-samples <数量>] [--max-questions-per-sample <数量>] [--candidate-k <显式覆盖返回数>] [--maximum-context-characters <显式覆盖上下文长度>] [--maximum-drain-passes <收尾保护上限>] [--embedding-interval-ms <间隔>] [--output <report.json>]";
+  return "node packages/evaluation/src/zh4o-system-cli.mjs --dataset <zh4o-data.json> --config <memory.config.json> --work-dir <评测目录> [--resume <report或pending文件>] [--rebuild-sample <样本ID，需resume>] [--dry-run] [--retrieval-only] [--no-control] [--full-context-control] [--without-embedding] [--source-diagnostics] [--start-sample <0起>] [--max-samples <数量>] [--max-questions-per-sample <数量>] [--candidate-k <显式覆盖返回数>] [--maximum-context-characters <显式覆盖上下文长度>] [--maximum-drain-passes <收尾保护上限>] [--embedding-interval-ms <间隔>] [--output <report.json>]";
 }
 
-const switches = new Set(["dry-run", "retrieval-only", "no-control", "without-embedding", "source-diagnostics"]);
+const switches = new Set(["dry-run", "retrieval-only", "no-control", "full-context-control", "without-embedding", "source-diagnostics"]);
 const values = new Set(["dataset", "config", "work-dir", "output", "resume", "start-sample", "max-samples",
-  "max-questions-per-sample", "candidate-k", "maximum-context-characters", "maximum-drain-passes", "embedding-interval-ms"]);
+  "max-questions-per-sample", "candidate-k", "maximum-context-characters", "maximum-drain-passes", "embedding-interval-ms", "rebuild-sample"]);
 
 function parseArgs(args) {
   const result = {};
@@ -43,6 +43,10 @@ export async function runMemoryZh4oSystemCli({ args = process.argv.slice(2), env
   const options = parseArgs(args);
   if (options.help) { const usage = memoryZh4oSystemUsage(); stdout.write(`${usage}\n`); return { status: "help", usage }; }
   if (!options.dataset || !options.config) throw new Error(memoryZh4oSystemUsage());
+  if (options['no-control'] && options['full-context-control']) throw new Error('--full-context-control cannot be combined with --no-control.');
+  if (options['rebuild-sample'] && (!options.resume || options['retrieval-only'])) {
+    throw new Error('--rebuild-sample requires --resume and cannot be combined with --retrieval-only.');
+  }
   const config = loadMemoryConfig(path.resolve(options.config));
   const capabilities = validateMemoryProviderConfig(config, { environment, requireGeneration: true, embedding: !options["without-embedding"] });
   const datasetPath = path.resolve(options.dataset);
@@ -57,7 +61,8 @@ export async function runMemoryZh4oSystemCli({ args = process.argv.slice(2), env
     maximumDrainPasses: integer(options["maximum-drain-passes"], 1000, "--maximum-drain-passes"),
     embeddingRequestIntervalMs: integer(options["embedding-interval-ms"], 0, "--embedding-interval-ms", 0),
     withoutEmbedding: Boolean(options["without-embedding"]), retrievalOnly: Boolean(options["retrieval-only"]),
-    control: options["no-control"] ? "none" : "no-memory", includeSourceDiagnostics: Boolean(options["source-diagnostics"]),
+    control: options["no-control"] ? "none" : options['full-context-control'] ? 'both' : "no-memory",
+    rebuildSample: options['rebuild-sample'] ?? null, includeSourceDiagnostics: Boolean(options["source-diagnostics"]),
   };
   if (runOptions.startSample >= samples.length) throw new Error("样本起点超出数据集范围。");
   if (options["dry-run"]) {
@@ -68,7 +73,8 @@ export async function runMemoryZh4oSystemCli({ args = process.argv.slice(2), env
       embeddingModel: capabilities.embedding ? config.providers.embedding.model : null,
       ingestion: config.defaults.ingestion, retrieval: config.defaults.retrieval,
       retrievalOverrides: { candidateK: runOptions.candidateK, maximumContextCharacters: runOptions.maximumContextCharacters },
-      answerRequests: questions * (runOptions.control === "no-memory" ? 2 : 1),
+      control: runOptions.control,
+      answerRequests: questions * (runOptions.control === 'both' ? 3 : runOptions.control === "no-memory" ? 2 : 1),
       note: "已检查配置结构、所需密钥是否已设置及数据格式；未建库、未调用模型。答题请求数不含记忆整理。" };
     stdout.write(`${JSON.stringify(result, null, 2)}\n`); return result;
   }

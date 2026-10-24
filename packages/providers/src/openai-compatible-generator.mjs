@@ -40,6 +40,74 @@ function jsonName(value) {
   return normalized || "memory_analysis";
 }
 
+// Strict tool APIs require complete object branches. Intersect the owner's
+// shared object with each conditional refinement without changing its contract.
+function intersectToolSchemas(base, refinement) {
+  if (base === false || refinement === false) return false;
+  if (base === true) return refinement;
+  if (refinement === true) return base;
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(refinement)) {
+    if (key === "properties") {
+      merged.properties = { ...base.properties };
+      for (const [name, child] of Object.entries(value)) {
+        if (!Object.hasOwn(base.properties || {}, name) && base.additionalProperties === false) {
+          if ((refinement.required || []).includes(name)) return false;
+          continue;
+        }
+        merged.properties[name] = intersectToolSchemas(base.properties?.[name] ?? true, child);
+      }
+    } else if (key === "required") {
+      merged.required = [...new Set([...(base.required || []), ...value])];
+    } else if (key === "enum" && base.enum) {
+      merged.enum = base.enum.filter(item => value.some(candidate => JSON.stringify(candidate) === JSON.stringify(item)));
+      if (!merged.enum.length) return false;
+    } else if (key === "description" || !Object.hasOwn(base, key)
+      || JSON.stringify(base[key]) === JSON.stringify(value)) {
+      merged[key] = value;
+    } else if (key === "additionalProperties" && (base[key] === false || value === false)) {
+      merged[key] = false;
+    } else {
+      throw new Error(`严格结构化工具无法展开 Schema 中的冲突约束：${key}。`);
+    }
+  }
+  if (refinement.additionalProperties === false) {
+    merged.properties = { ...merged.properties };
+    for (const name of Object.keys(base.properties || {})) {
+      if (Object.hasOwn(refinement.properties || {}, name)) continue;
+      if ((merged.required || []).includes(name)) return false;
+      delete merged.properties[name];
+    }
+  }
+  if (merged.properties) {
+    merged.properties = { ...merged.properties };
+    for (const [name, child] of Object.entries(merged.properties)) {
+      if (child !== false) continue;
+      if ((merged.required || []).includes(name)) return false;
+      if (merged.additionalProperties === false) delete merged.properties[name];
+    }
+  }
+  return merged;
+}
+
+function strictToolSchema(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (schema.anyOf && (schema.type === "object" || schema.properties)) {
+    const { anyOf, ...base } = schema;
+    const branches = anyOf.map(branch => intersectToolSchemas(base, branch)).filter(branch => branch !== false);
+    if (!branches.length) throw new Error("严格结构化工具的 Schema 条件没有可满足的分支。");
+    return { anyOf: branches.map(strictToolSchema) };
+  }
+  const result = { ...schema };
+  for (const key of ["properties", "$defs", "definitions"]) {
+    if (schema[key]) result[key] = Object.fromEntries(Object.entries(schema[key])
+      .map(([name, child]) => [name, strictToolSchema(child)]));
+  }
+  if (schema.items) result.items = strictToolSchema(schema.items);
+  if (schema.anyOf) result.anyOf = schema.anyOf.map(strictToolSchema);
+  return result;
+}
+
 function parseJsonContent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value;
   const text = clean(value)
@@ -240,7 +308,7 @@ export function createOpenAiCompatibleStructuredGenerator({
               name: selectedSchemaName,
               description: "Return the validated structured memory result.",
               strict: true,
-              parameters: schema,
+              parameters: strictToolSchema(schema),
             },
           }],
           tool_choice: {

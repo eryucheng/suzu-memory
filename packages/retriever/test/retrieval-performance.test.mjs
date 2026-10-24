@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createHook } from 'node:async_hooks';
+import { spawnSync } from 'node:child_process';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
-import { closeRetrievalWorkers, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
+import { closeRetrievalWorkers, DEFAULT_RETRIEVAL_OPTIONS, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
 import { createNodeReader } from '../src/node-reader.mjs';
 import { prefilterCandidateIds } from '../src/candidate-prefilter.mjs';
+import { buildEpisodicEvidenceSeedCandidates, buildOrdinarySeedCandidates, createSeedLexicalScorer } from '../src/seed-routes.mjs';
 
 function fixture(t, count = 60) {
   const parent = path.join(os.tmpdir(), 'Codex', 'suzu-memory-retrieval-performance-tests');
@@ -40,6 +42,87 @@ test('prepared lexical queries preserve every score and term', () => {
       assert.deepEqual(lexicalScore(prepared, content), lexicalScore(query, content));
     }
   }
+});
+
+test('seed routes share lexical work while retaining their own admission and adjustments', () => {
+  const reads = new Map();
+  const nodes = [
+    ['strong', 'utterance', 'coffee museum visit'],
+    ['weak', 'utterance', 'coffee'],
+    ['bm25', 'event', 'daily notes'],
+    ['vector', 'event', 'daily notes'],
+    ['entity', 'event', 'daily notes'],
+    ['none', 'utterance', 'unrelated'],
+  ].map(([id, kind, content]) => ({
+    id, kind, title: '', status: 'active', importance: 0.5, event_date: '2026-10-20', recorded_at: '2026-10-20T00:00:00Z',
+    get content() { reads.set(id, (reads.get(id) || 0) + 1); return content; },
+  }));
+  const input = { nodes, query: 'coffee museum', preparedQuery: prepareLexicalQuery('coffee museum'), intent: 'auto',
+    options: DEFAULT_RETRIEVAL_OPTIONS,
+    bm25Scores: new Map([['bm25', { normalizedScore: 0.8, bestSearchRank: -3 }]]),
+    vectorScores: new Map([['vector', 0.8]]), entityScores: new Map([['entity', 0.75]]) };
+  const adjusted = { ...input,
+    accessibilityAdjustments: new Map([['strong', { scoreAdjustment: -0.04 }]]),
+    recallReactivationAdjustments: new Map([['strong', { scoreAdjustment: 0.02 }]]),
+    naturalDecayAdjustments: new Map([['strong', { scoreAdjustment: -0.03 }]]),
+    affectiveAdjustments: new Map([['strong', { scoreAdjustment: 0.06 }]]) };
+  const collect = (shared = {}) => ({
+    direct: buildOrdinarySeedCandidates({ ...adjusted, ...shared }),
+    convergence: buildOrdinarySeedCandidates({ ...adjusted, ...shared, includeWeakLexical: true }),
+    episodic: buildEpisodicEvidenceSeedCandidates({ ...input, ...shared }),
+  });
+  const reference = collect();
+  assert.equal(reads.get('strong'), 3);
+  reads.clear();
+  const reused = collect({ scoreLexical: createSeedLexicalScorer(input.preparedQuery) });
+  assert.deepEqual(reused, reference);
+  assert.deepEqual([...reads.values()], nodes.map(() => 1), 'including rejected and zero-score nodes');
+  assert.deepEqual(new Set(reused.direct.map(value => value.node.id)), new Set(['strong', 'bm25', 'vector', 'entity']));
+  assert.ok(reused.convergence.some(value => value.node.id === 'weak' && value.admission === 'convergence-only'));
+  assert.deepEqual(reused.episodic.map(value => value.node.id), ['strong']);
+  assert.notEqual(reused.direct.find(value => value.node.id === 'strong').score, reused.episodic[0].score);
+  for (const route of ['lexical', 'bm25', 'vector', 'entity']) {
+    assert.ok(reused.direct.some(value => value.routeMatches.some(match => match.route === route)));
+  }
+});
+
+test('seed lexical reuse is bound to one prepared query and node snapshot', () => {
+  const node = { id: 'same-id', event_date: '2026-10-20', title: 'Coffee', content: 'Museum visit' };
+  const query = prepareLexicalQuery('coffee museum');
+  const score = createSeedLexicalScorer(query);
+  assert.deepEqual(score(node), lexicalScore(query, '2026-10-20\nCoffee\nMuseum visit'));
+  assert.equal(score({ ...node, title: '', content: 'hiking' }).score, 0, 'a different snapshot with the same ID must not reuse its text');
+  assert.equal(createSeedLexicalScorer(prepareLexicalQuery('hiking'))(node).score, 0, 'the next query has its own scores');
+  assert.ok(createSeedLexicalScorer(prepareLexicalQuery('2026-10-20'))(node).admissionOverlap > 0, 'event date remains part of seed text');
+});
+
+for (const execution of ['inline', 'worker']) test(`a retrieval scores seed text once per node (${execution})`, t => {
+  const { databasePath } = fixture(t, 60);
+  const coverageDirectory = path.join(path.dirname(databasePath), 'coverage');
+  const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
+  const childScript = path.join(path.dirname(databasePath), 'probe.mjs');
+  fs.writeFileSync(childScript, `
+    import { retrieveMemories, closeRetrievalWorkers } from ${JSON.stringify(moduleUrl)};
+    try {
+      const result = await retrieveMemories({ databasePath: ${JSON.stringify(databasePath)}, agentId: 'perf-agent',
+        query: '灯塔博物馆', now: new Date('2026-10-23T04:00:00Z'), options: { execution: ${JSON.stringify(execution)}, sqlPrefilter: false } });
+      if (result.status !== 'ready') throw new Error('Expected a real retrieval result.');
+    } finally { await closeRetrievalWorkers(); }
+  `);
+  const child = spawnSync(process.execPath, [childScript], {
+    env: { ...process.env, NODE_V8_COVERAGE: coverageDirectory }, encoding: 'utf8', windowsHide: true, timeout: 30000,
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  const queryUrl = new URL('../src/query.mjs', import.meta.url).href;
+  let calls = 0;
+  for (const file of fs.readdirSync(coverageDirectory)) {
+    const coverage = JSON.parse(fs.readFileSync(path.join(coverageDirectory, file), 'utf8'));
+    for (const script of coverage.result.filter(value => value.url === queryUrl)) {
+      calls += script.functions.filter(value => value.functionName === 'lexicalScore').reduce((sum, value) => sum + value.ranges[0].count, 0);
+    }
+  }
+  assert.equal(calls, 60, 'ordinary, convergence and episodic routes must reuse identical seed text scores');
 });
 
 test('SQL superset and worker execution preserve complete public retrieval results', async t => {

@@ -1,5 +1,6 @@
 import { ZH4O_SYSTEM_PROTOCOL_VERSION, summarizeZh4oRows, summarizeZh4oControls } from "./zh4o-system.mjs";
 import { evaluationPreparationKey } from './code-revision.mjs';
+import { summarizeMemoryPreparation } from './zh4o-execution.mjs';
 
 export function aggregateZh4oReports(reports) {
   if (!Array.isArray(reports) || !reports.length) throw new Error("At least one report is required.");
@@ -32,5 +33,6 @@ export function aggregateZh4oReports(reports) {
         : results.some(row => row.status === 'failed') ? 'completed-with-failures' : 'completed',
     notRunQuestions: reports.reduce((sum, report) => sum + Number(report.diagnostics?.notRunQuestions || 0), 0),
     degradedSamples: samples.filter(sample => sample.memorySystemDegraded).length,
+    memoryPreparation: summarizeMemoryPreparation(samples),
     scores: summarizeZh4oRows(results), controls: summarizeZh4oControls(results, first.run.control) };
 }

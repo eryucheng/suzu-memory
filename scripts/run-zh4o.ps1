@@ -5,6 +5,7 @@ param(
   [string]$WorkDirectory = "",
   [string]$OutputPath = "",
   [string]$ResumeReport = "",
+  [string]$RebuildSample = "",
   [int]$StartSample = 0,
   [int]$MaximumSamples,
   [int]$MaximumQuestionsPerSample,
@@ -15,6 +16,7 @@ param(
   [switch]$RetrievalOnly,
   [switch]$WithoutEmbedding,
   [switch]$NoControl,
+  [switch]$FullContextControl,
   [switch]$SourceDiagnostics,
   [switch]$DryRun
 )
@@ -34,6 +36,7 @@ $arguments = @("packages/evaluation/src/zh4o-system-cli.mjs", "--config", $confi
   "--dataset", $datasetResolved, "--work-dir", $workResolved, "--start-sample", [string]$StartSample)
 if (![string]::IsNullOrWhiteSpace($OutputPath)) { $arguments += @("--output", [System.IO.Path]::GetFullPath($OutputPath)) }
 if (![string]::IsNullOrWhiteSpace($ResumeReport)) { $arguments += @("--resume", (Resolve-Path -LiteralPath $ResumeReport).Path) }
+if (![string]::IsNullOrWhiteSpace($RebuildSample)) { $arguments += @("--rebuild-sample", $RebuildSample) }
 $optionalValues = @{
   MaximumSamples = "max-samples"; MaximumQuestionsPerSample = "max-questions-per-sample"
   CandidateK = "candidate-k"; MaximumContextCharacters = "maximum-context-characters"
@@ -43,7 +46,7 @@ foreach ($name in $optionalValues.Keys) {
   if ($PSBoundParameters.ContainsKey($name)) { $arguments += @("--" + $optionalValues[$name], [string]$PSBoundParameters[$name]) }
 }
 foreach ($entry in @(@("retrieval-only", $RetrievalOnly), @("without-embedding", $WithoutEmbedding),
-  @("no-control", $NoControl), @("source-diagnostics", $SourceDiagnostics), @("dry-run", $DryRun))) {
+  @("no-control", $NoControl), @("full-context-control", $FullContextControl), @("source-diagnostics", $SourceDiagnostics), @("dry-run", $DryRun))) {
   if ($entry[1]) { $arguments += "--" + $entry[0] }
 }
 Push-Location $repositoryRoot

@@ -12,6 +12,7 @@ export {
   buildLongTermExtractionInput,
   detectExtractionLanguage,
   isRetentionReasonCompatible,
+  normalizeGeneratedLongTermExtraction,
   parseGeneratedLongTermExtraction,
   sanitizeNarrativePunctuation,
 } from "./prompt.mjs";

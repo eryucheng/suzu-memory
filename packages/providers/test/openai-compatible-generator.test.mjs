@@ -136,6 +136,61 @@ test("strict tool mode sends the supplied schema to the configured endpoint and 
   assert.equal(result.metadata.responseFormat, "strict-tool");
 });
 
+test("strict tools expand conditional objects without requiring forbidden fields or mutating the owner schema", async () => {
+  const schema = { type: 'object', additionalProperties: false, required: ['memories'], properties: {
+    memories: { type: 'array', items: {
+      type: 'object', additionalProperties: false, required: ['family', 'content'],
+      properties: { family: { type: 'string', enum: ['identity', 'event'] },
+        content: { type: 'string', minLength: 1 }, target: { type: 'object', description: 'Conditional target.' } },
+      anyOf: [
+        { type: 'object', required: ['target'], properties: { family: { type: 'string', enum: ['identity'] },
+          target: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } } } },
+        { type: 'object', properties: { family: { type: 'string', enum: ['event'] }, target: false } },
+      ],
+    } },
+  } };
+  const original = structuredClone(schema);
+  const requests = [];
+  for (const structuredOutputMode of ['strict-tool', 'json-object']) {
+    const generate = createOpenAiCompatibleStructuredGenerator({
+      connection: { baseUrl: 'https://api.example.test', model: 'fixture', apiKey: 'secret', structuredOutputMode },
+      fetchImpl: async (_url, options) => {
+        requests.push(JSON.parse(options.body));
+        return response({ choices: [{ message: { content: '{"memories":[]}', tool_calls: [{
+          function: { name: 'conditional', arguments: '{"memories":[]}' },
+        }] } }] });
+      },
+    });
+    assert.deepEqual((await generate({ schema, schemaName: 'conditional' })).output, { memories: [] });
+  }
+  const [identity, event] = requests[0].tools[0].function.parameters.properties.memories.items.anyOf;
+  assert.deepEqual(identity.properties.family.enum, ['identity']);
+  assert.deepEqual(identity.required, ['family', 'content', 'target']);
+  assert.deepEqual(identity.properties.target, { ...original.properties.memories.items.properties.target,
+    additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } });
+  assert.equal(identity.additionalProperties, false);
+  assert.deepEqual(event.properties.family.enum, ['event']);
+  assert.deepEqual(event.required, ['family', 'content']);
+  assert.equal(Object.hasOwn(event.properties, 'target'), false);
+  assert.equal(event.additionalProperties, false);
+  assert.deepEqual(event.properties.content, { type: 'string', minLength: 1 });
+  assert.ok(requests[1].messages[0].content.includes(JSON.stringify(original)));
+  assert.deepEqual(schema, original);
+});
+
+test("strict conditional expansion rejects conflicting constraints before contacting a provider", async () => {
+  let calls = 0;
+  const generate = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://api.example.test', model: 'fixture', apiKey: 'secret', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async () => { calls += 1; throw new Error('Unexpected HTTP request'); },
+  });
+  await assert.rejects(() => generate({ schema: {
+    type: 'object', properties: { value: { type: 'string', minLength: 2 } }, required: ['value'],
+    anyOf: [{ properties: { value: { type: 'string', minLength: 3 } } }],
+  } }), /冲突约束：minLength/);
+  assert.equal(calls, 0);
+});
+
 test("configured provider errors do not expose credentials and invalid JSON is rejected", async () => {
   const generate = createOpenAiCompatibleStructuredGenerator({
     connection: {

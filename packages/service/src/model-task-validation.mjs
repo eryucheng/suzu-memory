@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { LONG_TERM_EXTRACTION_SCHEMA, normalizeGeneratedLongTermExtraction, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import * as analysis from '@suzu-memory/analysis';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA,
   parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration } from '@suzu-memory/structurer';
@@ -116,6 +116,7 @@ export function isMemoryStateAnalysisRequest(request) {
 
 export function validateMemoryTaskOutput(request, output) {
   const parse = resolveTaskParser(request);
+  if (parse === parseGeneratedLongTermExtraction) output = normalizeGeneratedLongTermExtraction(output);
   validateWireShape(request.schema, output);
   return parse(output);
 }

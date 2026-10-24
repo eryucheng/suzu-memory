@@ -10,11 +10,18 @@ function fixture(t, resolution = 'matched') {
   const service = Object.assign(Object.create(MemoryService.prototype), { paths: { agentId: 'owner' }, withRepository: callback => callback(repository) });
   const embeddingProvider = Object.assign(async () => ({ model: 'test', vector: [1, 0] }), { model: 'test', dimensions: 2 });
   let calls = 0;
-  const generator = async request => { calls++; return { output: { matches: JSON.parse(request.input).events.map(({memory, candidates}) => ({
-    memoryId: memory.id, resolution, candidateId: resolution === 'matched' ? candidates[0].id : '',
-    relation: resolution === 'matched' ? 'completes' : '', rationale: '对照原始材料判断具体事件。',
-    evidenceSourceIds: resolution === 'matched' ? [memory.sources[0].id, candidates[0].sources[0].id] : [],
-  })) } }; };
+  const generator = async request => {
+    calls++;
+    const input = JSON.parse(request.input), byId = new Map(input.memories.map(memory => [memory.id, memory]));
+    return { output: { matches: input.events.map(({ memoryId }) => {
+      const memory = byId.get(memoryId), candidates = input.memories.filter(candidate => candidate.id !== memoryId);
+      return {
+        memoryId: memory.id, resolution, candidateId: resolution === 'matched' ? candidates[0].id : '',
+        relation: resolution === 'matched' ? 'completes' : '', rationale: '对照原始材料判断具体事件。',
+        evidenceSourceIds: resolution === 'matched' ? [memory.sources[0].id, candidates[0].sources[0].id] : [],
+      };
+    }) } };
+  };
   const run = () => runEventContinuityMaintenance({repository, agentId: 'owner', generator, embeddingProvider});
   function seed(id, content, actorRoles = [{ role: 'participant', actorRole: 'agent', actorKey: 'owner' },
     { role: 'participant', actorRole: 'other', actorKey: 'friend', metadata: { actorName: '小明' } }]) {

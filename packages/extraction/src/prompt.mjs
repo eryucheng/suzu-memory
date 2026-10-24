@@ -477,6 +477,19 @@ function validCalendarDate(value) {
     && parsed.getUTCDate() === day;
 }
 
+// A null target carries no information for targetless families. Keep real
+// target objects and all other fields intact for the normal strict checks.
+export function normalizeGeneratedLongTermExtraction(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.memories)) return value;
+  return { ...value, memories: value.memories.map(candidate => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+      || candidate.stateTarget !== null || TARGET_SPEC_FAMILIES.has(candidate.stateFamily)) return candidate;
+    const normalized = { ...candidate };
+    delete normalized.stateTarget;
+    return normalized;
+  }) };
+}
+
 export function parseGeneratedLongTermExtraction(value) {
   let parsed = value;
   if (typeof value === "string") {
@@ -494,6 +507,7 @@ export function parseGeneratedLongTermExtraction(value) {
     throw new Error("长期记忆提取模型输出只能包含 memories。");
   }
   if (!Array.isArray(parsed.memories)) throw new Error("memories 必须是数组。");
+  parsed = normalizeGeneratedLongTermExtraction(parsed);
   const allowedKinds = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.kind.enum);
   const allowedRoles = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.subjectRole.enum);
   const allowedReality = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.reality.enum);

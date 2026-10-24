@@ -22,6 +22,42 @@ export function questionFailure(error) {
   return { message, code, kind, status, retryable, infrastructure: fatal || retryable, fatal };
 }
 
+/** Classify preparation diagnostics without treating memory quality failures as outages. */
+export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], finalProgress, expectedEvents = 0, mappedEvents = 0 } = {}) {
+  const infrastructureFailures = new Map();
+  const visit = value => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    const message = value.message || value.errorMessage || (typeof value.error === 'string' ? value.error : '') || value.last_error;
+    if (message) {
+      const failure = questionFailure({ ...value, message,
+        code: value.code || value.errorCode, name: value.name || value.errorName,
+        diagnostics: value.diagnostics || value.providerDiagnostics });
+      if (failure.infrastructure) infrastructureFailures.set(JSON.stringify(failure), failure);
+    }
+    for (const key of ['error', 'failures', 'maintenance', 'semantic', 'embedding', 'tasks', 'results', 'result', 'input', 'batches',
+      'semanticTasks', 'stateAnalysis', 'automaticStateAcceptance', 'pendingStateMaterialization', 'eventContinuity',
+      'consolidation', 'structures', 'retrievalContexts', 'reports', 'failed']) visit(value[key]);
+  };
+  visit(passes);
+  for (const event of inputEvents) visit(event.metadata?.suzuMemoryProcessing?.failureHistory);
+  const batches = passes.flatMap(pass => pass.input || []).flatMap(input => input.batches || []);
+  return {
+    quarantinedMessages: new Set(inputEvents.filter(event => event.processing_disposition === 'quarantined')
+      .map(event => event.metadata?.suzuMemoryFragment?.parentEventId || event.external_id || event.id)).size,
+    archiveOnlyBatches: batches.filter(batch => batch.generationDiagnostics?.degraded).length,
+    failedMaintenancePasses: passes.filter(pass => pass.failures?.length || ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(pass.status)).length,
+    pendingWork: Number(finalProgress?.total || 0), failedWork: Number(finalProgress?.failures || 0),
+    missingInputEvents: Math.max(0, expectedEvents - mappedEvents),
+    infrastructureFailures: [...infrastructureFailures.values()],
+  };
+}
+
+export function summarizeMemoryPreparation(samples) {
+  const keys = ['quarantinedMessages', 'archiveOnlyBatches', 'failedMaintenancePasses', 'pendingWork', 'failedWork', 'missingInputEvents'];
+  return Object.fromEntries(keys.map(key => [key, samples.reduce((sum, sample) => sum + Number(sample.memoryDiagnostics?.[key] || 0), 0)]));
+}
+
 /** Count provider transport attempts in the same budget as evaluator retries. */
 export async function runQuestionOperation(operation, { delayMs = 500, onAttempts = () => {} } = {}) {
   let attempts = 0;

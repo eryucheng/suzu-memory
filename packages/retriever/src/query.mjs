@@ -8,6 +8,36 @@ function normalizedQueryKey(value) {
   return normalize(value).replace(/[\s，。！？、,.!?：:；;“”"'（）()【】\[\]]+/gu, "");
 }
 
+const NAMING_QUESTION_PATTERN = "(?:叫\\s*(?:什么|啥)\\s*(?:名字|名称|名)?|(?:名字|名称|名)\\s*(?:是|叫)\\s*(?:什么|啥))";
+const NAMING_QUESTION_SUFFIX = new RegExp(`${NAMING_QUESTION_PATTERN}$`, "u");
+const NAMING_QUESTION_SPACING = new RegExp(`\\s*${NAMING_QUESTION_PATTERN}`, "gu");
+let chineseWordSegmenter;
+
+function normalizeNamingQuestionSpacing(value) {
+  return value.replace(NAMING_QUESTION_SPACING, suffix => suffix.replace(/\s+/gu, ""));
+}
+
+function stripRecallSubjectPrefix(value) {
+  const subject = value.match(/^(?:我们|你们|他们|她们|它们|咱们|我|你|他|她|它|咱|还|曾经|到底)+(?:自己)?/u)?.[0];
+  if (!subject) return value;
+  let offset = subject.length;
+  if (value.startsWith("家的", offset)) offset += 2;
+  else if (value[offset] === "的") offset++;
+  else if (value[offset] === "家") {
+    // Bare 家 is possessive only at a word boundary.
+    chineseWordSegmenter ||= new Intl.Segmenter("zh", { granularity: "word" });
+    const boundary = offset + 1;
+    for (const segment of chineseWordSegmenter.segment(value)) {
+      const end = segment.index + segment.segment.length;
+      if (end < boundary) continue;
+      if (end === boundary) offset = boundary;
+      break;
+    }
+  }
+  if (value[offset] === "有") offset++;
+  return value.slice(offset);
+}
+
 function cleanActor(role, key, names = []) {
   return {
     role: String(role || "").trim(),
@@ -134,6 +164,7 @@ function historicalStateCue(text) {
 function subjectPredicateMatches(text, pronoun) {
   const escaped = pronoun.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const patterns = [
+    new RegExp(`${escaped}(?:自己)?(?:家的?|的)\\s*[\\p{Script=Han}]{1,24}${NAMING_QUESTION_PATTERN}`, "gu"),
     new RegExp(`${escaped}(?:自己)?(?:上上周[一二三四五六日天]?|上周[一二三四五六日天]?|这周[一二三四五六日天]?|本周[一二三四五六日天]?|昨天|今天|前天|最近|以前|之前|现在|后来|当时|上次|曾经|小时候|童年时?|平时|通常|一直|总是|有时|偶尔|最|更|比较|特别|非常|很|\\d{1,2}月|\\d{1,2}号|\\d{1,2}日|\\s){0,4}(?:喜欢|偏爱|讨厌|不喜欢|觉得|认为|相信|想要|计划|决定|答应|承诺|会|能|做过|干过|去过|吃过|看过|玩过|说过|学过|读过|经历过|住过|工作|学习|去了|去|做了|做|吃了|吃|看了|看|玩了|玩|说了|说|在|有)`, "gu"),
     new RegExp(`${escaped}(?:是)?怎么说(?:的|过)?`, "gu"),
     new RegExp(`${escaped}的(?:喜好|偏好|习惯|计划|目标|能力|经历|原话|观点|看法|想法|选择|工作|住址|生日|本科|教育|学历|学校|院校|大学|专业|职业|职位|单位|公司|家乡|籍贯|住所|住处|姓名|名字|年龄|童年|求学经历|阅读经历|生平)`, "gu"),
@@ -157,7 +188,7 @@ export function resolveQuerySubject(query, {
   addresseeKey = "",
   addresseeNames = [],
 } = {}) {
-  const text = normalize(query);
+  const text = normalizeNamingQuestionSpacing(normalize(query));
   const speaker = cleanActor(speakerRole, speakerKey, speakerNames);
   const addressee = cleanActor(addresseeRole, addresseeKey, addresseeNames);
   const none = (reason = "no-explicit-subject") => ({
@@ -368,7 +399,10 @@ export function classifyChainIntent(query, temporal = { matched: false, remainin
   if (/(?:反证|反例|相反(?:的)?(?:依据|证据)|不支持(?:这个|这一|该)?(?:结论|判断|看法)?(?:的)?(?:依据|证据)|依据|证据|怎么(?:知道|判断|得出)|凭什么|(?:你)?为什么(?:会)?(?:觉得|认为|判断|说)|原话|哪句话|那句话|怎么说的|说过什么|原句|\bcounter(?:example|evidence)\b|\bevidence against\b|\bwhat(?:'s| is) (?:the )?evidence\b|\bhow do you know\b|\bwhy do you (?:think|believe)\b|\bexact (?:words|wording)\b|\bwhat did .{0,48}\bsay\b|\bquote\b)/iu.test(text)) {
     return { mode: "none", direction: "both" };
   }
-  if (/(?:为什么|为何|怎么会|原因(?:是什么|呢)?|什么(?:原因|导致|造成|引起)|由什么(?:导致|造成|引起)|\bwhy did\b|\bwhat caused\b|\bwhat (?:was|is) the reason\b|\bbecause of what\b)/iu.test(text)) {
+  // In a naming question, 为 belongs to the verb phrase: 称呼他为 + 什么.
+  // Preserve an earlier 为什么 so genuine questions about the reason remain causal.
+  const causalText = text.replace(/((?:称呼|称作|称|叫作|叫做|命名|改名|认定|认作|视)[^,，;；?？。！!]{0,12})为什么(?=(?:呢|啊|呀)?(?:[?？。！!]|$))/gu, '$1什么');
+  if (/(?:为什么|为何|怎么会|原因(?:是什么|呢)?|什么(?:原因|导致|造成|引起)|由什么(?:导致|造成|引起)|\bwhy did\b|\bwhat caused\b|\bwhat (?:was|is) the reason\b|\bbecause of what\b)/iu.test(causalText)) {
     return { mode: "causal", direction: "backward" };
   }
   if (/(?:导致(?:了)?什么|造成(?:了)?什么|引起(?:了)?什么|带来(?:了)?什么(?:后果|影响)?|有什么(?:后果|影响)|产生(?:了)?什么(?:后果|影响)|\bwhat (?:did|does) .{0,48}(?:cause|lead to|result in)\b|\bwhat happened as a result\b|\bwhat (?:was|is) the (?:result|outcome|effect)\b)/iu.test(text)) {
@@ -454,7 +488,7 @@ export function isGenericQuery(query, genericQueries = DEFAULT_GENERIC_QUERIES) 
 export function recallCorePhrases(query) {
   const english = englishCorePhrase(query);
   if (english) return [english];
-  let text = normalize(query).replace(/[，。！？、,.!?：:；;“”"'（）()【】\[\]]+/gu, " ");
+  let text = normalizeNamingQuestionSpacing(normalize(query)).replace(/[，。！？、,.!?：:；;“”"'（）()【】\[\]]+/gu, " ");
   for (const phrase of [
     "聊了些什么", "聊了什么", "聊过什么", "聊什么", "做了些什么", "干了些什么", "做了什么", "干了什么", "发生了什么", "有什么事情",
     "有什么事", "干啥了", "做啥了", "干什么", "做什么", "去了哪里", "去哪里了",
@@ -470,13 +504,18 @@ export function recallCorePhrases(query) {
     "那句话", "这句话", "那一句", "这一句", "那句", "这句",
     "之前", "以前", "当时", "后来", "结果", "经过", "记得", "回忆", "发生", "原话", "关于", "的话",
   ]) text = text.replaceAll(phrase, " ");
-  return text.split(/\s+/u)
-    .map((part) => part
-      .replace(/^(?:我们|你们|他们|她们|它们|咱们|我|你|他|她|它|咱|还|曾经|到底)+(?:自己)?(?:的)?(?:有)?/u, "")
+  const phrases = text.split(/\s+/u)
+    .map((part) => stripRecallSubjectPrefix(part)
       .replace(/^(?:去过|去)/u, "")
+      .replace(/(?:吗|呢|啊|呀|吧|了)+$/u, "")
+      .replace(NAMING_QUESTION_SUFFIX, "")
+      .replace(/^(?:说过|提过|聊过|谈过)(.+?)(?:的事(?:情)?)?$/u, "$1")
       .replace(/(?:是什么|是|的|吗|呢|啊|呀|吧|了)+$/u, "")
       .trim())
-    .filter((part) => Array.from(part).length >= 2);
+    .filter(Boolean);
+  return phrases.filter((part) => Array.from(part).length >= 2 || (
+    phrases.length === 1 && /^\p{Script=Han}$/u.test(part) && !STOP_CHARACTERS.has(part)
+  ));
 }
 
 export function planVectorQuery(query) {
@@ -515,29 +554,82 @@ export function lexicalTerms(value) {
   return [...terms];
 }
 
-export function prepareLexicalQuery(query) {
+function lexicalTermSpans(queryTerms, normalizedQuery) {
+  // Locate terms once. Nested and sliding n-grams over the same query span
+  // represent one textual clue, even when a document repeats that clue.
+  return Object.freeze(queryTerms.map((term, order) => {
+    const starts = [];
+    for (let at = normalizedQuery.indexOf(term); at >= 0; at = normalizedQuery.indexOf(term, at + 1)) {
+      starts.push(at);
+    }
+    return Object.freeze({ term, order, starts: Object.freeze(starts) });
+  }).sort((left, right) => right.term.length - left.term.length || left.order - right.order));
+}
+
+export function prepareLexicalQuery(query, { personNames = [] } = {}) {
   const phrases = recallCorePhrases(query);
   const queryText = phrases.length ? phrases.join(" ") : query;
-  return Object.freeze({ queryTerms: Object.freeze(lexicalTerms(queryText)),
-    normalizedQuery: normalize(queryText).replace(/[^\p{L}\p{N}]+/gu, '') });
+  const queryTerms = Object.freeze([...new Set([
+    ...lexicalTerms(queryText),
+    // A complete short topic is useful; arbitrary single-character n-grams
+    // from a longer question are not independent lexical evidence.
+    ...phrases.filter(phrase => /^\p{Script=Han}$/u.test(phrase)),
+  ])]);
+  const normalizedQuery = normalize(queryText).replace(/[^\p{L}\p{N}]+/gu, '');
+  const text = normalize(queryText);
+  const ignoredSpans = [];
+  const ignoredLabels = [...personNames.map(normalize).filter(name => name.length >= 2),
+    '为什么', '为何', '什么', '怎么', '怎样', '如何', '哪个', '哪些', '哪里', '是否', '谁'];
+  for (const name of new Set(ignoredLabels)) {
+    const occurrences = /[a-z]/u.test(name) ? boundedOccurrences(text, name)
+      : [...text.matchAll(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'gu'))].map(match => match.index);
+    for (const at of occurrences) {
+      ignoredSpans.push({ start: text.slice(0, at).replace(/[^\p{L}\p{N}]+/gu, '').length,
+        length: name.replace(/[^\p{L}\p{N}]+/gu, '').length });
+    }
+  }
+  const termSpans = Object.freeze(lexicalTermSpans(queryTerms, normalizedQuery).map(span => Object.freeze({
+    ...span,
+    scoringStarts: Object.freeze(span.starts.filter(start => !ignoredSpans.some(name => (
+      Math.min(start + span.term.length, name.start + name.length) - Math.max(start, name.start) > 0
+    )))),
+  })));
+  const topicTermSet = new Set(termSpans.filter(span => span.scoringStarts.length).map(span => span.term));
+  const topicTerms = Object.freeze(queryTerms.filter(term => topicTermSet.has(term)));
+  if (!topicTerms.length && personNames.length) return prepareLexicalQuery(query);
+  return Object.freeze({ queryTerms, normalizedQuery, termSpans, topicTerms });
 }
 
 export function lexicalScore(query, document) {
   const prepared = typeof query === 'object' && query !== null ? query : prepareLexicalQuery(query);
-  const { queryTerms, normalizedQuery } = prepared;
+  const { normalizedQuery } = prepared;
+  const queryTerms = prepared.topicTerms || prepared.queryTerms;
   const normalizedDocument = normalize(document).replace(/\s+/gu, "");
   let score = 0;
-  let overlap = 0;
-  const matchedTerms = [];
-  for (const term of queryTerms) {
+  let admissionScore = 0;
+  let admissionOverlap = 0;
+  const occupied = new Uint8Array(normalizedQuery.length);
+  const selected = new Set();
+  const spans = prepared.termSpans || lexicalTermSpans(queryTerms, normalizedQuery);
+  for (const { term, starts, scoringStarts = starts } of spans) {
     if (!normalizedDocument.includes(term)) continue;
-    overlap += 1;
-    matchedTerms.push(term);
+    // Keep configured admission thresholds separate from ranking credit;
+    // overlapping hits must not inflate the final relevance score.
+    admissionOverlap += 1;
+    admissionScore += Math.max(1, Array.from(term).length - 1);
+    const start = scoringStarts.find(at => !occupied.subarray(at, at + term.length).some(Boolean));
+    if (start === undefined) continue;
+    occupied.fill(1, start, start + term.length);
+    selected.add(term);
     score += Math.max(1, Array.from(term).length - 1);
   }
-  const exactPhrase = normalizedQuery.length >= 2 && normalizedDocument.includes(normalizedQuery);
-  if (exactPhrase) score += 8;
-  return { score, overlap, exactPhrase, queryTerms, matchedTerms };
+  const matchedTerms = queryTerms.filter(term => selected.has(term));
+  const overlap = matchedTerms.length;
+  const exactPhrase = queryTerms.length > 0
+    && (normalizedQuery.length >= 2 || /^\p{Script=Han}$/u.test(normalizedQuery))
+    && normalizedDocument.includes(normalizedQuery);
+  if (exactPhrase) { score += 8; admissionScore += 8; }
+  return { score, overlap, exactPhrase, queryTerms, matchedTerms, admissionScore, admissionOverlap };
 }
 
 export function isContinuationQuery(query) {

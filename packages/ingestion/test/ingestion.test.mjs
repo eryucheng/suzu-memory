@@ -106,6 +106,27 @@ test("normalizes one primary user and one companion while allowing third-party e
   );
 });
 
+test('keeps candidates with inapplicable null targets without sending a repair request', async () => {
+  const output = { memories: [
+    generatedEventCandidate({ sourceRefs: ['M0001'], stateTarget: null }),
+    generatedEventCandidate({ kind: 'preference', title: '喜欢薰衣草香味', content: 'User 明确说喜欢薰衣草香味。',
+      subjectRole: 'user', subjectName: 'User', canonicalKey: 'lavender', stateFamily: 'preference',
+      stateLabel: '薰衣草香味', retentionReason: 'explicit_preference', sourceRefs: ['M0001'], stateTarget: null }),
+  ] };
+  const original = structuredClone(output);
+  let calls = 0;
+  const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
+    generator: async ({ schemaName }) => {
+      calls++;
+      assert.equal(schemaName, 'long-term-memory-extraction-v2');
+      return { output, usage: {} };
+    } });
+  assert.equal(calls, 1);
+  assert.deepEqual(generated.generation.output.memories.map(m => m.title), ['共同完成事件入口设计', '喜欢薰衣草香味']);
+  for (const memory of generated.generation.output.memories) assert.equal(Object.hasOwn(memory, 'stateTarget'), false);
+  assert.deepEqual(output, original);
+});
+
 test("repairs one schema-valid JSON object that fails strict extraction validation", async () => {
   const { database, repository } = repositoryFixture();
   appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
@@ -215,7 +236,7 @@ test("retains individually valid candidates when one repair cannot satisfy domai
 
 test("never lets a repair response delete candidates that were already valid", async () => {
   const invalid = generatedEventCandidate({ eventDate: "August 4, 2026" });
-  const valid = generatedEventCandidate({ title: "必须保留的有效候选", sourceRefs: ["M0001"] });
+  const valid = generatedEventCandidate({ title: "必须保留的有效候选", sourceRefs: ["M0001"], stateTarget: null });
   let calls = 0;
   const generated = await generateCompanionEventBatch({
     events: [event()],

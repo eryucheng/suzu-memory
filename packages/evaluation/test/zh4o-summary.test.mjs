@@ -63,3 +63,18 @@ test('aggregation includes question failures in strict accuracy and labels parti
   assert.equal(summary.scores.failures, 1);
   assert.equal(summary.degradedSamples, 0);
 });
+
+test('aggregation retains full-context failures in its own denominator and sums memory quality diagnostics', () => {
+  const first = report('first', 1, 1), second = report('second', 0, 1);
+  first.run.control = second.run.control = 'both';
+  first.results[0].fullContextControl = { status: 'completed', correct: true };
+  second.results[0].fullContextControl = { status: 'failed' };
+  first.samples[0].memoryDiagnostics = { quarantinedMessages: 2, archiveOnlyBatches: 1 };
+  const summary = aggregateZh4oReports([first, second]);
+  assert.equal(summary.controls.fullContextQuestions, 2);
+  assert.equal(summary.controls.fullContextFailedQuestions, 1);
+  assert.equal(summary.controls.fullContextAccuracy, 0.5);
+  assert.equal(summary.scores.exactChoiceAccuracy, 0.5);
+  assert.equal(summary.memoryPreparation.quarantinedMessages, 2);
+  assert.equal(summary.memoryPreparation.archiveOnlyBatches, 1);
+});

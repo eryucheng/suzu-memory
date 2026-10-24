@@ -11,14 +11,14 @@ function setup(t) {
   const fixtures = new Map();
   let calls = 0;
   function add(index, { day = 10, space = 'reading-room', holder = 'suzu', constraint = 'none', alternatives = 'available',
-    behaviorType = 'choice', evidenceMode = 'inferred', expressionType = 'none', objectLabel = '推理小说' } = {}) {
+    behaviorType = 'choice', evidenceMode = 'inferred', expressionType = 'none', objectLabel = '推理小说', sourceTimeKnown = true } = {}) {
     const at = `2026-09-${day}T12:00:0${index % 10}.000Z`;
     const source = repository.upsertSource({ agentId: 'owner', sourceKind: 'transcript-message', externalId: `source-${index}`,
       occurredAt: at, knownAt: at, speaker: holder, content: `${holder} 在有其他选项时主动选了推理小说。`,
-      metadata: { eventSource: { spaceId: space } } });
+      metadata: { eventSource: { spaceId: space }, sourceTimeKnown } });
     const memory = repository.upsertMemory({ id: `evidence-${index}`, agentId: 'owner', kind: 'utterance', layer: 'evidence',
       subjectRole: 'agent', subjectKey: holder, reality: 'real', evidenceMode: 'imported', temporalState: 'historical',
-      content: source.content, eventStart: at, knownAt: at,
+      content: source.content, eventStart: at, knownAt: at, metadata: { sourceTimeKnown },
       actorRoles: [{ role: 'speaker', actorRole: 'agent', actorKey: holder, isPrimary: true, confidence: 1 }] });
     repository.linkSource(memory.id, source.id, 'verbatim', { authority: 'verbatim_record', sourceTrust: 1, evidenceStrength: 1 });
     const request = repository.recordStateAnalysisRequest({ agentId: 'owner', batchId: `batch-${index}`, candidateIndex: 0,
@@ -91,6 +91,37 @@ test('repeated days in one space do not satisfy distinct context support', async
   const f = setup(t);
   for (let index = 1; index <= 3; index++) { f.add(index, { day: 10 + index }); await f.run(); }
   assert.equal(f.repository.listPreferenceStateProposals('owner').length, 0);
+});
+
+test('unknown behavior contexts retain unresolved evidence without retrying specialist calls', async t => {
+  const f = setup(t);
+  const request = f.add(1, { space: '', sourceTimeKnown: false });
+  const report = await f.run();
+  assert.equal(f.calls(), 1);
+  assert.equal(report.results[0].automaticRetries, 0);
+  assert.equal(report.results[0].status, 'completed-without-proposal');
+  const [observation] = f.repository.listStateEvidenceObservations('owner');
+  assert.equal(observation.context_id, '');
+  assert.equal(observation.qualification, 'unresolved');
+  assert.equal(observation.excluded_reason, 'missing-behavior-context');
+  assert.equal(observation.effective_direction, 'neutral');
+  assert.equal(f.repository.getStateAnalysisRequest('owner', request.id).metadata.attemptCount, undefined);
+  assert.equal(f.repository.listPreferenceStateProposals('owner').length, 0);
+  assert.equal((await f.run()).selected, 0);
+  assert.equal(f.calls(), 1);
+});
+
+test('an explicit preference does not require a known calendar day or behavior context', async t => {
+  const f = setup(t);
+  f.add(1, { space: '', sourceTimeKnown: false, evidenceMode: 'explicit', expressionType: 'likes' });
+  const report = await f.run();
+  assert.equal(f.calls(), 1);
+  assert.equal(report.results[0].automaticRetries, 0);
+  assert.equal(report.results[0].status, 'proposal-pending');
+  const [observation] = f.repository.listStateEvidenceObservations('owner');
+  assert.equal(observation.context_id, '');
+  assert.equal(observation.qualification, 'qualified');
+  assert.equal(observation.signal, 'explicit_preference');
 });
 
 test('constrained choices, missing alternatives and other holders do not inflate support', async t => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
-import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
+import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 import { runEventContinuityMaintenance, runImmediateMemoryMaintenance, runEmbeddingMaintenance } from '../src/index.mjs';
 
 function fixture(t) {
@@ -19,7 +19,10 @@ function fixture(t) {
   const generator = async request => {
     calls.push(request);
     assertMemoryTaskRequest(request);
-    const output = { matches: JSON.parse(request.input).events.map(decide) };
+    const input = JSON.parse(request.input), byId = new Map(input.memories.map(memory => [memory.id, memory]));
+    const output = { matches: input.events.map(({ memoryId }) => decide({
+      memory: byId.get(memoryId), candidates: input.memories.filter(candidate => candidate.id !== memoryId),
+    })) };
     validateMemoryTaskOutput(request, output);
     return { output, model: 'test' };
   };
@@ -106,6 +109,116 @@ test('one batch resolves a chain in storage order and uses one matching call', a
   assert.equal(result.failed.length, 0);
   assert.equal(f.calls.length, 1);
   assert.equal(new Set([1, 2, 3].map(i => f.repository.getMemory(`event-${i}`).canonical_key)).size, 1);
+});
+
+test('shared candidates are transmitted once with complete source evidence', async t => {
+  const f = fixture(t);
+  for (let i = 1; i <= 5; i++) f.seed(`event-${i}`, { queue: false });
+  const original = new Map([1, 2, 3, 4, 5].map(i => [`event-${i}`, f.repository.getMemoryDetail('owner', `event-${i}`)]));
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: [...original.keys()] });
+  assert.equal((await f.run()).failed.length, 0);
+  assert.equal(f.calls.length, 1);
+  const input = JSON.parse(f.calls[0].input), byId = new Map(input.memories.map(memory => [memory.id, memory]));
+  assert.equal(input.memories.length, 5);
+  assert.equal(byId.size, 5);
+  assert.deepEqual(input.events.map(event => event.memoryId), ['event-2', 'event-3', 'event-4', 'event-5']);
+  for (const [id, detail] of original) {
+    assert.equal(byId.get(id).content, detail.memory.content);
+    assert.deepEqual(byId.get(id).sources.map(source => [source.id, source.content]), detail.sources.map(source => [source.id, source.content]));
+  }
+  for (const event of input.events) assert.deepEqual(Object.keys(event), ['memoryId']);
+});
+
+for (const reciprocal of [false, true]) test(`same-batch forward references share one event identity without repeated execution (reciprocal=${reciprocal})`, async t => {
+  const f = fixture(t);
+  f.seed('event-1'); await f.run();
+  f.seed('event-2', { queue: false }); f.seed('event-3', { queue: false });
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ['event-2', 'event-3'] });
+  f.setDecision(({ memory, candidates }) => {
+    if (memory.id === 'event-3' && !reciprocal) return { memoryId: memory.id, resolution: 'new', candidateId: '',
+      relation: '', evidenceSourceIds: [], rationale: '本条为同一事件的起点。' };
+    const target = candidates.find(candidate => candidate.id === (memory.id === 'event-2' ? 'event-3' : 'event-2'));
+    assert.ok(target, 'A same-batch event in the shared materials remains selectable.');
+    return { memoryId: memory.id, resolution: 'matched', candidateId: target.id, relation: 'same_thread',
+      evidenceSourceIds: [memory.sources[0].id, target.sources[0].id], rationale: '两条原文描述同一件具体事情。' };
+  });
+  assert.equal((await f.run()).failed.length, 0);
+  assert.equal(f.repository.getMemory('event-2').canonical_key, f.repository.getMemory('event-3').canonical_key);
+  assert.notEqual(f.repository.getMemory('event-1').canonical_key, f.repository.getMemory('event-2').canonical_key);
+  assert.equal(f.calls.length, 1);
+  await f.run();
+  assert.equal(f.calls.length, 1);
+});
+
+test('sharing materials still rejects a match across incompatible fictional worlds', async t => {
+  const f = fixture(t);
+  for (const [id, worldId] of [['event-1', 'story-a'], ['event-2', 'story-a'], ['event-3', 'story-b'], ['event-4', 'story-b']]) {
+    f.seed(id, { queue: false, reality: 'fictional', worldFrame: 'fictional', worldId });
+  }
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ['event-1', 'event-2', 'event-3', 'event-4'] });
+  const result = await runEventContinuityMaintenance({ repository: f.repository, agentId: 'owner', embeddingProvider: f.embeddingProvider,
+    generator: async request => {
+      const input = JSON.parse(request.input), byId = new Map(input.memories.map(memory => [memory.id, memory]));
+      assert.equal(byId.size, 4);
+      return { output: { matches: input.events.map(({ memoryId }) => ({ memoryId, resolution: 'matched',
+        candidateId: 'event-3', relation: 'same_thread',
+        evidenceSourceIds: [byId.get(memoryId).sources[0].id, byId.get('event-3').sources[0].id], rationale: '越过世界范围的错误判断。' })) } };
+    } });
+  assert.equal(result.failed.length, 1);
+  for (const id of ['event-1', 'event-2', 'event-3', 'event-4']) assert.equal(f.repository.getMemory(id).metadata.eventContinuity, undefined);
+});
+
+test('the service forwards its configured request limit without requiring a provider budget hook', async t => {
+  const f = fixture(t), ids = [];
+  for (let i = 1; i <= 20; i++) {
+    const memory = f.seed(`event-${i}`, { queue: false });
+    f.database.prepare('UPDATE memory_nodes SET content=? WHERE id=?').run(memory.content.repeat(60), memory.id);
+    ids.push(memory.id);
+  }
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ids });
+  const limit = 28000;
+  assert.equal(f.generator.assertRequestBudget, undefined);
+  const service = new MemoryService({ agentId: 'owner', dataRoot: process.env.TEMP,
+    defaults: { ingestion: { maximumRequestCharacters: limit } },
+    providers: { generator: f.generator, embedding: f.embeddingProvider } });
+  service.withRepository = callback => callback(f.repository);
+  const result = await service.runSemanticMaintenance({ processInputEvents: false, structureGenerator: null, minimumStructureMemories: 100 });
+  assert.equal(result.eventContinuity.failed.length, 0);
+  assert.ok(f.calls.length > 1);
+  const judged = [];
+  for (const request of f.calls) {
+    assert.ok(request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length <= limit);
+    const input = JSON.parse(request.input);
+    assert.equal(new Set(input.memories.map(memory => memory.id)).size, input.memories.length);
+    judged.push(...input.events.map(event => event.memoryId));
+    for (const memory of input.memories) assert.equal(memory.content, f.repository.getMemory(memory.id).content);
+  }
+  assert.deepEqual(new Set(judged), new Set(ids.slice(1)));
+  assert.equal(judged.length, ids.length - 1);
+});
+
+for (const fault of ['missing', 'duplicate', 'unexpected']) test(`coverage diagnostics record ${fault} decisions without partially applying them`, async t => {
+  const f = fixture(t);
+  f.seed('event-1'); await f.run();
+  f.seed('event-2', { queue: false }); f.seed('event-3', { queue: false });
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ['event-2', 'event-3'] });
+  const generator = async request => {
+    const matches = JSON.parse(request.input).events.map(({ memoryId }) => ({ memoryId, resolution: 'new', candidateId: '',
+      relation: '', evidenceSourceIds: [], rationale: '独立事件。' }));
+    if (fault === 'missing') matches.pop();
+    if (fault === 'duplicate') matches[1] = matches[0];
+    if (fault === 'unexpected') matches.push({ ...matches[0], memoryId: 'unrequested-event' });
+    return { output: { matches } };
+  };
+  const result = await runEventContinuityMaintenance({ repository: f.repository, agentId: 'owner', generator, embeddingProvider: f.embeddingProvider });
+  assert.equal(result.failed.length, 1);
+  const failure = JSON.parse(result.failed[0].failure_history_json).at(-1).details;
+  assert.equal(failure.errorCode, 'MEMORY_EVENT_CONTINUITY_COVERAGE');
+  assert.equal(failure.providerDiagnostics.expectedCount, 2);
+  assert.deepEqual(failure.providerDiagnostics.missingMemoryIds, fault === 'unexpected' ? [] : ['event-3']);
+  assert.deepEqual(failure.providerDiagnostics.duplicateMemoryIds, fault === 'duplicate' ? ['event-2'] : []);
+  assert.deepEqual(failure.providerDiagnostics.unexpectedMemoryIds, fault === 'unexpected' ? ['unrequested-event'] : []);
+  for (const id of ['event-2', 'event-3']) assert.equal(f.repository.getMemory(id).metadata.eventContinuity, undefined);
 });
 
 test('a late-arriving account can reference an already stored event with a later knowledge date', async t => {

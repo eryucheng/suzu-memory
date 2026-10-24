@@ -132,8 +132,8 @@ export function lexicalRoute(lexical, options) {
     + Math.min(1, coverage) * 0.2
     + (lexical.exactPhrase ? 0.25 : 0);
   const independentlyAdmissible = lexical.exactPhrase || (
-    lexical.score >= Number(options.strongLexicalScore)
-    && lexical.overlap >= 2
+    (lexical.admissionScore ?? lexical.score) >= Number(options.strongLexicalScore)
+    && (lexical.admissionOverlap ?? lexical.overlap) >= 2
   );
   if (!lexical.overlap && !lexical.exactPhrase) return null;
   return {
@@ -227,6 +227,23 @@ function priorContribution(node, intent, query, asksForHistoricalState, querySub
   return contribution;
 }
 
+// Share base lexical scores only within one query and node snapshot. Route
+// admission, priors and adjustments are still calculated by each caller.
+export function createSeedLexicalScorer(preparedQuery) {
+  const scores = new WeakMap();
+  return (node) => {
+    let score = scores.get(node);
+    if (!score) {
+      score = lexicalScore(
+        preparedQuery,
+        [node.event_date || "", node.title || "", node.content].filter(Boolean).join("\n"),
+      );
+      scores.set(node, score);
+    }
+    return score;
+  };
+}
+
 export function buildOrdinarySeedCandidates({
   nodes,
   query,
@@ -245,14 +262,12 @@ export function buildOrdinarySeedCandidates({
   naturalDecaySpecificityByMemory = new Map(),
   affectiveAdjustments = new Map(),
   preparedQuery = prepareLexicalQuery(query),
+  scoreLexical = createSeedLexicalScorer(preparedQuery),
 }) {
   const values = [];
   for (const node of nodes) {
     if (!memoryAllowed(node, intent)) continue;
-    const lexical = lexicalScore(
-      preparedQuery,
-      [node.event_date || "", node.title || "", node.content].filter(Boolean).join("\n"),
-    );
+    const lexical = scoreLexical(node);
     const bm25 = bm25Scores.get(node.id) || null;
     const similarity = vectorScores.get(node.id) ?? Number.NEGATIVE_INFINITY;
     const entityScore = entityScores.get(node.id) || 0;
@@ -263,34 +278,16 @@ export function buildOrdinarySeedCandidates({
       entityRoute(entityScore),
     ].filter(Boolean);
     const independentRoutes = routeMatches.filter((route) => route.independentlyAdmissible);
-    // BM25 and the custom n-gram route are two views over the same text. Keep
-    // both in the audit, but never add both textual contributions. A strong
-    // BM25 hit is itself enough to admit a memory; only suppress its score
-    // when a different independent route has already admitted that memory.
-    const hasNonBm25IndependentRoute = independentRoutes.some((route) => route.route !== "bm25");
-    if (hasNonBm25IndependentRoute) {
-      routeMatches = routeMatches.map((route) => (
-        route.route === "bm25" ? { ...route, contribution: 0 } : route
+    // The two text routes share a scoring budget. Entity/vector admission
+    // must not erase useful text evidence, nor count that evidence twice.
+    const lexicalIndex = routeMatches.findIndex((route) => route.route === "lexical");
+    const bm25Index = routeMatches.findIndex((route) => route.route === "bm25");
+    if (lexicalIndex >= 0 && bm25Index >= 0) {
+      const suppressedIndex = routeMatches[bm25Index].contribution > routeMatches[lexicalIndex].contribution
+        ? lexicalIndex : bm25Index;
+      routeMatches = routeMatches.map((route, index) => (
+        index === suppressedIndex ? { ...route, contribution: 0 } : route
       ));
-    } else {
-      const lexicalIndex = routeMatches.findIndex((route) => route.route === "lexical");
-      const bm25Index = routeMatches.findIndex((route) => route.route === "bm25");
-      const bm25IsIndependent = bm25Index >= 0
-        && Boolean(routeMatches[bm25Index].independentlyAdmissible);
-      if (bm25IsIndependent && lexicalIndex >= 0) {
-        routeMatches = routeMatches.map((route, index) => (
-          index === lexicalIndex ? { ...route, contribution: 0 } : route
-        ));
-      } else if (lexicalIndex >= 0 && bm25Index >= 0) {
-        const lexicalContribution = Number(routeMatches[lexicalIndex].contribution || 0);
-        const bm25Contribution = Number(routeMatches[bm25Index].contribution || 0);
-        const suppressedIndex = bm25Contribution > lexicalContribution
-          ? lexicalIndex
-          : bm25Index;
-        routeMatches = routeMatches.map((route, index) => (
-          index === suppressedIndex ? { ...route, contribution: 0 } : route
-        ));
-      }
     }
     const lexicalMatch = routeMatches.find((route) => route.route === "lexical");
     const bm25Match = routeMatches.find((route) => route.route === "bm25");
@@ -384,6 +381,7 @@ export function buildEpisodicEvidenceSeedCandidates({
   nodes,
   query,
   temporal = null,
+  intent = "auto",
   options = {},
   ...routes
 }) {
@@ -403,7 +401,7 @@ export function buildEpisodicEvidenceSeedCandidates({
       node.kind === "utterance" && inTemporalRange(node)
     )),
     query,
-    intent: "utterance",
+    intent,
   }).map((candidate) => ({
     ...candidate,
     retrievalLane: "episodic-evidence",
