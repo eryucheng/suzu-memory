@@ -114,6 +114,21 @@ function answerResponse(choice) {
   usage: { prompt_tokens: 10, completion_tokens: 2 } });
 }
 
+test('a truncated answer retains consumed usage while remaining a failed question', async t => {
+  const f = fixture(t);
+  const good = questionFixture(f, 2, () => answerResponse('A'));
+  const baseline = await runZh4oMemorySystemBenchmark(good.options);
+  const bad = questionFixture(f, 2, ({ ordinal }) => ordinal === 1
+    ? Response.json({ model: 'configured-model', choices: [{ finish_reason: 'length',
+      message: { content: '{"choice":' } }], usage: { prompt_tokens: 10, completion_tokens: 1024 } })
+    : answerResponse('A'));
+  const report = await runZh4oMemorySystemBenchmark({ ...bad.options, workDirectory: path.join(f.directory, 'truncated-answer') });
+  assert.equal(report.run.generationUsage.failedRequests, 1);
+  assert.equal(report.run.generationUsage.usage.completion_tokens - baseline.run.generationUsage.usage.completion_tokens, 1022);
+  assert.deepEqual(report.results.map(row => row.status), ['failed', 'completed']);
+  assert.equal(bad.calls.filter(call => call.ordinal === 1).length, 1);
+});
+
 test('a failed answer is incorrect in strict and category scores without excluding other questions', async t => {
   const f = fixture(t);
   const run = questionFixture(f, 3, ({ ordinal }) => ordinal === 2 ? Response.json({ error: { message: 'temporary' } }, { status: 503 }) : undefined);
@@ -576,11 +591,11 @@ test('nonempty event continuity receives no synthetic calendar dates at the mode
       data.choices[0].message.tool_calls[0].function.arguments = JSON.stringify({ memories });
       return Response.json(data);
     }
-    if (tool?.name !== 'memory-event-continuity-v1') return base(url, options);
+    if (tool?.name !== 'memory-event-continuity-v2') return base(url, options);
     const input = JSON.parse(body.messages[1].content);
     continuityInputs.push(input);
     const output = { matches: input.events.map(({ memoryId }) => ({ memoryId, resolution: 'new',
-      candidateId: '', relation: '', evidenceSourceIds: [], rationale: '原文记录了另一件事。' })) };
+      candidateId: '', relation: '', memorySourceIds: [], candidateSourceIds: [], rationale: '原文记录了另一件事。' })) };
     return Response.json({ model: body.model, choices: [{ message: { tool_calls: [{ type: 'function',
       function: { name: tool.name, arguments: JSON.stringify(output) } }] } }], usage: { prompt_tokens: 10, completion_tokens: 10 } });
   };

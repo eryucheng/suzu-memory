@@ -84,14 +84,86 @@ function add(repository, id, content, { kind = 'event', similarity = 0.8, ...ext
   return node;
 }
 
-function recall(databasePath, options = {}) {
-  return retrieveMemories({ databasePath, agentId: 'relevance-agent', query, now: new Date('2026-10-25T00:00:00Z'),
+function recall(databasePath, options = {}, text = query) {
+  return retrieveMemories({ databasePath, agentId: 'relevance-agent', query: text, now: new Date('2026-10-25T00:00:00Z'),
     world: { id: 'story', frame: 'fictional' },
     queryPerspective: { speakerNames: ['赵齐'], addresseeNames: ['白羽岚'] }, options,
     embeddingProvider: async () => ({ model: 'fixture', vector: new Float32Array([1, 0]) }) });
 }
 
-test('a relevant unconnected quote and its nearby reply reach context without promoting name-only distractions', async t => {
+for (const kind of ['event', 'utterance']) {
+  test(`ordinary matching can fill its shared budget with five ${kind} records`, async t => {
+    const { databasePath, repository } = fixture(t);
+    for (let index = 0; index < 6; index++) {
+      add(repository, `rank-${index}`, `量子航海记录，独立片段${index}。`, {
+        kind, similarity: 1 - index * 0.06, importance: 1 - index * 0.05,
+      });
+    }
+    const expansions = [];
+    const expand = MemoryRepository.prototype.expand;
+    MemoryRepository.prototype.expand = function (agentId, ids, options) {
+      const result = expand.call(this, agentId, ids, options);
+      expansions.push({ ids, depth: options.maxDepth, maximum: options.maxNodes, returned: result.nodes.length });
+      return result;
+    };
+    let result;
+    try { result = await recall(databasePath, { maximumContextMemories: 5, maximumContextChars: 2000 }, '量子航海记录'); }
+    finally { MemoryRepository.prototype.expand = expand; }
+    assert.deepEqual(result.graph.selectedMemoryIds, ['rank-0', 'rank-1', 'rank-2', 'rank-3', 'rank-4']);
+    for (let index = 0; index < 5; index++) assert.ok(result.context.includes(`独立片段${index}`));
+    assert.ok(!result.context.includes('独立片段5'));
+    assert.equal(new Set(result.graph.selectedMemoryIds).size, 5);
+    assert.ok(result.context.length <= 2000);
+    assert.ok(expansions.length <= 4);
+    assert.ok(expansions.every(value => value.depth <= 1 && value.maximum <= 20 && value.returned <= 20));
+    assert.equal(new Set(expansions.flatMap(value => value.ids)).size, expansions.length);
+    if (kind === 'event') assert.equal(expansions.length, 0);
+    t.diagnostic(JSON.stringify({ kind, expansionCalls: expansions.length, returnedNodes: expansions.reduce((n, value) => n + value.returned, 0) }));
+  });
+}
+
+test('ordinary mixed records follow the shared relevance order without a category reservation', async t => {
+  const { databasePath, repository } = fixture(t);
+  for (const [index, kind] of ['utterance', 'event', 'utterance', 'fact', 'event', 'utterance'].entries()) {
+    add(repository, `mixed-${index}`, `量子航海记录，资料编号${index}。`, {
+      kind, similarity: 1 - index * 0.06, importance: 1 - index * 0.05,
+    });
+  }
+  const result = await recall(databasePath, { maximumContextMemories: 4, maximumContextChars: 2000 }, '量子航海记录');
+  assert.deepEqual(result.graph.selectedMemoryIds, ['mixed-0', 'mixed-1', 'mixed-2', 'mixed-3']);
+  assert.ok(!result.context.includes('资料编号4'));
+  for (let index = 0; index < 4; index++) assert.equal(result.context.split(`资料编号${index}`).length - 1, 1);
+});
+
+test('a nearby answer consumes the same total context budget as ranked memories', async t => {
+  const { databasePath, repository } = fixture(t);
+  const text = '量子航海记录里的帆船叫什么名字？';
+  add(repository, 'question', text, { kind: 'utterance', similarity: 1, importance: 1 });
+  add(repository, 'reply', '叫逐浪号。', { kind: 'utterance', similarity: 0.1,
+    subjectRole: 'agent', subjectKey: 'relevance-agent', eventStart: '2026-10-20T08:00:01Z' });
+  add(repository, 'other', '量子航海记录里还讲了帆船的名字。', { similarity: 0.8, importance: 0.1 });
+  repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId: 'question', toMemoryId: 'reply',
+    relation: 'followed_by', weight: 1, confidence: 1 });
+  const result = await recall(databasePath, { maximumContextMemories: 2 }, text);
+  assert.deepEqual(result.graph.selectedMemoryIds, ['question', 'reply']);
+  assert.ok(result.context.includes('叫逐浪号'));
+  assert.ok(!result.context.includes('里还讲了'));
+  assert.equal(result.context.split('叫逐浪号').length - 1, 1);
+  const single = await recall(databasePath, { maximumContextMemories: 1 }, text);
+  assert.deepEqual(single.graph.selectedMemoryIds, ['question']);
+  assert.ok(!single.context.includes('叫逐浪号'));
+});
+
+test('independently matched vector evidence needs no lexical overlap with the question', async t => {
+  const { databasePath, repository } = fixture(t);
+  add(repository, 'question', '量子航海记录里问起了帆船名字。', { similarity: 1, importance: 1 });
+  add(repository, 'answer', '逐浪号。', { kind: 'utterance', similarity: 0.99, importance: 0.9 });
+  const result = await recall(databasePath, { maximumContextMemories: 2 }, '量子航海记录里的帆船叫什么？');
+  assert.ok(result.graph.selectedMemoryIds.includes('answer'));
+  assert.ok(result.context.includes('逐浪号'));
+});
+
+test('ranked quotes and their nearby reply preserve world and agent boundaries', async t => {
   const { databasePath, repository } = fixture(t);
   add(repository, 'office', '赵齐为了不让白羽岚伤心，说自己是军人。', { importance: 1, similarity: 1 });
   add(repository, 'address', '你可以称呼我为sensei。', { kind: 'utterance', similarity: 0.5, importance: 0.1 });
@@ -119,7 +191,10 @@ test('a relevant unconnected quote and its nearby reply reach context without pr
   assert.equal(result.seedRouting.primaryMemoryId, 'office');
   assert.match(result.context, /赵齐：你可以称呼我为sensei/u);
   assert.match(result.context, /白羽岚：好的，sensei/u);
-  assert.doesNotMatch(result.context, /院子吃饭|FORBIDDEN/u);
+  assert.doesNotMatch(result.context, /FORBIDDEN/u);
+  assert.ok(result.candidates.find(value => value.memoryId === 'garden').score
+    > result.candidates.find(value => value.memoryId === 'address').score);
+  assert.match(result.context, /院子吃饭/u);
   assert.ok(result.graph.selectedMemoryIds.includes('address'));
   assert.equal(result.graph.paths.some(value => value.memoryId === 'address'), false);
   assert.deepEqual(result.graph.convergedSeeds.connections, []);
@@ -128,18 +203,95 @@ test('a relevant unconnected quote and its nearby reply reach context without pr
   assert.equal((result.context.match(/你可以称呼我为sensei/gu) || []).length, 1);
 });
 
-test('independent evidence selection respects message, chain and character limits', async t => {
+for (const scenario of [
+  {
+    name: 'the answer to an already recalled question',
+    query: '小宁喜欢什么性别的小孩？ A 儿子 B 女儿 C 双胞胎 D 不喜欢小孩',
+    primary: '你喜欢儿子还是女儿呢', primaryKind: 'utterance',
+    answer: '谈到孩子时，双方明确说喜欢女儿。', answerKind: 'event',
+  },
+  {
+    name: 'a negative reply sharing words with the preceding positive preference',
+    query: '微符不喜欢看什么类型的书？ A 小说 B 历史和科学书籍 C 漫画 D 传记',
+    primary: '我喜欢阅读，尤其是关于历史和科学的书籍。', primaryKind: 'utterance',
+    answer: '我跟你相反，不喜欢看有关这些看了会想睡觉的书', answerKind: 'utterance',
+  },
+  {
+    name: 'a completed action sharing words with an unrelated offer of help',
+    query: '叶安宁帮李鱼做了什么？ A 找工作 B 找女朋友 C 找房子 D 找猫',
+    primary: '叶安宁询问李鱼工作困难并表示或许能帮忙，李鱼说女朋友已经解决了。', primaryKind: 'event',
+    answer: '叶安宁答应帮李鱼找女朋友，挑出几位女孩并打电话约她们过来。', answerKind: 'event',
+  },
+]) {
+  test(`retains ${scenario.name} without requiring a new query term`, async t => {
+    const { databasePath, repository } = fixture(t);
+    add(repository, 'primary', scenario.primary, { kind: scenario.primaryKind, similarity: 1, importance: 1 });
+    add(repository, 'answer', scenario.answer, { kind: scenario.answerKind, similarity: 0.99, importance: 0.5 });
+    const result = await recall(databasePath, {}, scenario.query);
+    assert.equal(result.seedRouting.primaryMemoryId, 'primary');
+    assert.ok(result.candidates.some(candidate => candidate.memoryId === 'answer'));
+    assert.ok(result.graph.selectedMemoryIds.includes('answer'));
+    assert.ok(result.context.includes(scenario.answer));
+    assert.equal(result.context.split(scenario.answer).length - 1, 1);
+    assert.ok(result.graph.selectedMemoryIds.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextMemories);
+    assert.ok(result.graph.evidenceMemoryIds.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextMemories);
+    assert.ok(result.context.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextChars);
+  });
+}
+
+test('a nearby answer remains in context when another independent quote shares the total budget', async t => {
+  const { databasePath, repository } = fixture(t);
+  const question = '小宁喜欢什么性别的小孩？ A 儿子 B 女儿 C 双胞胎 D 不喜欢小孩';
+  add(repository, 'question', '你喜欢儿子还是女儿呢', { kind: 'utterance', similarity: 1, importance: 1,
+    subjectRole: 'agent', subjectKey: 'relevance-agent' });
+  add(repository, 'answer', '很巧我也喜欢女儿', { kind: 'utterance', similarity: 0.99, importance: 0.9,
+    eventStart: '2026-10-20T08:00:01Z' });
+  add(repository, 'other-quote', '孩子性别的问题我也喜欢讨论', { kind: 'utterance', similarity: 0.85, importance: 0.3 });
+  repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId: 'question', toMemoryId: 'answer',
+    relation: 'followed_by', weight: 1, confidence: 1 });
+  const result = await recall(databasePath, {}, question);
+  assert.equal(result.seedRouting.primaryMemoryId, 'question');
+  assert.ok(result.context.includes('很巧我也喜欢女儿'));
+  assert.equal(result.context.split('很巧我也喜欢女儿').length - 1, 1);
+  assert.ok(result.graph.selectedMemoryIds.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextMemories);
+});
+
+test('a matched source exchange shares the total budget with an independent quote', async t => {
+  const { databasePath, repository } = fixture(t);
+  add(repository, 'summary', '赵齐让白羽岚称呼自己为sensei，白羽岚答应了。', { similarity: 1, importance: 1 });
+  add(repository, 'source', '你可以称呼我为sensei。', { kind: 'utterance', similarity: 0.5, importance: 0.1 });
+  add(repository, 'source-reply', '好的，sensei。', { kind: 'utterance', similarity: 0.5,
+    subjectRole: 'agent', subjectKey: 'relevance-agent', eventStart: '2026-10-20T08:00:01Z' });
+  add(repository, 'other-quote', '军人有时候也用小齐这个称呼。', { kind: 'utterance', similarity: 0.95, importance: 0.8 });
+  add(repository, 'other-reply', '是这样的。', { kind: 'utterance', similarity: 0.5,
+    subjectRole: 'agent', subjectKey: 'relevance-agent', eventStart: '2026-10-20T08:00:02Z' });
+  repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId: 'summary', toMemoryId: 'source',
+    relation: 'supported_by', weight: 1, confidence: 1 });
+  for (const [fromMemoryId, toMemoryId] of [['source', 'source-reply'], ['other-quote', 'other-reply']]) {
+    repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId, toMemoryId, relation: 'followed_by', weight: 1, confidence: 1 });
+  }
+  const result = await recall(databasePath);
+  assert.equal(result.seedRouting.primaryMemoryId, 'summary');
+  assert.ok(result.graph.selectedMemoryIds.includes('other-quote'));
+  assert.deepEqual(result.graph.selectedMemoryIds, ['summary', 'other-quote', 'other-reply', 'source', 'source-reply']);
+  assert.deepEqual(result.graph.evidenceMemoryIds, ['other-quote', 'other-reply', 'source', 'source-reply']);
+  assert.equal(result.context.split('你可以称呼我为sensei。').length - 1, 1);
+  assert.ok(result.context.includes('好的，sensei。'));
+  assert.ok(result.graph.selectedMemoryIds.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextMemories);
+  assert.ok(result.context.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextChars);
+});
+
+test('ordinary selection respects the shared record and character limits', async t => {
   const { databasePath, repository } = fixture(t);
   add(repository, 'office', '赵齐为了不让白羽岚伤心，说自己是军人。', { importance: 1, similarity: 1 });
   add(repository, 'address', '你可以称呼我为sensei。', { kind: 'utterance', similarity: 0.9 });
   add(repository, 'another-quote', '赵齐说小齐这个称呼也有人使用。', { kind: 'utterance', similarity: 0.85 });
-  const result = await recall(databasePath, { maximumEvidenceMessages: 1, maximumChainMemories: 2, maximumContextChars: 450 });
+  const result = await recall(databasePath, { maximumContextMemories: 2, maximumContextChars: 450 });
   assert.ok(result.context.length <= 450);
   assert.ok(result.graph.selectedMemoryIds.length <= 2);
-  assert.ok(result.graph.evidenceMemoryIds.length <= 1);
-  const withoutEvidence = await recall(databasePath, { maximumEvidenceMessages: 0 });
-  assert.deepEqual(withoutEvidence.graph.evidenceMemoryIds, []);
-  assert.ok(withoutEvidence.graph.selectedMemoryIds.filter(id => id.includes('quote') || id === 'address').length <= 1);
+  assert.ok(result.graph.evidenceMemoryIds.length <= 2);
+  const single = await recall(databasePath, { maximumContextMemories: 1 });
+  assert.deepEqual(single.graph.selectedMemoryIds, [single.seedRouting.primaryMemoryId]);
 });
 
 test('source exchange selection ranks question relevance ahead of the earliest attached exchange', async t => {
@@ -155,7 +307,7 @@ test('source exchange selection ranks question relevance ahead of the earliest a
   for (const [fromMemoryId, toMemoryId] of [['old-user', 'old-agent'], ['new-user', 'new-agent']]) {
     repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId, toMemoryId, relation: 'followed_by', weight: 1, confidence: 1 });
   }
-  const result = await recall(databasePath, { maximumConvergedSeeds: 1 });
+  const result = await recall(databasePath, { maximumContextMemories: 3 });
   assert.equal(result.seedRouting.primaryMemoryId, 'summary');
   assert.deepEqual(result.graph.evidenceMemoryIds, ['new-user', 'new-agent']);
   assert.doesNotMatch(result.context, /院子转一转/u);

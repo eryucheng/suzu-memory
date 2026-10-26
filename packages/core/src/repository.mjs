@@ -1849,6 +1849,36 @@ export class MemoryRepository {
     });
   }
 
+  releaseInputBatchForSplit(agentId, batchId, { leaseOwner, maximumCoreMessages, recordLimit = true,
+    errorMessage = "Extraction requires a smaller batch after reaching its output limit.", completedAt = nowIso() } = {}) {
+    if (!Number.isSafeInteger(maximumCoreMessages) || maximumCoreMessages < 1 || maximumCoreMessages > 500) {
+      throw new Error("Splitting an input batch requires a positive bounded message limit.");
+    }
+    agentId = clean(agentId);
+    batchId = clean(batchId);
+    leaseOwner = clean(leaseOwner);
+    return this.transaction(() => {
+      this.assertInputBatchLease(agentId, batchId, leaseOwner);
+      const events = recordLimit ? this.database.prepare(`SELECT id, metadata_json FROM memory_input_events
+        WHERE agent_id = ? AND batch_id = ? AND status = 'processing'`).all(agentId, batchId) : [];
+      for (const event of events) {
+        const metadata = parseJson(event.metadata_json, {});
+        const prior = metadata.suzuMemoryProcessing;
+        const processing = prior && typeof prior === 'object' && !Array.isArray(prior) ? prior : {};
+        const priorLimit = processing.extractionMaximumMessages;
+        this.database.prepare(`UPDATE memory_input_events SET metadata_json = ?
+          WHERE agent_id = ? AND id = ? AND batch_id = ? AND status = 'processing'`).run(
+          canonicalJson({ ...metadata, suzuMemoryProcessing: { ...processing,
+            extractionMaximumMessages: Math.min(maximumCoreMessages,
+              Number.isSafeInteger(priorLimit) && priorLimit > 0 ? priorLimit : maximumCoreMessages) } }, {}),
+          agentId, event.id, batchId,
+        );
+      }
+      return this.completeInputBatch(agentId, batchId, { success: false, leaseOwner,
+        output: { status: 'split', maximumCoreMessages }, errorMessage, completedAt });
+    });
+  }
+
   completeInputBatch(agentId, batchId, {
     success,
     leaseOwner,
@@ -4299,13 +4329,11 @@ export class MemoryRepository {
     const targetHasStructuredRole = memoryDetail?.roles.some((role) => (
       role.actor_role === normalizedSubjectRole && role.actor_key === normalizedSubjectKey
     ));
-    if (!targetIsPrimarySubject && !targetHasStructuredRole) {
-      throw new Error("State evidence memory does not identify the evaluated subject.");
-    }
     const linkedSourceIds = new Set(memoryDetail?.sources.map((item) => item.id) || []);
     if (normalizedSourceIds.some((sourceId) => !linkedSourceIds.has(sourceId))) {
       throw new Error("State evidence source must already support its evidence memory.");
     }
+    const requestIds = new Set();
     for (const runId of normalizedRunIds) {
       const run = this.getStateAnalysisRun(normalizedAgentId, runId);
       if (!run || run.state_family !== normalizedFamily
@@ -4316,6 +4344,21 @@ export class MemoryRepository {
         || !run.memoryIds.includes(normalizedMemoryId)
         || normalizedSourceIds.some((sourceId) => !run.sourceIds.includes(sourceId))) {
         throw new Error("State evidence analysis run does not cover the same target and sources.");
+      }
+      requestIds.add(clean(run.metadata?.stateAnalysisRequestId));
+    }
+    if (!targetIsPrimarySubject && !targetHasStructuredRole) {
+      // Raw speech retains its real speaker. A pending identity task can bind
+      // that speech to a different analysis target without changing the archive.
+      const request = normalizedFamily === 'identity' && memory.kind === 'utterance'
+        && memory.status === 'active' && requestIds.size === 1 && !requestIds.has('')
+        ? this.getStateAnalysisRequest(normalizedAgentId, [...requestIds][0]) : null;
+      const verbatimIds = new Set(memoryDetail.sources.filter(source => source.relation === 'verbatim').map(source => source.id));
+      if (!request || request.status !== 'pending' || request.state_family !== normalizedFamily
+        || request.subject_role !== normalizedSubjectRole || request.subject_key !== normalizedSubjectKey
+        || request.canonical_key !== normalizedCanonicalKey || !request.memoryIds.includes(normalizedMemoryId)
+        || normalizedSourceIds.some(sourceId => !request.sourceIds.includes(sourceId) || !verbatimIds.has(sourceId))) {
+        throw new Error("State evidence memory does not identify the evaluated subject.");
       }
     }
     const normalizedConfidence = unitInterval(confidence, "state evidence confidence");

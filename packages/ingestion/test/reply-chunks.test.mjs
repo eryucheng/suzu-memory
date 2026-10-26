@@ -77,6 +77,24 @@ const chars = selection => Object.values(selection).flat().reduce((sum, row) => 
 const lengthPlan = options => plan({ maximumCoreCharacters: 80, maximumContextCharacters: 80,
   maximumRequestCharacters: 240, measure: chars, ...options });
 
+test('dense short messages trigger a bounded batch even below the character target', async () => {
+  const result = await lengthPlan({ pending: rounds(1, 30), maximumCoreCharacters: 12000,
+    maximumCoreMessages: 100, maximumRequestCharacters: 64000 });
+  assert.equal(result.status, 'ready');
+  assert.equal(result.coreMessages, 100);
+  assert.deepEqual(ids(result.events), ids(rounds(1, 25)));
+  assert.deepEqual(ids(result.continuationGuidanceEvents), ids(rounds(26, 26)));
+});
+
+test('message cap counts an indivisible fragment group as one complete source', async () => {
+  const group = [1, 2, 3].map(index => ({ id: `fragment-${index}`, content: { text: 'part' },
+    metadata: { suzuMemoryFragment: { parentEventId: 'original', index, count: 3 } } }));
+  const result = await lengthPlan({ pending: [...group, ...rounds(1, 2)], maximumCoreCharacters: 12000,
+    maximumCoreMessages: 1, maximumRequestCharacters: 64000, flush: true, resolveReply: () => null });
+  assert.deepEqual(ids(result.events), ids(group));
+  assert.equal(result.coreMessages, 1);
+});
+
 test('character batching waits for length and one following completed round', async () => {
   const first = rounds(1, 1);
   assert.equal((await lengthPlan({ pending: first })).reason, 'content-length');

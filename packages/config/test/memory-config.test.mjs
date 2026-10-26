@@ -29,7 +29,7 @@ test("config resolves portable paths relative to its own file", () => {
   assert.equal(config.agentId, "companion-test");
   assert.equal(config.sourcePath, configPath);
   assert.deepEqual(config.defaults.ingestion, {
-    maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
+    maximumCoreCharacters: 12_000, maximumCoreMessages: 100, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
     maximumEventCharacters: 12_000,
     maximumBatchCharacters: 48_000,
     leaseSeconds: 1800,
@@ -49,7 +49,7 @@ test("config validates and exposes ingestion safety budgets", () => {
     },
   });
   assert.deepEqual(config.defaults.ingestion, {
-    maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
+    maximumCoreCharacters: 12_000, maximumCoreMessages: 100, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
     maximumEventCharacters: 8_000,
     maximumBatchCharacters: 32_000,
     leaseSeconds: 900,

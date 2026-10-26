@@ -1,10 +1,11 @@
-# 按内容长度整理对话
+# 分批整理对话
 
 宿主可以通过现有 `processPendingEvents` 或 `runMaintenance` 的 `chunkPolicy` 使用字符长度分窗：
 
 ```js
 const chunkPolicy = {
   maximumCoreCharacters: 12000,
+  maximumCoreMessages: 100,
   maximumContextCharacters: 12000,
   maximumRequestCharacters: 64000,
   flush: false,
@@ -17,11 +18,13 @@ const chunkPolicy = {
 
 没有设置 `maximumCoreCharacters` 时，原有按回复轮和请求 token 预算分窗的合同保持不变。
 
-正文积累不足时返回 `waiting/content-length`。达到目标后，优先在不超过目标的完整回复边界分批，等待后续一轮完成，作为只读参考。前文取最近一个已完成回复轮。参考事件不加入核心认领 ID，因此不会重复归档。
+正文长度与完整消息条数均不足时返回 `waiting/content-length`。任一达到目标后，优先在不超过目标的完整回复边界分批，等待后续一轮完成，作为只读参考。`maximumCoreMessages` 按重组后的完整消息计数，存储片段不单独计数。前文取最近一个已完成回复轮。参考事件不加入核心认领 ID，因此不会重复归档。
 
 前后参考各受 `maximumContextCharacters` 约束，只保留预算内完整消息。总请求按现有抽取请求的正文、系统提示词与 JSON Schema 长度，加 100 字符桥接余量计量；超过上限时先移除参考，再缩小核心前缀。长度计量不是 token 计量。核心原始消息及其存储片段保持完整，不静默截断；超出正文目标的单条消息可以单独处理，无法放入总请求预算的逻辑消息保留原文并进入现有审核流程。
 
-没有后续完整轮时暂缓；累计达到两批正文或待处理读取页已满时，可以带上已有的预算内后文先处理，避免一直等待。`flush: true` 在压缩、上下文移出或人工整理时处理不足一批的尾部；每次仍遵守相同总请求上限。
+没有后续完整轮时暂缓；累计达到两批正文、两批消息条数或待处理读取页已满时，可以带上已有的预算内后文先处理，避免一直等待。`flush: true` 在压缩、上下文移出或人工整理时处理不足一批的尾部；每次仍遵守相同总请求上限。
+
+模型以 `length` 或 `max_tokens` 结束响应时，Provider 抛出带用量的 `MAX_TOKENS`，不将其作为网络错误原样重试。抽取器释放原批次，将核心消息上限减半并处理较小前缀；剩余消息保存该上限，重新打开数据库后仍可继续。拆批沿用完整消息边界和预算内前后参考，不重复归档原话。格式修复阶段的输出截断同样进入拆批。单条完整消息仍超限时保留原文，并进入现有待审核流程。
 
 待处理及已归档前文各读取最多 500 行，按来源顺序排列；已有来源范围继续在选择与认领之前生效。字符分窗等待且本次未归档任何输入时，不启动后续语义生成任务。先前批次已经归档的后续维护仍可完成。
 
@@ -29,7 +32,7 @@ const chunkPolicy = {
 
 ## 聊天宿主适配器
 
-`createChatHostMemoryAdapter({ memory, hostId, identity, archiveMode: "length" })` 使用相同的字符分窗。长度设置来自正式配置的 `defaults.ingestion.maximumCoreCharacters`、`maximumContextCharacters`、`maximumRequestCharacters`，默认分别为 12000、12000、64000；未选用长度模式的宿主保持原窗口接口。宿主在内容足量后调用 `onIdle`；`onSessionEnd` 会处理尾批。返回的 `progress` 包含待处理输入、维护任务、状态请求、整合任务及失败数量。
+`createChatHostMemoryAdapter({ memory, hostId, identity, archiveMode: "length" })` 使用相同的分批规则。设置来自正式配置的 `defaults.ingestion.maximumCoreCharacters`、`maximumCoreMessages`、`maximumContextCharacters`、`maximumRequestCharacters`，默认分别为 12000、100、12000、64000；未选用长度模式的宿主保持原窗口接口。宿主在内容足量后调用 `onIdle`；`onSessionEnd` 会处理尾批。返回的 `progress` 包含待处理输入、维护任务、状态请求、整合任务及失败数量。
 
 `afterReply` 可以只提供一侧消息，另一侧不会被补造。`beforeReply({ ..., recall: { enabled: true, readOnly: true } })` 返回正式记忆上下文，同时跳过反馈观察、召回轨迹持久化、召回激活及会话头更新，适合独立查询或测评。
 

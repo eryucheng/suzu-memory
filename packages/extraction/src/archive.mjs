@@ -422,9 +422,9 @@ export function fallbackStateAnalysisToProvisionalReview({
     };
   });
   const fallbackReason = "state-analysis-specialist-fallback";
-  const actorIdentity = request.metadata?.actorIdentity && typeof request.metadata.actorIdentity === "object"
-    ? request.metadata.actorIdentity
-    : {};
+  // Preserve the extraction decision's identity when an invalid request binding
+  // is sent back to review; never reassign the original candidate's subject.
+  const actorIdentity = decision.candidate.metadata?.actorIdentity || request.metadata?.actorIdentity || {};
   return repository.transaction(() => {
     const provisional = storeProvisionalImpression({
       repository,

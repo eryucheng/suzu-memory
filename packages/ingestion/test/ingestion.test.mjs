@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   ensureCompanionRelationshipStructure,
@@ -978,6 +981,118 @@ test("output exhaustion preserves raw evidence and enters review after one extra
   await run();
   assert.equal(calls, 1);
   database.close();
+});
+
+test('output truncation splits once, persists the smaller limit, and archives every source exactly once', async () => {
+  const { database, repository } = repositoryFixture();
+  try {
+    appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+      events: Array.from({ length: 5 }, (_, i) => event({ eventId: `split-${i}`, content: { text: `独立原话${i}` } })) });
+    const sizes = [];
+    const generator = async ({ input }) => {
+      const refs = [...input.matchAll(/^\[(M\d{4})\]/gmu)].map(match => match[1]);
+      sizes.push(refs.length);
+      if (refs.length > 2) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' });
+      const sources = [...input.matchAll(/^\[(M\d{4})\].*?(独立原话\d)/gmu)];
+      return { output: { memories: sources.map(([, ref, text]) => generatedEventCandidate({ title: text,
+        content: text, subjectRole: 'user', subjectName: 'User',
+        actorRoles: [{ role: 'experiencer', actorRole: 'user', actorName: 'User', confidence: 1 }],
+        sourceRefs: [ref] })) }, usage: {} };
+    };
+    for (let i = 0; i < 3; i++) {
+      const result = await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+      assert.equal(result.status, 'processed');
+      assert.equal(result.generationDiagnostics.degraded, false);
+      assert.ok(result.memoriesStored > 0, JSON.stringify(result.candidateResults));
+    }
+    assert.deepEqual(sizes, [5, 2, 2, 1]);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['pending'] }).total, 0);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 5);
+    assert.equal(repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] }).length, 0);
+    assert.equal(repository.listMemories(AGENT_ID, { kinds: ['utterance'], limit: 20 }).total, 5);
+    const evidence = repository.listMemories(AGENT_ID, { kinds: ['event'], limit: 20 }).items
+      .flatMap(memory => repository.getMemoryDetail(AGENT_ID, memory.id).sources.map(source => source.content));
+    assert.deepEqual([...new Set(evidence)].sort(), Array.from({ length: 5 }, (_, i) => `独立原话${i}`));
+  } finally { database.close(); }
+});
+
+test('a split limit survives database reopening and a later network failure never repeats the original large request', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-extraction-split-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'memory.db');
+  let database = openMemoryDatabase(file);
+  let repository = new MemoryRepository(database);
+  appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+    events: Array.from({ length: 5 }, (_, i) => event({ eventId: `resume-${i}`, content: { text: `resume-source-${i}` } })) });
+  const sizes = [];
+  let failNetwork = true;
+  const generator = async ({ input }) => {
+    const refs = [...input.matchAll(/^\[(M\d{4})\]/gmu)].map(match => match[1]);
+    sizes.push(refs.length);
+    if (refs.length > 2) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' });
+    if (failNetwork) { failNetwork = false; throw new Error('network unavailable'); }
+    return { output: { memories: [] }, usage: {} };
+  };
+  try {
+    await assert.rejects(processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator }), /network unavailable/u);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 0);
+    database.close();
+    database = openMemoryDatabase(file);
+    repository = new MemoryRepository(database);
+    for (let i = 0; i < 3; i++) await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+    assert.deepEqual(sizes, [5, 2, 2, 2, 1]);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 5);
+    assert.equal(repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] }).length, 0);
+  } finally { database.close(); }
+});
+
+test('repeated subdivision stops at one whole source and only that source enters review', async () => {
+  const { database, repository } = repositoryFixture();
+  try {
+    appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+      events: Array.from({ length: 4 }, (_, i) => event({ eventId: `single-${i}`, content: { text: `single-source-${i}` } })) });
+    const sizes = [];
+    const generator = async ({ input }) => {
+      const refs = [...input.matchAll(/^\[(M\d{4})\]/gmu)].map(match => match[1]);
+      sizes.push(refs.length);
+      if (input.includes('single-source-0')) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' });
+      return { output: { memories: [] }, usage: {} };
+    };
+    for (let i = 0; i < 3; i++) await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+    assert.deepEqual(sizes, [4, 2, 1, 1, 2]);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 4);
+    const tasks = repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] });
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0].payload.eventIds.length, 1);
+    assert.equal(tasks[0].attempt_count, 1);
+  } finally { database.close(); }
+});
+
+test('a truncated repair also splits instead of silently retaining only the initially valid candidates', async () => {
+  const { database, repository } = repositoryFixture();
+  try {
+    appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+      events: [event({ eventId: 'repair-first' }), event({ eventId: 'repair-second' })] });
+    const calls = [];
+    const generator = async ({ input, schemaName }) => {
+      calls.push(schemaName);
+      if (schemaName === 'long-term-memory-extraction-repair-v2') {
+        throw Object.assign(new Error('repair output truncated'), { code: 'MAX_TOKENS', usage: { completion_tokens: 10 } });
+      }
+      const refs = [...input.matchAll(/^\[(M\d{4})\]/gmu)].map(match => match[1]);
+      return { output: { memories: refs.length === 2
+        ? [generatedEventCandidate({ sourceRefs: ['M0001'] }), generatedEventCandidate({ sourceRefs: ['M0002'], eventDate: 'bad-date' })]
+        : [] }, usage: { completion_tokens: 5 } };
+    };
+    const first = await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+    assert.equal(first.eventsProcessed, 1);
+    assert.equal(first.generationDiagnostics.degraded, false);
+    await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+    assert.deepEqual(calls, ['long-term-memory-extraction-v2', 'long-term-memory-extraction-repair-v2',
+      'long-term-memory-extraction-v2', 'long-term-memory-extraction-v2']);
+    assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 2);
+    assert.equal(repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] }).length, 0);
+  } finally { database.close(); }
 });
 
 test("archives raw evidence and queues human review after three ordinary extraction failures", async () => {

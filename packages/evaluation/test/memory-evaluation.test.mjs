@@ -574,7 +574,7 @@ test("runs the public baseline against the current retriever without changing it
   assert.equal(report.summary.primarySelection.accuracy, 1);
   assert.equal(report.summary.candidateRanking.hitRateAt5, 1);
   assert.ok(report.summary.candidateRanking.meanReciprocalRank < 1);
-  assert.equal(report.summary.graphExpansion.eligibleCaseCount, 5);
+  assert.equal(report.summary.graphExpansion.eligibleCaseCount, 6);
   assert.equal(report.summary.graphExpansion.expandedCaseCount, 3);
   assert.equal(report.summary.graphExpansion.truncationRate, 0);
   assert.equal(report.summary.graphExpansion.maximumObservedDepth, 1);

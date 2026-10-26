@@ -418,7 +418,7 @@ test("keeps LIKE fallback out of the BM25 route audit", () => {
   assert.equal(result.audit.matches[0].bestSearchRank, -0.42);
 });
 
-test("keeps a reviewed event primary while adding one bounded two-sided source exchange", async () => {
+test("keeps a reviewed event primary while ranking independently matched source text", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   seedMuseumMemory(repository);
   database.close();
@@ -429,13 +429,13 @@ test("keeps a reviewed event primary while adding one bounded two-sided source e
     now: new Date("2026-07-15T12:00:00+08:00"),
   });
   assert.equal(result.status, "ready");
-  assert.equal(result.disclosureLevel, "conclusion");
+  assert.equal(result.disclosureLevel, "related-memories");
   assert.equal(result.fragments.length, 1);
   assert.equal(result.fragments[0].memoryId, "event-museum");
   assert.match(result.context, /去了科技馆并参观机器人展/u);
-  assert.match(result.context, /相关原话/u);
   assert.match(result.context, /User：我上周六去了科技馆/u);
-  assert.match(result.context, /Agent：你还看了机器人展/u);
+  assert.doesNotMatch(result.context, /Agent：你还看了机器人展/u);
+  assert.deepEqual(result.graph.selectedMemoryIds, ['event-museum', 'u-user']);
   assert.deepEqual(result.seedRouting.plannedRoutes, ["lexical", "bm25", "entity"]);
   assert.deepEqual(result.seedRouting.executedRoutes, ["lexical", "bm25", "entity"]);
   assert.equal(result.seedRouting.primaryMemoryId, "event-museum");
@@ -858,7 +858,7 @@ test("separates direct supporting memories from deeper original wording", async 
   assert.deepEqual(originalWording.fragments[0].evidenceIds, ["puzzle-choice-utterance"]);
 });
 
-test("keeps ordinary and explicit evidence limits independently configurable", async () => {
+test("keeps the shared ordinary context budget separate from explicit evidence disclosure", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "evidence-window-event",
@@ -923,15 +923,16 @@ test("keeps ordinary and explicit evidence limits independently configurable", a
     query: "还记得那四轮连续问答吗",
   });
   assert.equal(ordinary.status, "ready");
-  assert.equal(ordinary.fragments[0].evidenceIds.length, 2);
+  assert.equal(ordinary.fragments[0].evidenceIds.length, 0);
+  assert.deepEqual(ordinary.graph.selectedMemoryIds, ['evidence-window-event']);
   assert.equal(
     ordinary.fragments[0].evidenceIds.every((id) => messages.some(([messageId]) => messageId === id)),
     true,
   );
   assert.deepEqual(ordinary.evidenceDisclosure, {
-    mode: "ordinary",
-    maximumMessages: 2,
-    ordinaryMaximum: 2,
+    mode: "ranked-context",
+    maximumMessages: 5,
+    ordinaryMaximum: 5,
     expandedMaximum: 4,
   });
 
@@ -2344,7 +2345,7 @@ test("returns a persistable retrieval trace without writing it by default", asyn
   assert.equal(result.trace.resultStatus, "ready");
   assert.equal(result.trace.queryText, "记得我之前去科技馆吗");
   assert.deepEqual(result.trace.seedIds, ["event-museum", "u-user"]);
-  assert.deepEqual(result.trace.selectedIds, ["event-museum"]);
+  assert.deepEqual(result.trace.selectedIds, ["event-museum", "u-user"]);
   assert.equal(result.trace.contextChars, result.context.length);
 
   const writable = openMemoryDatabase(databasePath);
@@ -3522,7 +3523,7 @@ test("bounds activation work even when the reachable graph contains a cycle", as
   assert.equal(result.graph.selectedMemoryIds.length <= 3, true);
 });
 
-test("does not promote an entity-only neighbor into a converged seed", async () => {
+test("an independently admitted entity match participates in the shared ranking", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   const direct = repository.upsertMemory({
     id: "direct-place-memory",
@@ -3566,9 +3567,10 @@ test("does not promote an entity-only neighbor into a converged seed", async () 
 
   assert.equal(result.status, "ready");
   assert.equal(result.fragments[0].memoryId, direct.id);
-  assert.equal(result.graph.convergedSeeds, null);
-  assert.deepEqual(result.graph.selectedMemoryIds, [direct.id]);
-  assert.doesNotMatch(result.context, /年度活动/u);
+  assert.deepEqual(result.graph.selectedMemoryIds, [direct.id, entityOnly.id]);
+  assert.ok(result.candidates.find(value => value.memoryId === direct.id).score
+    > result.candidates.find(value => value.memoryId === entityOnly.id).score);
+  assert.match(result.context, /年度活动/u);
 });
 
 test("uses date filtering without forcing unrelated lexical matches", async () => {

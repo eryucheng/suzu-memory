@@ -100,6 +100,56 @@ function analysisRun(repository, evidence, overrides = {}) {
   });
 }
 
+for (const scenario of ['valid', 'missing-request', 'wrong-subject', 'wrong-canonical',
+  'resolved-request', 'outside-memory', 'outside-source', 'not-verbatim', 'other-family', 'cross-agent']) {
+  test(`third-person identity observations require a complete request binding: ${scenario}`, t => {
+    const { database, repository } = setup();
+    t.after(() => database.close());
+    const evidence = evidenceMemory(repository);
+    database.prepare("UPDATE memory_nodes SET kind = 'utterance' WHERE id = ?").run(evidence.memory.id);
+    if (scenario !== 'not-verbatim') repository.linkSource(evidence.memory.id, evidence.source.id, 'verbatim');
+    const outside = evidenceMemory(repository, { id: 'outside-memory' });
+    repository.linkSource(evidence.memory.id, outside.source.id, 'verbatim');
+    const stateFamily = scenario === 'other-family' ? 'preference' : 'identity';
+    const requestAgent = scenario === 'cross-agent' ? 'agent-other' : 'agent-test';
+    const requestEvidence = requestAgent === 'agent-test' ? evidence
+      : evidenceMemory(repository, { agentId: requestAgent, id: 'other-agent-memory' });
+    const request = repository.recordStateAnalysisRequest({
+      agentId: requestAgent, batchId: 'third-person-batch', candidateIndex: 0,
+      stateFamily, subjectRole: 'other', subjectKey: scenario === 'wrong-subject' ? 'another-person' : 'third-person',
+      canonicalKey: scenario === 'wrong-canonical' ? 'another-target' : 'identity-target', targetLabel: '人物身份',
+      targetSpec: stateFamily === 'identity' ? { identityField: 'occupation', fieldCardinality: 'single' } : {},
+      representationLayer: 'reported', evidenceMode: 'explicit',
+      memoryIds: scenario === 'outside-memory' ? [outside.memory.id] : [requestEvidence.memory.id],
+      sourceIds: scenario === 'outside-memory' || scenario === 'outside-source' ? [outside.source.id] : [requestEvidence.source.id],
+    });
+    if (scenario === 'resolved-request') repository.resolveStateAnalysisRequest({
+      agentId: 'agent-test', requestId: request.id, status: 'completed' });
+    const run = analysisRun(repository, evidence, { stateFamily, subjectRole: 'other', subjectKey: 'third-person',
+      canonicalKey: 'identity-target', metadata: scenario === 'missing-request' ? {} : { stateAnalysisRequestId: request.id } });
+    let requestReads = 0;
+    const getRequest = repository.getStateAnalysisRequest.bind(repository);
+    repository.getStateAnalysisRequest = (...args) => { requestReads++; return getRequest(...args); };
+    const record = () => repository.recordStateEvidenceObservation({
+      agentId: 'agent-test', stateFamily, subjectRole: 'other', subjectKey: 'third-person', canonicalKey: 'identity-target',
+      memoryId: evidence.memory.id, evidenceGroupId: 'raw-source-group', signal: 'identity_assertion',
+      claimedDirection: 'support', effectiveDirection: 'neutral', qualification: 'unresolved',
+      payloadSchemaVersion: 'identity-merged-evidence-v1', sourceIds: [evidence.source.id], analysisRunIds: [run.id],
+    });
+    if (scenario === 'valid') {
+      const observation = record();
+      assert.equal(observation.subject_key, 'third-person');
+      assert.equal(observation.effective_direction, 'neutral');
+    } else {
+      assert.throws(record, /does not identify the evaluated subject/);
+      assert.equal(database.prepare('SELECT COUNT(*) AS count FROM memory_state_evidence_observations').get().count, 0);
+    }
+    assert.equal(requestReads, ['missing-request', 'other-family'].includes(scenario) ? 0 : 1,
+      'only the referenced request may be loaded once per observation');
+    assert.equal(repository.getMemory(evidence.memory.id).subject_key, 'user');
+  });
+}
+
 test("stores state analysis and evidence outside autobiographical memory", () => {
   const { database, repository } = setup();
   const evidence = evidenceMemory(repository);

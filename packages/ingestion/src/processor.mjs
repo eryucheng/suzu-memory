@@ -1,9 +1,12 @@
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { executionEventSourceView } from '@suzu-memory/core';
 import { normalizeCompanionIdentity } from "./protocol.mjs";
-import { selectReplyChunk } from './reply-chunks.mjs';
+import { DEFAULT_LENGTH_ARCHIVE_POLICY, planReplyChunk, selectReplyChunk } from './reply-chunks.mjs';
+import { logicalArchiveEventId } from './archive-windows.mjs';
 import {
   archiveCompanionEventBatch,
+  buildCompanionExtractionRequest,
+  companionMessagesFromEvents,
   generateCompanionEventBatch,
   recordCompanionEventGenerationUsage,
 } from "./processing-stages.mjs";
@@ -174,6 +177,48 @@ export async function processPendingCompanionEvents({
   }
 
   let generated;
+  const processSmallerBatch = async (maximumCoreMessages, errorMessage, recordLimit = true) => {
+    const selection = await planReplyChunk({
+      ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...chunkPolicy, maximumCoreMessages, flush: true,
+      pending: claimed.events, previous: previousContextEvents,
+      resolveReply: chunkPolicy?.resolveReply || (row => row.actor_role === 'companion'
+        ? { id: row.id, complete: true, lastEventId: logicalArchiveEventId(row) } : null),
+      measure: selection => {
+        const { request } = buildCompanionExtractionRequest({ ...selection, identity: normalizedIdentity, systemPrompt, timeZone });
+        return request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100;
+      },
+    });
+    if (selection.status !== 'ready' || selection.events.length >= claimed.events.length) return null;
+    const ids = new Set(selection.events.map(logicalArchiveEventId));
+    const smallerWindows = archiveWindows.flatMap(window => {
+      const coreEventIds = window.coreEventIds.filter(id => ids.has(id));
+      if (!coreEventIds.length) return [];
+      const following = selection.continuationGuidanceEvents.filter(row => window.coreEventIds.includes(logicalArchiveEventId(row)));
+      return [{ ...window, coreEventIds,
+        continuationGuidanceEvents: following.length ? following : window.continuationGuidanceEvents }];
+    });
+    repository.releaseInputBatchForSplit(agentId, claimed.batch.id, {
+      leaseOwner: claimed.batch.lease_owner, maximumCoreMessages, recordLimit, errorMessage, completedAt,
+    });
+    const result = await processPendingCompanionEvents({ repository, agentId, identity: normalizedIdentity,
+      maximumEvents: selection.events.length, maximumContentCharacters: 10_000_000,
+      candidateEventIds: selection.events.map(row => row.id), leaseSeconds, generator,
+      previousContextEvents: selection.previousContextEvents,
+      continuationGuidanceEvents: selection.continuationGuidanceEvents, archiveWindows: smallerWindows,
+      usageLedgerPath, systemPrompt, timeZone, memoriesOverride, now: executionTime });
+    return { ...result, quarantined: [...(claimed.quarantined || []), ...(result.quarantined || [])],
+      chunk: { reason: 'output-limit-split',
+      coreCharacters: selection.coreCharacters, maximumCoreCharacters: selection.maximumCoreCharacters,
+      coreMessages: selection.coreMessages, maximumCoreMessages,
+      estimatedRequestCharacters: selection.estimatedRequestCharacters,
+      maximumRequestCharacters: selection.maximumRequestCharacters } };
+  };
+  const priorLimit = claimed.events[0]?.metadata?.suzuMemoryProcessing?.extractionMaximumMessages;
+  if (Number.isSafeInteger(priorLimit) && priorLimit > 0
+    && companionMessagesFromEvents(claimed.events, normalizedIdentity).length > priorLimit) {
+    const smaller = await processSmallerBatch(priorLimit, undefined, false);
+    if (smaller) return smaller;
+  }
   const sourceView = executionEventSourceView(repository, agentId);
   if (sourceView) {
     const eligibleContext = rows => rows.filter(row => sourceView.inputIds.has(row.id))
@@ -186,6 +231,7 @@ export async function processPendingCompanionEvents({
     }));
   }
   let terminalGenerationFailure = null;
+  let failureUsageWarning = '';
   try {
     generated = await generateCompanionEventBatch({
       events: claimed.events,
@@ -201,6 +247,18 @@ export async function processPendingCompanionEvents({
   } catch (error) {
     assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
+    if (error?.usage) {
+      failureUsageWarning = await recordCompanionEventGenerationUsage({ usageLedgerPath, executionTime,
+        agentId, batchId: claimed.batch.id, generation: { ...error,
+          metadata: { ...error.metadata, failed: true, errorCode: error.code || '' } } });
+    }
+    if (error?.code === 'MAX_TOKENS') {
+      const count = companionMessagesFromEvents(claimed.events, normalizedIdentity).length;
+      if (count > 1) {
+        const smaller = await processSmallerBatch(Math.max(1, Math.floor(count / 2)), error.message);
+        if (smaller) return { ...smaller, warnings: [...(smaller.warnings || []), ...(failureUsageWarning ? [failureUsageWarning] : [])] };
+      }
+    }
     const transportAttempts = error?.code === "MEMORY_PROVIDER_TRANSPORT_EXHAUSTED"
       ? Number(error.transportAttempts || error.maximumTransportAttempts || MAXIMUM_EXTRACTION_ATTEMPTS)
       : 1;
@@ -323,6 +381,7 @@ export async function processPendingCompanionEvents({
   const warnings = usageWarning
     ? [...postProcessing.warnings, usageWarning]
     : postProcessing.warnings;
+  if (failureUsageWarning) warnings.push(failureUsageWarning);
   if (terminalGenerationFailure) {
     warnings.push(
       `Long-term extraction was deferred to human review after ${terminalGenerationFailure.attempts} failed attempts: ${terminalGenerationFailure.errorMessage}`,
@@ -334,6 +393,7 @@ export async function processPendingCompanionEvents({
     ...(chunk ? { chunk: { reason: chunk.reason, estimatedRequestTokens: chunk.estimatedRequestTokens,
       maximumRequestTokens: chunk.maximumRequestTokens, coreCharacters: chunk.coreCharacters,
       maximumCoreCharacters: chunk.maximumCoreCharacters, estimatedRequestCharacters: chunk.estimatedRequestCharacters,
+      coreMessages: chunk.coreMessages, maximumCoreMessages: chunk.maximumCoreMessages,
       maximumRequestCharacters: chunk.maximumRequestCharacters } } : {}),
     batchId: claimed.batch.id,
     eventsProcessed: claimed.events.length,

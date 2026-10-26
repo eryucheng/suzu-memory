@@ -16,6 +16,11 @@
 | `embeddingCacheMaxBytes` | 每个执行线程估算缓存预算 256 MiB；可设置 0 至 1 GiB 的整数 |
 | `workerIdleTimeoutMs` | 空闲线程保留 5 分钟；可设置 0 至 1800000 毫秒 |
 | `deferNodeBodies` | 大库开启延迟正文读取；`false` 使用完整节点读取，便于对照验证 |
+| `maximumContextMemories` | 普通召回最多输出 5 条内容，记忆与原话共用；补入的相邻原话也计入 |
+
+普通召回复用候选的综合相关性排序，不为摘要、状态记录或原话分别预留名额；没有足够合格候选时不补满。命中原话后，可以沿 `followed_by` 补入同一段短问答，重复记录按 ID 去重。所有选中内容共同受 `maximumContextMemories` 和 `maximumContextChars` 限制；候选列表的 `maximumReturnedCandidates` 独立控制返回的候选数量。
+
+时间线、因果、联想、当前状态及状态纠正、关系和认识类型、来源依据与反证查询继续使用对应的语义规则。`maximumChainMemories` 控制专门的关联展开，`maximumEvidenceMessages` 与 `maximumExpandedEvidenceMessages` 控制这些查询的来源披露，不再给普通召回分配分类名额。
 
 小库继续在调用线程执行全量路径。线程按数据库复用，最多同时保留两条；Embedding 提供者仍在调用方环境执行。任务 ID 区分并发调用，取消信号传递到检索任务；没有空闲容量时等待或响应取消。空闲线程默认 5 分钟后退出，等待中的其他数据库可以提前回收空闲线程，调用 `MemoryService.close()` 可主动释放当前库的空闲线程。空闲线程不阻止宿主进程正常退出。
 

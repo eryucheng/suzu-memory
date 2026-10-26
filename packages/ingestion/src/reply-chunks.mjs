@@ -3,7 +3,8 @@ import { buildCompanionExtractionRequest } from './processing-stages.mjs';
 import { logicalArchiveEventId } from './archive-windows.mjs';
 
 export const DEFAULT_LENGTH_ARCHIVE_POLICY = Object.freeze({
-  maximumCoreCharacters: 12_000, maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
+  maximumCoreCharacters: 12_000, maximumCoreMessages: 100,
+  maximumContextCharacters: 12_000, maximumRequestCharacters: 64_000,
 });
 
 const sourceOf = row => row.metadata?.eventSource || {};
@@ -42,9 +43,9 @@ async function roundEnds(groups, resolveReply, maximum, reverse = false) {
 
 const characters = rows => rows.reduce((sum, row) => sum + String(row.content?.text || '').length, 0);
 
-async function planLengthChunk({ pending, previous, resolveReply, measure, maximumCoreCharacters,
+async function planLengthChunk({ pending, previous, resolveReply, measure, maximumCoreCharacters, maximumCoreMessages = 100,
   maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false }) {
-  for (const value of [maximumCoreCharacters, maximumRequestCharacters, maximumContextCharacters]) {
+  for (const value of [maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Archive character limits must be positive integers.');
   }
   const groups = logicalGroups(pending);
@@ -52,19 +53,21 @@ async function planLengthChunk({ pending, previous, resolveReply, measure, maxim
     reason: pending.length ? 'incomplete-logical-event' : 'no-pending-events',
     inputEventIds: pending.length ? [pending[0].id] : [], eventsProcessed: 0 };
   const total = characters(groups.flat());
-  if (!flush && !scanFull && total < maximumCoreCharacters) return {
+  if (!flush && !scanFull && total < maximumCoreCharacters && groups.length < maximumCoreMessages) return {
     status: 'waiting', reason: 'content-length', characters: total, maximumCoreCharacters, eventsProcessed: 0,
   };
   const ends = await roundEnds(groups, resolveReply, groups.length);
   let count = 0, size = 0;
-  while (count < groups.length && (count === 0 || size + characters(groups[count]) <= maximumCoreCharacters)) {
+  while (count < Math.min(groups.length, maximumCoreMessages)
+    && (count === 0 || size + characters(groups[count]) <= maximumCoreCharacters)) {
     size += characters(groups[count++]);
   }
   count = ends.filter(end => end <= count).at(-1) || count;
   const followingEnd = ends.find(end => end > count);
   // Waiting for an ordinary following round is bounded by the next batch's
   // character budget. A long ongoing round cannot grow the waiting tail forever.
-  if (!flush && !scanFull && followingEnd === undefined && total < maximumCoreCharacters * 2) {
+  if (!flush && !scanFull && followingEnd === undefined && total < maximumCoreCharacters * 2
+    && groups.length < maximumCoreMessages * 2) {
     return { status: 'waiting', reason: 'following-round', characters: total, maximumCoreCharacters, eventsProcessed: 0 };
   }
   const historyStart = previous.findIndex(row => !row.metadata?.suzuMemoryFragment || row.metadata.suzuMemoryFragment.index === 1);
@@ -97,14 +100,15 @@ async function planLengthChunk({ pending, previous, resolveReply, measure, maxim
   return { status: 'ready', reason: flush ? 'flush' : 'content-length', events: groups.slice(0, count).flat(),
     previousContextEvents: before, continuationGuidanceEvents: after,
     coreCharacters: characters(groups.slice(0, count).flat()), maximumCoreCharacters,
+    coreMessages: count, maximumCoreMessages,
     estimatedRequestCharacters: requestCharacters(count), maximumRequestCharacters };
 }
 
 export async function planReplyChunk({ pending, previous = [], resolveReply, measure,
   coreRounds = 5, maximumRequestTokens = 16_384, scanFull = false, maximumCoreCharacters = null,
-  maximumRequestCharacters, maximumContextCharacters, flush = false }) {
+  maximumRequestCharacters, maximumContextCharacters, maximumCoreMessages = 100, flush = false }) {
   if (maximumCoreCharacters !== null) return planLengthChunk({ pending, previous, resolveReply, measure,
-    maximumCoreCharacters, maximumRequestCharacters, maximumContextCharacters, flush, scanFull });
+    maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters, flush, scanFull });
   const groups = logicalGroups(pending);
   if (!groups.length) return { status: pending.length ? 'blocked' : 'skipped',
     reason: pending.length ? 'incomplete-logical-event' : 'no-pending-events',
@@ -164,8 +168,11 @@ export async function selectReplyChunk({ repository, agentId, identity, systemPr
   const previous = page.items.length ? repository.listInputEvents(agentId, { statuses: ['archived'], limit: 500,
     ...scope, descending: true, beforeSourceEvent: page.items[0] }).items
     .filter(row => row.processing_disposition !== 'quarantined').reverse() : [];
+  const splitLimit = page.items[0]?.metadata?.suzuMemoryProcessing?.extractionMaximumMessages;
+  const splitPolicy = Number.isSafeInteger(splitLimit) && splitLimit > 0 ? { maximumCoreMessages: Math.min(
+    policy.maximumCoreMessages ?? DEFAULT_LENGTH_ARCHIVE_POLICY.maximumCoreMessages, splitLimit), flush: true } : {};
   return planReplyChunk({ pending: page.items, previous, scanFull: page.total > page.items.length,
-    ...policy, measure: selection => {
+    ...policy, ...splitPolicy, measure: selection => {
       const request = buildCompanionExtractionRequest({
       ...selection, identity, systemPrompt, timeZone,
       }).request;

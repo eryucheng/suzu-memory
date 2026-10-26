@@ -858,7 +858,8 @@ export async function runEventContinuityMaintenance({ repository, agentId, gener
     } catch (error) {
       assertEventSourceExecutionCurrent();
       failed.push(repository.failMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
-        errorMessage: error.message, retry: !['MAX_TOKENS', 'MEMORY_STRUCTURE_INPUT_TOO_LARGE'].includes(error.code),
+        errorMessage: error.message, retry: !['MAX_TOKENS', 'MEMORY_STRUCTURE_INPUT_TOO_LARGE',
+          'MEMORY_EVENT_CONTINUITY_COVERAGE', 'MEMORY_TASK_SCHEMA_INVALID'].includes(error.code),
           errorDetails: { stage: 'event-continuity', memoryIds: task.payload.memoryIds, errorCode: error.code || '',
             providerDiagnostics: error.diagnostics || {} },
         result: { eventContinuityProgress: progress } }));

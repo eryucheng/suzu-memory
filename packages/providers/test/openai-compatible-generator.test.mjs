@@ -14,6 +14,34 @@ function response(payload, { status = 200, headers = {} } = {}) {
   };
 }
 
+test('output truncation is a typed failure with usage and is not repeated as a transport retry', async () => {
+  let calls = 0;
+  const generate = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://api.example.test/v1', model: 'fixture', apiKey: 'secret' },
+    maxOutputTokens: 32768,
+    fetchImpl: async (_url, options) => {
+      calls++;
+      assert.equal(JSON.parse(options.body).max_tokens, 32768);
+      return response({ id: 'truncated', model: 'fixture', usage: { prompt_tokens: 20, completion_tokens: 32768 },
+        choices: [{ finish_reason: 'length', message: { content: '{"memories":[' } }] });
+    },
+  });
+  await assert.rejects(generate({ input: 'source' }), error => error.code === 'MAX_TOKENS'
+    && error.usage.completion_tokens === 32768 && error.requestId === 'truncated'
+    && error.diagnostics.maxOutputTokens === 32768);
+  assert.equal(calls, 1);
+});
+
+test('a malformed completed output retains the provider usage for failure accounting', async () => {
+  const generate = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://api.example.test/v1', model: 'fixture', apiKey: 'secret' },
+    fetchImpl: async () => response({ model: 'fixture', usage: { total_tokens: 42 },
+      choices: [{ finish_reason: 'stop', message: { content: 'invalid json' } }] }),
+  });
+  await assert.rejects(generate({ input: 'source' }), error => error.usage.total_tokens === 42
+    && error.model === 'fixture' && /有效 JSON/u.test(error.message));
+});
+
 test("OpenAI-compatible generator requests JSON and returns the shared generator envelope", async () => {
   let request = null;
   const generate = createOpenAiCompatibleStructuredGenerator({

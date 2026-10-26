@@ -422,11 +422,17 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
         initialSalvage?.output.memories || [],
         repairSalvage?.output.memories || [],
       );
-      if (!salvagedMemories.length) throw repairError;
+      if (repairError?.code === 'MAX_TOKENS' || !salvagedMemories.length) {
+        Object.assign(repairError, { usage: combinedNumericUsage(generation.usage, repair?.usage, repairError.usage),
+          model: repairError.model || repair?.model || generation.model,
+          metadata: { ...(repairError.metadata || repair?.metadata || generation.metadata),
+            initialRequestId: generation.requestId } });
+        throw repairError;
+      }
       parsedOutput = { memories: salvagedMemories };
     }
 
-    const numericUsage = combinedNumericUsage(generation.usage, repair?.usage);
+    const numericUsage = combinedNumericUsage(generation.usage, repair?.usage, repairError?.usage);
     const rejectedCandidates = [
       ...(initialSalvage?.rejected || []).map((item) => ({ ...item, stage: "initial" })),
       ...(repairSalvage?.rejected || []).map((item) => ({ ...item, stage: "repair" })),

@@ -7,7 +7,7 @@ import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRIT
   parseMemoryRetrievalContextProposal, parseMemoryRetrievalContextCritique } from '@suzu-memory/embedding-indexer';
 
 const tasks = new Map([
-  ['memory-event-continuity-v1', [analysis.EVENT_CONTINUITY_SCHEMA, analysis.parseEventContinuity]],
+  ['memory-event-continuity-v2', [analysis.EVENT_CONTINUITY_SCHEMA, analysis.parseEventContinuity]],
   ['long-term-memory-extraction-v2', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
   ['long-term-memory-extraction-repair-v2', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
   ['memory-structure-proposals-v1', [MEMORY_STRUCTURE_OUTPUT_SCHEMA, parseStructureGeneration]],

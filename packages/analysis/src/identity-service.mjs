@@ -95,7 +95,11 @@ function enforce(role, item, snapshot) {
     if (!hasSubject(memory, snapshot.target, new Set(["speaker"]), false)) {
       throw new Error("Explicit identity self report requires the fixed subject as speaker.");
     }
-  } else if (!hasSubject(memory, snapshot.target, new Set(["subject", "speaker", "participant"]))) {
+  } else if (!(memory.kind === "utterance"
+    && snapshot.inputPolicy.identityTargetIsRequestBound
+    && snapshot.inputPolicy.requestBoundUtteranceEvidence
+    && snapshot.inputPolicy.sourceIdsAreCallerBounded)
+    && !hasSubject(memory, snapshot.target, new Set(["subject", "speaker", "participant"]))) {
     throw new Error("Identity analysis does not identify the fixed subject.");
   }
   if (role === "current-relation") {
@@ -392,6 +396,7 @@ export async function evaluateIdentityEvidence({
   agentId,
   subjectRole,
   subjectKey,
+  subjectLabel = "",
   canonicalKey,
   identityField,
   identityLabel,
@@ -445,6 +450,7 @@ export async function evaluateIdentityEvidence({
     agentId: clean(agentId),
     target: {
       ...base.target,
+      subjectLabel: clean(subjectLabel) || clean(subjectKey),
       stateFamily: "identity",
       identityField: clean(identityField),
       identityLabel: clean(identityLabel),
@@ -461,6 +467,9 @@ export async function evaluateIdentityEvidence({
     ),
     inputPolicy: {
       ...base.inputPolicy,
+      // Request-bound raw speech may discuss or quote someone other than its speaker.
+      // Attribution decides whether the fixed target is actually described.
+      identityTargetIsRequestBound: Boolean(clean(snapshotOptions.analysisRequestId)),
       identityTargetIsFixedByCaller: true,
       fieldCardinalityIsFixedByCaller: true,
       currentStateIsReadOnly: true,
@@ -546,6 +555,7 @@ export async function evaluateIdentityEvidence({
       durationMs: Math.max(0, Math.trunc(Number(call.generation?.durationMs) || 0)),
       errorMessage: call.error,
       metadata: {
+        stateAnalysisRequestId: clean(snapshotOptions.analysisRequestId),
         identityField: clean(identityField),
         fieldCardinality: clean(fieldCardinality),
         currentRepresentationLayer: clean(currentRepresentationLayer),

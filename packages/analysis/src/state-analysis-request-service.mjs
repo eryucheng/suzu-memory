@@ -3,7 +3,7 @@ import {
   buildPreferenceEvidenceSnapshot,
 } from "./preference-snapshot.mjs";
 import { isStateAnalysisTargetComplete } from "@suzu-memory/core";
-import { fallbackStateAnalysisToProvisionalReview } from "@suzu-memory/extraction";
+import { fallbackStateAnalysisToProvisionalReview, resolveExtractedCandidateIdentity } from "@suzu-memory/extraction";
 import {
   evaluatePreferenceEvidenceSpecialists,
 } from "./preference-specialist-service.mjs";
@@ -201,6 +201,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     definitions: IDENTITY_ANALYZERS,
     evaluate: (common, analyzers, request) => evaluateIdentityEvidence({
       ...common,
+      subjectLabel: subjectLabel(request),
       identityField: request.targetSpec.identityField,
       identityLabel: request.target_label,
       fieldCardinality: request.targetSpec.fieldCardinality,
@@ -312,6 +313,7 @@ function requestSnapshotOptions(request, snapshotOptions) {
     ...snapshotOptions,
     allowUtteranceEvidence: true,
     allowedSourceIds: request.sourceIds,
+    analysisRequestId: request.id,
   };
 }
 
@@ -323,6 +325,22 @@ function validatePreflight(request, snapshot) {
   }
   if (!sameMembers(visibleSourceIds, exactSet(request.sourceIds))) {
     return "request-source-boundary-mismatch";
+  }
+  if (request.state_family === "identity" && snapshot.memories.some(memory => (
+    memory.kind === "utterance"
+    && !(memory.subjectRole === request.subject_role && memory.subjectKey === request.subject_key)
+    && !memory.actorRoles.some(role => ["subject", "speaker", "participant"].includes(role.role)
+      && role.actorRole === request.subject_role && role.actorKey === request.subject_key)
+  ))) {
+    // A third-party target is an extraction hypothesis, not the utterance's speaker.
+    // Resolve its name with the same host identities and evidence scope as extraction.
+    const name = clean(request.metadata?.subjectName);
+    const identity = resolveExtractedCandidateIdentity({
+      subjectRole: request.subject_role, subjectName: name, actorRoles: [],
+    }, request.agent_id, request.metadata?.actorIdentity || {});
+    if (!name || identity.subjectKey !== request.subject_key) {
+      return "request-subject-identity-mismatch";
+    }
   }
   return "";
 }

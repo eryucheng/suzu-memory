@@ -17,7 +17,7 @@ export function eventContinuityFingerprint(repository, agentId, memoryId) {
 
 // Use the existing durable maintenance store; the analysis is complete and its
 // uncertain identity decision awaits review, so it must never be claimed again.
-export function recordEventContinuityReview(repository, { agentId, memoryId, candidateIds, rationale, contentHash }) {
+export function recordEventContinuityReview(repository, { agentId, memoryId, candidateIds, rationale, contentHash, diagnostics }) {
   const memoryIds = [...new Set([memoryId, ...candidateIds])];
   const fingerprints = Object.fromEntries(memoryIds.map(id => [id, eventContinuityFingerprint(repository, agentId, id)]));
   const revision = Number(repository.getMemory(memoryId)?.metadata?.eventContinuityRevision || 0);
@@ -25,7 +25,7 @@ export function recordEventContinuityReview(repository, { agentId, memoryId, can
     payload: { memoryIds, memoryId, candidateIds, fingerprints, revision }, maxAttempts: 1 });
   if (task.wasInserted) repository.database.prepare(`UPDATE memory_maintenance_tasks SET status = 'completed',
     review_state = 'pending', result_json = ?, completed_at = updated_at WHERE agent_id = ? AND id = ?`)
-    .run(JSON.stringify({ rationale, contentHash }), agentId, task.id);
+    .run(JSON.stringify({ rationale, contentHash, ...(diagnostics ? { diagnostics } : {}) }), agentId, task.id);
   return repository.getMaintenanceTask(agentId, task.id);
 }
 

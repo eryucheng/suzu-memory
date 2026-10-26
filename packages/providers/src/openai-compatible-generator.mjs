@@ -417,10 +417,8 @@ export function createOpenAiCompatibleStructuredGenerator({
         }
         throw new Error(message);
       }
-      return {
-        output: parseJsonContent(anthropicCompatible
-          ? anthropicToolContent(envelope, selectedSchemaName)
-          : completionContent(envelope, outputMode, selectedSchemaName)),
+      const finishReason = anthropicCompatible ? envelope.stop_reason : envelope.choices?.[0]?.finish_reason;
+      const responseInfo = {
         usage: envelope.usage || {},
         model: clean(envelope.model) || model,
         requestId: clean(envelope.id)
@@ -434,6 +432,20 @@ export function createOpenAiCompatibleStructuredGenerator({
           transportAttempts: attempt,
         },
       };
+      try {
+        if (["length", "max_tokens"].includes(finishReason)) {
+          const error = new Error("Memory provider output reached the configured token limit.");
+          error.code = "MAX_TOKENS";
+          error.diagnostics = { kind: "output-limit", finishReason, maxOutputTokens: outputLimit };
+          throw error;
+        }
+        return { ...responseInfo, output: parseJsonContent(anthropicCompatible
+          ? anthropicToolContent(envelope, selectedSchemaName)
+          : completionContent(envelope, outputMode, selectedSchemaName)) };
+      } catch (error) {
+        Object.assign(error, responseInfo);
+        throw error;
+      }
     }
     throw new Error("记忆处理 API 传输重试未产生结果。");
   };

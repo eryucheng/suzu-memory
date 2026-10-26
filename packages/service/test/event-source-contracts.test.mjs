@@ -10,6 +10,7 @@ import { createMemoryService, validateMemoryExtractionOutput, inspectDatabaseBac
 import { getEventSourceCleanup, openMemoryDatabase, MemoryRepository, SCHEMA_VERSION } from '@suzu-memory/core';
 import { DatabaseSync } from 'node:sqlite';
 import { MIGRATIONS } from '../../core/src/schema.mjs';
+import { prepareEventContinuity, applyEventContinuity } from '@suzu-memory/analysis';
 
 const owner = 'product-events';
 const timestamp = '2026-09-06T03:00:00.000Z';
@@ -236,6 +237,43 @@ test('scoped RAG excludes unknown and future candidate/evidence bodies but mater
   assert.equal(empty.fragments.length, 0);
 });
 
+test('event citation repair narrows both model bodies and scoped provenance to the invalid pair', async t => {
+  const { memory } = fixture(t);
+  memory.appendEventSources({ scope: scope(), events: [
+    event('continuity-1', 1, '小明约好整理书单。'), event('continuity-2', 2, '小明已整理完那份书单。'),
+    event('continuity-3', 3, '小明把书单打印好了。'), event('continuity-future', 9, 'FUTURE_CONTINUITY_BODY'),
+  ] });
+  await archive(memory);
+  const sources = memory.withRepository(repository => repository.database.prepare('SELECT * FROM source_records').all());
+  for (let i = 1; i <= 3; i++) {
+    const source = sources.find(row => row.content === ['小明约好整理书单。', '小明已整理完那份书单。', '小明把书单打印好了。'][i - 1]);
+    node(memory, `continuity-${i}`, source.content, [source.id]);
+  }
+  node(memory, 'continuity-future', 'FUTURE_CONTINUITY_BODY', [sources.find(row => row.content === 'FUTURE_CONTINUITY_BODY').id]);
+  const requests = [];
+  const generator = async request => {
+    requests.push(request);
+    const input = JSON.parse(request.input), byId = new Map(input.memories.map(memory => [memory.id, memory]));
+    assert.ok(!request.input.includes('FUTURE_CONTINUITY_BODY'));
+    if (input.validationErrors) {
+      assert.deepEqual(input.events.map(event => event.memoryId), ['continuity-2']);
+      assert.deepEqual(request.sourceMaterial.memoryIds, ['continuity-1', 'continuity-2']);
+      assert.deepEqual(request.sourceMaterial.eventSources.map(source => source.eventId), ['continuity-1', 'continuity-2']);
+    }
+    return { output: { matches: input.events.map(({ memoryId }) => ({ memoryId, resolution: 'matched', candidateId: 'continuity-1',
+      relation: 'same_thread', memorySourceIds: [byId.get(memoryId).sources[0].id],
+      candidateSourceIds: [byId.get(!input.validationErrors && memoryId === 'continuity-2' ? 'continuity-3' : 'continuity-1').sources[0].id],
+      rationale: '对照两端原文核对书单的进展。' })) } };
+  };
+  const embeddingProvider = Object.assign(async () => ({ model: 'test', vector: [1, 0] }), { model: 'test', dimensions: 2 });
+  const result = await memory.withRepository(async repository => {
+    const prepared = await prepareEventContinuity({ repository, agentId: memory.agentId, memoryIds: ['continuity-2', 'continuity-3'], generator, embeddingProvider });
+    return applyEventContinuity({ repository, agentId: memory.agentId, prepared, generator });
+  }, { sourceScope: scope(3) });
+  assert.equal(requests.length, 2);
+  assert.deepEqual(result.repair, { requested: 1, repaired: 1, sentToReview: 0 });
+});
+
 test('committed fence rejects extraction and embedding late writes and lets newer Events proceed', async t => {
   const { memory } = fixture(t);
   memory.appendEventSources({ scope: scope(), events: [event('old', 1, 'LATE_ERASE_旧的雪山口令')] });
@@ -349,7 +387,16 @@ test('cleanup rejects a backup junction before following it and preserves the ot
   fs.writeFileSync(path.join(otherDirectory, 'keep.txt'), 'OTHER_OWNER_KEEP');
   fs.mkdirSync(memory.paths.backupDirectory, { recursive: true });
   const link = path.join(memory.paths.backupDirectory, 'redirect');
-  fs.symlinkSync(otherDirectory, link, process.platform === 'win32' ? 'junction' : 'dir');
+  try {
+    fs.symlinkSync(otherDirectory, link, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    // Windows reports EISDIR for a fresh junction on filesystems such as exFAT.
+    const unsupported = ['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes(error.code)
+      || (process.platform === 'win32' && error.code === 'EISDIR' && !fs.existsSync(link));
+    if (!unsupported) throw error;
+    t.skip(`Temporary filesystem does not support directory links (${error.code}).`);
+    return;
+  }
   try {
     assert.throws(() => memory.eraseEventSources({ id: 'junction-clear', scope: scope(20, [{ spaceId: 'direct-a', throughSequence: 1 }]) }), { code: 'EVENT_SOURCE_CLEANUP_PATH' });
     assert.equal(memory.getEventSourceCleanup('junction-clear').complete, false);

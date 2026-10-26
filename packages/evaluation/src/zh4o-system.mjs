@@ -57,9 +57,11 @@ function captureGenerationUsage(generator, phase, records) {
   if (typeof generator !== "function") return null;
   const wrapped = async (request) => {
     let response;
+    let failed = false;
     try { response = await generator(request); return response; }
+    catch (error) { response = error; failed = true; throw error; }
     finally {
-      records.push({ phase, schemaName: clean(request?.schemaName), failed: !response,
+      records.push({ phase, schemaName: clean(request?.schemaName), failed: failed || !response,
         model: clean(response?.model), provider: clean(response?.metadata?.provider), usage: { ...(response?.usage || {}) } });
     }
   };
