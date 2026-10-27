@@ -46,6 +46,8 @@ export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], fi
     quarantinedMessages: new Set(inputEvents.filter(event => event.processing_disposition === 'quarantined')
       .map(event => event.metadata?.suzuMemoryFragment?.parentEventId || event.external_id || event.id)).size,
     archiveOnlyBatches: batches.filter(batch => batch.generationDiagnostics?.degraded).length,
+    unresolvedExtractionCandidates: batches.reduce((sum, batch) => sum + Number(batch.generationDiagnostics?.unresolvedCandidateCount || 0), 0),
+    incompleteExtractionBatches: batches.filter(batch => batch.generationDiagnostics?.candidateValidationIncomplete).length,
     failedMaintenancePasses: passes.filter(pass => pass.failures?.length || ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(pass.status)).length,
     pendingWork: Number(finalProgress?.total || 0), failedWork: Number(finalProgress?.failures || 0),
     missingInputEvents: Math.max(0, expectedEvents - mappedEvents),
@@ -54,7 +56,7 @@ export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], fi
 }
 
 export function summarizeMemoryPreparation(samples) {
-  const keys = ['quarantinedMessages', 'archiveOnlyBatches', 'failedMaintenancePasses', 'pendingWork', 'failedWork', 'missingInputEvents'];
+  const keys = ['quarantinedMessages', 'archiveOnlyBatches', 'unresolvedExtractionCandidates', 'incompleteExtractionBatches', 'failedMaintenancePasses', 'pendingWork', 'failedWork', 'missingInputEvents'];
   return Object.fromEntries(keys.map(key => [key, samples.reduce((sum, sample) => sum + Number(sample.memoryDiagnostics?.[key] || 0), 0)]));
 }
 

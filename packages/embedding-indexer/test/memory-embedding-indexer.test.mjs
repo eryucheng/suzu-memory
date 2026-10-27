@@ -16,6 +16,22 @@ import {
   syncMemoryEmbeddings,
 } from "../src/index.mjs";
 
+test('English retrieval context recognizes discourse references and negation without substring triggers', () => {
+  for (const content of ['That exhibition was far more crowded than Caroline had expected.',
+    'She decided to return to the same museum with Melanie.']) {
+    const selection = assessMemoryRetrievalContextNeed({ content });
+    assert.ok(selection.reasons.includes('leading-reference'));
+    assert.ok(assessMemoryRetrievalContextCriticNeed({ content, subject_role: 'user' }, selection).needed);
+  }
+  for (const content of ["Caroline didn't attend the concert.", 'Caroline never visited that museum.']) {
+    const assessment = assessMemoryRetrievalContextCriticNeed({ content, subject_role: 'user' });
+    assert.ok(assessment.reasons.includes('negation-boundary'));
+  }
+  assert.equal(assessMemoryRetrievalContextNeed({ content: 'Itinerary planning occupied Caroline for the entire afternoon.' }).needed, false);
+  assert.ok(!assessMemoryRetrievalContextCriticNeed({ content: 'Caroline wrote a notebook entry.', subject_role: 'user' })
+    .reasons.includes('negation-boundary'));
+});
+
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-indexer-"));
   const database = openMemoryDatabase(path.join(root, "memory.db"));

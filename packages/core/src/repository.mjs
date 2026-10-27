@@ -2915,6 +2915,9 @@ export class MemoryRepository {
     if (containerKind === "topic" && ["topic", "topic_or_episode"].includes(source.kind)) {
       throw new Error("A topic cannot support another topic in the current model.");
     }
+    if (!memoryWorldsCompatible(source, container)) {
+      throw new Error("Membership source and target must share their reality and world scope.");
+    }
     return this.upsertEdge({
       agentId: normalizedAgentId,
       fromMemoryId: source.id,
@@ -2966,6 +2969,9 @@ export class MemoryRepository {
       || ["episode", "topic", "topic_or_episode"].includes(memory.kind)
     ))) {
       throw new Error("Episode expansion accepts only non-deleted concrete memories.");
+    }
+    if (members.some(memory => !memoryWorldsCompatible(episode, memory))) {
+      throw new Error("Episode expansion members must share the episode's reality and world scope.");
     }
 
     const memories = [episode, ...members];

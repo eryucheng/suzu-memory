@@ -82,19 +82,28 @@ const GENERATED_TARGET_PROPERTIES = Object.freeze({
   affective_association: { triggerRole: personRole, triggerName: personName },
 });
 const TARGET_SPEC_FAMILIES = new Set(Object.keys(GENERATED_TARGET_PROPERTIES));
+const kindsForFamily = family => DIRECT_INGESTION_MEMORY_KINDS.filter(kind => family === 'not_applicable'
+  ? !isStatefulMemoryKind(kind) : isMemoryKindAllowedForStateFamily(kind, family));
+const targetlessFamilies = new Map();
+for (const family of ['not_applicable', ...MEMORY_STATE_FAMILIES.filter(family => !TARGET_SPEC_FAMILIES.has(family))]) {
+  const key = kindsForFamily(family).join(',');
+  targetlessFamilies.set(key, [...(targetlessFamilies.get(key) || []), family]);
+}
 const targetAlternatives = [
   ...Object.entries(GENERATED_TARGET_PROPERTIES).map(([family, properties]) => ({
     type: "object",
     properties: {
+      kind: { type: 'string', enum: kindsForFamily(family) },
       stateFamily: { type: "string", enum: [family] },
       stateTarget: { type: "object", additionalProperties: false, properties, required: Object.keys(properties) },
     },
     required: ["stateTarget"],
   })),
-  { type: "object", properties: {
-    stateFamily: { type: "string", enum: ["not_applicable", ...MEMORY_STATE_FAMILIES.filter(family => !TARGET_SPEC_FAMILIES.has(family))] },
+  ...[...targetlessFamilies].map(([kinds, families]) => ({ type: "object", properties: {
+    kind: { type: 'string', enum: kinds.split(',') },
+    stateFamily: { type: "string", enum: families },
     stateTarget: false,
-  } },
+  } })),
 ];
 
 function normalizedGeneratedStateTarget(candidate, index) {
@@ -127,8 +136,6 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
-const EXTRACTION_LANGUAGES = new Set(["zh", "en", "mixed", "unknown"]);
-
 function normalizeExtractionLanguage(value) {
   const normalized = clean(value).toLowerCase();
   if (["zh", "zh-cn", "chinese", "中文", "汉语"].includes(normalized)) return "zh";
@@ -157,13 +164,12 @@ export function detectExtractionLanguage(value) {
   return smallerShare >= 0.25 ? "mixed" : han > latin ? "zh" : "en";
 }
 
-function archiveWindowLanguage(window) {
+function archiveWindowLanguage(window, messages) {
   const declared = normalizeExtractionLanguage(
     window?.sourceLanguage || window?.outputLanguage || window?.language,
   );
   if (declared) return declared;
-  const languages = new Set((window?.messages || []).map(message =>
-    normalizeExtractionLanguage(message.sourceLanguage) || detectExtractionLanguage(message.text))
+  const languages = new Set(messages.map(message => message.sourceLanguage)
     .filter(language => language !== 'unknown'));
   return languages.size > 1 || languages.has('mixed') ? 'mixed' : [...languages][0] || 'unknown';
 }
@@ -368,7 +374,6 @@ export function buildLongTermExtractionInput({
     }
     observedWindowIds.add(archiveWindowId);
     const archiveContinuityId = clean(window.continuityId) || archiveWindowId;
-    const sourceLanguage = archiveWindowLanguage(window);
     const standardized = assignMemoryRefs(window.messages || [], nextRef).map((message) => ({
       ...message,
       sourceLanguage: normalizeExtractionLanguage(message.sourceLanguage)
@@ -382,7 +387,7 @@ export function buildLongTermExtractionInput({
       id: archiveWindowId,
       continuityId: archiveContinuityId,
       label: `W${String(index + 1).padStart(4, "0")}`,
-      sourceLanguage,
+      sourceLanguage: archiveWindowLanguage(window, standardized),
       messages: standardized,
       previousContextMessages: [...(window.previousContextMessages || [])],
       continuationGuidanceMessages: [...(window.continuationGuidanceMessages || [])],
@@ -458,14 +463,6 @@ function stripCodeFence(value) {
   const text = String(value || "").trim();
   const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/iu);
   return clean(fenced?.[1] || text);
-}
-
-export function sanitizeNarrativePunctuation(value) {
-  return String(value || "")
-    .replace(/\s*[—–]+\s*/gu, "，")
-    .replace(/，{2,}/gu, "，")
-    .replace(/([。！？])，/gu, "$1")
-    .replace(/，([。！？])/gu, "$1");
 }
 
 function validCalendarDate(value) {
@@ -551,7 +548,7 @@ export function parseGeneratedLongTermExtraction(value) {
     if (
       candidateKeys.length !== expectedCandidateKeys.length
       || candidateKeys.some((key, keyIndex) => key !== expectedCandidateKeys[keyIndex])
-    ) throw new Error(`memories[${index}] 字段不符合约定。`);
+    ) throw new Error(`memories[${index}] 字段不符合约定（stateFamily=${clean(candidate.stateFamily)}）；缺少：${expectedCandidateKeys.filter(key => !Object.hasOwn(candidate, key)).join(', ') || '无'}；不适用：${candidateKeys.filter(key => !expectedCandidateKeys.includes(key)).join(', ') || '无'}。`);
     for (const field of ["kind", "content", "subjectRole", "reality", "evidenceMode", "temporalState", "revisionAction"]) {
       if (!clean(candidate[field])) throw new Error(`memories[${index}].${field} 不能为空。`);
     }
@@ -568,7 +565,7 @@ export function parseGeneratedLongTermExtraction(value) {
       throw new Error(`memories[${index}].stateFamily 无效。`);
     }
     const stateful = isStatefulMemoryKind(candidate.kind);
-    const stateLabel = sanitizeNarrativePunctuation(candidate.stateLabel).trim();
+    const stateLabel = clean(candidate.stateLabel);
     const stateTarget = normalizedGeneratedStateTarget(candidate, index);
     if (stateful) {
       if (!clean(candidate.canonicalKey)) {
@@ -576,7 +573,7 @@ export function parseGeneratedLongTermExtraction(value) {
       }
       if (!MEMORY_STATE_FAMILIES.includes(candidate.stateFamily)
         || !isMemoryKindAllowedForStateFamily(candidate.kind, candidate.stateFamily)) {
-        throw new Error(`memories[${index}] 的 kind 与 stateFamily 不兼容。`);
+        throw new Error(`memories[${index}] 的 kind 与 stateFamily 不兼容；${candidate.stateFamily} 允许的 kind：${kindsForFamily(candidate.stateFamily).join(', ')}。`);
       }
       if (!stateLabel) throw new Error(`memories[${index}].stateLabel 不能为空。`);
     } else if (candidate.stateFamily !== "not_applicable" || stateLabel) {
@@ -649,8 +646,8 @@ export function parseGeneratedLongTermExtraction(value) {
     }
     return {
       ...candidate,
-      title: sanitizeNarrativePunctuation(candidate.title).trim(),
-      content: sanitizeNarrativePunctuation(candidate.content).trim(),
+      title: clean(candidate.title),
+      content: clean(candidate.content),
       subjectName: clean(candidate.subjectName),
       canonicalKey: clean(candidate.canonicalKey),
       stateFamily: candidate.stateFamily,

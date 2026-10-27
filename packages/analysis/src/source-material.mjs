@@ -1,5 +1,9 @@
 import { currentEventSourceExecution, eventSourceMaterial } from '@suzu-memory/core';
 
+export function analysisSystemPrompt(prompt) {
+  return `${prompt}\n\nKeep free-text labels, values, claims, and time expressions in the language of each item's direct evidence. Preserve names and quotations. Do not translate English evidence into Chinese. Schema keys and enum values remain unchanged.`;
+}
+
 // These are the typed material fields in the specialist snapshots. Resolve
 // provenance before calling a generator, including the current-state comparison.
 export function analysisSourceMaterial(snapshot) {

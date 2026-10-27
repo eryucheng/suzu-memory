@@ -1,5 +1,5 @@
 const clean = value => String(value ?? '').trim();
-const folded = value => clean(value).normalize('NFKC').toLocaleLowerCase('zh-CN');
+export const extractionParticipantNameKey = value => clean(value).normalize('NFKC').toLowerCase().replace(/’/gu, "'");
 
 /** Host identities, not conversational guesses. Product inputs never add an
  * absent primary user; legacy two-party inputs retain their declared actors. */
@@ -37,9 +37,9 @@ export function buildExtractionParticipants(messages, identity = {}) {
     add('user', clean(identity.primaryUserId), identity.primaryUserName);
   }
   const participants = [...records.values()];
-  const names = participants.map(participant => folded(participant.name));
+  const names = participants.map(participant => extractionParticipantNameKey(participant.name));
   for (const participant of participants) {
-    if (names.filter(name => name === folded(participant.name)).length > 1) {
+    if (names.filter(name => name === extractionParticipantNameKey(participant.name)).length > 1) {
       participant.name = `${participant.name} [${participant.actorRole}:${participant.actorKey}]`;
     }
   }
@@ -47,10 +47,10 @@ export function buildExtractionParticipants(messages, identity = {}) {
 }
 
 export function resolveExtractionParticipant(name, participants = []) {
-  const selected = folded(name);
+  const selected = extractionParticipantNameKey(name);
   if (!selected) return { status: 'unknown' };
   const matches = participants.filter(participant => [participant.name, participant.actorKey, ...participant.aliases]
-    .some(alias => folded(alias) === selected));
+    .some(alias => extractionParticipantNameKey(alias) === selected));
   return matches.length === 1 ? { status: 'known', participant: matches[0] }
     : { status: matches.length ? 'ambiguous' : 'unknown', matches };
 }

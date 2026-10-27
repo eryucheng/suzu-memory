@@ -20,12 +20,6 @@ function canonicalHash(value) {
     .digest("hex");
 }
 
-function bounded(value, fallback = 0.5) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.min(1, Math.max(0, number));
-}
-
 function integer(value, name) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 0) {

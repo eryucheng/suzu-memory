@@ -12,10 +12,9 @@ import {
   isRetentionReasonCompatible,
 } from "./prompt.mjs";
 import {
-  DIRECT_USER_AGENT_DM_TOPOLOGY,
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
-import { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles } from './participant-identity.mjs';
+import { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles, extractionParticipantNameKey } from './participant-identity.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "system-prompt.md");
@@ -57,17 +56,6 @@ function stableId(prefix, ...parts) {
   return `${prefix}-${digest}`;
 }
 
-function writeFileAtomic(filePath, content) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, content, "utf8");
-  fs.renameSync(temporary, filePath);
-}
-
-function writeJsonAtomic(filePath, value) {
-  writeFileAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
-}
-
 function isoTimestamp(value, fallback = null) {
   const timestamp = new Date(value);
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : fallback;
@@ -85,7 +73,7 @@ function actorKeyFor(actorRole, actorName, agentId, identity = {}) {
     case "agent": return companionId;
     case "shared": return identity.eventSourceIdentity || !primaryUserId ? '' : `shared:${companionId}:${primaryUserId}`;
     case "other": return clean(actorName) && identity.unresolvedActorScope
-      ? stableId('unresolved-person', agentId, identity.unresolvedActorScope, clean(actorName).normalize('NFKC').toLocaleLowerCase('zh-CN')) : '';
+      ? stableId('unresolved-person', agentId, identity.unresolvedActorScope, extractionParticipantNameKey(actorName)) : '';
     case "world": return "";
     default: return "";
   }
@@ -206,11 +194,17 @@ function decisionForResult(result) {
   return result.memoryId ? "store" : "reject";
 }
 
-function sameNamedActor(candidate, actor) {
+function sameNamedActor(candidate, actor, identity) {
   if (actor.actorRole !== candidate.subjectRole) return false;
   if (candidate.subjectRole !== "other") return true;
-  return clean(actor.actorName).toLocaleLowerCase("zh-CN")
-    === clean(candidate.subjectName).toLocaleLowerCase("zh-CN");
+  const subject = resolveExtractionParticipant(candidate.subjectName, identity.participants);
+  const holder = resolveExtractionParticipant(actor.actorName, identity.participants);
+  if (subject.status === 'known' && holder.status === 'known') {
+    return subject.participant.actorKey === holder.participant.actorKey
+      && subject.participant.actorRole === holder.participant.actorRole;
+  }
+  return subject.status === 'unknown' && holder.status === 'unknown'
+    && extractionParticipantNameKey(actor.actorName) === extractionParticipantNameKey(candidate.subjectName);
 }
 
 function evidenceAlignmentProblems(candidate, referencedMessages, identity = {}) {
@@ -251,7 +245,7 @@ function evidenceAlignmentProblems(candidate, referencedMessages, identity = {})
       && !hasAgentEvidence
       && candidate.subjectRole !== "agent"
     ) problems.add("agent-actor-without-agent-source");
-    if (holderRole && actor.role === holderRole && !sameNamedActor(candidate, actor)) {
+    if (holderRole && actor.role === holderRole && !sameNamedActor(candidate, actor, identity)) {
       problems.add("holder-conflicts-with-subject");
     }
   }
@@ -485,8 +479,7 @@ export function archiveLongTermEvidence({
 }) {
   identity = { ...identity, participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
   if (messages.some(message => message.eventSource)) {
-    identity = { ...identity, eventSourceIdentity: true,
-      participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
+    identity = { ...identity, eventSourceIdentity: true };
     generatedMemories = normalizeExtractionParticipantRoles({ memories: generatedMemories }, identity.participants).output.memories;
   }
   const sourceByRef = new Map();

@@ -151,6 +151,13 @@ test("config reuses existing OpenAI-compatible generation and embedding provider
   assert.deepEqual([...embedded.vector], [1, 0, 0]);
   assert.equal(requests.length, 2);
   assert.ok(requests.every((item) => item.request.headers.Authorization === "Bearer secret"));
+  const controller = new AbortController();
+  controller.abort();
+  for (const embed of [text => providers.embedding(text, { signal: controller.signal }),
+    text => providers.embedding.embedMany([text], { signal: controller.signal })]) {
+    await assert.rejects(embed('cancelled'), { name: 'AbortError' });
+  }
+  assert.equal(requests.length, 2, 'Cancelled requests must not contact the provider.');
 });
 
 test("config validates and preserves strict structured output mode", () => {
@@ -297,6 +304,18 @@ test("configured service can initialize without configuring optional providers",
     agentId: "companion-test",
   });
   assert.equal(service.info().agentId, "companion-test");
+});
+
+test('configured owner-only services preserve the absence of a primary human', async t => {
+  const root = temporaryDirectory();
+  const service = createMemoryServiceFromConfig({ agentId: 'owner-only', dataRoot: root,
+    defaults: { memoryOwner: 'Suzu', primaryUserId: '', createPrimaryRelationship: false } });
+  t.after(async () => { await service.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  assert.equal(service.defaults.createPrimaryRelationship, false);
+  assert.equal(service.defaults.primaryUserId, '');
+  assert.equal(service.defaults.userName, '');
+  service.initialize();
+  service.withRepository(repository => assert.deepEqual(repository.listRelationships('owner-only'), []));
 });
 
 test("configured service does not require provider secrets for local inspection", () => {

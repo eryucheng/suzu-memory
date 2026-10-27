@@ -1187,3 +1187,29 @@ test("processes a bounded planned batch, retries failures, and keeps later runs 
   }), /1 to 100/u);
   database.close();
 });
+
+
+test('generated structures retain the nondefault world carried by their snapshot members', async () => {
+  const { database, repository } = fixture();
+  try {
+    database.prepare("UPDATE memory_nodes SET reality='fictional',world_id='story',world_frame='fictional' WHERE id IN (?,?)")
+      .run('batch-museum', 'batch-dinner');
+    database.prepare('UPDATE memory_nodes SET event_start=? WHERE id=?')
+      .run('2026-07-12T10:00:00Z', 'batch-dinner');
+    const result = await proposeStructuresForBatch({ repository, agentId: 'agent-test',
+      memoryIds: ['batch-museum', 'batch-dinner'],
+      generator: async () => ({ model: 'fixture', output: { proposals: ['topic', 'episode'].map(kind => ({
+        operation: 'create', targetMemoryId: '', kind, title: 'Museum visit', content: 'A museum visit and dinner.',
+        subjectRole: 'shared', subjectKey: 'agent-test:user', eventDate: kind === 'episode' ? '2026-07-11' : null,
+        eventStart: null, eventEnd: null, memberIds: ['batch-museum', 'batch-dinner'], actorRoles: [],
+        confidence: 0.9, rationale: 'Related experiences in the same world.',
+      })) } }),
+    });
+    assert.equal(result.proposed.length, 2);
+    assert.deepEqual(result.rejected, []);
+    for (const proposal of result.proposed) {
+      const memory = repository.getMemory(proposal.result_memory_id);
+      assert.deepEqual([memory.reality, memory.world_id, memory.world_frame], ['fictional', 'story', 'fictional']);
+    }
+  } finally { database.close(); }
+});

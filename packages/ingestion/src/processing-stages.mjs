@@ -358,9 +358,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
   if (execution?.sourceScope) {
     // built contains precisely the messages serialized by the existing input
     // builder, including archive-window context and fragmented input IDs.
-    const messages = [...(built.messages || []), ...(built.previousContextMessages || []), ...(built.continuationGuidanceMessages || []),
-      ...(built.archiveWindows || []).flatMap(window => [...(window.messages || []),
-        ...(window.previousContextMessages || []), ...(window.continuationGuidanceMessages || [])])];
+    const messages = [...built.messages, ...built.previousContextMessages, ...built.continuationGuidanceMessages];
     const ids = messages.flatMap(message => message.inputEventIds || [message.inputEventId]).filter(Boolean);
     generationRequest.sourceMaterial = eventSourceMaterial(execution.repository, identity.agentId || identity.companionId, [], [], ids);
   }
@@ -386,6 +384,9 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
         repair = await generator({
           input: JSON.stringify({
             validationError: clean(validationError?.message),
+            validationErrors: initialSalvage?.rejected.map((item, index) => ({
+              index, originalIndex: item.index, reason: item.reason,
+            })) || [],
             invalidOutput,
             preservedValidCandidates: initialSalvage?.output.memories.length || 0,
           }),
@@ -395,6 +396,8 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
             "Valid candidates from the initial response are preserved by code and are not included here.",
             "Preserve supported facts and sourceRefs; do not add memories, facts, people, dates, or evidence.",
             "Change only fields required to satisfy the validation error and schema.",
+            "Each validationErrors index identifies one candidate in invalidOutput.memories. Fix every listed error, not only the first one.",
+            "Omit stateTarget entirely for families whose schema branch forbids it; do not reuse belief targets for preference, value, or goal.",
             "If a candidate cannot be repaired without inferring a missing target or fact, omit that candidate.",
             ...extractionRepairLanguageInstruction(built.messages),
           ].join("\n"),
@@ -433,6 +436,10 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     }
 
     const numericUsage = combinedNumericUsage(generation.usage, repair?.usage, repairError?.usage);
+    const recoveredCount = mergeExtractionCandidates(initialSalvage?.output.memories || [],
+      repairSalvage?.output.memories || []).length - mergeExtractionCandidates(initialSalvage?.output.memories || []).length;
+    const unresolvedCandidateCount = initialSalvage
+      ? Math.max(0, initialSalvage.rejected.length - recoveredCount) : null;
     const rejectedCandidates = [
       ...(initialSalvage?.rejected || []).map((item) => ({ ...item, stage: "initial" })),
       ...(repairSalvage?.rejected || []).map((item) => ({ ...item, stage: "repair" })),
@@ -456,6 +463,8 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
         repairCandidateCount: repairSalvage?.originalCount ?? null,
         repairValidCandidateCount: repairSalvage?.output.memories.length || 0,
         finalCandidateCount: parsedOutput.memories.length,
+        unresolvedCandidateCount,
+        candidateValidationIncomplete: unresolvedCandidateCount === null || unresolvedCandidateCount > 0,
         rejectedCandidates,
         initialSchemaName: clean(generation.metadata?.schemaName) || generationRequest.schemaName,
         initialRequestId: clean(generation.requestId),
@@ -474,6 +483,8 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       ?? parsedOutput.memories.length,
     initialInvalidCandidateCount: generation.metadata?.initialInvalidCandidateCount ?? 0,
     finalCandidateCount: generation.metadata?.finalCandidateCount ?? parsedOutput.memories.length,
+    unresolvedCandidateCount: generation.metadata?.unresolvedCandidateCount ?? (generation.metadata?.candidateValidationIncomplete ? null : 0),
+    candidateValidationIncomplete: generation.metadata?.candidateValidationIncomplete ?? false,
     knownParticipantRoleCorrectionCount: participantNormalization.corrections.length,
     knownParticipantRoleCorrections: participantNormalization.corrections,
   };

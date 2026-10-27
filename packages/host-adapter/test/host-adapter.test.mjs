@@ -24,6 +24,30 @@ const IDENTITY = Object.freeze({
   defaultWorldFrame: "relational",
 });
 
+test('English intervention uses history, current-time and conversational acknowledgement semantics', async () => {
+  let calls = 0;
+  const decide = createMemoryInterventionPolicy({ generator: async () => {
+    calls += 1;
+    throw new Error('These explicit cases should not require a model.');
+  } });
+  for (const userText of ['Do you remember my cat?', 'When did Caroline visit the museum?', 'What did I say last time?']) {
+    const decision = await decide({ userText });
+    assert.equal(decision.action, 'recall');
+    assert.equal(decision.source, 'deterministic-history-cue');
+    assert.equal(decision.query, userText);
+  }
+  for (const userText of ["What's the time?", 'What’s the time?', 'What day is it?', 'What is today\'s date?']) {
+    assert.equal((await decide({ userText })).action, 'skip');
+  }
+  for (const userText of ['Not yet.', 'Sounds good!', 'Got it', 'No']) {
+    const decision = await decide({ userText, recentMessages: [{ role: 'assistant', content: 'Have you finished?' }] });
+    assert.equal(decision.source, 'deterministic-short-reply');
+  }
+  assert.equal(calls, 0);
+  assert.equal((await createMemoryInterventionPolicy()({ userText: 'Not yet.' })).action, 'recall',
+    'Without live context an acknowledgement may need its missing antecedent.');
+});
+
 function temporaryDirectory() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-host-adapter-"));
 }

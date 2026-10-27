@@ -235,6 +235,8 @@ test("retains individually valid candidates when one repair cannot satisfy domai
     ["initial", "repair"],
   );
   assert.match(generated.generation.metadata.repairValidationError, /eventDate/u);
+  assert.equal(generated.generation.metadata.unresolvedCandidateCount, 1);
+  assert.equal(generated.generation.metadata.candidateValidationIncomplete, true);
 });
 
 test("never lets a repair response delete candidates that were already valid", async () => {
@@ -261,6 +263,33 @@ test("never lets a repair response delete candidates that were already valid", a
   assert.equal(generated.generation.metadata.initialValidCandidateCount, 1);
   assert.equal(generated.generation.metadata.initialInvalidCandidateCount, 1);
   assert.equal(generated.generation.metadata.finalCandidateCount, 1);
+  assert.equal(generated.generation.metadata.unresolvedCandidateCount, 1);
+  assert.equal(generated.generation.metadata.candidateValidationIncomplete, true);
+});
+
+test('repairs each invalid candidate against its own family contract and reports complete recovery', async () => {
+  const valid = generatedEventCandidate();
+  const preference = generatedEventCandidate({ kind: 'preference', stateFamily: 'preference', stateLabel: '阅读偏好',
+    canonicalKey: 'reading', retentionReason: 'explicit_preference' });
+  const goal = generatedEventCandidate({ kind: 'plan', stateFamily: 'goal', stateLabel: '阅读计划',
+    canonicalKey: 'reading-plan', retentionReason: 'open_loop' });
+  let calls = 0;
+  const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
+    generator: async request => {
+      if (++calls === 1) return { output: { memories: [valid,
+        { ...preference, stateTarget: { objectRole: 'world', objectName: '阅读' } },
+        { ...goal, kind: 'belief_state' }] }, usage: {} };
+      const input = JSON.parse(request.input);
+      assert.equal(input.preservedValidCandidates, 1);
+      assert.deepEqual(input.validationErrors.map(item => [item.index, item.originalIndex]), [[0, 1], [1, 2]]);
+      assert.match(input.validationErrors[0].reason, /不适用：stateTarget/u);
+      assert.match(input.validationErrors[1].reason, /goal 允许的 kind：plan, commitment, open_loop/u);
+      return { output: { memories: [preference, goal] }, usage: {} };
+    } });
+  assert.equal(calls, 2);
+  assert.equal(generated.generation.output.memories.length, 3);
+  assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
+  assert.equal(generated.generation.metadata.candidateValidationIncomplete, false);
 });
 
 test("corrects known participant roles from host identity before evidence gates", async () => {

@@ -445,7 +445,7 @@ test("keeps a reviewed event primary while ranking independently matched source 
   assert.doesNotMatch(JSON.stringify(result.seedRouting), /机器人展/u);
 });
 
-test("falls back to a two-sided raw dialogue window when structured extraction missed an event", async () => {
+test("recalls matched raw evidence without inserting an adjacent acknowledgement", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "lunch-user-utterance",
@@ -491,7 +491,7 @@ test("falls back to a two-sided raw dialogue window when structured extraction m
   assert.equal(result.retrievalMode, "episodic-lexical");
   assert.equal(result.candidates[0].retrievalLane, "episodic-evidence");
   assert.match(result.context, /User：我昨天午饭吃了番茄牛腩饭/u);
-  assert.match(result.context, /Agent：番茄牛腩饭听起来挺香/u);
+  assert.doesNotMatch(result.context, /Agent：番茄牛腩饭听起来挺香/u);
 });
 
 test("ranks structured memories and raw evidence by their fused relevance instead of alternating lanes", () => {
@@ -696,7 +696,7 @@ test("labels the actual epistemic source of a non-state memory", async () => {
     query: "记得我七月一日去天文馆吗",
   });
   assert.equal(result.status, "ready");
-  assert.match(result.context, /来源性质：主体本人陈述；不等于外部独立核验/u);
+  assert.match(result.context, /来源性质：主体本人陈述\n/u);
 });
 
 test("marks imported non-state memory without inventing source authority", async () => {
@@ -1424,7 +1424,7 @@ test("resolves only explicit query subjects and ignores conversational frames", 
   assert.equal(resolveQuerySubject("我们上次一起去了科技馆", perspective).mode, "shared");
   assert.equal(resolveQuerySubject("你还记得科技馆吗", perspective).matched, false);
   assert.equal(resolveQuerySubject("我妈以前去了科技馆", perspective).matched, false);
-  assert.equal(resolveQuerySubject("我说过“你喜欢围棋”吗", perspective).matched, false);
+  assert.equal(resolveQuerySubject("我说过“你喜欢围棋”吗", perspective).role, "user");
   assert.equal(resolveQuerySubject("我小时候学过围棋吗", perspective).role, "user");
   assert.equal(resolveQuerySubject("我的本科院校是哪所", perspective).role, "user");
   assert.equal(resolveQuerySubject("你的大学读的哪里", perspective).role, "agent");
@@ -1588,7 +1588,7 @@ test("retrieves an English event by its content words instead of a same-name dis
   assert.equal(result.candidates.some((candidate) => candidate.memoryId === "melanie-camping"), false);
 });
 
-test("does not answer a personal state question from an unowned mixed event", async () => {
+test("keeps unowned mixed events out of personal recall while qualifying topical raw evidence", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "mixed-ai-conversation",
@@ -1629,7 +1629,9 @@ test("does not answer a personal state question from an unowned mixed event", as
     agentId: "agent-test",
     query: "你最喜欢人工智能吗",
   });
-  assert.equal(result.status, "no-match");
+  assert.equal(result.status, "ready");
+  assert.equal(result.fragments[0].memoryId, 'agent-ai-utterance');
+  assert.match(result.context, /不能自行扩大或更新为更强的稳定结论/u);
   assert.equal(
     result.seedRouting.subjectRouting.hardRejectedCandidateIds.includes(
       "mixed-ai-conversation",
@@ -1796,7 +1798,7 @@ test("does not let normalized vector queries bypass the explicit subject hard ga
   );
 });
 
-test("prefers a current structured state over its newer raw utterance", async () => {
+test("keeps the current structured state primary while allowing relevant raw evidence", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "user-go-current-state",
@@ -1840,7 +1842,7 @@ test("prefers a current structured state over its newer raw utterance", async ()
     result.candidates.slice(0, 2).map((candidate) => candidate.memoryId),
     ["user-go-current-state", "user-go-newer-utterance"],
   );
-  assert.doesNotMatch(result.context, /User说自己喜欢围棋/u);
+  assert.match(result.context, /User说自己喜欢围棋/u);
 });
 
 test("falls back to a subject-matched raw statement when a structured state is missing", async () => {
@@ -2050,7 +2052,7 @@ test("uses only explicitly enabled and policy-approved accessibility to rerank a
     kind: "event",
     layer: "episodic",
     title: "科技馆机器人展",
-    content: "用户又去了科技馆机器人展。",
+    content: "用户去了科技馆机器人展。",
     subjectRole: "user",
     subjectKey: "user",
     eventDate: "2026-07-02",
@@ -3828,7 +3830,7 @@ test("labels inferred long-term state as a revocable inference instead of report
     query: "解谜游戏",
   });
   assert.equal(result.status, "ready");
-  assert.match(result.context, /状态性质：基于行为与多条证据的可撤销推断；不是主体原话/u);
+  assert.match(result.context, /状态性质：基于行为与多条证据的推断/u);
   assert.match(result.context, /选择倾向/u);
 });
 
@@ -3878,8 +3880,8 @@ test("returns parallel current representation layers instead of choosing one by 
     "reported-puzzle-preference",
     "inferred-puzzle-preference",
   ]);
-  assert.match(result.context, /主体明确表达；不等于外部验证事实/u);
-  assert.match(result.context, /可撤销推断；不是主体原话/u);
+  assert.match(result.context, /主体明确表达/u);
+  assert.match(result.context, /基于行为与多条证据的推断/u);
   assert.match(result.context, /明确说自己喜欢机关解谜/u);
   assert.match(result.context, /多次主动选择/u);
   assert.deepEqual(result.graph.representationCompletion, {

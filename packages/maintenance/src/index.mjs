@@ -410,10 +410,6 @@ function taskMemoryIds(tasks) {
   return uniqueStrings(tasks.flatMap((task) => task.payload?.memoryIds || [])).sort();
 }
 
-function failedMemoryIds(report) {
-  return new Set((report?.failures || []).flatMap((failure) => failure.memoryIds || []).map(clean));
-}
-
 function embeddingTaskResult(report) {
   return {
     status: clean(report?.status),

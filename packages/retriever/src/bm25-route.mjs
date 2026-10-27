@@ -1,5 +1,7 @@
 import {
-  lexicalTerms,
+  boundedOccurrences,
+  lexicalScore,
+  prepareLexicalQuery,
   recallCorePhrases,
 } from "./query.mjs";
 
@@ -20,9 +22,8 @@ function trueBm25Rank(value) {
   return Number.isFinite(rank) && rank < 0;
 }
 
-export function planBm25Queries(query, { maximumQueries = 8 } = {}) {
+function preparedBm25Queries(query, prepared, { maximumQueries = 8 } = {}) {
   const phrases = recallCorePhrases(query);
-  const searchableText = phrases.length ? phrases.join(" ") : clean(query);
   const values = [];
   const seen = new Set();
   const add = (value, source) => {
@@ -33,12 +34,16 @@ export function planBm25Queries(query, { maximumQueries = 8 } = {}) {
   };
 
   for (const phrase of phrases) add(phrase, "core-phrase");
-  for (const term of lexicalTerms(searchableText)
+  for (const term of (prepared.topicTerms || prepared.queryTerms)
     .filter((value) => characterLength(value) >= 3)
     .sort((left, right) => characterLength(right) - characterLength(left))) {
     add(term, "lexical-term");
   }
   return values.slice(0, Math.max(0, Math.trunc(Number(maximumQueries) || 0)));
+}
+
+export function planBm25Queries(query, options = {}) {
+  return preparedBm25Queries(query, prepareLexicalQuery(query), options);
 }
 
 export function collectBm25SeedScores({
@@ -47,10 +52,12 @@ export function collectBm25SeedScores({
   query,
   maximumQueries = 8,
   maximumResultsPerQuery = 20,
+  preparedQuery = null,
   worldId = "",
   worldFrame = "",
 }) {
-  const queries = planBm25Queries(query, { maximumQueries });
+  const prepared = preparedQuery || prepareLexicalQuery(query);
+  const queries = preparedBm25Queries(query, prepared, { maximumQueries });
   if (!queries.length) {
     return {
       status: "not-run",
@@ -67,21 +74,41 @@ export function collectBm25SeedScores({
     };
   }
 
+  const topicTerms = new Set(prepared.topicTerms || prepared.queryTerms);
+  const queryEnglishTerms = Object.keys(prepared.englishForms).filter(term => topicTerms.has(term));
+  const plannedMatches = queries.map(planned => ({ planned, matches: repository.search(agentId, planned.text, {
+    includeArchived: true, limit: maximumResultsPerQuery, worldId, worldFrame,
+  }), englishTerms: queryEnglishTerms.filter(term => boundedOccurrences(
+    planned.text.normalize('NFKC').toLowerCase(), term).length) }));
+  // The shared trigram index also finds fragments inside English words. Check
+  // those hits against the same word matcher used by the lexical route. Read
+  // only the bounded FTS hits, including their approved retrieval context.
+  const englishMemoryIds = [...new Set(plannedMatches.filter(item => item.englishTerms.length)
+    .flatMap(item => item.matches.filter(memory => trueBm25Rank(memory.search_rank)).map(memory => memory.id)))];
+  const documents = new Map(englishMemoryIds.length && repository.database
+    ? repository.database.prepare(`SELECT memory_id,title,content FROM memory_fts
+        WHERE rowid IN (SELECT fts_rowid FROM memory_fts_rows INDEXED BY memory_fts_rows_memory
+          WHERE memory_id IN (SELECT value FROM json_each(?)) AND agent_id=?)`)
+      .all(JSON.stringify(englishMemoryIds), agentId).map(row => [row.memory_id, `${row.title}\n${row.content}`]) : []);
   const byMemory = new Map();
+  const lexicalMatches = new Map();
   let ignoredLikeFallbackCount = 0;
-  for (const planned of queries) {
-    const matches = repository.search(agentId, planned.text, {
-      includeArchived: true,
-      limit: maximumResultsPerQuery,
-      worldId,
-      worldFrame,
+  let rejectedWordBoundaryCount = 0;
+  for (const { planned, matches, englishTerms } of plannedMatches) {
+    const ftsRanked = matches.filter(memory => trueBm25Rank(memory.search_rank));
+    ignoredLikeFallbackCount += matches.length - ftsRanked.length;
+    const ranked = ftsRanked.filter(memory => {
+      if (!englishTerms.length) return true;
+      if (!lexicalMatches.has(memory.id)) lexicalMatches.set(memory.id, new Set(lexicalScore(prepared,
+        documents.get(memory.id) ?? `${memory.title || ''}\n${memory.content || ''}`).matchedTerms));
+      return englishTerms.every(term => lexicalMatches.get(memory.id).has(term));
     });
-    const ranked = matches.filter((memory) => trueBm25Rank(memory.search_rank));
-    ignoredLikeFallbackCount += matches.length - ranked.length;
+    rejectedWordBoundaryCount += ftsRanked.length - ranked.length;
     const resultCount = ranked.length;
+    let rank = 0;
     for (let index = 0; index < ranked.length; index += 1) {
       const memory = ranked[index];
-      const rank = index + 1;
+      if (index === 0 || Number(memory.search_rank) !== Number(ranked[index - 1].search_rank)) rank = index + 1;
       const selectivity = 1 / Math.sqrt(Math.max(1, resultCount));
       const rankEvidence = (1 / rank) * selectivity;
       const current = byMemory.get(memory.id) || {
@@ -132,6 +159,7 @@ export function collectBm25SeedScores({
       queryCount: queries.length,
       matchedMemoryCount: scores.size,
       ignoredLikeFallbackCount,
+      rejectedWordBoundaryCount,
       matches: auditMatches,
     },
   };

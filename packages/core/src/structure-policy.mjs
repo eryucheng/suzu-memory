@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   MEMORY_ACTOR_ROLES,
   SUBJECT_ROLES,
+  memoryWorldsCompatible,
 } from "./ontology.mjs";
 
 function clean(value) {
@@ -111,6 +112,14 @@ function existingMembershipIds(repository, { agentId, kind, targetMemoryId }) {
   return new Set(members.map((memory) => memory.id));
 }
 
+function structureScope(members, target = null) {
+  const origin = target || members[0];
+  if (members.some(member => !memoryWorldsCompatible(origin, member))) {
+    throw new Error("Structure members and target must share their reality and world scope.");
+  }
+  return { reality: origin.reality, worldId: origin.world_id, worldFrame: origin.world_frame };
+}
+
 function validateAttachTarget(repository, { agentId, kind, targetMemoryId }) {
   const target = repository.getMemory(clean(targetMemoryId));
   if (!target || target.agent_id !== agentId) {
@@ -144,13 +153,14 @@ function normalizeProposal(repository, input = {}) {
   let memberIds = [...new Set(
     (Array.isArray(input.memberIds) ? input.memberIds : []).map(clean).filter(Boolean),
   )];
-  validateMembers(repository, {
+  const members = validateMembers(repository, {
     agentId,
     kind,
     memberIds,
     minimum: operation === "attach" ? 1 : 2,
     targetMemoryId,
   });
+  structureScope(members, target);
   if (target) {
     const existing = existingMembershipIds(repository, { agentId, kind, targetMemoryId });
     memberIds = memberIds.filter((id) => !existing.has(id));
@@ -321,8 +331,10 @@ export function materializeMemoryStructureProposal(repository, {
     minimum: proposal.operation === "attach" ? 1 : 2,
     targetMemoryId: proposal.targetMemoryId,
   });
+  const scope = structureScope(members, target);
   if (proposal.result_memory_id) {
     const memory = proposalResultMemory(repository, proposal);
+    structureScope(members, memory);
     return {
       status: "already-materialized",
       proposal,
@@ -338,6 +350,7 @@ export function materializeMemoryStructureProposal(repository, {
 
   return repository.transaction(() => {
     const common = {
+      ...scope,
       agentId: normalizedAgentId,
       title: proposal.title,
       content: proposal.content,

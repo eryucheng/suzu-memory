@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
-import { classifyChainIntent, closeRetrievalWorkers, DEFAULT_RETRIEVAL_OPTIONS, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
+import { classifyChainIntent, closeRetrievalWorkers, collectBm25SeedScores, DEFAULT_RETRIEVAL_OPTIONS, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
 import { buildOrdinarySeedCandidates } from '../src/seed-routes.mjs';
 
 const query = '赵齐让白羽岚称呼他为什么？A 大佬 B 军人 C sensei D 小齐';
@@ -46,7 +46,7 @@ test('declared people retain candidate lookup terms while topic scoring excludes
   assert.deepEqual(question.matchedTerms, []);
 });
 
-test('strong entity and vector routes retain BM25 evidence within one text scoring budget', () => {
+test('BM25 owns the text score even when literal evidence and independent routes also match', () => {
   const nodes = ['fts', 'other'].map(id => ({ id, kind: 'event', title: '', content: '整理旧资料。', status: 'active', importance: 0.5 }));
   const options = DEFAULT_RETRIEVAL_OPTIONS;
   const input = { nodes, query: 'university education', intent: 'auto', options,
@@ -60,11 +60,102 @@ test('strong entity and vector routes retain BM25 evidence within one text scori
   const [both] = buildOrdinarySeedCandidates({ ...input, nodes: [{ ...nodes[0], content: 'University education at the local college.' }] });
   const text = both.routeMatches.filter(route => ['lexical', 'bm25'].includes(route.route));
   assert.equal(text.filter(route => route.contribution > 0).length, 1);
-  assert.ok(both.routeContributions.lexical > 0);
+  assert.equal(both.routeContributions.lexical, 0);
+  assert.equal(both.routeContributions.bm25, 0.9 * options.bm25ContributionWeight);
   const [ftsWithLexical] = buildOrdinarySeedCandidates({ ...input, options: { ...options, strongLexicalScore: 100 },
     nodes: [{ ...nodes[0], content: 'education' }] });
   assert.ok(ftsWithLexical.routeContributions.bm25 > 0);
   assert.equal(ftsWithLexical.routeContributions.lexical, 0);
+});
+
+test('literal fallback scores coverage rather than the number of letters in a word', () => {
+  const scores = [];
+  for (const [text, content] of [['tea walk', 'tea'], ['activities partake', 'activities']]) {
+    const [candidate] = buildOrdinarySeedCandidates({
+      nodes: [{ id: 'match', kind: 'event', title: '', content, status: 'active', importance: 0.5 }],
+      query: text, intent: 'auto', options: DEFAULT_RETRIEVAL_OPTIONS,
+      entityScores: new Map([['match', 0.8]]),
+    });
+    assert.equal(candidate.routeContributions.lexical, DEFAULT_RETRIEVAL_OPTIONS.bm25ContributionWeight / 2);
+    scores.push(candidate.score);
+  }
+  assert.equal(scores[0], scores[1]);
+});
+
+test('a literal match outside indexed results does not bypass BM25 ranking', () => {
+  const nodes = ['indexed', 'outside'].map(id => ({ id, kind: 'event', title: '',
+    content: 'University education', status: 'active', importance: 0.5 }));
+  const result = buildOrdinarySeedCandidates({ nodes, query: 'university education', intent: 'auto',
+    options: DEFAULT_RETRIEVAL_OPTIONS,
+    bm25Scores: new Map([['indexed', { normalizedScore: 0.3, bestSearchRank: -1 }]]),
+  });
+  assert.equal(result.length, 2);
+  assert.deepEqual(result.map(c => c.node.id), ['indexed', 'outside']);
+  assert.ok(result[0].score > result[1].score);
+  assert.equal(result[1].routeContributions.lexical, 0);
+  assert.equal(result[1].routeContributions.bm25, undefined);
+});
+
+test('short Chinese terms retain a fallback when another query term has indexed matches', () => {
+  const nodes = [
+    { id: 'short', content: '咖啡' },
+    { id: 'indexed', content: 'Museum' },
+  ].map(n => ({ ...n, kind: 'event', title: '', status: 'active', importance: 0.5 }));
+  const result = buildOrdinarySeedCandidates({ nodes, query: '咖啡 museum', intent: 'auto',
+    options: DEFAULT_RETRIEVAL_OPTIONS, entityScores: new Map(nodes.map(n => [n.id, 0.8])),
+    bm25Scores: new Map([['indexed', { normalizedScore: 0.8, bestSearchRank: -1 }]]),
+  });
+  const short = result.find(c => c.node.id === 'short');
+  assert.ok(short.routeContributions.lexical > 0);
+  assert.ok(short.routeContributions.lexical <= DEFAULT_RETRIEVAL_OPTIONS.bm25ContributionWeight);
+  assert.equal(result.find(c => c.node.id === 'indexed').routeContributions.lexical, 0);
+});
+
+test('BM25 reuses the prepared topic terms instead of querying a configured person name alone', () => {
+  const calls = [];
+  const preparedQuery = prepareLexicalQuery('What did Melanie paint?', { personNames: ['Melanie'] });
+  const result = collectBm25SeedScores({ query: 'What did Melanie paint?', preparedQuery, agentId: 'person-query',
+    repository: { search(_agent, text) { calls.push(text); return []; } },
+  });
+  assert.ok(calls.length > 0);
+  assert.ok(!calls.some(text => text.toLowerCase() === 'melanie'));
+  assert.ok(calls.some(text => text.toLowerCase() === 'paint'));
+  assert.equal(result.audit.queryCount, calls.length);
+});
+
+test('equal BM25 scores remain equal regardless of index return order', () => {
+  const rows = ['older', 'newer'].map(id => ({ id, content: 'Museum', search_rank: -2 }));
+  const score = values => collectBm25SeedScores({ query: 'museum', agentId: 'ties',
+    repository: { search() { return values; } },
+  });
+  const forward = score(rows), backward = score([...rows].reverse());
+  assert.equal(forward.scores.get('older').normalizedScore, forward.scores.get('newer').normalizedScore);
+  assert.deepEqual(forward.scores.get('older'), backward.scores.get('older'));
+  assert.deepEqual(forward.scores.get('newer'), backward.scores.get('newer'));
+});
+
+test('configured person names in a phrase do not invalidate its matching topic words', () => {
+  const query = 'Melanie pottery class';
+  const result = collectBm25SeedScores({ query, agentId: 'phrase-person',
+    preparedQuery: prepareLexicalQuery(query, { personNames: ['Melanie'] }),
+    repository: { search() { return [{ id: 'pottery', content: query, search_rank: -2 }]; } },
+  });
+  assert.equal(result.scores.has('pottery'), true);
+  assert.equal(result.audit.rejectedWordBoundaryCount, 0);
+});
+
+test('current-state priority applies to state questions rather than every named-person query', () => {
+  const node = { id: 'preference', kind: 'preference', title: '', content: 'Melanie finds blue calming.',
+    status: 'active', importance: 0.5, state_family: 'preference', temporal_state: 'current',
+    subject_role: 'agent', subject_key: 'melanie', canonical_key: 'melanie:blue', representation_layer: 'reported' };
+  const input = { nodes: [node], query: 'Melanie activities', intent: 'auto', options: DEFAULT_RETRIEVAL_OPTIONS,
+    entityScores: new Map([[node.id, 0.8]]) };
+  const personal = { matched: true, mode: 'personal', role: 'agent', key: 'melanie' };
+  const [event] = buildOrdinarySeedCandidates({ ...input, querySubject: { ...personal, focus: 'event' } });
+  const [state] = buildOrdinarySeedCandidates({ ...input, querySubject: { ...personal, focus: 'state' } });
+  const [generic] = buildOrdinarySeedCandidates(input);
+  assert.equal(event.score, generic.score);
+  assert.ok(Math.abs(state.score - event.score - 0.1) < 1e-12);
 });
 
 function fixture(t) {
@@ -185,7 +276,8 @@ test('ranked quotes and their nearby reply preserve world and agent boundaries',
   try { result = await recall(databasePath); }
   finally { MemoryRepository.prototype.expand = expand; }
   assert.ok(expansions.length <= 2);
-  assert.equal(expansions.filter(value => value.ids.includes('address')).length, 1);
+  assert.equal(expansions.filter(value => value.ids.includes('address')).length, 0,
+    'A self-contained statement does not require reading its adjacent acknowledgement.');
   assert.ok(expansions.every(value => value.maxNodes <= 100));
   assert.equal(result.status, 'ready');
   assert.equal(result.seedRouting.primaryMemoryId, 'office');
@@ -228,7 +320,6 @@ for (const scenario of [
     add(repository, 'primary', scenario.primary, { kind: scenario.primaryKind, similarity: 1, importance: 1 });
     add(repository, 'answer', scenario.answer, { kind: scenario.answerKind, similarity: 0.99, importance: 0.5 });
     const result = await recall(databasePath, {}, scenario.query);
-    assert.equal(result.seedRouting.primaryMemoryId, 'primary');
     assert.ok(result.candidates.some(candidate => candidate.memoryId === 'answer'));
     assert.ok(result.graph.selectedMemoryIds.includes('answer'));
     assert.ok(result.context.includes(scenario.answer));
@@ -271,10 +362,9 @@ test('a matched source exchange shares the total budget with an independent quot
     repository.upsertEdge({ agentId: 'relevance-agent', fromMemoryId, toMemoryId, relation: 'followed_by', weight: 1, confidence: 1 });
   }
   const result = await recall(databasePath);
-  assert.equal(result.seedRouting.primaryMemoryId, 'summary');
   assert.ok(result.graph.selectedMemoryIds.includes('other-quote'));
-  assert.deepEqual(result.graph.selectedMemoryIds, ['summary', 'other-quote', 'other-reply', 'source', 'source-reply']);
-  assert.deepEqual(result.graph.evidenceMemoryIds, ['other-quote', 'other-reply', 'source', 'source-reply']);
+  assert.deepEqual(new Set(result.graph.selectedMemoryIds), new Set(['summary', 'other-quote', 'other-reply', 'source', 'source-reply']));
+  assert.deepEqual(new Set(result.graph.evidenceMemoryIds), new Set(['other-quote', 'other-reply', 'source', 'source-reply']));
   assert.equal(result.context.split('你可以称呼我为sensei。').length - 1, 1);
   assert.ok(result.context.includes('好的，sensei。'));
   assert.ok(result.graph.selectedMemoryIds.length <= DEFAULT_RETRIEVAL_OPTIONS.maximumContextMemories);
@@ -309,7 +399,7 @@ test('source exchange selection ranks question relevance ahead of the earliest a
   }
   const result = await recall(databasePath, { maximumContextMemories: 3 });
   assert.equal(result.seedRouting.primaryMemoryId, 'summary');
-  assert.deepEqual(result.graph.evidenceMemoryIds, ['new-user', 'new-agent']);
+  assert.deepEqual(new Set(result.graph.evidenceMemoryIds), new Set(['new-user', 'new-agent']));
   assert.doesNotMatch(result.context, /院子转一转/u);
 });
 

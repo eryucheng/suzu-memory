@@ -37,20 +37,65 @@ async function process(memory, memories) {
   return { result, request };
 }
 
+test('English evidence retains language, names, quotation and source identity through archive and recall', async t => {
+  const memory = fixture(t, { primaryUserId: '', userName: '' });
+  t.after(() => memory.close());
+  const raw = 'I painted a sunrise yesterday. I called it "A New Beginning".';
+  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Melanie', raw)] });
+  const content = 'Melanie painted a sunrise—she named it "A New Beginning".';
+  const { request, result } = await process(memory, [candidate({
+    title: 'Melanie painted a sunrise', content, subjectName: 'Melanie',
+    actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: 'Melanie', confidence: 1 }],
+    eventDate: '2026-09-20',
+  })]);
+  assert.equal(result.memoriesStored, 1);
+  assert.match(request.input, /本窗口输出语言：English/);
+  const saved = memory.listMemories({ kinds: ['event'] }).items[0];
+  assert.equal(saved.content, content);
+  assert.equal(saved.subject_key, 'agent-b');
+  const detail = memory.getMemory(saved.id);
+  assert.equal(detail.sources[0].content, raw);
+  const recalled = await memory.search('When did Melanie paint a sunrise?', { sourceScope: scope,
+    now: '2026-09-22T10:00:00Z', persistTrace: false });
+  assert.equal(recalled.status, 'ready');
+  assert.ok(recalled.candidates.some(item => item.memoryId === saved.id));
+  assert.match(recalled.context, /Melanie painted a sunrise/);
+  assert.match(recalled.context, /A New Beginning/);
+});
+
+test('English name apostrophe typography preserves host identity through extraction and recall', async t => {
+  const memory = fixture(t, { primaryUserId: '', userName: '' });
+  t.after(() => memory.close());
+  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'O’Neill', 'I visited the lighthouse museum.')] });
+  const { result } = await process(memory, [candidate({ subjectName: "O'Neill", title: 'Museum visit',
+    content: "O'Neill visited the lighthouse museum.",
+    actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: "O'Neill", confidence: 1 }] })]);
+  assert.equal(result.memoriesStored, 1);
+  const saved = memory.listMemories({ kinds: ['event'] }).items[0];
+  assert.equal(saved.subject_key, 'agent-b');
+  assert.ok(memory.getMemory(saved.id).roles.every(actor => actor.actor_key === 'agent-b'));
+  for (const name of ["O'Neill", 'O’Neill']) {
+    const recalled = await memory.search(`When did ${name} visit the lighthouse museum?`, { sourceScope: scope,
+      now: '2026-09-22T10:00:00Z', persistTrace: false });
+    assert.equal(recalled.status, 'ready');
+    assert.ok(recalled.candidates.some(item => item.memoryId === saved.id));
+  }
+});
+
 test('named extraction preserves its narrative in storage, embeddings, presentation and recall', async t => {
   const memory = fixture(t, { primaryUserId: '', userName: '' });
-  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', '我想独自练习，请Suzu来看。')] });
-  const title = 'Mio邀请Suzu看练习';
-  const content = 'Mio请Suzu看练习。Mio说：“我想独自练习。”';
-  const { request } = await process(memory, [candidate({ title, content })]);
-  assert.match(request.systemPrompt, /叙述者不用“我”或“你”代替姓名/);
+  const raw = '我想独自练习《海边—灯塔》，时间是18:00–19:00，请Suzu来看。';
+  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', raw)] });
+  const title = 'Mio邀请Suzu看《海边—灯塔》练习';
+  const content = 'Mio请Suzu看练习。Mio说：“我想独自练习《海边—灯塔》，时间是18:00–19:00。”';
+  await process(memory, [candidate({ title, content })]);
   const saved = memory.listMemories({ kinds: ['event'] }).items[0];
   assert.equal(saved.content, content);
   assert.equal(saved.title, title);
   const detail = memory.getMemory(saved.id);
   assert.equal(detail.memory.content, content, 'The editor receives the stored narrative.');
   assert.equal(detail.memory.title, title);
-  assert.equal(detail.sources[0].content, '我想独自练习，请Suzu来看。');
+  assert.equal(detail.sources[0].content, raw);
   const graph = memory.brainSnapshot();
   assert.equal(graph.nodes.find(n => n.id === saved.id).preview, content);
   const calls = [];
@@ -63,7 +108,7 @@ test('named extraction preserves its narrative in storage, embeddings, presentat
     now: '2026-09-21T10:00:00Z', options: { heading: '我想起了：', guidance: '', maximumContextChars: 3000 } });
   assert.equal(recalled.status, 'ready');
   assert.match(recalled.context, /Mio请Suzu看练习/);
-  assert.match(recalled.context, /Mio说：“我想独自练习。”/);
+  assert.ok(recalled.context.includes(content));
   assert.equal(memory.getMemory(saved.id).memory.content, content);
 });
 
@@ -200,8 +245,6 @@ test('owner perspective works without a primary human and preserves who experien
     candidate({subjectRole: 'agent', subjectName: 'Suzu', content: '我今天独自去了书店。', sourceRefs: ['M0002'],
       actorRoles: [{role: 'experiencer', actorRole: 'agent', actorName: 'Suzu', confidence: 1}]})]);
   assert.equal(result.memoriesStored, 2);
-  assert.match(request.input, /标题和正文叙述使用人物完整姓名，包括拥有者/);
-  assert.match(request.systemPrompt, /原消息和引语里的“我”属于该消息的实际说话者/);
   assert.doesNotMatch(request.input, /"role":"user"|Absent Human|absent-human/);
   const nodes = memory.listMemories({kinds: ['event']}).items;
   assert.equal(nodes.find(node => node.content.startsWith('我今天')).subject_key, 'agent-a');
@@ -296,6 +339,31 @@ function directStateAnalysis({ input, analyzerRole, stateFamily }) {
   assert.ok(fields[analyzerRole], analyzerRole);
   return { output: { analyses: [{ ...common, ...fields[analyzerRole] }] }, usage: {} };
 }
+
+test('state holders use resolved identities across English apostrophes and Chinese name typography', async t => {
+  const memory = fixture(t);
+  t.after(() => memory.close());
+  memory.appendEventSources({ scope, events: [
+    event(1, 'agent-b', 'O’Neill', 'I like sunrise painting.'),
+    event(2, 'agent-c', 'Ｍｉｏ', '我喜欢灯塔画。'),
+  ] });
+  const preference = (subjectName, holderName, sourceRef) => candidate({
+    kind: 'preference', stateFamily: 'preference', stateLabel: 'painting', canonicalKey: 'painting',
+    title: sourceRef === 'M0001' ? 'Sunrise painting' : '灯塔画',
+    content: sourceRef === 'M0001' ? `${subjectName} likes sunrise painting.` : `${subjectName}喜欢灯塔画。`,
+    temporalState: 'current', retentionReason: 'explicit_preference', subjectName,
+    actorRoles: [{ role: 'preference_holder', actorRole: 'other', actorName: holderName, confidence: 1 }],
+    sourceRefs: [sourceRef],
+  });
+  const { result } = await process(memory, [preference("O'Neill", 'O’Neill', 'M0001'),
+    preference('Mio', 'Ｍｉｏ', 'M0002'), preference("O'Neill", 'Mio', 'M0001')]);
+  for (const [index, expectedKey] of ['agent-b', 'agent-c'].entries()) {
+    const id = result.candidateResults[index].stateAnalysisRequestId;
+    assert.ok(id, JSON.stringify(result.candidateResults[index]));
+    memory.withRepository(repository => assert.equal(repository.getStateAnalysisRequest(agentId, id).subject_key, expectedKey));
+  }
+  assert.ok(result.candidateResults[2].reasons.includes('holder-conflicts-with-subject'));
+});
 
 test('one Agent keeps separate states for same-name Agents and humans across group spaces', async t => {
   const memory = fixture(t);

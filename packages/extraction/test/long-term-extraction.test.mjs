@@ -13,9 +13,12 @@ import {
   RETENTION_REASONS,
   archiveLongTermEvidence,
   buildLongTermExtractionInput,
+  buildExtractionParticipants,
   detectExtractionLanguage,
   isRetentionReasonCompatible,
   parseGeneratedLongTermExtraction,
+  resolveExtractionParticipant,
+  resolveExtractedCandidateIdentity,
 } from "../src/index.mjs";
 
 function temporaryDatabase() {
@@ -24,6 +27,26 @@ function temporaryDatabase() {
   const database = openMemoryDatabase(databasePath);
   return { root, database, repository: new MemoryRepository(database) };
 }
+
+test('apostrophe folding resolves known names without collapsing distinct host identities', () => {
+  const participants = buildExtractionParticipants([
+    { role: 'assistant', speaker: "O'Neill", text: 'I visited the museum.' },
+    { role: 'user', speaker: 'O’Neill', text: 'I visited the library.' },
+  ], { companionId: 'agent-oneill', companionName: "O'Neill", primaryUserId: 'human-oneill', primaryUserName: 'O’Neill' });
+  for (const name of ["O'Neill", 'O’Neill']) {
+    assert.equal(resolveExtractionParticipant(name, participants).status, 'ambiguous');
+  }
+  assert.equal(new Set(participants.map(person => person.actorKey)).size, 2);
+  for (const person of participants) {
+    const resolved = resolveExtractionParticipant(person.name, participants);
+    assert.equal(resolved.status, 'known');
+    assert.equal(resolved.participant.actorKey, person.actorKey);
+  }
+  const unresolved = resolveExtractedCandidateIdentity({ subjectRole: 'other', subjectName: 'O’Neill', kind: 'event',
+    actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: "Ｏ'Ｎｅｉｌｌ", confidence: 1 }] },
+  'owner', { participants: [], unresolvedActorScope: 'one-window' });
+  assert.equal(unresolved.actorRoles[0].actorKey, unresolved.subjectKey);
+});
 
 test("long-term extraction schema has no host continuity summary", () => {
   assert.deepEqual(LONG_TERM_EXTRACTION_SCHEMA.required, ["memories"]);
@@ -138,6 +161,24 @@ test('a short English message retains its language in a mostly Chinese batch', (
   assert.equal(built.archiveWindows[0].sourceLanguage, 'mixed');
   assert.deepEqual(built.messages.map(message => message.sourceLanguage), ['zh', 'en']);
   assert.match(built.input, /\[source-language=en\] user：I prefer mysteries\./u);
+});
+
+test('extraction preserves quoted names, time ranges and state labels in Chinese, English and mixed narratives', () => {
+  const narratives = [
+    { title: 'Reading—at home', content: 'Caroline prefers reading at 18:00–19:00—after dinner.', stateLabel: 'Reading at 18:00–19:00' },
+    { title: '阅读《海边—灯塔》', content: '小夏说：“我喜欢《海边—灯塔》，每天18:00–19:00读。”', stateLabel: '喜欢《海边—灯塔》' },
+    { title: '小夏每晚阅读《Sea–Light》', content: '小夏说：“我喜欢每天晚上安静地阅读Sea–Light。”', stateLabel: '喜欢安静阅读《Sea–Light》' },
+  ];
+  const input = { memories: narratives.map(narrative => ({
+    kind: 'preference', ...narrative, subjectRole: 'user', subjectName: '小夏', actorRoles: [],
+    canonicalKey: 'reading', stateFamily: 'preference', reality: 'real', evidenceMode: 'explicit',
+    temporalState: 'current', revisionAction: 'add', retentionReason: 'explicit_preference',
+    eventDate: '', eventStart: '', eventEnd: '', confidence: 1, importance: 0.5, sourceRefs: ['M0001'],
+  })) };
+  const original = structuredClone(input);
+  const parsed = parseGeneratedLongTermExtraction(input);
+  assert.deepEqual(parsed.memories.map(({ title, content, stateLabel }) => ({ title, content, stateLabel })), narratives);
+  assert.deepEqual(input, original);
 });
 
 test('owner and same-name speakers use supplied identities throughout core and boundary context', () => {

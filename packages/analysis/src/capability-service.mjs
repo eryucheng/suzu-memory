@@ -1,5 +1,5 @@
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial } from './source-material.mjs';
+import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -121,7 +121,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
   const input = buildCapabilityGenerationInput(snapshot, definition);
   let generation = null;
   try {
-    generation = await generator({ input, systemPrompt, schema: definition.schema,
+    generation = await generator({ input, systemPrompt: analysisSystemPrompt(systemPrompt), schema: definition.schema,
       schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}), stateFamily: "capability", analyzerRole: definition.role });
     const parsed = parseCapabilityGeneration(definition.role, generation?.output, { maximumAnalyses });
     const accepted = [];

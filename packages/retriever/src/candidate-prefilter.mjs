@@ -2,7 +2,15 @@
 export function prefilterCandidateIds(database, agentId, prepared, routes, options, count) {
   if (options.sqlPrefilter === false || count < (options.sqlPrefilterThreshold ?? 1000)) return null;
   if (!database.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_fts_rows'").get()) return null;
-  const terms = [...new Set([...prepared.queryTerms, prepared.normalizedQuery].filter(Boolean))];
+  // This is a substring superset, not scoring. Silent-e/y spellings can differ
+  // across inflections (hope/hoping, study/studied) before word matching runs.
+  const englishPrefixes = Object.values(prepared.englishForms || {}).flat()
+    .flatMap(form => form.length >= 3 && /[ey]$/u.test(form) ? [form, form.slice(0, -1),
+      ...(form.endsWith('ie') ? [`${form.slice(0, -2)}y`] : [])] : [form]);
+  const apostropheParts = Object.values(prepared.englishForms || {}).flat().filter(form => form.includes("'"))
+    .map(form => form.split("'").filter(Boolean).sort((left, right) => right.length - left.length)[0]);
+  const terms = [...new Set([...prepared.queryTerms, ...englishPrefixes, ...apostropheParts,
+    prepared.normalizedQuery].filter(Boolean))];
   if (terms.length > 512) return null;
   const rows = database.prepare(`SELECT node.id FROM memory_nodes node
     LEFT JOIN memory_fts_rows search ON search.memory_id=node.id

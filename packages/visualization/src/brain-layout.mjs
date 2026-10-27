@@ -87,10 +87,6 @@ function finite(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function bounded(value, minimum, maximum) {
-  return Math.min(maximum, Math.max(minimum, finite(value)));
-}
-
 function hashUnit(value, salt) {
   const buffer = createHash("sha256").update(`${salt}\u001f${value}`).digest();
   return buffer.readUInt32BE(0) / 0xffffffff;

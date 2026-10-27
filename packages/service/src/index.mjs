@@ -1431,8 +1431,6 @@ export class MemoryService {
         retrievalOptions.recallReactivation,
       );
       if (sourceScope) sourceScope = this.withRepository(repository => assertEventSourceScope(repository, sourceScope, this.agentId), { readOnly: true });
-      const scopedEmbeddingProvider = embeddingProvider && Object.assign(
-        text => embeddingProvider(text, { signal }), embeddingProvider);
       const result = await retrieveMemories({
         databasePath: this.paths.databasePath,
         agentId: this.agentId,
@@ -1440,7 +1438,7 @@ export class MemoryService {
         anchorMemoryIds: anchors,
         anchorSelection,
         now: executionTime,
-        embeddingProvider: scopedEmbeddingProvider,
+        embeddingProvider,
         usageLedgerPath: this.paths.usageLedgerPath,
         queryPerspective: resolvedQueryPerspective,
         world: worldScope,

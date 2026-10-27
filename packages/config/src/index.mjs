@@ -175,7 +175,8 @@ export function normalizeMemoryConfig(value, {
     defaults: Object.freeze({
       memoryOwner: clean(defaults.memoryOwner),
       userName: clean(defaults.userName),
-      primaryUserId: clean(defaults.primaryUserId) || "user",
+      primaryUserId: clean(defaults.primaryUserId) || (defaults.createPrimaryRelationship === false ? '' : 'user'),
+      createPrimaryRelationship: defaults.createPrimaryRelationship !== false,
       companionId: clean(defaults.companionId) || clean(input.agentId),
       relationshipLabel: clean(defaults.relationshipLabel) || "关系",
       defaultWorldId: clean(defaults.defaultWorldId) || "relationship",
@@ -308,9 +309,9 @@ export function createProvidersFromMemoryConfig(config, {
     });
     return resolvedEmbedding;
   }
-  const embedding = embeddingConfig ? async (text) => embeddingProvider()(text) : null;
+  const embedding = embeddingConfig ? async (text, context) => embeddingProvider()(text, context) : null;
   if (embedding) {
-    embedding.embedMany = async (texts) => embeddingProvider().embedMany(texts);
+    embedding.embedMany = async (texts, context) => embeddingProvider().embedMany(texts, context);
     embedding.model = embeddingConfig.model;
     embedding.dimensions = embeddingConfig.dimensions;
   }

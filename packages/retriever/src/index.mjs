@@ -1,4 +1,5 @@
 export {
+  asksForHistoricalState,
   classifyChainIntent,
   classifyLifecycleCompletionIntent,
   classifyRecallIntent,

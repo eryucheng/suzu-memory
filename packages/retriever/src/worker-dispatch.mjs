@@ -58,7 +58,7 @@ async function acquire(databasePath, signal, idleTimeoutMs) {
     if (!job) return;
     if (message.type === 'embedding') {
       try {
-        const value = await job.scope(() => job.embeddingProvider(message.text));
+        const value = await job.scope(() => job.embeddingProvider(message.text, { signal: job.controller.signal }));
         if (pool.jobs.has(message.id)) worker.postMessage({ type: 'embedding-result', callId: message.callId, value });
       } catch (error) {
         if (pool.jobs.has(message.id)) worker.postMessage({ type: 'embedding-result', callId: message.callId, error: errorValue(error) });
@@ -73,7 +73,7 @@ async function acquire(databasePath, signal, idleTimeoutMs) {
   const failed = error => {
     if (pools.get(key) === pool) pools.delete(key);
     clearTimeout(pool.timer);
-    for (const job of pool.jobs.values()) { job.cleanup(); job.reject(error); }
+    for (const job of pool.jobs.values()) { job.controller.abort(error); job.cleanup(); job.reject(error); }
     pool.jobs.clear();
     available();
   };
@@ -127,12 +127,13 @@ export async function retrieveMemories(input = {}) {
     const onAbort = () => {
       const job = pool.jobs.get(id);
       if (!job) return;
+      job.controller.abort(signal.reason);
       pool.jobs.delete(id); job.cleanup(); reject(signal.reason);
       pool.worker.postMessage({ type: 'cancel', id });
       if (!pool.jobs.size && !pool.reservations) void stop(pool);
     };
     const cleanup = () => signal?.removeEventListener('abort', onAbort);
-    pool.jobs.set(id, { resolve, reject, cleanup, embeddingProvider, scope: AsyncLocalStorage.snapshot() });
+    pool.jobs.set(id, { resolve, reject, cleanup, embeddingProvider, controller: new AbortController(), scope: AsyncLocalStorage.snapshot() });
     signal?.addEventListener('abort', onAbort, { once: true });
     pool.worker.postMessage({ type: 'retrieve', id, input: clone, embedding: typeof embeddingProvider === 'function' });
     if (signal?.aborted) onAbort();

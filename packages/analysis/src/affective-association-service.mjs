@@ -1,5 +1,5 @@
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial } from './source-material.mjs';
+import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -66,7 +66,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
   const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8").replace(/^\uFEFF/u, "").trim();
   const sourceMaterial = analysisSourceMaterial(snapshot);
   const input = buildAffectiveAssociationGenerationInput(snapshot, definition); let generation = null;
-  try { generation = await generator({ input, systemPrompt, schema: definition.schema, schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
+  try { generation = await generator({ input, systemPrompt: analysisSystemPrompt(systemPrompt), schema: definition.schema, schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
     stateFamily: "affective_association", analyzerRole: definition.role });
     const parsed = parseAffectiveAssociationGeneration(definition.role, generation?.output, { maximumAnalyses });
     const analyses = []; const rejected = []; const seen = new Set();

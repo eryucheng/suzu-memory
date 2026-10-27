@@ -429,6 +429,8 @@ export async function processPendingCompanionEvents({
         generated.generation.metadata?.finalCandidateCount
         ?? generated.generation.output.memories.length,
       ),
+      unresolvedCandidateCount: generated.generation.metadata?.unresolvedCandidateCount ?? null,
+      candidateValidationIncomplete: Boolean(generated.generation.metadata?.candidateValidationIncomplete),
       knownParticipantRoleCorrectionCount: Number(
         generated.generation.metadata?.knownParticipantRoleCorrectionCount || 0,
       ),

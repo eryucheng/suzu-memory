@@ -9,6 +9,7 @@ import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
 import { closeRetrievalWorkers, DEFAULT_RETRIEVAL_OPTIONS, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
 import { createNodeReader } from '../src/node-reader.mjs';
 import { prefilterCandidateIds } from '../src/candidate-prefilter.mjs';
+import { collectBm25SeedScores } from '../src/bm25-route.mjs';
 import { buildEpisodicEvidenceSeedCandidates, buildOrdinarySeedCandidates, createSeedLexicalScorer } from '../src/seed-routes.mjs';
 
 function fixture(t, count = 60) {
@@ -42,6 +43,80 @@ test('prepared lexical queries preserve every score and term', () => {
       assert.deepEqual(lexicalScore(prepared, content), lexicalScore(query, content));
     }
   }
+});
+
+test('SQL English prefilter is a superset across word forms and apostrophe typography', t => {
+  const { databasePath } = fixture(t, 1);
+  const words = [...new Set([
+    ['paint','paints','painted','painting'], ['walk','walks','walked','walking'],
+    ['run','runs','running'], ['hop','hops','hopped','hopping'], ['hope','hopes','hoped','hoping'],
+    ['call','calls','called','calling'], ['fill','fills','filled','filling'], ['pass','passes','passed','passing'],
+    ['add','adds','added','adding'], ['cancel','cancels','cancelled','cancelling'],
+    ['travel','travels','traveled','travelled','traveling','travelling'], ['study','studies','studied','studying'],
+    ['try','tries','tried','trying'], ['lie','lies','lying'], ['die','dies','dying'], ['tie','ties','tying'],
+    ['use','uses','used','using'], ['prefer','prefers','preferred','preferring'],
+    ['stop','stops','stopped','stopping'], ['class','classes'], ['quiz','quizzes'], ['bus','buses'],
+    ['box','boxes'], ['city','cities'], ["O'Neill",'O’Neill'], ["D'Arcy",'D’Arcy'],
+    ["rock'n'roll",'rock’n’roll'], ["can't",'can’t'], ["I've",'I’ve'], ['well-being'], ['résumé'],
+  ].flat())];
+  const database = openMemoryDatabase(databasePath);
+  try {
+    const repository = new MemoryRepository(database);
+    repository.transaction(() => {
+      for (const [index, content] of words.entries()) repository.upsertMemory({ id: `word-${index}`,
+        agentId: 'perf-agent', kind: 'event', layer: 'episodic', content });
+    });
+    for (const query of words) {
+      const prepared = prepareLexicalQuery(query);
+      const ids = prefilterCandidateIds(database, 'perf-agent', prepared, {}, { sqlPrefilterThreshold: 0 }, words.length + 1);
+      for (const [index, document] of words.entries()) {
+        if (lexicalScore(prepared, document).overlap) {
+          assert.ok(ids.has(`word-${index}`), `Prefilter excluded a lexical match: ${query} / ${document}`);
+        }
+      }
+    }
+  } finally { database.close(); }
+});
+
+test('English BM25 boundary checks batch only matched FTS rows through their rowid mapping', t => {
+  const { databasePath } = fixture(t);
+  const database = openMemoryDatabase(databasePath);
+  try {
+    const repository = new MemoryRepository(database);
+    for (const [id, content] of [['cat', 'Caroline visited a museum with her cat.'],
+      ['education', 'Caroline discussed education.'], ['why-title', 'Caroline read Why.'], ['why-name', 'Caroline met Whyatt.']]) {
+      repository.upsertMemory({ id, agentId: 'perf-agent', kind: 'event', layer: 'episodic', content });
+    }
+    const reads = [];
+    const observed = { search: repository.search.bind(repository), database: { prepare(sql) {
+      const statement = database.prepare(sql);
+      return { all(...args) {
+        const rows = statement.all(...args);
+        reads.push({ sql, args, ids: rows.map(row => row.memory_id) });
+        return rows;
+      } };
+    } } };
+    const result = collectBm25SeedScores({ repository: observed, agentId: 'perf-agent', query: 'cat museum' });
+    assert.ok(result.scores.has('cat'));
+    assert.ok(!result.scores.has('education'));
+    assert.ok(result.audit.rejectedWordBoundaryCount > 0);
+    assert.equal(reads.length, 1, 'one additional batch for all English query plans');
+    assert.deepEqual(new Set(reads[0].ids), new Set(['cat', 'education']), 'only actual FTS hits are hydrated');
+    const plan = database.prepare(`EXPLAIN QUERY PLAN ${reads[0].sql}`).all(...reads[0].args);
+    assert.ok(plan.some(row => /memory_fts_rows.*USING INDEX memory_fts_rows_memory/u.test(row.detail)), JSON.stringify(plan));
+    assert.ok(plan.some(row => /VIRTUAL TABLE INDEX.*=/u.test(row.detail)), JSON.stringify(plan));
+    reads.length = 0;
+    const literal = collectBm25SeedScores({ repository: observed, agentId: 'perf-agent', query: 'What did I say about "Why"?' });
+    assert.ok(literal.scores.has('why-title'));
+    assert.ok(!literal.scores.has('why-name'));
+    assert.ok(literal.audit.rejectedWordBoundaryCount > 0);
+    assert.equal(reads.length, 1, 'quoted stop words use the same single batch');
+    assert.deepEqual(new Set(reads[0].ids), new Set(['why-title', 'why-name']));
+    reads.length = 0;
+    collectBm25SeedScores({ repository: observed, agentId: 'perf-agent', query: '灯塔博物馆' });
+    collectBm25SeedScores({ repository: observed, agentId: 'perf-agent', query: 'unmatchedword' });
+    assert.equal(reads.length, 0, 'no extra FTS body reads for Chinese or empty English results');
+  } finally { database.close(); }
 });
 
 test('seed routes share lexical work while retaining their own admission and adjustments', () => {
@@ -96,7 +171,7 @@ test('seed lexical reuse is bound to one prepared query and node snapshot', () =
   assert.ok(createSeedLexicalScorer(prepareLexicalQuery('2026-10-20'))(node).admissionOverlap > 0, 'event date remains part of seed text');
 });
 
-for (const execution of ['inline', 'worker']) test(`a retrieval scores seed text once per node (${execution})`, t => {
+for (const execution of ['inline', 'worker']) test(`a retrieval shares candidate assembly and seed text (${execution})`, t => {
   const { databasePath } = fixture(t, 60);
   const coverageDirectory = path.join(path.dirname(databasePath), 'coverage');
   const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
@@ -115,13 +190,20 @@ for (const execution of ['inline', 'worker']) test(`a retrieval scores seed text
   assert.equal(child.error, undefined);
   assert.equal(child.status, 0, child.stderr);
   const queryUrl = new URL('../src/query.mjs', import.meta.url).href;
+  const seedUrl = new URL('../src/seed-routes.mjs', import.meta.url).href;
   let calls = 0;
+  let assemblies = 0;
   for (const file of fs.readdirSync(coverageDirectory)) {
     const coverage = JSON.parse(fs.readFileSync(path.join(coverageDirectory, file), 'utf8'));
     for (const script of coverage.result.filter(value => value.url === queryUrl)) {
       calls += script.functions.filter(value => value.functionName === 'lexicalScore').reduce((sum, value) => sum + value.ranges[0].count, 0);
     }
+    for (const script of coverage.result.filter(value => value.url === seedUrl)) {
+      assemblies += script.functions.filter(value => value.functionName === 'buildOrdinarySeedCandidates')
+        .reduce((sum, value) => sum + value.ranges[0].count, 0);
+    }
   }
+  assert.equal(assemblies, 2, 'one shared ordinary assembly plus the separate episodic evidence policy');
   assert.equal(calls, 60, 'ordinary, convergence and episodic routes must reuse identical seed text scores');
 });
 
@@ -235,18 +317,41 @@ for (const execution of ['inline', 'worker']) test(`deferred bodies retain the e
   assert.match((await recall('雪山博物馆', options)).context, /SNAPSHOT_NEW/);
 });
 
-test('worker cancellation rejects promptly and subsequent retrieval still works', async t => {
+test('inline and worker cancellation reaches the embedding request and releases retrieval resources', async t => {
   const { recall } = fixture(t);
-  const controller = new AbortController();
-  let requested;
-  const started = new Promise(resolve => { requested = resolve; });
-  const work = recall('灯塔博物馆', { execution: 'worker' }, { signal: controller.signal,
-    embeddingProvider: async () => { requested(); return new Promise(() => {}); } });
-  const rejected = assert.rejects(work, { name: 'AbortError' });
-  await started;
-  controller.abort();
-  await rejected;
+  for (const execution of ['inline', 'worker']) {
+    const controller = new AbortController();
+    let requested, finish, providerSignal;
+    const started = new Promise(resolve => { requested = resolve; });
+    const work = recall('灯塔博物馆', { execution }, { signal: controller.signal,
+      embeddingProvider: (_text, context) => new Promise((resolve, reject) => {
+        providerSignal = context?.signal;
+        finish = () => resolve({ model: 'fixture', vector: [1, 0] });
+        providerSignal?.addEventListener('abort', () => reject(providerSignal.reason), { once: true });
+        requested();
+      }) });
+    const rejected = assert.rejects(work, { name: 'AbortError' });
+    await started;
+    controller.abort();
+    finish();
+    await rejected;
+    assert.equal(providerSignal?.aborted, true, execution);
+  }
   await closeRetrievalWorkers();
+  let requested, providerSignal;
+  const started = new Promise(resolve => { requested = resolve; });
+  const work = recall('灯塔博物馆', { execution: 'worker' }, {
+    embeddingProvider: (_text, context) => new Promise((_resolve, reject) => {
+      providerSignal = context?.signal;
+      providerSignal?.addEventListener('abort', () => reject(providerSignal.reason), { once: true });
+      requested();
+    }),
+  });
+  const rejected = assert.rejects(work, /worker exited/);
+  await started;
+  await closeRetrievalWorkers();
+  await rejected;
+  assert.equal(providerSignal?.aborted, true, 'Shutting down a worker must also stop its external request.');
   assert.equal((await recall('灯塔博物馆', { execution: 'worker' })).status, 'ready');
 });
 

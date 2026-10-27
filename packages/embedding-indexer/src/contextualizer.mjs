@@ -18,7 +18,7 @@ const DEFAULT_PROMPT_VERSION = "retrieval-context-v1";
 const DEFAULT_CONTEXT_EXCLUDED_KINDS = Object.freeze(["utterance", "topic_or_episode"]);
 const DEFAULT_SHORT_CONTENT_THRESHOLD_CHARS = 32;
 
-const LEADING_REFERENCE_PATTERN = /^(?:(?:对|嗯|啊|哦)[，,。\s]*)?(?:(?:这|那)(?:个|件|次|段|些|种|里|边|时候|句话|回事)|(?:他|她|它)(?:当时|后来|之前|之后|又|也|就|才|说|做|觉得))/u;
+const LEADING_REFERENCE_PATTERN = /^(?:(?:对|嗯|啊|哦)[，,。\s]*)?(?:(?:这|那)(?:个|件|次|段|些|种|里|边|时候|句话|回事)|(?:他|她|它)(?:当时|后来|之前|之后|又|也|就|才|说|做|觉得))|^(?:(?:yes|well|right|oh)[,\s]+)?(?:this|that|these|those|it|he|she|they|there|then)\b/iu;
 
 const PROPOSAL_SCHEMA = Object.freeze({
   type: "object",
@@ -65,7 +65,7 @@ function contentCharacters(value) {
   return [...clean(value).replace(/\s+/gu, "")].length;
 }
 
-const NEGATION_PATTERN = /(?:不|没|无|未|并非|不是|从不|不再|没有)/u;
+const NEGATION_PATTERN = /(?:不|没|无|未|并非|不是|从不|不再|没有)|\b(?:not|no|never|neither|nor|without|cannot|[a-z]+n['’]t)\b/iu;
 
 export function assessMemoryRetrievalContextCriticNeed(memory = {}, selection = {}) {
   const source = buildMemoryRetrievalContextSource(memory);

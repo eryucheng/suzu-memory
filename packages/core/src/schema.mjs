@@ -1,6 +1,7 @@
 import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
 import { backfillSearchRows } from './search-index.mjs';
-export const SCHEMA_VERSION = 45;
+import { memoryWorldsCompatible } from './ontology.mjs';
+export const SCHEMA_VERSION = 46;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2301,6 +2302,47 @@ export const MIGRATIONS = Object.freeze([
         `);
       }
       backfillSearchRows(database);
+    },
+  },
+  {
+    version: 46, name: 'inherit-structure-world-scope',
+    apply(database) {
+      // Only the default scope written by the old materializer is recoverable.
+      // Repair episodes first because they can themselves be topic members.
+      const containers = database.prepare(`
+        SELECT node.id, node.agent_id, node.kind, proposal.member_ids_json
+        FROM memory_structure_proposals proposal
+        JOIN memory_nodes node ON node.id = proposal.result_memory_id
+          AND node.agent_id = proposal.agent_id AND node.kind = proposal.kind
+        WHERE proposal.operation = 'create' AND node.status <> 'deleted'
+          AND proposal.review_state IN ('pending', 'accepted')
+          AND json_extract(node.metadata_json, '$.structureProposalId') = proposal.id
+          AND node.reality = 'real' AND node.world_id = 'primary' AND node.world_frame = 'unknown'
+        ORDER BY CASE node.kind WHEN 'episode' THEN 0 ELSE 1 END, node.id
+      `).all();
+      const readMembers = database.prepare(`
+        WITH ids AS (
+          SELECT value AS id FROM json_each(?)
+          UNION SELECT from_memory_id FROM memory_edges WHERE to_memory_id = ? AND relation = ?
+        )
+        SELECT node.id, node.agent_id, node.status, node.reality, node.world_id, node.world_frame
+        FROM ids LEFT JOIN memory_nodes node ON node.id = ids.id
+      `);
+      const update = database.prepare(`
+        UPDATE memory_nodes SET reality = ?, world_id = ?, world_frame = ?, updated_at = ? WHERE id = ?
+      `);
+      const repairedAt = new Date().toISOString();
+      for (const container of containers) {
+        const ids = JSON.parse(container.member_ids_json);
+        if (!Array.isArray(ids) || new Set(ids).size < 2) continue;
+        const members = readMembers.all(container.member_ids_json, container.id,
+          container.kind === 'episode' ? 'part_of_episode' : 'supports_topic');
+        const origin = members[0];
+        if (!origin || members.some(member => !member.id || member.agent_id !== container.agent_id
+          || member.status === 'deleted' || !memoryWorldsCompatible(origin, member))) continue;
+        if (origin.reality === 'real' && origin.world_id === 'primary' && origin.world_frame === 'unknown') continue;
+        update.run(origin.reality, origin.world_id, origin.world_frame, repairedAt, container.id);
+      }
     },
   },
 ]);

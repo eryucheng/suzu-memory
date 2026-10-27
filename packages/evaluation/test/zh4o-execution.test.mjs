@@ -87,11 +87,12 @@ test('resumed usage preserves prior costs, failures and provider attribution', (
 test('memory quality diagnostics retain counts without classifying quarantine, raw fallback or stalled work as outages', () => {
   const diagnostics = memoryPreparationDiagnostics({
     passes: [{ status: 'completed-with-failures', failures: [{ error: { code: 'INVALID_RESPONSE', message: 'invalid model response' } }],
-      input: [{ batches: [{ generationDiagnostics: { degraded: true } }] }] }],
+      input: [{ batches: [{ generationDiagnostics: { degraded: true, unresolvedCandidateCount: 2, candidateValidationIncomplete: true } }] }] }],
     inputEvents: [{ processing_disposition: 'quarantined' }],
     finalProgress: { total: 2, failures: 3 }, expectedEvents: 4, mappedEvents: 3,
   });
   assert.deepEqual(diagnostics, { quarantinedMessages: 1, archiveOnlyBatches: 1, failedMaintenancePasses: 1,
+    unresolvedExtractionCandidates: 2, incompleteExtractionBatches: 1,
     pendingWork: 2, failedWork: 3, missingInputEvents: 1, infrastructureFailures: [] });
   assert.equal(summarizeMemoryPreparation([{ memoryDiagnostics: diagnostics }, { memoryDiagnostics: diagnostics }]).quarantinedMessages, 2);
 });

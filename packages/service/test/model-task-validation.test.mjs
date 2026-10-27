@@ -24,7 +24,7 @@ test('extraction target branches expose only their family fields and reject cros
   await generator(request);
   assert.deepEqual(request.schema, original);
   const wireBranches = wireSchema.properties.memories.items.anyOf;
-  assert.equal(wireBranches.length, 5);
+  assert.equal(wireBranches.length, LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.anyOf.length);
   const verifyStrictObjects = schema => {
     if (schema.type === 'object') {
       assert.equal(schema.additionalProperties, false);
@@ -71,8 +71,13 @@ test('extraction target branches expose only their family fields and reject cros
   const event = { ...base, kind: 'event', stateFamily: 'not_applicable', canonicalKey: '', stateLabel: '', retentionReason: 'episodic_event' };
   const eventBranch = wireBranches.find(item => item.properties.stateFamily.enum.includes('not_applicable'));
   assert.equal(Object.hasOwn(eventBranch.properties, 'stateTarget'), false);
+  assert.deepEqual(eventBranch.properties.kind.enum, ['event', 'reflection']);
+  assert.deepEqual(wireBranches.find(item => item.properties.stateFamily.enum.includes('goal')).properties.kind.enum,
+    ['plan', 'commitment', 'open_loop']);
+  assert.deepEqual(wireBranches.find(item => item.properties.stateFamily.enum.includes('preference')).properties.kind.enum,
+    ['preference']);
   for (const [key, value] of Object.entries(original.properties.memories.items.properties)) {
-    if (['stateTarget', 'stateFamily'].includes(key)) continue;
+    if (['stateTarget', 'stateFamily', 'kind'].includes(key)) continue;
     for (const branch of wireBranches) assert.deepEqual(branch.properties[key], value);
   }
   assert.equal(Object.hasOwn(validateMemoryTaskOutput(request, { memories: [event] }).memories[0], 'stateTarget'), false);

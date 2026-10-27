@@ -16,3 +16,4 @@
 8. 不确定时不提议。宁可返回空数组，也不要为了产出而强行聚类。
 9. 输出必须严格符合给定 JSON Schema，不要输出解释、Markdown 或代码块。
 10. 如果输入含 `retrospectiveContext`，这是新记忆触发的旧网络回顾：`create` 必须同时引用 trigger 与 historical 成员；`attach` 必须至少引用 trigger，并只能挂到快照中已有容器。不要只重整旧记忆。
+11. 新建结构的 title、content 跟随 memberIds 所引用材料的语言；英文材料用英文，不受本提示词语言影响。混合材料保留各自语义，人物姓名、专有名词和引语不翻译。

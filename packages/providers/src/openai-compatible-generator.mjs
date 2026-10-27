@@ -323,6 +323,8 @@ export function createOpenAiCompatibleStructuredGenerator({
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
       let response;
+      let envelope;
+      let bodyText = "";
       try {
         response = await fetchImpl(endpoint, {
           method: "POST",
@@ -340,6 +342,17 @@ export function createOpenAiCompatibleStructuredGenerator({
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
+        try {
+          if (typeof response.text === "function") {
+            bodyText = await response.text();
+            envelope = JSON.parse(bodyText.replace(/^\uFEFF/u, ""));
+          } else {
+            envelope = await response.json();
+          }
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          // An unreadable body leaves no envelope and uses the validation below.
+        }
       } catch (error) {
         const message = error?.name === "AbortError"
           ? `记忆处理 API 请求超过 ${requestTimeoutMs}ms。`
@@ -357,19 +370,7 @@ export function createOpenAiCompatibleStructuredGenerator({
         clearTimeout(timer);
       }
 
-      let envelope;
-      let bodyText = "";
-      try {
-        if (typeof response.text === "function") {
-          bodyText = await response.text();
-          envelope = JSON.parse(bodyText.replace(/^\uFEFF/u, ""));
-        } else {
-          envelope = await response.json();
-        }
-        if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
-          throw new Error("Response envelope must be a JSON object.");
-        }
-      } catch {
+      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
         const message = invalidEnvelopeMessage(
           response,
           bodyText,

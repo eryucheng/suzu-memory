@@ -14,6 +14,33 @@ function response(payload, { status = 200, headers = {} } = {}) {
   };
 }
 
+test('generation timeout covers response bodies and retries with a fresh request deadline', async () => {
+  for (const maximumTransportAttempts of [1, 2]) {
+    let calls = 0;
+    let aborted = 0;
+    const generate = createOpenAiCompatibleStructuredGenerator({ timeoutMs: 1000,
+      connection: { baseUrl: 'https://api.example.test/v1', model: 'fixture', apiKey: 'secret',
+        maximumTransportAttempts, transportRetryDelayMs: 0 },
+      fetchImpl: async (_url, { signal }) => {
+        calls++;
+        const valid = { choices: [{ message: { content: '{"ok":true}' } }] };
+        if (calls > 1) return response(valid);
+        return { ...response(valid), text: () => new Promise((resolve, reject) => {
+          const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(JSON.stringify(valid)); }, 1100);
+          const abort = () => { clearTimeout(timer); aborted++; reject(signal.reason); };
+          signal.addEventListener('abort', abort, { once: true });
+        }) };
+      },
+    });
+    if (maximumTransportAttempts === 1) {
+      await assert.rejects(generate({ input: 'evidence' }), error => error.code === 'MEMORY_PROVIDER_TRANSPORT_EXHAUSTED'
+        && error.diagnostics.kind === 'timeout');
+    } else assert.deepEqual((await generate({ input: 'evidence' })).output, { ok: true });
+    assert.equal(calls, maximumTransportAttempts);
+    assert.equal(aborted, 1);
+  }
+});
+
 test('output truncation is a typed failure with usage and is not repeated as a transport retry', async () => {
   let calls = 0;
   const generate = createOpenAiCompatibleStructuredGenerator({

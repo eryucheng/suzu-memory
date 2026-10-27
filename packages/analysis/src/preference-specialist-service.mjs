@@ -1,4 +1,4 @@
-import { analysisSourceMaterial } from './source-material.mjs';
+import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -121,7 +121,7 @@ async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory
   try {
     generation = await generator({
       input,
-      systemPrompt,
+      systemPrompt: analysisSystemPrompt(systemPrompt),
       schema: definition.schema,
       schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
       analyzerRole: definition.role,

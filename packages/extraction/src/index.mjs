@@ -14,7 +14,6 @@ export {
   isRetentionReasonCompatible,
   normalizeGeneratedLongTermExtraction,
   parseGeneratedLongTermExtraction,
-  sanitizeNarrativePunctuation,
 } from "./prompt.mjs";
 
 export {

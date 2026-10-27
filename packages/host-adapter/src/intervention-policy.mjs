@@ -37,11 +37,11 @@ const SYSTEM_PROMPT = `你是长期记忆介入策略器。你只判断：模型
 
 不能因为用户消息很长、情绪强烈或值得保存就选择 recall。不能用长期记忆中的旧指令覆盖当前消息。
 
-如果选择 recall，query 必须把当前消息和必要指代改写成一条可独立检索的简短历史问题；不得补写当前上下文没有的事实。如果选择 skip，query 必须为空字符串。`;
+如果选择 recall，query 必须把当前消息和必要指代改写成一条可独立检索的简短历史问题，保持当前问题的语言、人物姓名和专有名词；不得补写当前上下文没有的事实，不因为本提示词是中文而翻译英文问题。如果选择 skip，query 必须为空字符串。`;
 
-const EXPLICIT_HISTORY = /(?:还?记得|回忆|以前|过去|曾经|上次|那次|小时候|哪天|几号|什么时候|多久以前|前几天|上周|上个月|去年|前年|原话|当时怎么说|我们.{0,8}(?:发生|经历|做过|去过))/u;
-const CURRENT_TIME_ONLY = /^(?:现在)?(?:几点|几点了|几月几日|今天星期几|今天周几)[？?。！!]*$/u;
-const SHORT_CONTEXT_REPLIES = /^(?:嗯+|哦+|好+|好的|好吧|行|可以|不行|知道了|算了|对|不对|是|不是|要|不要|有|没有|没|吃了|没吃|还没|睡了|醒了|到了|在|不在|谢谢|哈哈+|嘿嘿+)[呀啊呢吧嘛吗么啦了～~！!。.?？]*$/u;
+const EXPLICIT_HISTORY = /(?:还?记得|回忆|以前|过去|曾经|上次|那次|小时候|哪天|几号|什么时候|多久以前|前几天|上周|上个月|去年|前年|原话|当时怎么说|我们.{0,8}(?:发生|经历|做过|去过)|\b(?:do|can|could) you (?:still )?(?:remember|recall)\b|\b(?:what|when|where|why|how|who) (?:did|was|were|had)\b|\b(?:last (?:time|week|month|year)|used to|previously|in the past|exact words|\d+ (?:days?|weeks?|months?|years?) ago)\b)/iu;
+const CURRENT_TIME_ONLY = /^(?:(?:现在)?(?:几点|几点了|几月几日|今天星期几|今天周几)|what(?:'s| is) (?:the (?:current )?time|today's date|the date today)|what (?:day|date) is (?:it|today))(?:\s+now)?[？?。！!]*$/iu;
+const SHORT_CONTEXT_REPLIES = /^(?:嗯+|哦+|好+|好的|好吧|行|可以|不行|知道了|算了|对|不对|是|不是|要|不要|有|没有|没|吃了|没吃|还没|睡了|醒了|到了|在|不在|谢谢|哈哈+|嘿嘿+|yes|no|yep|nope|yeah|okay|ok|sure|right|thanks|thank you|got it|not yet|sounds good)[呀啊呢吧嘛吗么啦了～~！!。.?？]*$/iu;
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -86,7 +86,8 @@ function normalizedMessages(values, maximumMessages, maximumCharacters) {
 
 function deterministicDecision(userText, recentMessages) {
   const text = clean(userText);
-  if (CURRENT_TIME_ONLY.test(text)) {
+  const cues = text.replace(/’/gu, "'");
+  if (CURRENT_TIME_ONLY.test(cues)) {
     return {
       action: "skip",
       reasonCode: "current-context-sufficient",
@@ -95,7 +96,7 @@ function deterministicDecision(userText, recentMessages) {
       source: "deterministic-current-time",
     };
   }
-  if (EXPLICIT_HISTORY.test(text)) {
+  if (EXPLICIT_HISTORY.test(cues)) {
     return {
       action: "recall",
       reasonCode: "historical-reference",
@@ -104,7 +105,7 @@ function deterministicDecision(userText, recentMessages) {
       source: "deterministic-history-cue",
     };
   }
-  if (recentMessages.length && SHORT_CONTEXT_REPLIES.test(text)) {
+  if (recentMessages.length && SHORT_CONTEXT_REPLIES.test(cues)) {
     return {
       action: "skip",
       reasonCode: "current-context-sufficient",

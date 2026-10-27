@@ -1,5 +1,5 @@
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial } from './source-material.mjs';
+import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -148,7 +148,7 @@ async function invoke({ definition, generator, snapshot, promptDirectory, maximu
   try {
     generation = await generator({
       input,
-      systemPrompt,
+      systemPrompt: analysisSystemPrompt(systemPrompt),
       schema: definition.schema,
       schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
       stateFamily: "identity",
