@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AsyncResource } from 'node:async_hooks';
+import { DatabaseSync } from 'node:sqlite';
+import { executionEventSourceView, withEventSourceExecution } from '@suzu-memory/core';
 import { createMemoryService } from '../src/index.mjs';
 import { buildStructureSnapshot, buildRelationSnapshot } from '@suzu-memory/structurer';
 import { buildPreferenceEvidenceSnapshot } from '@suzu-memory/analysis';
@@ -138,4 +140,53 @@ test('cancellation fences late embedding writes and leaves the original lease fo
   const recovered = memory.recoverRunningMaintenance({ now: new Date(Date.now() + 3600000) });
   assert.equal(recovered.tasks.requeued, active.length);
   assert.ok(tasks(memory).filter(task => active.some(row => row.id === task.id)).every(task => task.status === 'pending' && !task.lease_owner));
+});
+
+// Verify the fixed source snapshot is reused, but never outlives writes or scope changes.
+test('source views reuse unchanged reads and invalidate for local writes, external writes and nested scopes', async t => {
+  const { memory, dataRoot, nodes } = await fixture();
+  t.after(async () => { await memory.close(); fs.rmSync(dataRoot, { recursive: true, force: true }); });
+  let collections = 0, rows = 0;
+  const prepare = DatabaseSync.prototype.prepare;
+  DatabaseSync.prototype.prepare = function (sql) {
+    const statement = prepare.call(this, sql);
+    return new Proxy(statement, { get(target, key) {
+      const value = target[key];
+      if (key === 'all') return (...args) => {
+        const result = value.apply(target, args);
+        if (/FROM (?:memory_input_events|source_records|memory_sources link|memory_state_analysis_runs|memory_state_evidence_observations observation)/u.test(sql)) {
+          collections += 1; rows += result.length;
+        }
+        return result;
+      };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  };
+  try {
+    memory.withRepository(repository => {
+      const first = executionEventSourceView(repository, agentId);
+      const initial = { collections, rows };
+      assert.ok(initial.collections > 0 && initial.rows > 0);
+      assert.equal(executionEventSourceView(repository, agentId), first);
+      assert.deepEqual({ collections, rows }, initial, 'No additional collections are read without a change.');
+      assert.equal(first.memoryIds.has(nodes[2].node.id), false);
+      repository.database.prepare('UPDATE memory_nodes SET title=? WHERE id=?').run('Local update', nodes[1].node.id);
+      const local = executionEventSourceView(repository, agentId);
+      assert.notEqual(local, first);
+      const external = new DatabaseSync(memory.paths.databasePath);
+      try { external.prepare('UPDATE memory_nodes SET title=? WHERE id=?').run('External update', nodes[1].node.id); }
+      finally { external.close(); }
+      const refreshed = executionEventSourceView(repository, agentId);
+      assert.notEqual(refreshed, local);
+      assert.equal(executionEventSourceView(repository, agentId), refreshed);
+      withEventSourceExecution(repository, () => {
+        const wider = executionEventSourceView(repository, agentId);
+        assert.notEqual(wider, refreshed);
+        assert.equal(wider.memoryIds.has(nodes[2].node.id), true);
+      }, { sourceScope: scope(2) });
+      const restored = executionEventSourceView(repository, agentId);
+      assert.equal(restored.memoryIds.has(nodes[2].node.id), false);
+      assert.equal(executionEventSourceView(repository, agentId), restored);
+    }, { sourceScope: scope() });
+  } finally { DatabaseSync.prototype.prepare = prepare; }
 });

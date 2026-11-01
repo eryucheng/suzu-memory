@@ -233,10 +233,12 @@ test("does not promote a single-side mutual claim into a shared relationship", (
     relationType: "closeness",
     relationLabel: "亲密",
     direction: "mutual_claim",
-    qualification: "unresolved",
+    qualification: "qualified",
   });
   const result = review(fixture.repository);
-  assert.equal(result.status, "skipped");
+  assert.equal(result.status, "ready");
+  assert.equal(result.proposedState.relationshipView.expressedDirection, "mutual_claim");
+  assert.equal(result.proposedState.relationshipView.sharedConfirmation, "unconfirmed");
   assert.equal(result.automaticSharedRelationshipWriteAllowed, false);
   fixture.database.close();
 });

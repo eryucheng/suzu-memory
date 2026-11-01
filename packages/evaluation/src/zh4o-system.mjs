@@ -884,7 +884,7 @@ export async function runZh4oMemorySystemBenchmark({
       ...conversation.sessions.flatMap(session => [`\n会话 ${session.ordinal}：`, ...session.turns.map(turn => `${turn.speaker}：${turn.text}`)]),
     ].join('\n') : '';
     const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "zh4o", identity: plan.identity,
-      sourceKind: "zh4o-roleplay-conversation", archiveMode: "length" });
+      sourceKind: "zh4o-roleplay-conversation" });
     const sample = previousSamples.get(conversation.sampleId) || { sampleId: conversation.sampleId,
       inputEvents: plan.events.length, imported: 0, memorySystemDegraded: false, preparationErrors: [],
       maintenanceCalls: 0, maintenanceFailures: [], inputBatches: [], effectiveDefaults: service.defaults,

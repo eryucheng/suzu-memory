@@ -232,7 +232,7 @@ test("requires explicit field cardinality and never lets the model change the fi
   fixture.database.close();
 });
 
-test("requires a value-scoped canonical key for another multi-value item", async () => {
+test("retains another multi-value item for lossless layer-specific set review", async () => {
   const fixture = setup({ currentLayer: "reported" });
   const record = fixture.add({ id: "second-alias", sourceContent: "我也用另一个别名小五。" });
   const result = await evaluate(fixture, record, {
@@ -248,8 +248,8 @@ test("requires a value-scoped canonical key for another multi-value item", async
     fieldCardinality: "multi_item",
     currentRepresentationLayer: "reported",
   });
-  assert.equal(result.actionPreviews[0].action, "review_required");
-  assert.equal(result.actionPreviews[0].reason, "multi-value-identity-item-requires-a-value-scoped-canonical-key");
+  assert.equal(result.actionPreviews[0].action, "accumulate_evidence");
+  assert.equal(result.actionPreviews[0].reason, "additional-identity-value-awaits-lossless-set-review");
   fixture.database.close();
 });
 

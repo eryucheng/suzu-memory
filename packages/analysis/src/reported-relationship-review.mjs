@@ -2,6 +2,7 @@ import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -37,7 +38,7 @@ function candidateFromObservation(observation, currentStatePresent) {
     || (grounding.polarity === "conditional" && !clean(grounding.conditionLabel))
     || perspective?.holderMatch !== "yes"
     || perspective?.counterpartMatch !== "yes"
-    || perspective?.direction !== "holder_to_counterpart"
+    || !["holder_to_counterpart", "mutual_claim", "about_pair"].includes(perspective?.direction)
     || perspective?.attribution !== "explicit_self_statement"
     || !ACTIVE_TIMES.has(scopeTime?.stateTime)
     || (!ACTIVE_DURATIONS.has(scopeTime?.duration) && !isExplicitRevocation)
@@ -65,6 +66,24 @@ function candidateFromObservation(observation, currentStatePresent) {
     ].join("\u001f")),
     observedAt: observation.observedAt,
   };
+}
+
+function compatibleRelationshipClaims(left, right, candidates) {
+  if (left.claimKey === right.claimKey) return true;
+  const affirmative = new Set(["sets", "affirms"]);
+  if (left.grounding.polarity !== right.grounding.polarity
+    && !(affirmative.has(left.grounding.polarity) && affirmative.has(right.grounding.polarity))) return false;
+  if ([left.grounding.relationType, right.grounding.relationType].some(type => SCOPED_RELATION_TYPES.has(type))
+    && left.grounding.relationType !== right.grounding.relationType) return false;
+  const comparison = left.relation.comparisonMemoryId === right.observation.memoryId ? left.relation
+    : right.relation.comparisonMemoryId === left.observation.memoryId ? right.relation : null;
+  const sharedAnchor = !comparison && left.relation.comparisonMemoryId
+    && left.relation.comparisonMemoryId === right.relation.comparisonMemoryId
+    && candidates.some(item => item.observation.memoryId === left.relation.comparisonMemoryId);
+  const comparisons = comparison ? [comparison] : sharedAnchor ? [left.relation, right.relation] : [];
+  return comparisons.length > 0 && comparisons.every(item => ["equivalent", "supports"].includes(item.comparisonRelation)
+    && (SCOPED_RELATION_TYPES.has(left.grounding.relationType)
+      ? item.comparisonScopeOverlap === "exact" : ["exact", "partial"].includes(item.comparisonScopeOverlap)));
 }
 
 function actionAgainstCurrent(candidate) {
@@ -102,6 +121,7 @@ function proposedState(candidate, snapshot, counterpart) {
       conditionLabel: clean(candidate.grounding.conditionLabel),
       duration: candidate.scopeTime.duration,
       holderViewStatus: "directly-reported",
+      expressedDirection: candidate.perspective.direction,
       truthStatus: "unverified",
       sharedConfirmation: "unconfirmed",
       runtimeAuthority: "none",
@@ -195,6 +215,8 @@ export function reviewReportedRelationshipState({
   }
   const selection = selectLatestReportedCandidate(candidates, {
     hasCurrentState: Boolean(snapshot.currentState),
+    compatible: (left, right) => compatibleRelationshipClaims(left, right, candidates),
+    compareTie: (left, right) => left.observation.memoryId.localeCompare(right.observation.memoryId),
     isExplicitChange: (candidate) => (
       candidate.relation.relation === "replaces"
       || (candidate.relation.relation === "revokes"
@@ -231,7 +253,7 @@ export function reviewReportedRelationshipState({
     representationLayer: "reported",
     action,
     currentStateId: snapshot.currentState?.id || "",
-    proposedState: action === "revoke" ? null : proposedState(selected, snapshot, counterpart),
+    proposedState: action === "revoke" ? null : withReportedEvidence(proposedState(selected, snapshot, counterpart), selection),
     selectedObservationId: selected.observation.id,
     consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
     snapshot,

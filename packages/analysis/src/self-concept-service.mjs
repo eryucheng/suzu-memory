@@ -1,11 +1,8 @@
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import { SELF_CONCEPT_ANALYZERS, buildSelfConceptGenerationInput,
   parseSelfConceptGeneration } from "./self-concept-contracts.mjs";
 import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
@@ -56,39 +53,10 @@ function enforceBoundary(role, analysis, snapshot) {
   }
   return analysis;
 }
-async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), { agentId, provider: generation.metadata?.provider || "",
-      model: generation.model, source: "memory-evaluation", feature: `memory-self-concept-${definition.role}`,
-      requestId: generation.requestId || "", usage: generation.usage,
-      metadata: { batchId, durationMs: Number(generation.durationMs || 0), ...generation.metadata } });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent(); return `费用流水写入失败：${error.message}`; }
-}
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8")
-    .replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildSelfConceptGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({ input, systemPrompt: analysisSystemPrompt(systemPrompt), schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}), stateFamily: "self_concept", analyzerRole: definition.role });
-    const parsed = parseSelfConceptGeneration(definition.role, generation?.output, { maximumAnalyses });
-    const accepted = []; const rejected = []; const seen = new Set();
-    for (const [index, item] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(item.memoryId)) throw new Error("A self-concept analyzer can analyze each memory at most once.");
-        accepted.push(enforceBoundary(definition.role, item, snapshot)); seen.add(item.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent(); rejected.push({ index, memoryId: item.memoryId, error: error.message }); }
-    }
-    return { definition, input, generation, analyses: accepted, rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" };
-  } catch (error) {
-      assertEventSourceExecutionCurrent(); return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildSelfConceptGenerationInput,
+    parseGeneration: parseSelfConceptGeneration, enforceBoundary: enforceBoundary });
 }
 function byMemory(items) { return new Map((Array.isArray(items) ? items : []).map((item) => [item.memoryId, item])); }
 function selfConceptGate({ concept, holder, stability, time, relation, currentState }) {
@@ -162,6 +130,7 @@ function mergeAnalyses({ evaluation, persistEvidenceLedger }) {
   const memoryIds = uniqueStrings(Object.values(evaluation.analyses).flat().map((item) => item.memoryId));
   const observations = []; const previews = [];
   for (const memoryId of memoryIds) {
+    if (Object.values(maps).some(map => !map.has(memoryId))) continue;
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const concept = maps.conceptGrounding?.get(memoryId) || null;
     const holder = maps.holderAttribution?.get(memoryId) || null;
@@ -205,7 +174,7 @@ function mergeAnalyses({ evaluation, persistEvidenceLedger }) {
 export async function evaluateSelfConceptEvidence({
   repository, agentId, subjectRole, subjectKey, canonicalKey, selfConceptLabel,
   memoryIds = [], analyzers = {}, usageLedgerPath = "", promptDirectory = DEFAULT_PROMPT_DIRECTORY,
-  snapshotOptions = {}, maximumAnalyses = 60, persistEvidenceLedger = true,
+  snapshotOptions = {}, maximumAnalyses = Infinity, persistEvidenceLedger = true,
   currentRepresentationLayer = "",
 } = {}) {
   if (!repository) throw new Error("Self-concept evaluation requires a repository.");
@@ -232,34 +201,15 @@ export async function evaluateSelfConceptEvidence({
     batchId, snapshot, runs: {}, analyses: {}, rejected: {}, observations: [], actionPreviews: [], failedRoles: [],
     warnings: [], automaticStateWriteAllowed: false };
   const definitions = Object.entries(SELF_CONCEPT_ANALYZERS);
+  const previousRuns = priorAnalyzerRuns(repository, snapshot, batchId, definitions, snapshotOptions);
   const invocations = await Promise.all(definitions.map(async ([key, definition]) => [key,
-    await invokeAnalyzer({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses })]));
-  const sourceIds = uniqueStrings(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-  const runs = {}; const analyses = {}; const rejected = {}; const warnings = [];
-  for (const [key, invocation] of invocations) {
-    const warning = await appendAnalyzerUsage({ usageLedgerPath, generation: invocation.generation,
-      definition: invocation.definition, agentId: clean(agentId), batchId });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot), agentId: clean(agentId), batchId, stateFamily: "self_concept",
-      analyzerRole: invocation.definition.role, subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey, canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported", promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName, inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
-      status: invocation.status, memoryIds: snapshot.memories.map((memory) => memory.id), sourceIds,
-      output: invocation.generation?.output ?? {}, rejected: invocation.rejected, usage: invocation.generation?.usage || {},
-      costAmount: Number(invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0) || 0,
-      costCurrency: clean(invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error, metadata: { selfConceptLabel: clean(selfConceptLabel),
-        currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false } });
-    analyses[key] = invocation.analyses; rejected[key] = invocation.rejected;
-  }
-  const failedRoles = definitions.map(([key]) => key).filter((key) => ["failed", "rejected"].includes(runs[key].status));
+    await invokeAnalyzer({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses, previousRuns })]));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, stateFamily: 'self_concept', snapshot, invocations, usageLedgerPath,
+    metadata: { selfConceptLabel: clean(selfConceptLabel), currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false },
+  });
   const evaluation = { repository, batchId, snapshot, runs, analyses };
-  let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) merged = repository.transaction(() => mergeAnalyses({ evaluation, persistEvidenceLedger }));
+  const merged = repository.transaction(() => mergeAnalyses({ evaluation, persistEvidenceLedger }));
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
   return { status: failedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
     reason: failedRoles.length ? "required-self-concept-analyzer-failed-or-rejected" : "", batchId, snapshot,

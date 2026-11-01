@@ -1,5 +1,6 @@
 export * from "./affective-association-contracts.mjs";
 export * from "./affective-association-service.mjs";
+export { analysisCountLimit, analysisSchemaForCount } from './analysis-output.mjs';
 export * from "./behavior-state-contracts.mjs";
 export * from "./behavior-state-service.mjs";
 export * from "./belief-contracts.mjs";

@@ -1,19 +1,10 @@
 export {
-  asksForHistoricalState,
-  classifyChainIntent,
-  classifyLifecycleCompletionIntent,
-  classifyRecallIntent,
-  classifyRelationshipQueryIntent,
-  classifyRepresentationIntent,
-  isContinuationQuery,
   isGenericQuery,
   lexicalScore,
   lexicalTerms,
   planVectorQuery,
   prepareLexicalQuery,
   recallCorePhrases,
-  resolveContinuationAnchors,
-  resolveQuerySubject,
   resolveTemporalQuery,
 } from "./query.mjs";
 

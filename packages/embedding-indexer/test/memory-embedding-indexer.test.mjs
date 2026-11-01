@@ -266,6 +266,45 @@ test("replaces a metadata-bearing legacy vector once during ordinary synchroniza
   assert.equal(provider.calls.length, 1);
 });
 
+test('a late embedding response cannot overwrite the vector for edited content', async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  let finishOld, started;
+  const requestStarted = new Promise(resolve => { started = resolve; });
+  const old = Object.assign(async () => {
+    started();
+    return new Promise(resolve => { finishOld = () => resolve({ model: old.model, vector: [1, 0, 0] }); });
+  }, { model: 'race-test', dimensions: 3 });
+  const first = syncMemoryEmbeddings({ repository, agentId: 'agent-test', embeddingProvider: old, memoryIds: ['museum-event'] });
+  await requestStarted;
+  repository.editMemoryManually({ agentId: 'agent-test', memoryId: 'museum-event',
+    patch: { content: 'The museum trip was cancelled; I went to the library instead.' }, reason: 'Corrected destination' });
+  const fresh = Object.assign(async () => ({ model: old.model, vector: [0, 1, 0] }), { model: old.model, dimensions: 3 });
+  await syncMemoryEmbeddings({ repository, agentId: 'agent-test', embeddingProvider: fresh, memoryIds: ['museum-event'] });
+  const expected = repository.listEmbeddings('agent-test', old.model)[0];
+  finishOld();
+  const late = await first;
+  const actual = repository.listEmbeddings('agent-test', old.model)[0];
+  assert.equal(actual.content_hash, expected.content_hash);
+  assert.deepEqual(actual.vector, expected.vector);
+  assert.equal(late.failed, 1);
+  assert.deepEqual(late.failures[0].memoryIds, ['museum-event']);
+});
+
+test('deleting a memory while its embedding is pending does not restore a vector', async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const provider = Object.assign(async () => {
+    repository.setMemoryDeleted({ agentId: 'agent-test', memoryId: 'museum-event' });
+    return { model: 'deletion-test', vector: [1, 0] };
+  }, { model: 'deletion-test', dimensions: 2 });
+  const result = await syncMemoryEmbeddings({ repository, agentId: 'agent-test', embeddingProvider: provider, memoryIds: ['museum-event'] });
+  assert.equal(result.added, 0);
+  assert.equal(result.failed, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(database.prepare('SELECT count(*) n FROM memory_embeddings WHERE memory_id=?').get('museum-event').n, 0);
+});
+
 test("indexes structured memories and raw evidence, reuses hashes, and reindexes a changed node", async () => {
   const { database, repository } = fixture();
   const provider = fakeProvider();

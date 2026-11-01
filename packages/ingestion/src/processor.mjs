@@ -8,6 +8,7 @@ import {
   buildCompanionExtractionRequest,
   companionMessagesFromEvents,
   generateCompanionEventBatch,
+  extractionRepairFailure,
   recordCompanionEventGenerationUsage,
 } from "./processing-stages.mjs";
 
@@ -140,8 +141,7 @@ export async function processPendingCompanionEvents({
         maximumEvents: 500, maximumContentCharacters: 10_000_000, createdAt: completedAt,
         validateLogicalEvent: () => ({ code: 'INPUT_EVENT_CHUNK_LIMIT',
           message: 'The complete input event cannot fit the extraction chunk; original content is retained for review.',
-          details: { reason: chunk.reason, maximumRequestTokens: chunkPolicy.maximumRequestTokens,
-            estimatedRequestTokens: chunk.estimatedRequestTokens, maximumRequestCharacters: chunk.maximumRequestCharacters,
+          details: { reason: chunk.reason,  maximumRequestCharacters: chunk.maximumRequestCharacters,
             estimatedRequestCharacters: chunk.estimatedRequestCharacters } }),
       });
       return { status: 'quarantined', reason: chunk.reason, eventsProcessed: 0, quarantined: review.quarantined };
@@ -244,6 +244,7 @@ export async function processPendingCompanionEvents({
       systemPrompt,
       timeZone,
     });
+    terminalGenerationFailure = extractionRepairFailure(generated.generation);
   } catch (error) {
     assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
@@ -390,8 +391,8 @@ export async function processPendingCompanionEvents({
 
   return {
     status: "processed",
-    ...(chunk ? { chunk: { reason: chunk.reason, estimatedRequestTokens: chunk.estimatedRequestTokens,
-      maximumRequestTokens: chunk.maximumRequestTokens, coreCharacters: chunk.coreCharacters,
+    ...(chunk ? { chunk: { reason: chunk.reason,
+      coreCharacters: chunk.coreCharacters,
       maximumCoreCharacters: chunk.maximumCoreCharacters, estimatedRequestCharacters: chunk.estimatedRequestCharacters,
       coreMessages: chunk.coreMessages, maximumCoreMessages: chunk.maximumCoreMessages,
       maximumRequestCharacters: chunk.maximumRequestCharacters } } : {}),
@@ -413,6 +414,8 @@ export async function processPendingCompanionEvents({
         generated.generation.metadata?.transportAttempts || 0,
       ),
       repaired: Boolean(generated.generation.metadata?.repaired),
+      repairAttempts: Number(generated.generation.metadata?.repairAttempts || 0),
+      repairRejectedCandidateCount: Number(generated.generation.metadata?.repairRejectedCandidateCount || 0),
       salvaged: Boolean(generated.generation.metadata?.salvaged),
       initialCandidateCount: generated.generation.metadata?.initialCandidateCount ?? null,
       initialValidCandidateCount: Number(

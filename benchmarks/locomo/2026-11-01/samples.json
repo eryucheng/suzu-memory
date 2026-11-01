@@ -1,0 +1,382 @@
+[
+  {
+    "sampleId": "conv-26",
+    "sampleIndex": 0,
+    "sessions": 19,
+    "originalMessages": 419,
+    "questions": 152,
+    "correct": 140,
+    "failed": 0,
+    "accuracy": 0.9210526315789473,
+    "byCategory": {
+      "1": {
+        "questions": 32,
+        "correct": 28
+      },
+      "2": {
+        "questions": 37,
+        "correct": 35
+      },
+      "3": {
+        "questions": 13,
+        "correct": 9
+      },
+      "4": {
+        "questions": 70,
+        "correct": 68
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-30",
+    "sampleIndex": 1,
+    "sessions": 19,
+    "originalMessages": 369,
+    "questions": 81,
+    "correct": 73,
+    "failed": 0,
+    "accuracy": 0.9012345679012346,
+    "byCategory": {
+      "1": {
+        "questions": 11,
+        "correct": 9
+      },
+      "2": {
+        "questions": 26,
+        "correct": 26
+      },
+      "3": {
+        "questions": 0,
+        "correct": 0
+      },
+      "4": {
+        "questions": 44,
+        "correct": 38
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-41",
+    "sampleIndex": 2,
+    "sessions": 32,
+    "originalMessages": 663,
+    "questions": 152,
+    "correct": 140,
+    "failed": 0,
+    "accuracy": 0.9210526315789473,
+    "byCategory": {
+      "1": {
+        "questions": 31,
+        "correct": 25
+      },
+      "2": {
+        "questions": 27,
+        "correct": 25
+      },
+      "3": {
+        "questions": 8,
+        "correct": 5
+      },
+      "4": {
+        "questions": 86,
+        "correct": 85
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-42",
+    "sampleIndex": 3,
+    "sessions": 29,
+    "originalMessages": 629,
+    "questions": 199,
+    "correct": 175,
+    "failed": 0,
+    "accuracy": 0.8793969849246231,
+    "byCategory": {
+      "1": {
+        "questions": 37,
+        "correct": 29
+      },
+      "2": {
+        "questions": 40,
+        "correct": 36
+      },
+      "3": {
+        "questions": 11,
+        "correct": 6
+      },
+      "4": {
+        "questions": 111,
+        "correct": 104
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 1,
+      "unresolvedExtractionCandidates": 1,
+      "incompleteExtractionBatches": 1,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-43",
+    "sampleIndex": 4,
+    "sessions": 29,
+    "originalMessages": 680,
+    "questions": 178,
+    "correct": 149,
+    "failed": 0,
+    "accuracy": 0.8370786516853933,
+    "byCategory": {
+      "1": {
+        "questions": 31,
+        "correct": 25
+      },
+      "2": {
+        "questions": 26,
+        "correct": 21
+      },
+      "3": {
+        "questions": 14,
+        "correct": 7
+      },
+      "4": {
+        "questions": 107,
+        "correct": 96
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 1,
+      "unresolvedExtractionCandidates": 1,
+      "incompleteExtractionBatches": 1,
+      "failedMaintenancePasses": 1,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-44",
+    "sampleIndex": 5,
+    "sessions": 28,
+    "originalMessages": 675,
+    "questions": 123,
+    "correct": 114,
+    "failed": 0,
+    "accuracy": 0.926829268292683,
+    "byCategory": {
+      "1": {
+        "questions": 30,
+        "correct": 27
+      },
+      "2": {
+        "questions": 24,
+        "correct": 22
+      },
+      "3": {
+        "questions": 7,
+        "correct": 3
+      },
+      "4": {
+        "questions": 62,
+        "correct": 62
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 1,
+      "unresolvedExtractionCandidates": 5,
+      "incompleteExtractionBatches": 1,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-47",
+    "sampleIndex": 6,
+    "sessions": 31,
+    "originalMessages": 689,
+    "questions": 150,
+    "correct": 135,
+    "failed": 0,
+    "accuracy": 0.9,
+    "byCategory": {
+      "1": {
+        "questions": 20,
+        "correct": 16
+      },
+      "2": {
+        "questions": 34,
+        "correct": 29
+      },
+      "3": {
+        "questions": 13,
+        "correct": 7
+      },
+      "4": {
+        "questions": 83,
+        "correct": 83
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-48",
+    "sampleIndex": 7,
+    "sessions": 30,
+    "originalMessages": 681,
+    "questions": 191,
+    "correct": 173,
+    "failed": 0,
+    "accuracy": 0.9057591623036649,
+    "byCategory": {
+      "1": {
+        "questions": 21,
+        "correct": 17
+      },
+      "2": {
+        "questions": 42,
+        "correct": 38
+      },
+      "3": {
+        "questions": 10,
+        "correct": 9
+      },
+      "4": {
+        "questions": 118,
+        "correct": 109
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 1,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-49",
+    "sampleIndex": 8,
+    "sessions": 25,
+    "originalMessages": 509,
+    "questions": 156,
+    "correct": 140,
+    "failed": 0,
+    "accuracy": 0.8974358974358975,
+    "byCategory": {
+      "1": {
+        "questions": 37,
+        "correct": 32
+      },
+      "2": {
+        "questions": 33,
+        "correct": 29
+      },
+      "3": {
+        "questions": 13,
+        "correct": 12
+      },
+      "4": {
+        "questions": 73,
+        "correct": 67
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 1,
+      "unresolvedExtractionCandidates": 1,
+      "incompleteExtractionBatches": 1,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  },
+  {
+    "sampleId": "conv-50",
+    "sampleIndex": 9,
+    "sessions": 30,
+    "originalMessages": 568,
+    "questions": 158,
+    "correct": 145,
+    "failed": 0,
+    "accuracy": 0.9177215189873418,
+    "byCategory": {
+      "1": {
+        "questions": 32,
+        "correct": 30
+      },
+      "2": {
+        "questions": 32,
+        "correct": 29
+      },
+      "3": {
+        "questions": 7,
+        "correct": 6
+      },
+      "4": {
+        "questions": 87,
+        "correct": 80
+      }
+    },
+    "preparation": {
+      "quarantinedMessages": 0,
+      "archiveOnlyBatches": 0,
+      "unresolvedExtractionCandidates": 0,
+      "incompleteExtractionBatches": 0,
+      "failedMaintenancePasses": 0,
+      "pendingWork": 0,
+      "failedWork": 0,
+      "missingInputEvents": 0
+    }
+  }
+]

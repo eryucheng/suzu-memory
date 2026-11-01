@@ -55,6 +55,7 @@ export function collectBm25SeedScores({
   preparedQuery = null,
   worldId = "",
   worldFrame = "",
+  eligibleMemoryIds = null,
 }) {
   const prepared = preparedQuery || prepareLexicalQuery(query);
   const queries = preparedBm25Queries(query, prepared, { maximumQueries });
@@ -76,34 +77,29 @@ export function collectBm25SeedScores({
 
   const topicTerms = new Set(prepared.topicTerms || prepared.queryTerms);
   const queryEnglishTerms = Object.keys(prepared.englishForms).filter(term => topicTerms.has(term));
-  const plannedMatches = queries.map(planned => ({ planned, matches: repository.search(agentId, planned.text, {
-    includeArchived: true, limit: maximumResultsPerQuery, worldId, worldFrame,
-  }), englishTerms: queryEnglishTerms.filter(term => boundedOccurrences(
-    planned.text.normalize('NFKC').toLowerCase(), term).length) }));
-  // The shared trigram index also finds fragments inside English words. Check
-  // those hits against the same word matcher used by the lexical route. Read
-  // only the bounded FTS hits, including their approved retrieval context.
-  const englishMemoryIds = [...new Set(plannedMatches.filter(item => item.englishTerms.length)
-    .flatMap(item => item.matches.filter(memory => trueBm25Rank(memory.search_rank)).map(memory => memory.id)))];
-  const documents = new Map(englishMemoryIds.length && repository.database
-    ? repository.database.prepare(`SELECT memory_id,title,content FROM memory_fts
-        WHERE rowid IN (SELECT fts_rowid FROM memory_fts_rows INDEXED BY memory_fts_rows_memory
-          WHERE memory_id IN (SELECT value FROM json_each(?)) AND agent_id=?)`)
-      .all(JSON.stringify(englishMemoryIds), agentId).map(row => [row.memory_id, `${row.title}\n${row.content}`]) : []);
   const byMemory = new Map();
   const lexicalMatches = new Map();
   let ignoredLikeFallbackCount = 0;
   let rejectedWordBoundaryCount = 0;
-  for (const { planned, matches, englishTerms } of plannedMatches) {
-    const ftsRanked = matches.filter(memory => trueBm25Rank(memory.search_rank));
-    ignoredLikeFallbackCount += matches.length - ftsRanked.length;
-    const ranked = ftsRanked.filter(memory => {
-      if (!englishTerms.length) return true;
-      if (!lexicalMatches.has(memory.id)) lexicalMatches.set(memory.id, new Set(lexicalScore(prepared,
-        documents.get(memory.id) ?? `${memory.title || ''}\n${memory.content || ''}`).matchedTerms));
-      return englishTerms.every(term => lexicalMatches.get(memory.id).has(term));
+  let examinedFtsMatchCount = 0;
+  for (const planned of queries) {
+    const englishTerms = queryEnglishTerms.filter(term => boundedOccurrences(
+      planned.text.normalize('NFKC').toLowerCase(), term).length);
+    const matches = repository.search(agentId, planned.text, {
+      includeArchived: true, limit: maximumResultsPerQuery, worldId, worldFrame, eligibleMemoryIds,
+      acceptMatch(memory, document) {
+        if (memory.status === 'archived') return false;
+        if (trueBm25Rank(memory.search_rank)) examinedFtsMatchCount++;
+        if (!englishTerms.length) return true;
+        if (!lexicalMatches.has(memory.id)) lexicalMatches.set(memory.id, new Set(lexicalScore(prepared,
+          document).matchedTerms));
+        const accepted = englishTerms.every(term => lexicalMatches.get(memory.id).has(term));
+        if (!accepted && trueBm25Rank(memory.search_rank)) rejectedWordBoundaryCount++;
+        return accepted;
+      },
     });
-    rejectedWordBoundaryCount += ftsRanked.length - ranked.length;
+    const ranked = matches.filter(memory => trueBm25Rank(memory.search_rank));
+    ignoredLikeFallbackCount += matches.length - ranked.length;
     const resultCount = ranked.length;
     let rank = 0;
     for (let index = 0; index < ranked.length; index += 1) {
@@ -160,6 +156,7 @@ export function collectBm25SeedScores({
       matchedMemoryCount: scores.size,
       ignoredLikeFallbackCount,
       rejectedWordBoundaryCount,
+      examinedFtsMatchCount,
       matches: auditMatches,
     },
   };

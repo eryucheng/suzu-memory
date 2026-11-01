@@ -160,37 +160,41 @@ test('unresolved names are evidence-scoped references instead of global person I
   }
 });
 
-test('human approval preserves distinct known people and the observing owner', async t => {
+test('human approval preserves known people separately from the memory owner', async t => {
   const memory = fixture(t, { primaryUserId: '', userName: '' });
   memory.appendEventSources({ scope, events: [event(1, 'ren', 'Ren', '你好。'), event(2, 'mio', 'Mio', '我想和 Ren 再合作一次。')] });
   const { result } = await process(memory, [candidate({ kind: 'relationship', stateFamily: 'relationship',
     title: 'Mio 对 Ren 的信任', content: '我觉得 Mio 对 Ren 渐渐有了信任。',
-    canonicalKey: 'trust-ren', stateLabel: '对 Ren 的信任', stateTarget: { counterpartRole: 'other', counterpartName: 'Ren' },
+    canonicalKey: 'trust-ren', stateLabel: '对 Ren 的信任', stateTarget: { counterpartRole: 'other', counterpartName: 'Ren', relationshipDimension: 'trust' },
     evidenceMode: 'inferred', temporalState: 'current', retentionReason: 'relationship', sourceRefs: ['M0002'],
     actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: 'Mio', confidence: .9 },
       { role: 'participant', actorRole: 'other', actorName: 'Ren', confidence: .9 }] })]);
   const review = result.candidateResults[0];
-  const before = memory.getMemory(review.provisionalMemoryId).roles;
+  await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
+    generator: async () => { throw new Error('fixture provider unavailable'); }, structureGenerator: null });
+  const detail = memory.getReviewConsoleProposal('ingestion', review.ingestionDecisionId);
+  const before = memory.getMemory(detail.members.find(item => item.memory.layer === 'provisional').memory.id).roles;
   assert.ok(before.some(role => role.actor_key === 'ren'));
   const accepted = memory.resolveHighLevelProposal('ingestion', review.ingestionDecisionId, { action: 'accept' });
   assert.equal(accepted.resolution.status, 'accepted');
   const after = memory.getMemory(accepted.resolution.memory.id).roles;
   assert.ok(after.some(role => role.role === 'participant' && role.actor_key === 'ren'));
   assert.ok(after.some(role => role.role === 'experiencer' && role.actor_key === 'mio'));
-  assert.ok(after.some(role => role.role === 'observer' && role.actor_key === agentId));
+  assert.equal(accepted.resolution.memory.agent_id, agentId);
+  assert.equal(after.some(role => role.role === 'experiencer' && role.actor_key === agentId), false);
 });
 
-test('review retains known identities even when evidence alignment produces no provisional memory', async t => {
+test('third-party reports retain the described identity and their hearsay authority', async t => {
   const memory = fixture(t);
   memory.appendEventSources({ scope, events: [event(1, 'ren', 'Ren', 'Mio 今天参观了博物馆。'), event(2, 'mio', 'Mio', '你好。')] });
   const { result } = await process(memory, [candidate()]);
-  const review = result.candidateResults[0];
-  assert.ok(review.reasons.includes('explicit-memory-without-subject-source'));
-  assert.equal(review.provisionalMemoryId, '');
-  const accepted = memory.resolveHighLevelProposal('ingestion', review.ingestionDecisionId, { action: 'accept' });
-  assert.equal(accepted.resolution.status, 'accepted');
-  assert.equal(accepted.resolution.memory.subject_key, 'mio');
-  assert.ok(memory.getMemory(accepted.resolution.memory.id).roles.some(role => role.actor_key === 'mio'));
+  assert.equal(result.candidateResults[0].status, 'created');
+  const stored = memory.listMemories({ kinds: ['event'] }).items[0];
+  assert.equal(stored.subject_key, 'mio');
+  const detail = memory.getMemory(stored.id);
+  assert.ok(detail.roles.some(role => role.actor_key === 'mio'));
+  assert.equal(detail.sources[0].speaker, 'Ren');
+  assert.equal(detail.sources[0].authority, 'hearsay');
 });
 
 test('ambiguous people can only be bound to a supplied identity during human review', async t => {
@@ -288,15 +292,20 @@ test('shared group events use actual participants instead of a default user pair
   assert.doesNotMatch(node.subject_key, /user|absent-human/u);
 });
 
-test('explicit other-person state needs that person as source; observed owner events need no owner reply', async t => {
+test('third-party reports and observed owner events retain separate source authority', async t => {
   const memory = fixture(t);
-  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', 'Suzu 被分配了整理书单的任务。'),
+  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', 'Ren 今天参观了博物馆，Suzu 被分配了整理书单的任务。'),
     event(2, 'agent-c', 'Ren', '我去了公园。')] });
-  const { result } = await process(memory, [candidate({ subjectName: 'Ren', actorRoles: [], sourceRefs: ['M0001'] }),
+  const { result } = await process(memory, [candidate({ subjectName: 'Ren', content: 'Ren 今天参观了博物馆。', actorRoles: [], sourceRefs: ['M0001'] }),
     candidate({ subjectName: 'Suzu', subjectRole: 'agent', actorRoles: [], evidenceMode: 'observed',
       content: 'Mio 报告 Suzu 被分配了整理书单的任务。' })]);
-  assert.ok(result.candidateResults[0].reasons.includes('explicit-memory-without-subject-source'));
-  assert.equal(result.candidateResults[1].status, 'created');
+  assert.ok(result.candidateResults.every(item => item.status === 'created'));
+  const nodes = memory.listMemories({ kinds: ['event'] }).items;
+  const report = memory.getMemory(nodes.find(node => node.subject_key === 'agent-c').id);
+  const observation = memory.getMemory(nodes.find(node => node.subject_key === agentId).id);
+  assert.equal(report.sources[0].authority, 'hearsay');
+  assert.equal(observation.sources[0].authority, 'direct_observation');
+  assert.equal(report.sources[0].speaker, 'Mio');
 });
 
 test('known relationship target and holder resolve to actual Agent IDs', async t => {
@@ -304,7 +313,7 @@ test('known relationship target and holder resolve to actual Agent IDs', async t
   memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', '我信任 Suzu，会和它继续合作。')] });
   const { result } = await process(memory, [candidate({ kind: 'relationship', stateFamily: 'relationship',
     stateLabel: '对 Suzu 的信任', canonicalKey: 'mio-trust-suzu', temporalState: 'current', retentionReason: 'relationship',
-    stateTarget: { counterpartRole: 'other', counterpartName: 'Suzu' } })]);
+    stateTarget: { counterpartRole: 'other', counterpartName: 'Suzu', relationshipDimension: 'trust' } })]);
   const requestId = result.candidateResults[0].stateAnalysisRequestId;
   assert.ok(requestId, JSON.stringify(result.candidateResults));
   memory.withRepository(repository => {
@@ -316,7 +325,7 @@ test('known relationship target and holder resolve to actual Agent IDs', async t
 });
 
 function directStateAnalysis({ input, analyzerRole, stateFamily }) {
-  const snapshot = JSON.parse(input.slice(input.indexOf('\n\n{') + 2));
+  const snapshot = JSON.parse(input);
   assert.equal(snapshot.inputPolicy.memoryNarratorActorKey, agentId);
   assert.equal(snapshot.inputPolicy.firstPersonInUtterancesAndSourcesRefersToSpeaker, true);
   assert.equal(snapshot.currentState, null, 'Each personal target starts with its own state.');
@@ -328,7 +337,8 @@ function directStateAnalysis({ input, analyzerRole, stateFamily }) {
     'perspective-direction': { holderMatch: 'yes', counterpartMatch: 'yes',
       direction: 'holder_to_counterpart', attribution: 'explicit_self_statement' },
     'scope-time': { stateTime: 'current', duration: 'ongoing', revocationCue: 'none' },
-    'current-relation': { currentStatePresent: false, relation: 'no_current_state', scopeOverlap: 'unknown' },
+    'current-relation': { currentStatePresent: false, relation: 'no_current_state', scopeOverlap: 'unknown',
+      comparisonMemoryId: '', comparisonRelation: 'no_comparison', comparisonScopeOverlap: 'unknown' },
   } : {
     'target-intent': { targetMatch: 'exact', goalText: '整理书单', intentionLevel: 'plan', specificity: 'actionable' },
     'holder-responsibility': { holderMatch: 'yes', attribution: 'explicit_self_statement',
@@ -417,7 +427,7 @@ test('group relationship analysis accepts owner and multiple counterpart identit
     kind: 'relationship', stateFamily: 'relationship', stateLabel: `对 ${counterpartName} 的信任`,
     canonicalKey: `trust:${counterpart}`, subjectName: name, content: `${name} 信任 ${counterpartName}。`,
     temporalState: 'current', retentionReason: 'relationship', sourceRefs: [`M000${index + 3}`],
-    stateTarget: { counterpartRole: 'other', counterpartName },
+    stateTarget: { counterpartRole: 'other', counterpartName, relationshipDimension: 'trust' },
   })));
   const result = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
     generator: directStateAnalysis, structureGenerator: null });

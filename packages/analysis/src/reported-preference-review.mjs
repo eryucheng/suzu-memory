@@ -1,7 +1,10 @@
+import { readReportedStateDraft } from "@suzu-memory/core";
 import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.mjs";
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
+  compatibleReportedClaims,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -91,9 +94,7 @@ function candidateFromObservation(repository, snapshot, observation) {
 function currentClaim(repository, snapshot) {
   if (!snapshot.currentState) return null;
   const memory = repository.getMemory(snapshot.currentState.id);
-  const stored = memory?.metadata?.reportedPreference
-    || memory?.metadata?.preferenceClaim
-    || null;
+  const stored = readReportedStateDraft(memory).preferenceClaim;
   if (!stored || !["positive", "negative"].includes(clean(stored.polarity))) return null;
   const scope = stored.scope && typeof stored.scope === "object"
     ? stored.scope
@@ -232,6 +233,7 @@ export function reviewReportedPreferenceState({
     };
   }
   const selection = selectLatestReportedCandidate(candidates, {
+    compatible: (left, right) => compatibleReportedClaims("preference", left, right),
     hasCurrentState: Boolean(snapshot.currentState),
     isExplicitChange: (candidate) => CHANGE_CUES.has(candidate.time.revisionCue),
   });
@@ -255,7 +257,7 @@ export function reviewReportedPreferenceState({
       selection,
     );
   }
-  const proposed = action === "correct_attribution" ? null : proposedState(selected, snapshot);
+  const proposed = action === "correct_attribution" ? null : withReportedEvidence(proposedState(selected, snapshot), selection);
   return {
     status: "ready",
     reason: "",

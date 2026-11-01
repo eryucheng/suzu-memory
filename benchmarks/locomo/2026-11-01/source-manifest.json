@@ -1,0 +1,1710 @@
+{
+  "algorithm": "sha256-path-nul-lf-normalized-v1",
+  "sha256": "99ea9dbe0a7b15133db7ffca9e4f0b9ac9d561d5fb47b15530e5ce0737481d12",
+  "files": [
+    {
+      "path": "package-lock.json",
+      "sha256": "a0ca74d9debdab56adc50248d518ecfff683e2b125217d3d4096a1062e476d22"
+    },
+    {
+      "path": "package.json",
+      "sha256": "0dcd0ca025434a9dc44cc21eb943899dfd5bdfb729cdeedcb45802398aa72edd"
+    },
+    {
+      "path": "packages/analysis/package.json",
+      "sha256": "bc377d371a483349166decf6de23c95d193c03be5e8397b5c7637d4b40d402dc"
+    },
+    {
+      "path": "packages/analysis/resources/affective-association-basis-system-prompt.md",
+      "sha256": "50c568e6e49d343401959f68689873003e9c571167a44fb2302c4f4b0403ff89"
+    },
+    {
+      "path": "packages/analysis/resources/affective-current-relation-system-prompt.md",
+      "sha256": "cfa2690630404ef1eb143981eef67f1215e49cc16997d70ad86bcfe2930c7752"
+    },
+    {
+      "path": "packages/analysis/resources/affective-experiencer-system-prompt.md",
+      "sha256": "fbeac16bb0b7b4801f84df824b060f70039d96c1f07de0d128d8af5e87add52a"
+    },
+    {
+      "path": "packages/analysis/resources/affective-time-system-prompt.md",
+      "sha256": "6e166200d62b8e2c914817782b8de7bb2725d4870b943b315d0997ab7165fdef"
+    },
+    {
+      "path": "packages/analysis/resources/affective-trigger-emotion-system-prompt.md",
+      "sha256": "5ab658ed9e2327197126df44c9852ef1d0a4cd3fda50967d235dde64a10bab5c"
+    },
+    {
+      "path": "packages/analysis/resources/belief-current-relation-system-prompt.md",
+      "sha256": "d10fa0134f54a27211bed4d551c14277ef8946af184e9efa785f056b436777f6"
+    },
+    {
+      "path": "packages/analysis/resources/belief-holder-attribution-system-prompt.md",
+      "sha256": "bb5d4221a32834012597c48f519e3b5f159b93c3ea878223e7d89865b88670e2"
+    },
+    {
+      "path": "packages/analysis/resources/belief-proposition-grounding-system-prompt.md",
+      "sha256": "f7d8a1745db8d0a077df0ace7a24d923500875f69f860d42b7f2d5ed32cf6440"
+    },
+    {
+      "path": "packages/analysis/resources/belief-time-revision-system-prompt.md",
+      "sha256": "a99743e4ea37ce35666fc7c66baa37867abb55326da9486283f9e344d6fe14d7"
+    },
+    {
+      "path": "packages/analysis/resources/capability-holder-attribution-system-prompt.md",
+      "sha256": "8529a288df36e6b105295bde1360cfe2bc8b95e8eeb5661418025b0c4f43ddd4"
+    },
+    {
+      "path": "packages/analysis/resources/capability-independence-conditions-system-prompt.md",
+      "sha256": "4f3433d5357a89fcf20c9d22d85f841c8255c84cf4aa1e8da6fa7e7961af766a"
+    },
+    {
+      "path": "packages/analysis/resources/capability-performance-evidence-system-prompt.md",
+      "sha256": "48f22955892917df5b46376c677f4cf7adb1edafa353e1ae546ca3592d7451b7"
+    },
+    {
+      "path": "packages/analysis/resources/capability-skill-grounding-system-prompt.md",
+      "sha256": "230ccb058afd0e1242df3da626a96a6b5b4d799d5c85c04dd5f47c9a0b825b19"
+    },
+    {
+      "path": "packages/analysis/resources/capability-time-current-relation-system-prompt.md",
+      "sha256": "08e1ed80371fd7b6df238aee36969059946c3a86264ef7d2e57521dc01770752"
+    },
+    {
+      "path": "packages/analysis/resources/condition-evidence-system-prompt.md",
+      "sha256": "1aa61c712439d246319466a63bcb9a2ef50146d66d3973c7aaa9bfe5e598b62b"
+    },
+    {
+      "path": "packages/analysis/resources/disposition-evidence-system-prompt.md",
+      "sha256": "43c73a396b7cf195dcd2e0a3fdd6d650b7f32f129771b4dbfb5e18f0f1e40ce6"
+    },
+    {
+      "path": "packages/analysis/resources/goal-current-relation-system-prompt.md",
+      "sha256": "43e0f16ff2c315b23c168524a577f0b5e7b33953d00ab1d17ebd148cff34262f"
+    },
+    {
+      "path": "packages/analysis/resources/goal-holder-responsibility-system-prompt.md",
+      "sha256": "9a26df859fa46d7c33a7a07554710b3c6e0b83ff84eb2618680ee058abd9f56d"
+    },
+    {
+      "path": "packages/analysis/resources/goal-lifecycle-system-prompt.md",
+      "sha256": "2aa9253c9d8eabc1e12c30b0842119cbeb042b188268fc17d8000bd6cb33057f"
+    },
+    {
+      "path": "packages/analysis/resources/goal-target-intent-system-prompt.md",
+      "sha256": "b166b476fa444f98c55729d90b3740186e7fca70a524b291c607fd882e286a34"
+    },
+    {
+      "path": "packages/analysis/resources/habit-evidence-system-prompt.md",
+      "sha256": "30556e3597d48b80d3f8c10f7533ad5d04230ab575a0e5fccea5e187bf8b3953"
+    },
+    {
+      "path": "packages/analysis/resources/identity-current-relation-system-prompt.md",
+      "sha256": "3e433c95ea73fd38d0d344c32745d7b1a513ac0eadce53341c78653bb262911b"
+    },
+    {
+      "path": "packages/analysis/resources/identity-family-boundary-system-prompt.md",
+      "sha256": "fc9ef9459da4ed56768be729ad8c9b5ad061f0b301104187e177d54cf5981e71"
+    },
+    {
+      "path": "packages/analysis/resources/identity-field-value-system-prompt.md",
+      "sha256": "79b2ac0d58f954d995cfc84dac82c58f1c97849ef74715f3fc614d00aa64187e"
+    },
+    {
+      "path": "packages/analysis/resources/identity-subject-attribution-system-prompt.md",
+      "sha256": "7eb9785bc8524c89939c802d47e46526c9263f1dc30b928050c34ec2f4279257"
+    },
+    {
+      "path": "packages/analysis/resources/identity-time-revision-system-prompt.md",
+      "sha256": "f9937364cf33cc505f1b81206e6181f8e50713b76f8a74e71f10815be6509bdf"
+    },
+    {
+      "path": "packages/analysis/resources/preference-behavior-conditions-system-prompt.md",
+      "sha256": "f43d7830dff49eb7358bc6db2a5a5193d26053760f3f6b07f7c96fb73bb9df48"
+    },
+    {
+      "path": "packages/analysis/resources/preference-explicit-expression-system-prompt.md",
+      "sha256": "f1557bd25c99eef0228e90c145914614357a97f1932e901ef28e55175de7b560"
+    },
+    {
+      "path": "packages/analysis/resources/preference-object-grounding-system-prompt.md",
+      "sha256": "afddd6834dc950565bda39afaaffc30bdc708980976e45f8a11d497358354f2b"
+    },
+    {
+      "path": "packages/analysis/resources/preference-sharing-affect-system-prompt.md",
+      "sha256": "5d7b80156354c497ae8df52e0c9508bebee9985cc09ea8d910709b893fc81e88"
+    },
+    {
+      "path": "packages/analysis/resources/preference-time-scope-system-prompt.md",
+      "sha256": "b8f4be40fb393eeef5fd277c27b0746fd66efeb70cfdb5dc9d840f0c4898b80b"
+    },
+    {
+      "path": "packages/analysis/resources/relationship-current-relation-system-prompt.md",
+      "sha256": "acaa6ac0a36bac7b16e500aed1225fcfa51bcde7fe406ef1b75caba710518563"
+    },
+    {
+      "path": "packages/analysis/resources/relationship-grounding-system-prompt.md",
+      "sha256": "8be18479427db6c747874677ae60ba395eb17c00d11c0f994ba7ff8d22f465d8"
+    },
+    {
+      "path": "packages/analysis/resources/relationship-perspective-system-prompt.md",
+      "sha256": "dcfbf0d08db790de1adb2008b097e9335f26d5c79d63905fd6f7f85f32600747"
+    },
+    {
+      "path": "packages/analysis/resources/relationship-scope-time-system-prompt.md",
+      "sha256": "2b9f6418e41e653d419a735feab15cdd6cfbd512acf3cdc2d4cbec54d66a8593"
+    },
+    {
+      "path": "packages/analysis/resources/self-concept-current-relation-system-prompt.md",
+      "sha256": "f8fbee84cde9761b88cf82fbb37f7a7911859f0723571a50a57e04d41b3aa20a"
+    },
+    {
+      "path": "packages/analysis/resources/self-concept-grounding-system-prompt.md",
+      "sha256": "a1c1d2fa74ac2884266d706f5e0052b32bb18584df389e9eea94e405d6b4e75e"
+    },
+    {
+      "path": "packages/analysis/resources/self-concept-holder-system-prompt.md",
+      "sha256": "04f112a3727840859f9cdafe07f150476623e33f7406f7f4ba6b339b490d0d5b"
+    },
+    {
+      "path": "packages/analysis/resources/self-concept-stability-system-prompt.md",
+      "sha256": "e95eb0ee20e1dc048a832bacb8718f2afd7d1c6ad3c7af99f219b3e8bdbc479e"
+    },
+    {
+      "path": "packages/analysis/resources/self-concept-time-system-prompt.md",
+      "sha256": "d8fc70081ce06ad764bc4bdc2468d204f25a84c53434f7927a59a39e7ce8dcfb"
+    },
+    {
+      "path": "packages/analysis/resources/value-current-relation-system-prompt.md",
+      "sha256": "af8a5f554efe274794351e69866ad63454bf0c1c571f48c7fdff69577df3ce60"
+    },
+    {
+      "path": "packages/analysis/resources/value-evidence-basis-system-prompt.md",
+      "sha256": "453b7d7c20211ee7b2d2e514fc36f310048bb4c0ebcf33a349a5149f123cbd8c"
+    },
+    {
+      "path": "packages/analysis/resources/value-holder-attribution-system-prompt.md",
+      "sha256": "28d0be8ee3f6161db097b4b901db9e4e8d36c1e6a53bd2dca0dfd2d092932875"
+    },
+    {
+      "path": "packages/analysis/resources/value-target-stance-system-prompt.md",
+      "sha256": "7ea69f8873429df8414fc20c678a71fbfcb6e8e2258d5d6ee5647ac3e8b42ad5"
+    },
+    {
+      "path": "packages/analysis/resources/value-time-revision-system-prompt.md",
+      "sha256": "ff8224b2734c1cf9340c861cbed74a412c0d7bb3155453c0fc44eabb3bab633f"
+    },
+    {
+      "path": "packages/analysis/src/affective-association-contracts.mjs",
+      "sha256": "2f0300f2ef41009b16cb2d1ab37e020814ef6d3548439fa2b80a1f3b962c2c50"
+    },
+    {
+      "path": "packages/analysis/src/affective-association-service.mjs",
+      "sha256": "0ab5de821cc9e514039909ebbdfdb4e2234a08029b2f9ae658fc02bf3f439976"
+    },
+    {
+      "path": "packages/analysis/src/analysis-output.mjs",
+      "sha256": "51be2f3fa600eec0eb47813d23c2abab69d99f831fbb430bbdf48076934c12de"
+    },
+    {
+      "path": "packages/analysis/src/behavior-state-contracts.mjs",
+      "sha256": "850f3f089113881655f9f17728737d122083ee786d88f3e737379ce188ea6fa3"
+    },
+    {
+      "path": "packages/analysis/src/behavior-state-service.mjs",
+      "sha256": "28a3a139583ea74c0ebea45fc803e03a0466bdc99e6cbbd385519063d68279ad"
+    },
+    {
+      "path": "packages/analysis/src/belief-contracts.mjs",
+      "sha256": "ba0fe1a5d00a57a93c2dc8055edcd14646c4e1831cf0871d42fa1d6505afba43"
+    },
+    {
+      "path": "packages/analysis/src/belief-service.mjs",
+      "sha256": "e98af2a60b10519e14894d1d8ac637a04b79b3e1661d26a8a226877c55dba0fb"
+    },
+    {
+      "path": "packages/analysis/src/canonical-state-snapshot.mjs",
+      "sha256": "5718001765a71786240307c2fc8d4513a34308976d823464b962aaa0b5f2243a"
+    },
+    {
+      "path": "packages/analysis/src/capability-contracts.mjs",
+      "sha256": "4a143847e7c62f09c5dad1c6876b571231fcc17837f7577b2e64978644cdb232"
+    },
+    {
+      "path": "packages/analysis/src/capability-service.mjs",
+      "sha256": "629309677969fd6a7e8753cc62f8aeb55c08154b626fcf7d5266466b52d5f283"
+    },
+    {
+      "path": "packages/analysis/src/event-continuity.mjs",
+      "sha256": "c558f7c8ded7ec1cc28778a38fab6701f772cb500588883c193ab71a06e705e4"
+    },
+    {
+      "path": "packages/analysis/src/goal-contracts.mjs",
+      "sha256": "9d2f514fc6fafc4667a7d74003d0f11dbcfeb7b7daa5f3fcbdeb0c4433dfefee"
+    },
+    {
+      "path": "packages/analysis/src/goal-service.mjs",
+      "sha256": "c0da1b05671980150013bd434648485819245f5f8d5625df9f29ac0d4562604c"
+    },
+    {
+      "path": "packages/analysis/src/identity-contracts.mjs",
+      "sha256": "e05fd299fbb71158b6037900cb6731548f3509e31a19584546500b64177b3f4f"
+    },
+    {
+      "path": "packages/analysis/src/identity-service.mjs",
+      "sha256": "13c823a042ee080a520dcbe7bb648de53b9eb60473f74c5d5f132dd3ba67f804"
+    },
+    {
+      "path": "packages/analysis/src/index.mjs",
+      "sha256": "b9f767ae6545aa2fd36e7b68f41dd391a5a7ac59c62e25940a5008dd6d88ff36"
+    },
+    {
+      "path": "packages/analysis/src/inferred-preference.mjs",
+      "sha256": "d4d11b3d7fe173616ce17777b8f76c7c8d3ffd1470a600a25c79041d466fcfc5"
+    },
+    {
+      "path": "packages/analysis/src/preference-contract.mjs",
+      "sha256": "50924f771fe6186181a82cd709cb1578b12d3f4c46e32caabf436e00a0cb4c8f"
+    },
+    {
+      "path": "packages/analysis/src/preference-simulator.mjs",
+      "sha256": "701be44125c7c2bbc40e5861905c884bcfbfccad2607102778943cfa336879eb"
+    },
+    {
+      "path": "packages/analysis/src/preference-snapshot.mjs",
+      "sha256": "1d70eb5821773f74e0b0613d325d9c856922a852811583cdf132ac3594d08ce2"
+    },
+    {
+      "path": "packages/analysis/src/preference-specialist-contracts.mjs",
+      "sha256": "68af11237cd106d0a0dde4de23c0dea73b90e119885bf3ed70554c982b32ec30"
+    },
+    {
+      "path": "packages/analysis/src/preference-specialist-merge.mjs",
+      "sha256": "3a2a03fde74546100321bd73befe7158dfa3ba0d4647d499c24e292d8c96b36c"
+    },
+    {
+      "path": "packages/analysis/src/preference-specialist-service.mjs",
+      "sha256": "b324199ebaf088beebb00ec591621e09ff4b4bad4e6bd3d3d2da0e13e4a45573"
+    },
+    {
+      "path": "packages/analysis/src/related-analyzer-batch.mjs",
+      "sha256": "99fb087e96738af8ac3ca312abf970b62dd612552a5c264764b640ef976d71b0"
+    },
+    {
+      "path": "packages/analysis/src/relationship-contracts.mjs",
+      "sha256": "ff57f00faf6412f7223051b438ab1c7aacbd651b5c696bf535425485925c8df4"
+    },
+    {
+      "path": "packages/analysis/src/relationship-requests.mjs",
+      "sha256": "25e607af726764f6479969f4d402b819c7804b9b08b06473b103f3c0f86795a9"
+    },
+    {
+      "path": "packages/analysis/src/relationship-service.mjs",
+      "sha256": "8755adb3d4d49cf0532cb3aea316e792657cbfda77d81948ad1b31b46f5b9fdd"
+    },
+    {
+      "path": "packages/analysis/src/reported-affective-association-review.mjs",
+      "sha256": "8eeac3a16a6bf633a10313e7671d73d3701d48bae346b375a9ed64617dc4b36d"
+    },
+    {
+      "path": "packages/analysis/src/reported-belief-review.mjs",
+      "sha256": "b65a52360eb07a901cb461364dc4099df3296a17a83a1123990a25adf2e2152c"
+    },
+    {
+      "path": "packages/analysis/src/reported-capability-review.mjs",
+      "sha256": "a0f05d181d1bbaf02348b7935b5630544e7ed90c7354e167366826fbe50a12cc"
+    },
+    {
+      "path": "packages/analysis/src/reported-condition-review.mjs",
+      "sha256": "24710feb266717e36a11771b185e27927c875202a192315bbb540c8f2d717b28"
+    },
+    {
+      "path": "packages/analysis/src/reported-disposition-review.mjs",
+      "sha256": "a6ebe4550cb27adb4c98ae42ab40b39651010b0c2b3c7e0e73cf6b07e7e69daa"
+    },
+    {
+      "path": "packages/analysis/src/reported-goal-review.mjs",
+      "sha256": "51ccaa895b8196bc3096e38d0a891aa0dba94cbf5ba3ba0bcda99bf5489ed638"
+    },
+    {
+      "path": "packages/analysis/src/reported-habit-review.mjs",
+      "sha256": "e6c48698d43a8a64c42075e7f3697079bc70beb5172101f147a5bb1b8a0ac8f7"
+    },
+    {
+      "path": "packages/analysis/src/reported-identity-review.mjs",
+      "sha256": "8868dc289b10ea30e67a2d7533c418f5c5e7c689316e567264019a3f3e0d2472"
+    },
+    {
+      "path": "packages/analysis/src/reported-preference-review.mjs",
+      "sha256": "127b2fc1a7cb2820b68d69a6b4312d445a2936b532542fb7478e6563fbfb9f6c"
+    },
+    {
+      "path": "packages/analysis/src/reported-relationship-review.mjs",
+      "sha256": "a5fe12dca26444677bf8c027c0a102907b55db3234ff0d6edc6a04abb17d51d6"
+    },
+    {
+      "path": "packages/analysis/src/reported-self-concept-review.mjs",
+      "sha256": "e629a92a06f00d1a6860e0b355065506c07e6aec0fa14334a9808e19e9128ebe"
+    },
+    {
+      "path": "packages/analysis/src/reported-state-persistence.mjs",
+      "sha256": "2e5f213aeea8680664b2402487f3f6e5ee94f0f03e1a6743e826e175fb50d0b9"
+    },
+    {
+      "path": "packages/analysis/src/reported-state-review-core.mjs",
+      "sha256": "8b797988cf8d61debc3589967765000ab52a563ac2fe2724e035df7d171ba238"
+    },
+    {
+      "path": "packages/analysis/src/reported-value-review.mjs",
+      "sha256": "6a9842bcf5a2c5fef93775b8f6b3c647aac8b06b18519a62114500a287e597b5"
+    },
+    {
+      "path": "packages/analysis/src/request-budget.mjs",
+      "sha256": "e350d174b5063135b45a28fb4dbd4f5028680b35c6a0297ff198c41326e1f7d2"
+    },
+    {
+      "path": "packages/analysis/src/self-concept-contracts.mjs",
+      "sha256": "fd6785284c56fa56285244bf1846328712ca3a7fc2273bf6a5b7e898b4c6fd4a"
+    },
+    {
+      "path": "packages/analysis/src/self-concept-service.mjs",
+      "sha256": "b33ffaba412acd2f164f1cd207ff4d4e7a59b1345517c5c8bb9e526c1e7fb6aa"
+    },
+    {
+      "path": "packages/analysis/src/source-material.mjs",
+      "sha256": "e60fa86ff407e42bac59505a2ea01030f4645213096c09b10f57f241d94d78ba"
+    },
+    {
+      "path": "packages/analysis/src/state-analysis-cli.mjs",
+      "sha256": "3188da9107abcbf91b81c11719755536ef2c9f88642e56bd6ab5db36007a3bfb"
+    },
+    {
+      "path": "packages/analysis/src/state-analysis-request-service.mjs",
+      "sha256": "3b55023b28cd4478a6f54e857551f62a89042fdbe9a3a4dea6ccb7b086a1c85a"
+    },
+    {
+      "path": "packages/analysis/src/state-memory-candidates.mjs",
+      "sha256": "68864ddc07a8ec4ace961c16ff1d5beb75dd0aa1ca587feebfe4b7f550664ebb"
+    },
+    {
+      "path": "packages/analysis/src/value-contracts.mjs",
+      "sha256": "efd638119ccbf8b351185fa296ccf27280922f7c09b216e4e7efe5fa83b9c95d"
+    },
+    {
+      "path": "packages/analysis/src/value-service.mjs",
+      "sha256": "96811547a920b719a24f56a1c414f40bdd7c3515ae103f5a8664eb429436bb36"
+    },
+    {
+      "path": "packages/analysis/test/analysis-output.test.mjs",
+      "sha256": "f33a3da8b893cd628bd1609922173e96bda5cc65fc9087bd33b8744650e468cd"
+    },
+    {
+      "path": "packages/analysis/test/identity-request-evidence.test.mjs",
+      "sha256": "062b60f7c26a25e48024544733f9f696e23e4ffc8c118904ad4546c85299d0a4"
+    },
+    {
+      "path": "packages/analysis/test/inferred-preference.test.mjs",
+      "sha256": "124922cfcebcf0bb07f43c4776a713fa7fa891ac100476c9429d386e0000895c"
+    },
+    {
+      "path": "packages/analysis/test/preference-snapshot.test.mjs",
+      "sha256": "cb7cbd0518c74896a27f84deabb0180305eaf2ad5ca67defdd8d3d3428df1fcf"
+    },
+    {
+      "path": "packages/analysis/test/relationship-request-evidence.test.mjs",
+      "sha256": "6b899bca83b7b374c384ef3b37cfe9b1ddfe98d407686365c96e3e18bd85ff47"
+    },
+    {
+      "path": "packages/analysis/test/state-analysis-cli.test.mjs",
+      "sha256": "f45e1ef7c0f3b06be8de348a7e40ddc38f64f653d5c1f4d948d7c941f0787f22"
+    },
+    {
+      "path": "packages/analysis/test/state-analysis-request-service.test.mjs",
+      "sha256": "f2a2fef73161845fe870d91c3d81674872e0ad5bf3556e1f0ad8a60afc6f08a3"
+    },
+    {
+      "path": "packages/cli/bin/suzu-memory.mjs",
+      "sha256": "80cc383ec88c3c5f3c6228911b1a68da8cc39384393f2d86f37911ef98c5d71d"
+    },
+    {
+      "path": "packages/cli/package.json",
+      "sha256": "6ce20414fffecda958d99130b10bec29b3053858ab381f8207e88896e1c6092d"
+    },
+    {
+      "path": "packages/cli/src/index.mjs",
+      "sha256": "a8fc1b1f495f1e8c41b313752899664d5350c92ca1bab068e43c119bc4ca845f"
+    },
+    {
+      "path": "packages/cli/src/worker.mjs",
+      "sha256": "a67fa480faea16bebfa92886c974e8ad8827c65f99d100f356fe13e7cfbd7aa3"
+    },
+    {
+      "path": "packages/cli/test/memory-cli.test.mjs",
+      "sha256": "5dec0faa8eff420355d7e70ad164e75bc1aae35f251d0bd1c1789b6c9b9e9a2b"
+    },
+    {
+      "path": "packages/config/package.json",
+      "sha256": "a0058f08bab33b2f77920507f26e89843c96176b826c7e2e9656bb669aed0a0a"
+    },
+    {
+      "path": "packages/config/src/index.mjs",
+      "sha256": "40d60c2fabf7659b6269ff5bc4d775fc3a6651ccf6787053192b995008fe2bfa"
+    },
+    {
+      "path": "packages/config/test/memory-config.test.mjs",
+      "sha256": "a9e77ad73de2b5e6bb9c33ede3339aa26a14850616b2592360698fa6fcc81e60"
+    },
+    {
+      "path": "packages/console/package.json",
+      "sha256": "dd74a3ab39e6da5e29f982e07366b1156d3e7712fe1ff156cf405b70166a293e"
+    },
+    {
+      "path": "packages/console/src/index.mjs",
+      "sha256": "8e2b90b5a76d58441c97924a727145e2f16ece98acecd10719bba5cfe2390938"
+    },
+    {
+      "path": "packages/console/test/memory-console.test.mjs",
+      "sha256": "7aa5759a7360a6bd14e48b587202467d66895dd20abfec631fe45cd98620523b"
+    },
+    {
+      "path": "packages/console/web/app.js",
+      "sha256": "07ac4904488b60af5374ecf0aaf5eec6b6cbaff44b0d37c80e313acf718e92d9"
+    },
+    {
+      "path": "packages/console/web/icon.svg",
+      "sha256": "fdf025cc4687ea641d3091db20c24625cb90300f537d7acd029404b9dac4f648"
+    },
+    {
+      "path": "packages/console/web/index.html",
+      "sha256": "24b07142cf904bb436384f807f06d67febd7a371df3b12f27ae20dd6aff05f5d"
+    },
+    {
+      "path": "packages/console/web/styles.css",
+      "sha256": "f28c27c54e941ed1fd7b2d7cd192aeb069889f055e29693b9608e6bffb9f3f44"
+    },
+    {
+      "path": "packages/core/package.json",
+      "sha256": "33eaa75814226f080e7bf0f209c9c2f6cb8063a52d7ebc81f0dad0e26fc67ded"
+    },
+    {
+      "path": "packages/core/src/access-dynamics.mjs",
+      "sha256": "668190fe448281f4a2c9dfa670282e3569f55efab418320296f94be95d8f2483"
+    },
+    {
+      "path": "packages/core/src/association-graph.mjs",
+      "sha256": "6aaf0e70094428dd5eb602968acec693527989f5f640d39d72403c490007cd72"
+    },
+    {
+      "path": "packages/core/src/calendar-expression.mjs",
+      "sha256": "58673b83c0b1edd22716dc89ccb00f140ca89ae0581fc81f56d4d3f98501ed2c"
+    },
+    {
+      "path": "packages/core/src/calendar-time.mjs",
+      "sha256": "b881c716f88e5f6851cb36d654060b8acfd9f55481c61b7633d79ae1174f3bd7"
+    },
+    {
+      "path": "packages/core/src/database.mjs",
+      "sha256": "50de9ff7a1ab261022616df248a3d397f27f7ca22e50258ef1ddad5ffaf4bb94"
+    },
+    {
+      "path": "packages/core/src/embedding-cache.mjs",
+      "sha256": "b5ab945f68c8bed105980b00ae4dd7995a5157c0620b72ca03ed3f9a3505dff5"
+    },
+    {
+      "path": "packages/core/src/event-continuity-policy.mjs",
+      "sha256": "9fce9afd2609aeebf291179ef37092782048d0835bd0ab75cb0d1ae877bbc7d9"
+    },
+    {
+      "path": "packages/core/src/event-source-cleanup.mjs",
+      "sha256": "689ca22b66dd62b8e3ec744647639ee255053db75a20f90204d4e6888af0011a"
+    },
+    {
+      "path": "packages/core/src/event-source-contract.mjs",
+      "sha256": "44e87f98e7534acd16f6f91e419b4f10efa504601432a1b460126d5dc4ac9694"
+    },
+    {
+      "path": "packages/core/src/event-source-execution.mjs",
+      "sha256": "9da7e1d87f9e1c9abb866d9102d7e5f2307f7189c26493c804e6bc8446839f19"
+    },
+    {
+      "path": "packages/core/src/event-source-state.mjs",
+      "sha256": "907347280318e9035e87706d17be2fd914488ba560c3630a96c31d2070cc7fa6"
+    },
+    {
+      "path": "packages/core/src/event-source-view.mjs",
+      "sha256": "272e48c67e64c7027d53594ea5f4891cd664316558bc3179298d133972fe4ff9"
+    },
+    {
+      "path": "packages/core/src/index.mjs",
+      "sha256": "a1d9fcbbee8cccf26ba552f9b5668c764e9b34d706ca39263904fc04b1c6a3e2"
+    },
+    {
+      "path": "packages/core/src/maintenance-tasks.mjs",
+      "sha256": "90377aaab57b1007cd01eb88ff65a5ee60d6ec4cefcd73574abaf5215227cbaf"
+    },
+    {
+      "path": "packages/core/src/ontology.mjs",
+      "sha256": "72844582521631ea7bb9d31525b3659952deb819fefe979bd692c02b5b6b97ab"
+    },
+    {
+      "path": "packages/core/src/plasticity-policy.mjs",
+      "sha256": "28bc6529546ea7ee21bd4aa06e5a6e25a1f01406d40a79ff5f92605a3b436fcd"
+    },
+    {
+      "path": "packages/core/src/policy.mjs",
+      "sha256": "6964d3328db2ade2195d2046ca4d7a4bbd1a7397f80ef07123c10f36c31b013f"
+    },
+    {
+      "path": "packages/core/src/preference-state-policy.mjs",
+      "sha256": "ecfbfadbef285fbb6c0d4e6acbbeaeb9849dadab766f242edbd992593ea83022"
+    },
+    {
+      "path": "packages/core/src/relation-policy.mjs",
+      "sha256": "846ea68615487c97aee7794235c7de1f176758e529f25f1f808ee7c87569f929"
+    },
+    {
+      "path": "packages/core/src/relationship-structure.mjs",
+      "sha256": "15d18db3a18669b87b70859c4d7f47ffde0cbf371d4fd2ae672827e905a41614"
+    },
+    {
+      "path": "packages/core/src/reported-state-policy.mjs",
+      "sha256": "311af4942204929122d086bf9dd23f4b51ef1353fa4ca69bd3d3bea649878716"
+    },
+    {
+      "path": "packages/core/src/repository.mjs",
+      "sha256": "4ca976f39c0b5aeceda60003182406b7807e50435ac9310bf60a15f5821da5f3"
+    },
+    {
+      "path": "packages/core/src/retrieval-context.mjs",
+      "sha256": "83ef8e26ad6cf43dba027b46a0eacb4f156f1a8cad8b09504a386a3a89fc0a1c"
+    },
+    {
+      "path": "packages/core/src/schema-event-sources.mjs",
+      "sha256": "6626ce64092f0d41c2c8bafd888090fcf5835e9d55e5ce2eb3d693596c932d42"
+    },
+    {
+      "path": "packages/core/src/schema.mjs",
+      "sha256": "f647e701af4311ac8f7e471b032d8cd397eb3cf553dc2556a7561ed8ee3aedc0"
+    },
+    {
+      "path": "packages/core/src/search-index.mjs",
+      "sha256": "db0d88010ea29497434388038deffab3f0d6cbf941ddeff13388f3e1102fae7a"
+    },
+    {
+      "path": "packages/core/src/state-analysis-target.mjs",
+      "sha256": "a2e6b680362fe57c97af272c14b3b3fea045e069ac1d92a0ad3a02e8110828ac"
+    },
+    {
+      "path": "packages/core/src/state-promotion-policy.mjs",
+      "sha256": "0d75b4641ed1be2c9db5500397725ab5e5f0b7b8dd7886e34b1b13452a9e7230"
+    },
+    {
+      "path": "packages/core/src/state-read.mjs",
+      "sha256": "93bf8685018d64e1ae15a3d8c29dab7ba29f51c6936baffe6b507d984f1499d9"
+    },
+    {
+      "path": "packages/core/src/state-scope.mjs",
+      "sha256": "6757f02e404e65d658334b320e2f9ad3882586150a87be3c747e5ca40c235de1"
+    },
+    {
+      "path": "packages/core/src/structure-policy.mjs",
+      "sha256": "3a4efbc198e14b5d3c086098493558238ac9cb60bd9123ce29cb0f72e047de73"
+    },
+    {
+      "path": "packages/core/src/subject-attribution-policy.mjs",
+      "sha256": "b16f8b977b6024a9f84829d8929d0c7440f9d6f50c42a0cbe3b4bf86dd233449"
+    },
+    {
+      "path": "packages/core/test/access-dynamics.test.mjs",
+      "sha256": "dbd95730a2889a3f351f8b56fb13c8208c54cbd4cc550762e158f9bdfe63142a"
+    },
+    {
+      "path": "packages/core/test/calendar-time.test.mjs",
+      "sha256": "322c1281cae9e9062c4b9cbd3fe62194c2c0282dacdbd72a154daa7c0ca880b1"
+    },
+    {
+      "path": "packages/core/test/embedding-cache.test.mjs",
+      "sha256": "afe88bc6aa10b0e10b583105268f196408b5c4c3c0f035d1740009925579280c"
+    },
+    {
+      "path": "packages/core/test/memory-core.test.mjs",
+      "sha256": "ff700f9bd2823fc8c28d3ce8755ab07c2cc3af771327e8dea08506420b612f98"
+    },
+    {
+      "path": "packages/core/test/memory-policy.test.mjs",
+      "sha256": "0851b16b06e2525e20732b8be00ce9a04fac9e6c46d2422a544a57c375923ed7"
+    },
+    {
+      "path": "packages/core/test/model-calendar-time.test.mjs",
+      "sha256": "4f8def6b8777ab79efff088859842971d84ee3687c1b1eb92e001f443e687865"
+    },
+    {
+      "path": "packages/core/test/plasticity-policy.test.mjs",
+      "sha256": "58f2aaf6028d00cb18ec6ef21c5553fc0caeba6967ad10942fa1b51ff9f242c9"
+    },
+    {
+      "path": "packages/core/test/preference-state-policy.test.mjs",
+      "sha256": "3e72fe26741e29d69d2143a0bf6e252f09e7078eb0820274ba3bc48f5b829ff7"
+    },
+    {
+      "path": "packages/core/test/recall-reactivation.test.mjs",
+      "sha256": "2a03ca4193fb538f3ea1fe20806700e0ab8cdd34525bab418df8b46cb78f1a0f"
+    },
+    {
+      "path": "packages/core/test/relationship-membership.test.mjs",
+      "sha256": "91032e5382d167eaafff5257efc328c28636c5600a857637b2849f555a81248a"
+    },
+    {
+      "path": "packages/core/test/reported-state-proposal.test.mjs",
+      "sha256": "1473dab3fa01b34e2b02a5b2eeb61b87b9de50ccb36d0e51851b044a817b7a8f"
+    },
+    {
+      "path": "packages/core/test/reward-credit-application.test.mjs",
+      "sha256": "61b8e129d40bfdff26e84d884468584512713df7c212d7d8116e57c909dc77da"
+    },
+    {
+      "path": "packages/core/test/search-index.test.mjs",
+      "sha256": "763d26f17160db1e7c6b173c05c429953aa8aa96c2bc1b1becfac77c6a2148aa"
+    },
+    {
+      "path": "packages/core/test/state-evidence-ledger.test.mjs",
+      "sha256": "a4428c0f3c5ee561befcef1a843e3920068d2cc8e81dbc5f6f65fd36cd1e008e"
+    },
+    {
+      "path": "packages/core/test/structure-scope.test.mjs",
+      "sha256": "940c7caec5ea5df96af668d767ac528db9637d46e1d864d622fa00c0a4f2d6a7"
+    },
+    {
+      "path": "packages/core/test/subject-attribution-policy.test.mjs",
+      "sha256": "3565ddcf8b24a9c98db361f1872eb5fd7c414d201fb92f90f1a1ac588952d364"
+    },
+    {
+      "path": "packages/embedding-indexer/package.json",
+      "sha256": "6a2f504637d724d6673b2815e61b8354ce08ecfcfbf8f0efd56120c2368799a0"
+    },
+    {
+      "path": "packages/embedding-indexer/resources/retrieval-context-critic-system-prompt.md",
+      "sha256": "8074a204492bac86b64f6f1ab8bb76b69cd05b187fff7ab88d4a394325f1bbe0"
+    },
+    {
+      "path": "packages/embedding-indexer/resources/retrieval-context-system-prompt.md",
+      "sha256": "3641d9c0a6edb608648eefe6c56677f35d917a30179ea8a421cae8f080e8dffb"
+    },
+    {
+      "path": "packages/embedding-indexer/src/cli.mjs",
+      "sha256": "6757897eb7d5dbc8153b208323a9de26c416be1febefe5982cbd47ffa9ac8b59"
+    },
+    {
+      "path": "packages/embedding-indexer/src/contextualizer.mjs",
+      "sha256": "38db7230923e4a6bb0aeaa47e14a9a42ccdc4919a3c24621097ff48dd35744da"
+    },
+    {
+      "path": "packages/embedding-indexer/src/index.mjs",
+      "sha256": "0dbeaa600cd0ea82cff3baf14c52078d5d5a15b671bef818e588df3397b6f0e9"
+    },
+    {
+      "path": "packages/embedding-indexer/test/memory-embedding-indexer.test.mjs",
+      "sha256": "eebf068f6d263e2dd4d92b1d63b5861d6b0fe0b41e0fd92d7abbe48ccfc773f8"
+    },
+    {
+      "path": "packages/evaluation/fixtures/example-cases.json",
+      "sha256": "90813879c55ec17b768e346cc1ec62edf883e76c4068f1a12c8934ddc62f0fae"
+    },
+    {
+      "path": "packages/evaluation/fixtures/ingestion-cases.json",
+      "sha256": "62b7c5f830051c40f2a5f9726565a6bbf84ebae25bf7ac3ae3819b3170b8bdc5"
+    },
+    {
+      "path": "packages/evaluation/fixtures/reward-credit-holdout-v1.mjs",
+      "sha256": "71108f95e5c809f17dfbe44211261dc16758eb3b5416ba9f5e939389c4ca59f2"
+    },
+    {
+      "path": "packages/evaluation/fixtures/reward-credit-mini-v1.mjs",
+      "sha256": "9b68baded507d9b5b558099ee9625c7c143e4b6ecaeb86c2e4c7243dd4585678"
+    },
+    {
+      "path": "packages/evaluation/package.json",
+      "sha256": "87cadbc24846aa2e98a3938c009213ee32de3999c450d3626bd1578baab69f0c"
+    },
+    {
+      "path": "packages/evaluation/resources/baselines/reward-credit-holdout-v1-rc1-manifest.json",
+      "sha256": "36b1578038df70e8c3caad68d5f85bbf41836ebfddb10926a3dfef3159dfcfa6"
+    },
+    {
+      "path": "packages/evaluation/resources/preference-counter-match-system-prompt.md",
+      "sha256": "c2b44453c15c792abebf3510981cb39b382912a5310f171bb2ea072feae6fd0b"
+    },
+    {
+      "path": "packages/evaluation/resources/preference-labeling-system-prompt.md",
+      "sha256": "1c098d1c31fa182f0adbbde34e2d3bac0767bdcb6779341240a70c81687d37cc"
+    },
+    {
+      "path": "packages/evaluation/resources/preference-state-critic-system-prompt.md",
+      "sha256": "bdd71f075de7ca7a44275ab4eb26c78ba374f1db207dd59dfe1a8afc3af89000"
+    },
+    {
+      "path": "packages/evaluation/resources/preference-state-synthesizer-system-prompt.md",
+      "sha256": "db91e24df23fd4cfca2b8d5508fedd2fd227675b4ce4a06d64b48ef2691d146c"
+    },
+    {
+      "path": "packages/evaluation/resources/public-memory-datasets.json",
+      "sha256": "613dacd7f7c78881dce1acfdcbb85d6b1daa92312c8e4eddf350bb24279ec080"
+    },
+    {
+      "path": "packages/evaluation/resources/retrieval-usage-system-prompt.md",
+      "sha256": "b6a7e2e4b317e2c0bee1c4f35017d836697fee8c30cba6ac86e9e8fbb3a84a83"
+    },
+    {
+      "path": "packages/evaluation/resources/reward-credit-system-prompt.md",
+      "sha256": "26acc940694ec3fa629c4ebe64c0481396ffc11dd63f7d9e9321c3a4f5b86380"
+    },
+    {
+      "path": "packages/evaluation/resources/reward-outcome-system-prompt.md",
+      "sha256": "88df647bc348d53288c5cf6899cbf9d09eb5d7543da64b121e777e8353f1615a"
+    },
+    {
+      "path": "packages/evaluation/resources/reward-target-system-prompt.md",
+      "sha256": "e6ed1c70381841dafd47c39ba17eab83932926913bf75f9ba74d0bdbef465b56"
+    },
+    {
+      "path": "packages/evaluation/src/cli.mjs",
+      "sha256": "00bdfc368d09fadf2f6ce4d16fde04a4c191a7257daa8fe4f5d4a30754d251cc"
+    },
+    {
+      "path": "packages/evaluation/src/code-revision.mjs",
+      "sha256": "af9e8841265a629a51aac0c89db1df2ab81d6c97da807f75edba2ad7bb83cd63"
+    },
+    {
+      "path": "packages/evaluation/src/embedding-connection.mjs",
+      "sha256": "22de4e6a7d505cf73755d62669c489f5fe2c3d009cd4223610cefb0dec38e41f"
+    },
+    {
+      "path": "packages/evaluation/src/evaluator.mjs",
+      "sha256": "2c5b3db90d5de615af1f02df9b018d2b087b551a48c99f37e6c98830c7d123f2"
+    },
+    {
+      "path": "packages/evaluation/src/index.mjs",
+      "sha256": "4e98b17494e3384b2db1273d44de1fee5d2f3b4cf50a2e1f3f194bf446cf0e78"
+    },
+    {
+      "path": "packages/evaluation/src/ingestion-evaluator.mjs",
+      "sha256": "7f3cf6d31c33c18f70ad1f64c7bffc6cb55099599cdd9647ba516c75790dfa75"
+    },
+    {
+      "path": "packages/evaluation/src/memory-tool-answer.mjs",
+      "sha256": "07e5ba2e0716fde6878d4ab30d312bf0946bb43d3adcc266f5da3daf30d400e5"
+    },
+    {
+      "path": "packages/evaluation/src/plasticity-shadow.mjs",
+      "sha256": "208390912a637736e8dc0fdacd7aa349c0574f374c19c02cb45a0fd235cad692"
+    },
+    {
+      "path": "packages/evaluation/src/plasticity-simulator.mjs",
+      "sha256": "6b48baadc00495b886e29e3dcc8c9a564d6ccfc1c1ffb77967af27932fbef55c"
+    },
+    {
+      "path": "packages/evaluation/src/preference-counter-contract.mjs",
+      "sha256": "74dd3dfc631cb0905cfba6d883f3d92ab2ba528540d569841b90babef5a00719"
+    },
+    {
+      "path": "packages/evaluation/src/preference-counter-service.mjs",
+      "sha256": "4c5cc07dac39b2a0768a2b6b8c7b0e8b17170ab031ce5cbc0f6166bcafda24ce"
+    },
+    {
+      "path": "packages/evaluation/src/preference-evidence-policy.mjs",
+      "sha256": "62fcd56a05e38bda3ac01f1aaab1cd7bb1b1a74746be6fb4ef999bfe2eb6e5fa"
+    },
+    {
+      "path": "packages/evaluation/src/preference-persistence.mjs",
+      "sha256": "609de739b21d50480958e2b17b25de10f379fab00b78652e8a2205f75b76afb9"
+    },
+    {
+      "path": "packages/evaluation/src/preference-prompt.mjs",
+      "sha256": "e3a778cdc5af0783578c8206a2e44dd94dd356d4fafe2b595c2b60d6c32b76a5"
+    },
+    {
+      "path": "packages/evaluation/src/preference-review-contracts.mjs",
+      "sha256": "f29d83fe319a821d9cb611a0da6f7a2f49a631618f8950e15bce645e1536e62f"
+    },
+    {
+      "path": "packages/evaluation/src/preference-review-service.mjs",
+      "sha256": "3147449c192f47fc5a52f4a633676114dd1cef71c5d65142c8e16cfff1f0bb9e"
+    },
+    {
+      "path": "packages/evaluation/src/preference-service.mjs",
+      "sha256": "9d8217face27184d26735b9e49b184788b6e728cd5cf920ed0ea180cd8987ec0"
+    },
+    {
+      "path": "packages/evaluation/src/retrieval-benchmark-utils.mjs",
+      "sha256": "3f25b9ed28baf1540634d725633bf23b5b729305e780c7c06de5c50f39befefe"
+    },
+    {
+      "path": "packages/evaluation/src/retrieval-usage-cli.mjs",
+      "sha256": "b2f0816ba0c50e0f3e786f2d965b05718457d5370383f602254af880cc46c665"
+    },
+    {
+      "path": "packages/evaluation/src/retrieval-usage-contracts.mjs",
+      "sha256": "7d12340c13b3512535ca89cf9a80153d796cce6af5318bc9c0228f045f61d440"
+    },
+    {
+      "path": "packages/evaluation/src/retrieval-usage-service.mjs",
+      "sha256": "2d7a217c17455639df87c5131861766f0c71d6dc5a529b8d2d73e393b67e4910"
+    },
+    {
+      "path": "packages/evaluation/src/retriever-adapter.mjs",
+      "sha256": "657a1d8966ae55fc06da3cb8fdab9069bcafdfb0dbbbd1829dd4ae96e46d2aeb"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-benchmark-cli.mjs",
+      "sha256": "85006c150ab1dfa304871ef67ba64d79127bd71cca51cc9f0ae5f3f155f97f16"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-benchmark.mjs",
+      "sha256": "eeda34963b0541cf29e057993fa592df0181e956fcd0eb77ed62cac128917702"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-calibration-cli.mjs",
+      "sha256": "1f3c9d388c3671b5bfd1b509837d08f1101a29e011243462a2859a943202e65d"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-calibration.mjs",
+      "sha256": "4b529d414d977e93abed4f39797fee9a378d653043e039883fd61bff8fb66d57"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-cli.mjs",
+      "sha256": "835ccabc9c19bf3dccc4904c6e8a9b17bfa251bea105a5504826c7913d557df9"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-contracts.mjs",
+      "sha256": "0373a5e8752c723d6f608f36498d506ebbf16cd3a32e2012b55eb47a781ffabd"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-policy.mjs",
+      "sha256": "e5bdce2c6b060478377da102ccacb28d3d93a2b5237c188cda0bfa7d53c029d7"
+    },
+    {
+      "path": "packages/evaluation/src/reward-credit-service.mjs",
+      "sha256": "4da668a3efeed92acd9174a06aa04a67d497a6a8537c79e63975f62ce0b60937"
+    },
+    {
+      "path": "packages/evaluation/src/rhelm-cli.mjs",
+      "sha256": "10c923e5f04e7214124a17bb0fc68eb2f256fd480e4fee319189750972377f5c"
+    },
+    {
+      "path": "packages/evaluation/src/rhelm-contract.mjs",
+      "sha256": "b023093421d026334a5cea473afbd0c66fb74fbd989cfce09cd5ddedede610f4"
+    },
+    {
+      "path": "packages/evaluation/src/rhelm-retrieval.mjs",
+      "sha256": "c28e1f900a50c893946aade7f1bcfd972a323f9c6ecc93c3fc23869316633a9f"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-contract.mjs",
+      "sha256": "91c72309405adfa30e864a1ad7764f2965e0e1fbbdd2d4e38440416241e96458"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-execution.mjs",
+      "sha256": "2fc7594dfdfb4a04088e720e9735cd3ec8a399482d70176b0e63ad1fdae5177e"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-source-cli.mjs",
+      "sha256": "e48c362d3b7d9cc94b5b6c1af8edd6acd1996616e5a97f3ad6e248e6f5d8a5a2"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-source.mjs",
+      "sha256": "7df47dd19438b717baa6a81b067f71fa3db107d462d5fe6ab6fbb427b6ef78eb"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-summary.mjs",
+      "sha256": "76abe1b65314a291e9042ef8155572aa0d246d3ecdbeebd134ac187ac2e15176"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-system-cli.mjs",
+      "sha256": "18335c8e306a6a62799675ed2375c1458ffe5c24de36bf7b51289c0436e87abe"
+    },
+    {
+      "path": "packages/evaluation/src/zh4o-system.mjs",
+      "sha256": "40d05b4d4cfe68848ede50cd07b9e2351618868ed476dd4062bbb9c4c1eddf9e"
+    },
+    {
+      "path": "packages/evaluation/test/affective-association-evidence.test.mjs",
+      "sha256": "c39c64aa15be666febb65b90ff119144f0047482c2bab2009426b704b7717f42"
+    },
+    {
+      "path": "packages/evaluation/test/behavior-state-specialists.test.mjs",
+      "sha256": "3ef9e093e2e6de37e30dc6ff5bf31d2b9c59965ab2026f3f0c936915cc3d9ce0"
+    },
+    {
+      "path": "packages/evaluation/test/belief-evidence.test.mjs",
+      "sha256": "2f20a0def3b1193639ce47f1f4000962315d7ece757e201a7eb49e6fad85503e"
+    },
+    {
+      "path": "packages/evaluation/test/canonical-state-snapshot.test.mjs",
+      "sha256": "1e2c08ecc9165b4a0dea0cede35a0d4cdea0a67ac6ac96c98fa21f8085118be3"
+    },
+    {
+      "path": "packages/evaluation/test/capability-evidence.test.mjs",
+      "sha256": "e7eed0f55aab33bbdebca280d359c6eab54d674577a852429dcf2c25281f14ee"
+    },
+    {
+      "path": "packages/evaluation/test/code-revision.test.mjs",
+      "sha256": "73ee22fc6391a06288fda20a09b093a1d0716dad27c032aa24c6cd9feb133f6a"
+    },
+    {
+      "path": "packages/evaluation/test/goal-evidence.test.mjs",
+      "sha256": "05205c8e394bcb3f2f40047254261f2efd6935a63716d4bf5b8bc95e5f6733b9"
+    },
+    {
+      "path": "packages/evaluation/test/identity-evidence.test.mjs",
+      "sha256": "4e3f2f70dac0ccbb8f9a5838d63cc722b3003efe1c34923bf90fdf2795d8128c"
+    },
+    {
+      "path": "packages/evaluation/test/memory-evaluation-cli.test.mjs",
+      "sha256": "a59caddcc25455ca442a641e4b2fe54dd4cc9d320de8d481a08836a1088a520c"
+    },
+    {
+      "path": "packages/evaluation/test/memory-evaluation.test.mjs",
+      "sha256": "5d49928620753ba3baeb4cdf526a7c8321cf4ffa5c353fa2c66a94ec15eeb562"
+    },
+    {
+      "path": "packages/evaluation/test/memory-tool-answer.test.mjs",
+      "sha256": "2db81ceb2ecc785b8eadd54c3e67b772c608a63e0026d4036c55a379245a8f03"
+    },
+    {
+      "path": "packages/evaluation/test/plasticity-shadow.test.mjs",
+      "sha256": "261731857249372cec9dccc9ed8aba14d80c34d57e71758f7bdc28a354a67b7b"
+    },
+    {
+      "path": "packages/evaluation/test/plasticity-simulator.test.mjs",
+      "sha256": "1deb7324cc400fea0438a68e2b4ce3a157eede291d5d4be983e88e9b6d03d313"
+    },
+    {
+      "path": "packages/evaluation/test/preference-counter.test.mjs",
+      "sha256": "adfb859ea5577c92b37d8a4daab4e583d7506e0e4e4ce499bcdafb3822700fa1"
+    },
+    {
+      "path": "packages/evaluation/test/preference-evidence.test.mjs",
+      "sha256": "e797a70b2bbe111c958a9bf1e19fee76c30eea9f1933556c840ca9497d9fea4b"
+    },
+    {
+      "path": "packages/evaluation/test/preference-review.test.mjs",
+      "sha256": "2d9a3db480cd52d27e68f7d6b03eb25ffc4037c5ce4bb85b4493c6f1999cd8f2"
+    },
+    {
+      "path": "packages/evaluation/test/preference-simulator.test.mjs",
+      "sha256": "feb94269968cb2645eb132d6d717abe08dcc147526b59ae4f7cd92a489417686"
+    },
+    {
+      "path": "packages/evaluation/test/preference-specialists.test.mjs",
+      "sha256": "9ca1d9fc4b66976890104aee38b33320bbe449f21178459ebdfc59deae9f59e2"
+    },
+    {
+      "path": "packages/evaluation/test/relationship-evidence.test.mjs",
+      "sha256": "79bf3a3f9fd259938fa33571de74c57552723da010706b24944d6e5fe91f1b8f"
+    },
+    {
+      "path": "packages/evaluation/test/reported-affective-association-review.test.mjs",
+      "sha256": "d75c35465144dc3a563c615c61d4a936702f230fc4b0d45805701da6dedff3d0"
+    },
+    {
+      "path": "packages/evaluation/test/reported-belief-review.test.mjs",
+      "sha256": "0292ff7c0673391b4d88475b61da746bdf63ad2ef8a9cbc45bdfe0a0ae2ab94c"
+    },
+    {
+      "path": "packages/evaluation/test/reported-capability-review.test.mjs",
+      "sha256": "da19e82f1ea15488ba291b361a3016552c550d71357866ae020cf7f7aa3fbfdf"
+    },
+    {
+      "path": "packages/evaluation/test/reported-condition-habit-review.test.mjs",
+      "sha256": "d037d846d16f2d3a4be8faca4f5623d88b592faeb13337a49feaaf0227d47809"
+    },
+    {
+      "path": "packages/evaluation/test/reported-disposition-review.test.mjs",
+      "sha256": "b11dfad3e4e38476f40d15d68ff4197a0b59b323509e4bd07915fad9538f27b0"
+    },
+    {
+      "path": "packages/evaluation/test/reported-goal-review.test.mjs",
+      "sha256": "74dfccaf0fb63177747de069b3f46a509c936477ce28f4994ff3bd78ad33ded9"
+    },
+    {
+      "path": "packages/evaluation/test/reported-identity-review.test.mjs",
+      "sha256": "3ff13863435cb0a97334c982ac672b523df0f49b2007d3cfa5fd0723002ef62f"
+    },
+    {
+      "path": "packages/evaluation/test/reported-preference-review.test.mjs",
+      "sha256": "64dd98e5e78efaebd56bf2215c987613412da045c774eb2dd5a8b4ef958c45b8"
+    },
+    {
+      "path": "packages/evaluation/test/reported-relationship-review.test.mjs",
+      "sha256": "7c98c65d76550c7f9bd004b662557324b4bb1ff00ff36b72d735231a67ef1a77"
+    },
+    {
+      "path": "packages/evaluation/test/reported-self-concept-review.test.mjs",
+      "sha256": "83c8b2e930e899552b372b6bfb20f697cde504afbe522dc7498a85df77baceb7"
+    },
+    {
+      "path": "packages/evaluation/test/reported-value-review.test.mjs",
+      "sha256": "b988bc9843cb7ea3edf777365452d0b8605e96386846ae5d9329825929d86968"
+    },
+    {
+      "path": "packages/evaluation/test/retrieval-benchmark-utils.test.mjs",
+      "sha256": "cf54d5f4d15e09dbf0ea26a64fae3aa942cf95805df4d89ac2140b4c04ade54a"
+    },
+    {
+      "path": "packages/evaluation/test/retrieval-usage-cli.test.mjs",
+      "sha256": "db95c3ae38796eda5de86fb1dc535e80c3dc97cb876707c1d1fe598353f043ca"
+    },
+    {
+      "path": "packages/evaluation/test/retrieval-usage-service.test.mjs",
+      "sha256": "403a01d61f913fda80cac1c5bd687945434dda75bc7d276f7ca0dfe4de1465b3"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-benchmark-cli.test.mjs",
+      "sha256": "a480938bbf05bbcd7c90336d835a6804fc98b7552579e9748bfedc206700871c"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-benchmark.test.mjs",
+      "sha256": "7f8f0eb71753452dc1f058c873abb4e61196bb4dfda0b90867b013c17eba5313"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-calibration-cli.test.mjs",
+      "sha256": "b441c8cbbc5a674ff256e9b84e1a31e88654fae77e5d30a77c965db6d9986114"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-calibration.test.mjs",
+      "sha256": "5010a838cbc145a1838a471bb96287670f813d4d15d862b76a87b23a77b11c63"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-cli.test.mjs",
+      "sha256": "c51f9b3d8c37c924a6048b2b3c794c4a37c623d714d6969f6f930b1a048d74d0"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-contracts.test.mjs",
+      "sha256": "a8b86ac34377058a23f575742cef0a13f715cfb3c50ab0a58c75dfba928c3664"
+    },
+    {
+      "path": "packages/evaluation/test/reward-credit-service.test.mjs",
+      "sha256": "48da81d9fd5e000aeb9c509dba978d1dd6016294b87c0123c0b0d2651918074a"
+    },
+    {
+      "path": "packages/evaluation/test/rhelm-contract.test.mjs",
+      "sha256": "f056dfd4f8783cd12fa74c0e4b720bad8a7b8d0aa035615d4ac688741f5e5257"
+    },
+    {
+      "path": "packages/evaluation/test/rhelm-retrieval.test.mjs",
+      "sha256": "87da7c8a715aa7997ebfa4974f87446c82a16cccd190352d62cb6e9498c6548b"
+    },
+    {
+      "path": "packages/evaluation/test/self-concept-evidence.test.mjs",
+      "sha256": "784870f419f436646013668eb1060c8f979d3adb08c556b734c8f5086fab5fe5"
+    },
+    {
+      "path": "packages/evaluation/test/value-evidence.test.mjs",
+      "sha256": "949240c4feb048b09043d59d37fb2fa5078305cb552540c659b05b4db254d4c4"
+    },
+    {
+      "path": "packages/evaluation/test/zh4o-execution.test.mjs",
+      "sha256": "4114fcaedb68187dae73a6b7df5699cc9c0e505adbb0fcb05de1912bd8b3fcf2"
+    },
+    {
+      "path": "packages/evaluation/test/zh4o-source.test.mjs",
+      "sha256": "515714a9b37dcf710a2a8717f9a7cd2edb41a20f7407a67f0a305511378a2654"
+    },
+    {
+      "path": "packages/evaluation/test/zh4o-summary.test.mjs",
+      "sha256": "173f5ad5549200f388429089e4c19abceaafdb34aac6d222dde464f5d0eec8c6"
+    },
+    {
+      "path": "packages/evaluation/test/zh4o-system-cli.test.mjs",
+      "sha256": "43fe8beae7172a854e77d26061fd0a5714fbfc0e891d838928f7233e8e9c57ea"
+    },
+    {
+      "path": "packages/evaluation/test/zh4o-system.test.mjs",
+      "sha256": "ed8304570c559e73afed6c65e33edf80c0fb4861a865fb497c9f2559065e3f38"
+    },
+    {
+      "path": "packages/extraction/package.json",
+      "sha256": "874d0a9b0928e9f605e91bcd1bdf585ce837e00caa8c9c7f6274b17e398d6af7"
+    },
+    {
+      "path": "packages/extraction/resources/system-prompt.md",
+      "sha256": "d154bee5e6037412ac4c5b54ba7ec54bf4c056563e9f8dd395608765b44ab287"
+    },
+    {
+      "path": "packages/extraction/src/archive.mjs",
+      "sha256": "4823ae87a82300452d1e1d011a1fa27d2ec5e43519d4ff61c29a4d4d6ecf1274"
+    },
+    {
+      "path": "packages/extraction/src/index.mjs",
+      "sha256": "18d005ea79fdde8b32fa734451c8223c1c1c5cc2cebb0eaed7f72c2a6280ce1f"
+    },
+    {
+      "path": "packages/extraction/src/participant-identity.mjs",
+      "sha256": "ed4a5c2717c4d16d75437937551df402d4fd9006955dc95261ac4505b1e4e41b"
+    },
+    {
+      "path": "packages/extraction/src/prompt.mjs",
+      "sha256": "5ab2323454728256d3cb03c7e9e8fe1f4e4d1cdf9c151fb3d6d558a32dffb84d"
+    },
+    {
+      "path": "packages/extraction/src/repair.mjs",
+      "sha256": "7e476c882e7899bb5f86ffca3faf3ce8c66e1c1b30588255d18bbf184d9f31d1"
+    },
+    {
+      "path": "packages/extraction/src/temporal-evidence.mjs",
+      "sha256": "8aa264452705663f08a2cbf4342e4b39df0a3f93f5ad1f4f5b0aaab52d79a51a"
+    },
+    {
+      "path": "packages/extraction/src/utterance-evidence.mjs",
+      "sha256": "c66cff46d6c3a7bd0f56afe4514cd5b939e3186c428dad36f22f70e950be3aac"
+    },
+    {
+      "path": "packages/extraction/test/calendar-time.test.mjs",
+      "sha256": "de65cc0a9afb3b0dd16fd1c1be7055da5603ed09377c43a44ea6a23a8fb126a4"
+    },
+    {
+      "path": "packages/extraction/test/long-term-extraction.test.mjs",
+      "sha256": "fe36f720175db3f8ba573a0e271c7414abfafd6baa512eb37606a460d15115a0"
+    },
+    {
+      "path": "packages/extraction/test/temporal-evidence.test.mjs",
+      "sha256": "6eff978aced023215d227215ff538e2a99d1cb98485bb104f772f2fee65d5e0a"
+    },
+    {
+      "path": "packages/host-adapter/package.json",
+      "sha256": "ad8067d848dd547b3d9a18a2cce0c6e0fac0471de27322b14d1fb2396c17eb06"
+    },
+    {
+      "path": "packages/host-adapter/src/index.mjs",
+      "sha256": "6691f6fd8e4577290160a92f2d6e2b544bb13e53320d8a847aa39180d36feaed"
+    },
+    {
+      "path": "packages/host-adapter/src/intervention-policy.mjs",
+      "sha256": "117b1ce38b521b23437866b596b07f66022d21c3a1d3c70e70fa023fb1db6db4"
+    },
+    {
+      "path": "packages/host-adapter/test/host-adapter.test.mjs",
+      "sha256": "acf34db90833fb8afee2f6bb44d044a6940bdd37ff043c3e67329161cf35ffd0"
+    },
+    {
+      "path": "packages/ingestion/package.json",
+      "sha256": "2ce45b78e8a759f9ef1aaf22ca7b9d4e05710565e5f81d194b71758f17a5ae46"
+    },
+    {
+      "path": "packages/ingestion/src/archive-windows.mjs",
+      "sha256": "c7b4832018aeadf9289c17171ddf407f4ccd59c580d401316a811c9a1e0490b3"
+    },
+    {
+      "path": "packages/ingestion/src/extraction-repair.mjs",
+      "sha256": "eb44757868576640219e397c4cd4ab98f5863e312d34ba83b684bafa1ba53cf6"
+    },
+    {
+      "path": "packages/ingestion/src/index.mjs",
+      "sha256": "b4e7e421d77e3d1bfe02da244931333fca8842d2ab066b8d21f05871939d3892"
+    },
+    {
+      "path": "packages/ingestion/src/processing-stages.mjs",
+      "sha256": "d690613112f153d98ff15f9b2a8aa2ef7e926a2bb48f9448cfac7e460959e459"
+    },
+    {
+      "path": "packages/ingestion/src/processor.mjs",
+      "sha256": "9dd1cdcbdeab14f405e153b99fd62da392de96d945e8724f46f50fd61f6173c4"
+    },
+    {
+      "path": "packages/ingestion/src/protocol.mjs",
+      "sha256": "408fa41cb85b44df777d107f387df2dc683e3ddef7c66e9121cbe9b14fe6dd5e"
+    },
+    {
+      "path": "packages/ingestion/src/reply-chunks.mjs",
+      "sha256": "8ef656c400fb538d03970ec884a16992119e6a01e358fece7dbad678c16d09cf"
+    },
+    {
+      "path": "packages/ingestion/test/archive-windows.test.mjs",
+      "sha256": "a46a083d4ddda7ef70225f89a7449ce82fa7577dbf6eccfa37e17e76e72f03a5"
+    },
+    {
+      "path": "packages/ingestion/test/ingestion.test.mjs",
+      "sha256": "d97521a965b3c6774ca00ed1bc529ec22b03fbb2317d4a0946591af34629f758"
+    },
+    {
+      "path": "packages/ingestion/test/reply-chunks.test.mjs",
+      "sha256": "5cb096ca6c5e5cca0cfbc0a06673925545ab209b94b4184b78c70c041561ab46"
+    },
+    {
+      "path": "packages/maintenance/package.json",
+      "sha256": "5fbf3370bd82df1280ea7e2bd4dbdef6cc5f63b3140197358f470ea29c3f91ce"
+    },
+    {
+      "path": "packages/maintenance/src/index.mjs",
+      "sha256": "a209de3cb5e8552a7fc14711f5c65f4e187f01df3080d6069111916bdd80aeba"
+    },
+    {
+      "path": "packages/maintenance/src/structure-batching.mjs",
+      "sha256": "d713a43eb27b59e9ac9e54307c5550f1d5b4418a9b21cda54fce3147e14dd56e"
+    },
+    {
+      "path": "packages/maintenance/test/event-continuity.test.mjs",
+      "sha256": "0b53d59d906cfdb59d4317f88b33b8ab583d9a827f43366057765812e54b8ae8"
+    },
+    {
+      "path": "packages/maintenance/test/maintenance.test.mjs",
+      "sha256": "70a78542b664c19494dceb85758a4a29343156bc4164c70b8b6346e0548e4801"
+    },
+    {
+      "path": "packages/maintenance/test/structure-batching.test.mjs",
+      "sha256": "aa41fd150e7fdcaea6ecbd217703178d211ca25cd55f69e366d91221b65844a8"
+    },
+    {
+      "path": "packages/providers/package.json",
+      "sha256": "67602bc60e025ef252130517baec4271fc97c71ebef020e98b8ab95a95f84f6d"
+    },
+    {
+      "path": "packages/providers/src/index.mjs",
+      "sha256": "0bcf4da4bf1e06f0964720a32ef15071c48e0eb5b373e6050c7fecefeded0bed"
+    },
+    {
+      "path": "packages/providers/src/injected-generator.mjs",
+      "sha256": "f9786273a1d07d42935db0e02a381342531523c534c57669fed6c39b595018c2"
+    },
+    {
+      "path": "packages/providers/src/openai-compatible-embedding.mjs",
+      "sha256": "a30a91c15608a36e48cd874a26cc1b2845c24b023bb3d7ac3329a06d232292a3"
+    },
+    {
+      "path": "packages/providers/src/openai-compatible-generator.mjs",
+      "sha256": "6f98ca04d0956479c041011ee63ae008c84b860f17190a43ebd3dc94fbbde442"
+    },
+    {
+      "path": "packages/providers/src/openai-compatible-url.mjs",
+      "sha256": "8a4fb5ec0265ce96a193aa7b967db70a8bdf8f936a786147cf7eafc2e7958756"
+    },
+    {
+      "path": "packages/providers/test/injected-generator.test.mjs",
+      "sha256": "68f4d4f5202dbde896c2ee17bf032c5965577673af094c6a8d27fc15e6f9cfdb"
+    },
+    {
+      "path": "packages/providers/test/openai-compatible-embedding.test.mjs",
+      "sha256": "1b8fb16f38b0dc72c4cfc90db7b47d5f061af2b48ce14a4f14e6dfd22e9176d1"
+    },
+    {
+      "path": "packages/providers/test/openai-compatible-generator.test.mjs",
+      "sha256": "036552d908e9b77c476a993bc8ca58f838d1e5a704e831527885ca215a563ceb"
+    },
+    {
+      "path": "packages/retriever/package.json",
+      "sha256": "991f1a3530be9a236a2550d71049ebb7f3abddb64c73a977317983e0b88d733a"
+    },
+    {
+      "path": "packages/retriever/src/affective-ranking.mjs",
+      "sha256": "31ff0e21858a40c73b3a89f728c243f480c832392ce164b1bc69fda83b9055be"
+    },
+    {
+      "path": "packages/retriever/src/bm25-route.mjs",
+      "sha256": "f8913b081a533676bdd9c7ea153a83be235c6b6ebf439662a75003a7a331f8fb"
+    },
+    {
+      "path": "packages/retriever/src/candidate-prefilter.mjs",
+      "sha256": "2a2548504e984bd24756d5c42157155b2fc127ffce854f5c52a6185da8a4278f"
+    },
+    {
+      "path": "packages/retriever/src/candidate-selection.mjs",
+      "sha256": "eed1d1191e401991a1d68acf3b3361d9b47bfa953f71c4a09597542c0f569399"
+    },
+    {
+      "path": "packages/retriever/src/context-renderer.mjs",
+      "sha256": "817058c990771bb3ea16c47d40aedc3b85fd726ccead03877258f6651125b2bc"
+    },
+    {
+      "path": "packages/retriever/src/context-selection.mjs",
+      "sha256": "14d06fe0aacc5c5a6c2b421232f807f7c4e854b58c92339bd3884126e502456d"
+    },
+    {
+      "path": "packages/retriever/src/index.mjs",
+      "sha256": "4fa77bb723f520aab67cf722ffeb1d314a52dcf13b00e4a4936fe1ded11fe003"
+    },
+    {
+      "path": "packages/retriever/src/memory-chain.mjs",
+      "sha256": "ef97003ab75fe2e95d5f5b19965a299f8392a428384359ff4df318f4eef02831"
+    },
+    {
+      "path": "packages/retriever/src/natural-decay.mjs",
+      "sha256": "f17238812e0bf11725c93dfd852e1e7af83d51abcf9a9362e38994149b24b195"
+    },
+    {
+      "path": "packages/retriever/src/node-reader.mjs",
+      "sha256": "7cb29e62213eee0f5cbce4cc8e9353c903b93607edcdc8b93cc2681464bd30bd"
+    },
+    {
+      "path": "packages/retriever/src/plasticity-ranking.mjs",
+      "sha256": "f735103bc07402d7b83c61e2caf013d188ab20e2599b9fcd92e544222593aae4"
+    },
+    {
+      "path": "packages/retriever/src/query-plan.mjs",
+      "sha256": "134f7b81ff0825d073e97ab5375efeafc3503c25dade70fc6ff95430585d990f"
+    },
+    {
+      "path": "packages/retriever/src/query-text.mjs",
+      "sha256": "dd14eb692ec9caa2bbd520644afb8d3d9b50cde9623674aac78295d1bc13e3b2"
+    },
+    {
+      "path": "packages/retriever/src/query.mjs",
+      "sha256": "42779f2fedbaa63e8b695a133d4f3e66894e60c94ab285bf62ffa2f5dd3e85a3"
+    },
+    {
+      "path": "packages/retriever/src/ranked-context.mjs",
+      "sha256": "7319e3136d93543e099d5ea8b9d40c29977627ea4dd9c7ffea8b15d9781a59ba"
+    },
+    {
+      "path": "packages/retriever/src/recall-reactivation.mjs",
+      "sha256": "24bec994c7516e92fec7ec78bd458a3c309d19ecebf9ea6ca4b0ac48302d3a61"
+    },
+    {
+      "path": "packages/retriever/src/retriever.mjs",
+      "sha256": "b504b7ce5b27f53e6b18b17fcdac62828e6ee373e55db1bafecb9d86a993a9b8"
+    },
+    {
+      "path": "packages/retriever/src/seed-routes.mjs",
+      "sha256": "3dfac92396415d4eb19ef0079e8c276e2eed84e9deba2a3fd3bb0f0ce8243a82"
+    },
+    {
+      "path": "packages/retriever/src/temporal-query.mjs",
+      "sha256": "5e10dfdd06bc1071d5b168f8fd50c7b69150defddf71877491d8da37357cc2c3"
+    },
+    {
+      "path": "packages/retriever/src/temporal-ranking.mjs",
+      "sha256": "55d59325e021c43d4254e38a3045d4ce83f7bbf9c1501a383c2fcfcc02d3139a"
+    },
+    {
+      "path": "packages/retriever/src/worker-dispatch.mjs",
+      "sha256": "908ec50fd9454ee878de596affec08e6e433a9cb55c38bcc5d6cace643bd9f4a"
+    },
+    {
+      "path": "packages/retriever/src/worker-entry.mjs",
+      "sha256": "8a3c453592ad37b17cc7c1b7cfbe240c99f06b994e3801232efc0917dca75498"
+    },
+    {
+      "path": "packages/retriever/test/english-retrieval.test.mjs",
+      "sha256": "ce95764d7f763acf926ee49fe3c1bce4fa01ba34e103d9d44d0f706c73207082"
+    },
+    {
+      "path": "packages/retriever/test/memory-retriever.test.mjs",
+      "sha256": "b677952eecd262f62b6e539ebe116c413533b3ae2d753476000c70dfba63df3a"
+    },
+    {
+      "path": "packages/retriever/test/natural-decay.test.mjs",
+      "sha256": "e956477260f9ed592afdaa2506c8a5fba2a47c722daa4e7118dfc77fd0f74f17"
+    },
+    {
+      "path": "packages/retriever/test/recall-reactivation.test.mjs",
+      "sha256": "50175fab5ffa5b3b44c965c017c1b8ebb355c4f406b1cb27a7305ff83d893963"
+    },
+    {
+      "path": "packages/retriever/test/relevance-selection.test.mjs",
+      "sha256": "2d8730cb7e0b6e0d02981c3fa129e5ee3c926ab0c366f7524ede55cada7cc915"
+    },
+    {
+      "path": "packages/retriever/test/retrieval-performance.test.mjs",
+      "sha256": "ba444e26771d9cfffa3007675cdf61ff3697b29d08fb2df3071193bdb401117f"
+    },
+    {
+      "path": "packages/retriever/test/short-keyword-recall.test.mjs",
+      "sha256": "ae839f525ed0721aa57e5ceec0fc55ac1b2ed3ad1bd0799f7821d3fe71e4610b"
+    },
+    {
+      "path": "packages/retriever/test/temporal-regressions.test.mjs",
+      "sha256": "08bc075ff54dbf7e06486e62354446ff3f979c15e70842fd0c17c06eace9367d"
+    },
+    {
+      "path": "packages/retriever/test/temporal-windows.test.mjs",
+      "sha256": "e4b148e9bdceb6119188b04eaa3c07a6f8a7a6ce289b9fb364d6f651ee1d5ef3"
+    },
+    {
+      "path": "packages/runtime/package.json",
+      "sha256": "8c3678bd30ff9f5427dd078d8d0a98911a107600d2036244f1e1959725eb5618"
+    },
+    {
+      "path": "packages/runtime/src/index.mjs",
+      "sha256": "8cd5f924f47938d720e5885cf40f1ad7c3d9f0f0e2c1ba373550437dd94c7888"
+    },
+    {
+      "path": "packages/runtime/test/runtime.test.mjs",
+      "sha256": "2b86dcdc34cde31bab0f9940c5091995eef191feb034ae671bbdd93ae7252033"
+    },
+    {
+      "path": "packages/sdk/package.json",
+      "sha256": "062d24cbe2333c37f9befe8482f15e60fdc414b2da2f9566b5647f99c144bf1a"
+    },
+    {
+      "path": "packages/sdk/src/index.mjs",
+      "sha256": "61d94b8403200602838c6340c71380a0e86f76315751f0090bea8bc7aadde4ec"
+    },
+    {
+      "path": "packages/sdk/test/memory-sdk.test.mjs",
+      "sha256": "9ec70283a3af3c089dd73232daa3332cb231b055bdedf700246ad00156cd53b3"
+    },
+    {
+      "path": "packages/server/bin/suzu-memory-server.mjs",
+      "sha256": "8c94e776082b506c672ac8b8e854504b7bc93adf6cc6ee00283fb19c4ae5aac3"
+    },
+    {
+      "path": "packages/server/package.json",
+      "sha256": "120baaba841036337949f4ed2a40a34d3a358ed629809de280a862ae6dbced4f"
+    },
+    {
+      "path": "packages/server/src/index.mjs",
+      "sha256": "34008b0086071b4610279c1c56aee058d5fc917f9dada00ad52ff3c002b829ad"
+    },
+    {
+      "path": "packages/server/test/memory-server.test.mjs",
+      "sha256": "83cd696ab5a0e69ccd1c1ddd18df85758465d54ffdf95b4eec1d33dd6330ba7e"
+    },
+    {
+      "path": "packages/service/package.json",
+      "sha256": "d85fa2993a1fae2a8b3c8af628ff8c5ddb87443ff5ffe55efd1819ab605b7c6a"
+    },
+    {
+      "path": "packages/service/src/database-backup.mjs",
+      "sha256": "61e77625925411648ec18f9ca4c3401b320b350292abde2259c9db9c94a719f7"
+    },
+    {
+      "path": "packages/service/src/event-source-cleanup.mjs",
+      "sha256": "a746740fb4ebc56279d1df3cc59923376590ea6963954c0a77981b802bd2dde7"
+    },
+    {
+      "path": "packages/service/src/event-source-ingestion.mjs",
+      "sha256": "a21b679a8a36e0290d576019c1787746e5f58ea772b64a3a84350a99dd4aebbb"
+    },
+    {
+      "path": "packages/service/src/index.mjs",
+      "sha256": "9eb19acb515a04fb67a9532af9ae154b1028f3fdf482362e7ad7a850717ffc5e"
+    },
+    {
+      "path": "packages/service/src/legacy-source-import.mjs",
+      "sha256": "874a2c307e141ae0d6ec194ee38e8fb692135b9dfb921da06c21d9a48fb6534a"
+    },
+    {
+      "path": "packages/service/src/model-task-validation.mjs",
+      "sha256": "e04638ab4747cd899925109c4b5222201d5584e6019b4e777bc0ea780176b8f3"
+    },
+    {
+      "path": "packages/service/src/review-console.mjs",
+      "sha256": "ecdf6fc6a34010fe752bad47993a2d21e9082595e814590892fcffa8cda5dcf9"
+    },
+    {
+      "path": "packages/service/src/search-session.mjs",
+      "sha256": "1379a960a38b7c15c1c6a0f2a197448b90b3d603d2381dc9335c1316c72db387"
+    },
+    {
+      "path": "packages/service/test/agent-memory-extraction.test.mjs",
+      "sha256": "6b896f571b58189c7fd508f2fdc0360bce6b0c997d37718c5268cec1822efbb2"
+    },
+    {
+      "path": "packages/service/test/calendar-time.test.mjs",
+      "sha256": "f3b260360a1aa3148559c7cc08fb8b85fea7fc5d0f893299da2f5d99db71bf6c"
+    },
+    {
+      "path": "packages/service/test/event-source-contracts.test.mjs",
+      "sha256": "31a84671b4d8830c5ce204b10da9dc7ba6bc114997a30b2e54b34613e4201f00"
+    },
+    {
+      "path": "packages/service/test/event-source-experience.test.mjs",
+      "sha256": "70ca5d1a13ed832d994fca420ea00d7264bef0423c7c676106cbaad738e3340b"
+    },
+    {
+      "path": "packages/service/test/event-source-id-scope.test.mjs",
+      "sha256": "bf07dc4de887500afdb5ed9fd26ac96d6de7d211763bfd2cc40793b8708dd458"
+    },
+    {
+      "path": "packages/service/test/event-source-maintenance.test.mjs",
+      "sha256": "a51ecdceb0f4260059c3c2eaee6e9a9fbe2d4b5e920977c368fd6baac177c59e"
+    },
+    {
+      "path": "packages/service/test/event-source-repair.test.mjs",
+      "sha256": "a2e7d6216a76ab1b35c16deef203e8f59b3f113b4a29181035ec6c9cce9b5864"
+    },
+    {
+      "path": "packages/service/test/fixtures/event-source-interrupt.mjs",
+      "sha256": "7ab9273d5a1cdf5a86c4937e486c9d21af420fcdce40a4a5066cdee6b867f40c"
+    },
+    {
+      "path": "packages/service/test/legacy-source-import.test.mjs",
+      "sha256": "53eb1a4a55bae0a0dcab566955ce81d2e52547e8c4cc0c2e71cbb1bf8b71feba"
+    },
+    {
+      "path": "packages/service/test/memory-service.test.mjs",
+      "sha256": "323536a51368f42812524edceb421f36cbb4f06352336295c8f13407eca6c032"
+    },
+    {
+      "path": "packages/service/test/model-task-validation.test.mjs",
+      "sha256": "c6a43d97a8763c2bb36d8b7790997262747a3871105200137e445fcd41804a5a"
+    },
+    {
+      "path": "packages/service/test/preference-integration.test.mjs",
+      "sha256": "8d097368541bb6ccb2160bfbb13d2236cced8f3d535219ff4a26e348eaf5456c"
+    },
+    {
+      "path": "packages/service/test/search-session.test.mjs",
+      "sha256": "f3a9b0884f38da1b9ff33d387631612ed367dafce24982fe02576b356113ea9d"
+    },
+    {
+      "path": "packages/service/test/storage-lifecycle.test.mjs",
+      "sha256": "d4ee3d60a9d7e2e61de5276ea0147d4100bdd27f1f47ddfce2df587821743c6a"
+    },
+    {
+      "path": "packages/structurer/package.json",
+      "sha256": "be185de8d4327bf514ef18b6d3dc2a1d87e1e81b24f67df654e0b41e661a595b"
+    },
+    {
+      "path": "packages/structurer/resources/relation-system-prompt.md",
+      "sha256": "5db5d9025a0e870264d44e67cb79f122aecc6df2352a04cba718e2e31272ce4a"
+    },
+    {
+      "path": "packages/structurer/resources/subject-attribution-system-prompt.md",
+      "sha256": "ef9b6aa60989c332c957c5f92ac77062e71164698860847bb7963ee7f935df8f"
+    },
+    {
+      "path": "packages/structurer/resources/system-prompt.md",
+      "sha256": "d0757963117e430ebb0ec9412c8528de6f7de4f42b6dbb73dcab51b436d52cc6"
+    },
+    {
+      "path": "packages/structurer/src/budgeted-parts.mjs",
+      "sha256": "f4e014518a7c03590364b3400d2f499f7153e938f7839897ee817b019d27f588"
+    },
+    {
+      "path": "packages/structurer/src/consolidation-batch.mjs",
+      "sha256": "bf847006ec37c4fecfbf317495a51b050dd344e5d7f5a006539e16a0050a4c7b"
+    },
+    {
+      "path": "packages/structurer/src/consolidation-generation-batch.mjs",
+      "sha256": "ad9618da9d2189a153923cde4c884cc3e2bb27c7b961f1fbc21e1598d6dcd602"
+    },
+    {
+      "path": "packages/structurer/src/consolidation-planner.mjs",
+      "sha256": "0e8f94df13744403bf486f634e3c9985c5056d825be2205826b87787181ec56c"
+    },
+    {
+      "path": "packages/structurer/src/consolidation-service.mjs",
+      "sha256": "ea0222be9173571f8d519d8271beb06d610993120ad44e9717feb4ec39fab3b2"
+    },
+    {
+      "path": "packages/structurer/src/index.mjs",
+      "sha256": "60e7dfcbbae2bb903fa64e96532ab1dc73bfd0e4dad8a3202a93bb74042fa490"
+    },
+    {
+      "path": "packages/structurer/src/policy.mjs",
+      "sha256": "c156c894a11d2a312be75806e2467bf9d34a63db7055bab5b41e8a88f2cfe580"
+    },
+    {
+      "path": "packages/structurer/src/prompt.mjs",
+      "sha256": "1ddcb474ad44f70a816e04d02870015cc859d12d6b3f713a0537ef2fffc4ee71"
+    },
+    {
+      "path": "packages/structurer/src/relation-candidate-policy.mjs",
+      "sha256": "1139afa972560e12854ca13fbad26873b4ad2781efc96e4c0e30d270cf28ef26"
+    },
+    {
+      "path": "packages/structurer/src/relation-prompt.mjs",
+      "sha256": "c16ccda067b739c8c337bc2d59719c7dde57e4796e678ffd9b05b354bafb6b84"
+    },
+    {
+      "path": "packages/structurer/src/relation-service.mjs",
+      "sha256": "ed50a5098199e596364c82db94604c3e844063485298bca00ffccb4fc8fb9644"
+    },
+    {
+      "path": "packages/structurer/src/relation-snapshot.mjs",
+      "sha256": "a8b224c4f9996df49874f70b1d0d0f08ab92198e4502a5d373e3ce48403309a2"
+    },
+    {
+      "path": "packages/structurer/src/service.mjs",
+      "sha256": "a0bf63b6938911a43c9c507629a8c57fe4b43788887446ca456ee03a857d872b"
+    },
+    {
+      "path": "packages/structurer/src/snapshot.mjs",
+      "sha256": "82514838761e91c91f0cac2afa38ed158e4c2d1409566e3c6b51bc3d28510559"
+    },
+    {
+      "path": "packages/structurer/src/subject-attribution-batch.mjs",
+      "sha256": "b7cbe8b6db93186efba830ba6595421300f445f2cd083fc63d0b2707e73e6d65"
+    },
+    {
+      "path": "packages/structurer/src/subject-attribution-prompt.mjs",
+      "sha256": "6b89de82c957e0f9512f460400e117f4cb1c4be4ac6125918e0b65281543ab58"
+    },
+    {
+      "path": "packages/structurer/src/subject-attribution-service.mjs",
+      "sha256": "2bf3a0aaaf067113a9dd48466f9649b3e4d837cb5d89a2ec0b68a1609520e058"
+    },
+    {
+      "path": "packages/structurer/test/budgeted-consolidation.test.mjs",
+      "sha256": "55de4b7278a46d6d2ffc58ca4c7af0ff4b3e0a2c2cfc4f51d96d4c89f4ad5639"
+    },
+    {
+      "path": "packages/structurer/test/complete-snapshot.test.mjs",
+      "sha256": "ef7c7feccbc54b660e322c7eff1945889d6985c18236ee9c50f3f453a7131130"
+    },
+    {
+      "path": "packages/structurer/test/memory-structurer.test.mjs",
+      "sha256": "829291f629d0520aa9e0077f8f6f270e70fdd9d1ee89b718fa69fd24f6d53d4b"
+    },
+    {
+      "path": "packages/usage-ledger/package.json",
+      "sha256": "622e68540e6d68f931264fdfe47bd270b18e1996522fbdda2f2f65f2cd3fcfda"
+    },
+    {
+      "path": "packages/usage-ledger/resources/default-prices.json",
+      "sha256": "c82037136cf78594431ce8001537327ca8524482a76b4675f3a4c9629dd94177"
+    },
+    {
+      "path": "packages/usage-ledger/schema/event.schema.json",
+      "sha256": "23b46fd5a956b17f84bdd15977a73571a47e633518bad8733d53092e94c530de"
+    },
+    {
+      "path": "packages/usage-ledger/src/calculator.mjs",
+      "sha256": "232218a0c6c55637b47d301715f30061ac2928a50bd0a3a11218cef59328775e"
+    },
+    {
+      "path": "packages/usage-ledger/src/catalog.mjs",
+      "sha256": "9dfca9dc4055bf283f8ba1ffe2a14dd07b69314a4fd6844405672e1749a50fe9"
+    },
+    {
+      "path": "packages/usage-ledger/src/index.mjs",
+      "sha256": "2a981f02eac05cb019aa5a6e83746d4b6a53857b2f1b8bb9c5ea7115c8ce243e"
+    },
+    {
+      "path": "packages/usage-ledger/src/store.mjs",
+      "sha256": "5624195c7acfaa3b5b16965a72bd0b651461e2a1726bbe573c5d64f7495fe2d7"
+    },
+    {
+      "path": "packages/usage-ledger/test/cost-ledger.test.mjs",
+      "sha256": "1ef3be5049a508cabfb95065dcc3d55948e306cbfe8612de4a46517b9ec50c6c"
+    },
+    {
+      "path": "packages/visualization/package.json",
+      "sha256": "a8a6abe808b1f07b28cbc66e6ceeec61e2d4c6a1b12a28ed4ab4207b5ef9246b"
+    },
+    {
+      "path": "packages/visualization/src/brain-layout.mjs",
+      "sha256": "3844a30d4737d6d28d2ad130cfbe7985374f20addfd5327c9df75b5bd9ab15d6"
+    },
+    {
+      "path": "packages/visualization/src/index.mjs",
+      "sha256": "f722eda86a903c7c6e411aa410450bc6cadba0e8ddcb6d8a17e1c33854da9009"
+    },
+    {
+      "path": "packages/visualization/test/memory-visualization.test.mjs",
+      "sha256": "55a533e6a13317f6aa33bc8d67b526e0622404f03b8291009d7c074a2c180819"
+    },
+    {
+      "path": "scripts/check-syntax.mjs",
+      "sha256": "c8cc274c0b35d158a3c570d2abe77b53aebb3c8ce8ba51abee5bcf6a08ccf901"
+    },
+    {
+      "path": "scripts/run-zh4o.ps1",
+      "sha256": "160ac7669d7c48bd21bfaf06910cff94896e34359efe6fffed39d1116953d80e"
+    },
+    {
+      "path": "scripts/summarize-zh4o.mjs",
+      "sha256": "329b3ce595abff686215b3c6c7069619c64d851d5d93a3919e680ee87ee5dae2"
+    }
+  ]
+}

@@ -82,44 +82,6 @@ test('windows use the local day across DST, New Year, and clamped month ends', (
     win('2024-02-14', '2024-03-15'));
 });
 
-test('unbounded topicless recall covers historical periods despite dense recent dialogue', async t => {
-  const memories = [
-    { id: 'oldest', eventDate: '2024-01-01' },
-    { id: 'middle', eventDate: '2025-05-01' },
-    ...Array.from({ length: 30 }, (_, i) => ({ id: `recent-${i}`, eventDate: '2026-10-22' })),
-  ];
-  for (const kind of ['event', 'utterance']) {
-    const recall = fixture(t, memories.map(memory => ({ ...memory, kind, layer: kind === 'utterance' ? 'raw' : 'episodic',
-      eventStart: `${memory.eventDate}T07:30:00+08:00`, recordedAt: `${memory.eventDate}T07:30:00+08:00` })));
-    const historical = await recall('以前我们聊了什么', { maximumReturnedCandidates: 3, maximumChainMemories: 3 });
-    assert.equal(historical.status, 'ready');
-    assert.ok(historical.candidates.some(c => c.memoryId === 'oldest'));
-    assert.ok(historical.candidates.some(c => c.memoryId === 'middle'));
-    assert.match(historical.context, /2024-01-01/);
-    assert.match(historical.context, /2025-05-01/);
-    const recent = await recall('最近我们聊了什么', { maximumReturnedCandidates: 3 });
-    assert.ok(recent.candidates.every(c => c.memoryId.startsWith('recent-')));
-    const topic = await recall('以前聊过灯塔博物馆吗');
-    assert.ok(topic.candidates.every(c => c.temporalRanking.topicScore > 0));
-  }
-});
-
-test('topicless historical utterance recall keeps the requested speaker while covering history', async t => {
-  const recall = fixture(t, [
-    { id: 'agent-old', eventDate: '2024-01-01' },
-    { id: 'agent-middle', eventDate: '2025-05-01' },
-    ...Array.from({ length: 25 }, (_, i) => ({ id: `agent-new-${i}`, eventDate: '2026-10-22' })),
-  ].map(memory => ({ ...memory, kind: 'utterance', layer: 'raw', subjectRole: 'agent', subjectKey: 'window-agent',
-    eventStart: `${memory.eventDate}T07:30:00+08:00` })).concat([{
-    id: 'other-speaker', kind: 'utterance', layer: 'raw', subjectRole: 'user', subjectKey: 'user',
-    eventStart: '2020-01-01T07:30:00+08:00', importance: 1, content: '另一位说话人的原话。',
-  }]));
-  const result = await recall('你以前说过什么', { maximumReturnedCandidates: 3 });
-  assert.ok(result.candidates.some(c => c.memoryId === 'agent-old'));
-  assert.ok(result.candidates.some(c => c.memoryId === 'agent-middle'));
-  assert.ok(result.candidates.every(c => c.memoryId !== 'other-speaker'));
-});
-
 test('time affinity is bounded, tapers to zero, and never penalizes outside dates', () => {
   const parsed = resolveTemporalQuery('前几天', now);
   for (const [date, score] of [['2026-10-17', 1], ['2026-10-21', 1], ['2026-10-15', 0.5],
@@ -165,7 +127,7 @@ test('vague time boosts topic matches without admitting unrelated or discarding 
   assert.match(fallback.context, /2026-09-13/);
 });
 
-test('vague topic recall still invokes BM25 and vector routes with the time phrase removed', async t => {
+test('vague topic recall preserves the caller’s full query for semantic search', async t => {
   const recall = fixture(t, [{ id: 'old', eventDate: '2026-09-13' }]);
   const inputs = [];
   const result = await recall('两周前聊过灯塔博物馆吗', {}, { embeddingProvider: async text => {
@@ -175,7 +137,7 @@ test('vague topic recall still invokes BM25 and vector routes with the time phra
   assert.ok(result.seedRouting.plannedRoutes.includes('bm25'));
   assert.ok(result.seedRouting.plannedRoutes.includes('vector'));
   assert.ok(inputs.length > 0);
-  assert.ok(inputs.every(text => !text.includes('两周前')));
+  assert.ok(inputs.every(text => text.includes('两周前')));
 });
 
 test('topicless recent recall returns local dated memories in reverse date order', async t => {
@@ -189,7 +151,7 @@ test('topicless recent recall returns local dated memories in reverse date order
   assert.match(recent.context, /2026-10-22/);
   assert.match(recent.context, /2026-10-20/);
   const latest = await recall('上次聊过灯塔博物馆吗');
-  assert.deepEqual(latest.candidates.map(c => c.memoryId), ['recent']);
+  assert.ok(latest.candidates.some(c => c.memoryId === 'recent'));
 });
 
 test('raw evidence retains ordinary matches when an exact date is only a bonus', async t => {

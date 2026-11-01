@@ -19,14 +19,17 @@ export function utteranceStatements(value) {
   const grammar = maskQuotedText(original);
   let hasQuestion = false;
   const statements = [];
+  const questions = [];
   for (const match of grammar.matchAll(/[^.!?。！？\n]+[.!?。！？]*/gu)) {
     if (/[?？]/u.test(match[0])) {
       hasQuestion = true;
+      questions.push(original.slice(match.index, match.index + match[0].length));
     } else {
       statements.push(original.slice(match.index, match.index + match[0].length));
     }
   }
-  return { hasQuestion, text: hasQuestion ? statements.join('\n') : original };
+  return { hasQuestion, text: hasQuestion ? statements.join('\n') : original,
+    questions: questions.join('\n') };
 }
 
 const REJECTED_REQUESTS = [

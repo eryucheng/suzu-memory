@@ -43,7 +43,7 @@ test("nineteen memories wait without generation or attempts, the twentieth is gr
   f.seed(19);
   await f.run();
   assert.equal(f.calls.length, 1);
-  const snapshot = JSON.parse(f.calls[0].input.split("\n\n").slice(1).join("\n\n"));
+  const snapshot = JSON.parse(f.calls[0].input);
   assert.equal(snapshot.currentMemories.length, 20);
   await f.run();
   assert.equal(f.calls.length, 1);
@@ -159,7 +159,7 @@ test("twenty memories across two spaces trigger together and organize in separat
   f.seed(9, { world: 'room-b' });
   await f.run();
   assert.equal(f.calls.length, 2);
-  const snapshots = f.calls.map(call => JSON.parse(call.input.split('\n\n').slice(1).join('\n\n')));
+  const snapshots = f.calls.map(call => JSON.parse(call.input));
   assert.deepEqual(snapshots.map(snapshot => snapshot.currentMemories.length), [10, 10]);
   assert.deepEqual(snapshots.map(snapshot => [...new Set(snapshot.currentMemories.map(memory => memory.worldId))]), [['room-a'], ['room-b']]);
   await f.run();
@@ -171,7 +171,7 @@ test("a failed accumulated batch retries its whole material and does not consume
   for (let i = 0; i < 20; i += 1) f.seed(i);
   let attempts = 0;
   const generator = async ({ input }) => {
-    const snapshot = JSON.parse(input.split("\n\n").slice(1).join("\n\n"));
+    const snapshot = JSON.parse(input);
     assert.equal(snapshot.currentMemories.length, 20);
     if (++attempts === 1) throw new Error("temporary provider failure");
     return { output: { proposals: [] } };
@@ -195,7 +195,7 @@ test("interrupted batches retain membership before the first provider call", asy
   f.repository.recoverRunningMaintenanceTasks("owner", { force: true });
   f.seed(20);
   await f.run();
-  const snapshot = JSON.parse(f.calls[0].input.split("\n\n").slice(1).join("\n\n"));
+  const snapshot = JSON.parse(f.calls[0].input);
   assert.equal(snapshot.currentMemories.length, 20);
   assert.equal(snapshot.currentMemories.some(memory => memory.id === "owner-primary-20"), false);
 });
@@ -215,7 +215,7 @@ test("oversized batches split complete memories and retry only unfinished parts"
   assert.equal((await run()).semanticTasks.tasksCompleted, 20);
   assert.equal(calls.length, 3);
   assert.equal(calls[1].input, calls[2].input);
-  const successful = [calls[0], calls[2]].flatMap(request => JSON.parse(request.input.split("\n\n").slice(1).join("\n\n")).currentMemories);
+  const successful = [calls[0], calls[2]].flatMap(request => JSON.parse(request.input).currentMemories);
   assert.equal(new Set(successful.map(memory => memory.id)).size, 20);
   assert.ok(successful.every(memory => memory.content.endsWith(`尾部-${memory.id.split("-").at(-1)}`)));
 });

@@ -8,10 +8,12 @@
   },
   "devDependencies": {
     "@suzu-memory/core": "0.1.0",
-    "@suzu-memory/ingestion": "0.1.0",
     "@suzu-memory/service": "0.1.0"
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@suzu-memory/ingestion": "0.1.0"
   }
 }

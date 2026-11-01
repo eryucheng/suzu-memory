@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible, modelCalendarFields } from '@suzu-memory/core';
+import { readReportedStateDraft, executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible, modelCalendarFields } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
 import { lexicalScore } from '@suzu-memory/retriever';
 
@@ -21,6 +21,31 @@ function similarity(left, right) {
   return left.reduce((sum, value, index) => sum + value * right[index], 0);
 }
 
+function storedTarget(memory, earlierRequest = null) {
+  const stored = readReportedStateDraft(memory);
+  if (earlierRequest) return earlierRequest.targetSpec;
+  if (stored?.identityClaim) return { identityField: stored.identityClaim.identityField };
+  if (stored?.counterpart) return { counterpartRole: stored.counterpart.role, counterpartKey: stored.counterpart.key,
+    relationshipDimension: stored.relationshipView?.relationType };
+  const trigger = stored.affectiveClaim?.trigger;
+  if (trigger) return { triggerRole: trigger.role, triggerKey: trigger.key, triggerLabel: trigger.label };
+  return null;
+}
+
+function targetCompatible(request, targetSpec) {
+  if (!targetSpec) return true;
+  if (request.state_family === 'identity') return targetSpec.identityField === request.targetSpec.identityField;
+  if (request.state_family === 'relationship') return targetSpec.counterpartRole === request.targetSpec.counterpartRole
+    && targetSpec.counterpartKey === request.targetSpec.counterpartKey
+    && (!targetSpec.relationshipDimension || !request.targetSpec.relationshipDimension
+      || targetSpec.relationshipDimension === request.targetSpec.relationshipDimension);
+  if (request.state_family === 'affective_association') return targetSpec.triggerRole === request.targetSpec.triggerRole
+    && targetSpec.triggerKey === request.targetSpec.triggerKey
+    && (targetSpec.triggerRole !== 'world' || String(targetSpec.triggerLabel).normalize('NFKC').toLowerCase()
+      === String(request.targetSpec.triggerLabel).normalize('NFKC').toLowerCase());
+  return true;
+}
+
 function candidateView(repository, memory) {
   const detail = repository.getMemoryDetail(memory.agent_id, memory.id);
   return {
@@ -39,17 +64,18 @@ function candidateView(repository, memory) {
 
 // Candidate selection is local; the existing evidence call resolves identity.
 export async function prepareStateMemoryCandidates({ repository, request, embeddingProvider, usageLedgerPath }) {
-  if (typeof embeddingProvider !== 'function') return null;
+  const useEmbeddings = typeof embeddingProvider === 'function';
   const draft = repository.materializeStateAnalysisMemory(request.agent_id, request.id);
   if (!draft) return null;
-  const report = await syncMemoryEmbeddings({ repository, agentId: request.agent_id,
-    embeddingProvider, memoryIds: [draft.id], ledgerPath: usageLedgerPath, continueOnError: false });
+  const report = useEmbeddings ? await syncMemoryEmbeddings({ repository, agentId: request.agent_id,
+    embeddingProvider, memoryIds: [draft.id], ledgerPath: usageLedgerPath, continueOnError: false }) : null;
   assertEventSourceExecutionCurrent();
   const sourceView = executionEventSourceView(repository, request.agent_id);
-  const embeddings = new Map(repository.listEmbeddings(request.agent_id, embeddingProvider.model, { includeArchived: true })
+  const embeddings = new Map((useEmbeddings
+    ? repository.listEmbeddings(request.agent_id, embeddingProvider.model, { includeArchived: true }) : [])
     .map(row => [row.memory_id, row]));
   const vector = embeddings.get(draft.id)?.vector;
-  if (!vector) throw new Error('State analysis semantic memory has no embedding.');
+  if (useEmbeddings && !vector) throw new Error('State analysis semantic memory has no embedding.');
   const pending = new Set(repository.listPendingProvisionalMemories(request.agent_id, { limit: 5000 }).map(item => item.id));
   const ids = repository.database.prepare(`SELECT id FROM memory_nodes
     WHERE agent_id = ? AND subject_role = ? AND subject_key = ? AND state_family = ?
@@ -65,6 +91,8 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     if (sourceView && !sourceView.allows(memory)) continue;
     const earlierRequest = memory.metadata?.stateAnalysisDraft
       ? repository.getStateAnalysisRequest(request.agent_id, memory.metadata.stateAnalysisRequestId) : null;
+    const targetSpec = storedTarget(memory, earlierRequest);
+    if (!targetCompatible(request, targetSpec)) continue;
     const evidenceOnly = earlierRequest?.status === 'completed' && earlierRequest.metadata?.outcome === 'accumulating';
     const historical = memory.status === 'superseded' && memory.layer !== 'provisional';
     if (memory.status !== 'active' && !historical && !pending.has(id) && !evidenceOnly) continue;
@@ -72,7 +100,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     const score = row && row.content_hash === prepareMemoryEmbeddingDocument(repository, memory, { sourceView }).contentHash
       ? similarity(vector, row.vector) : -1;
     const lexical = lexicalScore(draft.content, `${memory.title}\n${memory.content}`).score;
-    ranked.push({ memory, score, lexical, earlierRequest });
+    ranked.push({ memory, score, lexical, earlierRequest, targetSpec });
   }
   // Reserve recent candidates for short references and rows awaiting indexing.
   const selected = [...new Map([
@@ -80,13 +108,14 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     ...[...ranked].sort((a, b) => b.lexical - a.lexical || b.score - a.score).slice(0, 2),
     ...ranked.slice(0, 2),
   ].map(item => [item.memory.id, item])).values()];
-  const candidates = selected.map(({ memory, earlierRequest }) => ({ ...candidateView(repository, memory),
+  const candidates = selected.map(({ memory, earlierRequest, targetSpec }) => ({ ...candidateView(repository, memory),
+    ...(targetSpec ? { targetSpec } : {}),
     canonicalKey: earlierRequest?.canonical_key || memory.canonical_key }));
   const validityById = new Map(selected.map(({ memory }) => [memory.id, memory.valid_to]));
-  const newCanonicalKey = `state-${createHash('sha256').update(request.id).digest('hex').slice(0, 24)}`;
-  Object.assign(request, repository.bindStateAnalysisTarget({ agentId: request.agent_id, requestId: request.id,
-    canonicalKey: newCanonicalKey, metadata: { semanticMemoryId: draft.id,
-      stateIdentityResolution: null, stateCandidateIds: candidates.map(item => item.id) } }));
+  // A persisted binding belongs to this request across retries. Only a successful
+  // match moves it to another existing state; preparing candidates never rebinds it.
+  const newCanonicalKey = request.metadata?.originalCanonicalKey ? request.canonical_key
+    : `state-${createHash('sha256').update(request.id).digest('hex').slice(0, 24)}`;
   const snapshots = [];
   const context = {
     draft, report, candidates, selected: null, ambiguous: false,
@@ -121,6 +150,9 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
           includePending: true, includeHistorical: true });
         if (latest && !memoryWorldsCompatible(draft, latest, { allowRealSpaces: true })) {
           throw new Error('Canonical state identity crosses incompatible worlds.');
+        }
+        if (latest && !targetCompatible(request, storedTarget(latest))) {
+          throw new Error('Canonical state identity crosses incompatible target dimensions.');
         }
         if (latest) context.selected = candidateView(repository, latest);
       }

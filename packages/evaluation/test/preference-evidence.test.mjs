@@ -182,6 +182,35 @@ function generatedLabel(repository, memoryId, signal, overrides = {}) {
   });
 }
 
+test('preference labeling uses the complete input size above eighty and checks explicit budgets before generation', async t => {
+  const database = openMemoryDatabase(':memory:');
+  t.after(() => database.close());
+  const repository = new MemoryRepository(database);
+  const memoryIds = Array.from({ length: 81 }, (_, index) => {
+    const source = repository.upsertSource({ agentId: 'agent-test', sourceKind: 'conversation', externalId: `choice-${index}`,
+      speaker: 'User', content: index % 2 ? 'I chose a puzzle game.' : '我主动选了解谜游戏。' });
+    const memory = repository.upsertMemory({ id: `choice-${index}`, agentId: 'agent-test', kind: 'event', layer: 'episodic',
+      content: source.content, subjectRole: 'user', subjectKey: 'user', reality: 'real' });
+    repository.linkSource(memory.id, source.id, 'evidence');
+    return memory.id;
+  });
+  let calls = 0;
+  const options = { repository, agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: 'user:preference:puzzle-games', memoryIds, policy, snapshotOptions: { maxSnapshotChars: 250000 },
+    generator: async request => {
+      calls += 1;
+      assert.equal(request.schema.properties.evidence.maxItems, 81);
+      assert.equal(JSON.parse(request.input).memories.length, 81);
+      return { output: { evidence: memoryIds.map(id => generatedLabel(repository, id, 'active_choice')) }, model: 'fixture' };
+    } };
+  await assert.rejects(evaluatePreferenceEvidenceTarget({ ...options, maximumEvidence: 0 }), /maximumEvidence/);
+  assert.equal(calls, 0);
+  const result = await evaluatePreferenceEvidenceTarget(options);
+  assert.equal(result.labels.length, 81);
+  assert.equal(result.evidenceLedger.observations.length, 81);
+  assert.equal(calls, 1);
+});
+
 test("builds a bounded target-specific snapshot with code-derived groups", () => {
   const { database, repository, episode } = fixture();
   const snapshot = buildPreferenceEvidenceSnapshot({

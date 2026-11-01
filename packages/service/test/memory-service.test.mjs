@@ -951,6 +951,136 @@ test("service retries a degraded long-term extraction from retained raw events a
   assert.equal(service.listMemories({ statuses: [], kinds: ["event"] }).total, 1);
 });
 
+test('service persists unresolved repair candidates and retries only the remaining candidates', async t => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'partial-extraction-repair',
+    defaults: { memoryOwner: 'Companion', userName: 'User' } };
+  t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
+  const service = createMemoryService(options);
+  service.appendEvent(inputEvent('repair-persistence'));
+  const first = { ...generatedEventCandidate(), title: 'First repaired event', content: 'User and Companion completed the design.' };
+  const second = { ...generatedEventCandidate(), title: 'Second repaired event', content: 'User and Companion agreed on the event boundary.' };
+  const third = { ...generatedEventCandidate(), title: 'Third repaired event', content: 'User and Companion completed the review.' };
+  const firstDetail = { ...first, title: 'First independent detail', content: 'User and Companion separately confirmed the input format.' };
+  const secondDetail = { ...second, title: 'Second independent detail', content: 'User and Companion separately confirmed the scope.' };
+  const invalid = memory => ({ ...memory, eventDate: 'last week' });
+  let calls = 0;
+  const processed = await service.processPendingEvents({ now: '2026-08-04T03:05:00.000Z',
+    generator: async request => {
+      calls++;
+      if (calls === 1) return { output: { memories: [invalid(first), invalid(second), invalid(third)] } };
+      const candidates = JSON.parse(request.input).candidates;
+      if (calls === 2) {
+        assert.deepEqual(candidates.map(item => item.candidateIndex), [0, 1, 2]);
+        return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [first, firstDetail] }] } };
+      }
+      assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
+      return { output: { results: [] } };
+    } });
+  assert.equal(calls, 4);
+  assert.equal(processed.generationDiagnostics.degraded, true);
+  assert.equal(processed.generationDiagnostics.unresolvedCandidateCount, 2);
+  assert.ok(processed.generationDiagnostics.failureReviewTaskId);
+  assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 2);
+  const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
+  assert.deepEqual(review.proposal.payload.extractionRepair.candidates.map(item => item.index), [1, 2]);
+  const batch = service.listInputBatches()[0];
+  assert.equal(batch.output.degraded, true);
+  assert.equal(batch.output.unresolvedCandidateCount, 2);
+  const resumed = createMemoryService(options);
+  let retryCalls = 0;
+  const partial = await resumed.retryLongTermExtractionFailure(review.id, { now: '2026-08-04T03:10:00.000Z',
+    generator: async request => {
+      retryCalls++;
+      assert.equal(request.schemaName, 'long-term-memory-extraction-repair-v3');
+      const candidates = JSON.parse(request.input).candidates;
+      if (retryCalls > 1) {
+        assert.deepEqual(candidates.map(item => item.candidateIndex), [2]);
+        return { output: { results: [] } };
+      }
+      assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
+      assert.equal(candidates[0].candidate.title, second.title);
+      return { output: { results: [{ candidateIndex: 1, status: 'repaired', memories: [second, secondDetail] }] } };
+    } });
+  assert.equal(retryCalls, 3);
+  assert.equal(partial.status, 'retry-degraded');
+  assert.deepEqual(partial.reviewTask.payload.extractionRepair.candidates.map(item => item.index), [2]);
+  assert.equal(resumed.listHighLevelProposals({ types: ['maintenance-failure'] }).items.length, 1);
+  const retried = await resumed.retryLongTermExtractionFailure(partial.reviewTask.id, { now: '2026-08-04T03:15:00.000Z',
+    generator: async request => {
+      assert.deepEqual(JSON.parse(request.input).candidates.map(item => item.candidateIndex), [2]);
+      return { output: { results: [{ candidateIndex: 2, status: 'repaired', memories: [third] }] } };
+    } });
+  assert.equal(retried.status, 'retried');
+  assert.equal(retried.reviewTask.review_state, 'accepted');
+  assert.equal(service.listInputBatches().length, 1);
+  assert.equal(service.listInputEvents({ statuses: ['archived'] }).total, 1);
+  assert.equal(service.listMemories({ statuses: [], kinds: ['utterance'] }).total, 1);
+  assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 5);
+  assert.deepEqual(new Set(service.listMemories({ statuses: [], kinds: ['event'] }).items.map(item => item.title)),
+    new Set([first.title, firstDetail.title, second.title, secondDetail.title, third.title]));
+  const decisions = resumed.withRepository(repository => repository.listIngestionDecisions(options.agentId,
+    { batchId: batch.id, limit: 10 }), { readOnly: true });
+  assert.deepEqual(decisions.map(item => item.candidate_index).sort((a, b) => a - b), [0, 1, 2, 3, 4]);
+});
+
+test('concurrent split repairs append once and preserve earlier valid records', async t => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'concurrent-split-repair',
+    defaults: { memoryOwner: 'Companion', userName: 'User' } };
+  t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
+  const service = createMemoryService(options);
+  service.appendEvent(inputEvent('split-concurrent-source'));
+  const valid = { ...generatedEventCandidate(), title: 'Previously valid event', content: 'User confirmed the design.' };
+  const split = [
+    { ...valid, title: 'First split event', content: 'User confirmed the input boundary.' },
+    { ...valid, title: 'Second split event', content: 'User confirmed the output boundary.' },
+  ];
+  const processed = await service.processPendingEvents({ generator: async request => ({ output:
+    request.schemaName === 'long-term-memory-extraction-v2'
+      ? { memories: [{ ...split[0], kind: 'invalid-kind' }, valid] } : { results: [] } }) });
+  const originalId = processed.candidateResults[0].memoryId;
+  const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
+  let release, ready, entered = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const bothStarted = new Promise(resolve => { ready = resolve; });
+  const generator = async request => {
+    assert.deepEqual(JSON.parse(request.input).candidates.map(item => item.candidateIndex), [0]);
+    if (++entered === 2) ready();
+    await gate;
+    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: split }] } };
+  };
+  const pending = Promise.allSettled([
+    service.retryLongTermExtractionFailure(review.id, { generator }),
+    service.retryLongTermExtractionFailure(review.id, { generator }),
+  ]);
+  await bothStarted;
+  release();
+  const outcomes = await pending;
+  assert.equal(outcomes.filter(item => item.status === 'fulfilled').length, 1);
+  assert.match(outcomes.find(item => item.status === 'rejected').reason.message, /no longer pending/u);
+  assert.equal(service.getMemory(originalId).memory.content, valid.content);
+  assert.equal(service.listMemories({ kinds: ['event'], statuses: [] }).total, 3);
+  assert.equal(service.listHighLevelProposals({ types: ['maintenance-failure'] }).items.length, 0);
+});
+
+for (const timing of ['before', 'during']) test('candidate repair cannot restore a withdrawn source: ' + timing, async () => {
+  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'withdrawn-repair-' + timing,
+    defaults: { memoryOwner: 'Companion', userName: 'User' } });
+  service.appendEvent(inputEvent('withdrawn-source'));
+  await service.processPendingEvents({ generator: async request => ({ output: request.schemaName === 'long-term-memory-extraction-v2'
+    ? { memories: [{ ...generatedEventCandidate(), eventDate: 'invalid' }] } : { results: [] } }) });
+  const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
+  const retract = () => service.reviseEvent('withdrawn-source', { action: 'retract', reason: 'Source withdrawn.' });
+  if (timing === 'before') retract();
+  let calls = 0;
+  await assert.rejects(service.retryLongTermExtractionFailure(review.id, { generator: async () => {
+    calls++;
+    if (timing === 'during') retract();
+    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate()] }] } };
+  } }), /Only active archived/);
+  assert.equal(calls, timing === 'before' ? 0 : 1);
+  assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 0);
+});
+
 test("service carries configured identities from input through archive into entity-seeded recall", async () => {
   const service = createMemoryService({
     dataRoot: temporaryDirectory(),
@@ -1004,14 +1134,6 @@ test("service carries configured identities from input through archive into enti
     persistTrace: false,
   });
   assert.equal(result.status, "ready");
-  assert.deepEqual(
-    {
-      matched: result.seedRouting.subjectRouting.query.matched,
-      role: result.seedRouting.subjectRouting.query.role,
-      key: result.seedRouting.subjectRouting.query.key,
-    },
-    { matched: true, role: "user", key: "caroline" },
-  );
   assert.ok(result.fragments.some((fragment) => identities.actorMemoryIds.includes(fragment.memoryId)));
   const entity = result.matchedEntities.find((item) => item.entityId === identities.user.entity_id);
   assert.ok(entity);

@@ -2,6 +2,7 @@ export {
   buildStructureGenerationInput,
   MEMORY_STRUCTURE_OUTPUT_SCHEMA,
   parseStructureGeneration,
+  proposalSchemaForLimit,
 } from "./prompt.mjs";
 
 export {

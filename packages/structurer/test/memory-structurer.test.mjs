@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
 import { readUsageEvents } from "@suzu-memory/usage-ledger";
 import {
@@ -146,7 +147,8 @@ test("creates only a pending bounded subject attribution proposal", async () => 
   assert.equal(result.proposal.review_state, "pending");
   assert.equal(repository.getMemory(memory.id).subject_role, "unknown");
   assert.equal(received.schemaName, "memory-subject-attribution-v1");
-  assert.match(received.systemPrompt, /speaker.*不自动等于/u);
+  assert.match(received.systemPrompt, /speaker.*发话者/u);
+  assert.match(received.systemPrompt, /按正文确定经历者/u);
   assert.doesNotMatch(received.input, /private\/conversation/u);
   const ledger = await readUsageEvents(ledgerPath);
   assert.equal(ledger.events.length, 1);
@@ -460,6 +462,39 @@ function relationFixture() {
   }
   return { database, repository, directSource, unrelatedSource };
 }
+
+test('structure and relation budgets reach the model and validator without fixed twenty or hundred item caps', async t => {
+  for (const kind of ['structure', 'relations']) {
+    const f = kind === 'structure' ? fixture() : relationFixture();
+    t.after(() => f.database.close());
+    const operation = kind === 'structure' ? proposeStructuresForBatch : proposeRelationsForBatch;
+    const memoryIds = kind === 'structure' ? ['batch-museum', 'batch-dinner'] : ['relation-rain', 'relation-cancel'];
+    let calls = 0;
+    for (const maximumProposals of [0, 31, 101]) {
+      const result = await operation({ repository: f.repository, agentId: 'agent-test', memoryIds, maximumProposals,
+        generator: async request => {
+          calls += 1;
+          assertMemoryTaskRequest(request);
+          assert.equal(request.schema.properties.proposals.maxItems, maximumProposals);
+          const proposal = kind === 'structure' ? { operation: 'create', targetMemoryId: '', kind: 'topic', title: 'Museum visit',
+            content: 'A visit to the museum and dinner afterwards.', subjectRole: 'unknown', subjectKey: '',
+            eventDate: null, eventStart: null, eventEnd: null, memberIds: memoryIds, actorRoles: [], confidence: 0.9, rationale: 'A shared subject.' }
+            : { relation: 'causes', fromMemoryId: memoryIds[0], toMemoryId: memoryIds[1], evidenceSourceIds: [f.directSource.id], confidence: 0.9, rationale: 'The speaker explicitly describes the cause.' };
+          const proposals = Array.from({ length: maximumProposals }, () => proposal);
+          assert.equal(validateMemoryTaskOutput(request, { proposals }).proposals.length, maximumProposals);
+          assert.throws(() => validateMemoryTaskOutput(request, { proposals: [...proposals, proposal] }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
+          return { output: { proposals: [] } };
+        } });
+      if (maximumProposals === 0) {
+        assert.equal(result.status, 'skipped');
+        assert.equal(calls, 0);
+      }
+    }
+    assert.equal(calls, 2);
+    for (const maximumProposals of [-1, 1.5, Infinity]) await assert.rejects(operation({ repository: f.repository,
+      agentId: 'agent-test', memoryIds, maximumProposals, generator: () => { throw new Error('Should not call provider.'); } }), /maximumProposals/);
+  }
+});
 
 test("builds a bounded causal snapshot with source evidence but no paths or metadata", () => {
   const { database, repository, directSource } = relationFixture();
@@ -911,6 +946,9 @@ test("combines retrospective structure and relation generation into one provider
     calls.push(request);
     assert.equal(request.schemaName, "memory-consolidation-combined-v1");
     assert.deepEqual(request.combinedOutputs, ["structure", "relations"]);
+    assert.equal(request.schema.properties.structure.properties.proposals.maxItems, 31);
+    assert.equal(request.schema.properties.relations.properties.proposals.maxItems, 43);
+    assertMemoryTaskRequest(request);
     return {
       output: {
         structure: retrospectiveStructureOutput(),
@@ -937,6 +975,8 @@ test("combines retrospective structure and relation generation into one provider
     runId: plan.id,
     structureGenerator: generator,
     relationGenerator: generator,
+    structureOptions: { maximumProposals: 31 },
+    relationOptions: { maximumProposals: 43 },
   });
   assert.equal(result.status, "completed");
   assert.equal(calls.length, 1);

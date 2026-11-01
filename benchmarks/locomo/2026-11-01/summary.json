@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "LoCoMo",
+  "date": "2026-11-01",
+  "timeZone": "Asia/Shanghai",
+  "status": "completed",
+  "dataset": {
+    "samples": 10,
+    "questions": 1540,
+    "includedCategories": [
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "result": {
+    "correct": 1384,
+    "failed": 0,
+    "judged": 1540,
+    "accuracy": 0.8987012987012987
+  },
+  "byCategory": {
+    "1": {
+      "name": "multi-hop",
+      "questions": 282,
+      "correct": 238,
+      "accuracy": 0.8439716312056738
+    },
+    "2": {
+      "name": "temporal",
+      "questions": 321,
+      "correct": 290,
+      "accuracy": 0.9034267912772586
+    },
+    "3": {
+      "name": "open-domain",
+      "questions": 96,
+      "correct": 64,
+      "accuracy": 0.6666666666666666
+    },
+    "4": {
+      "name": "single-hop",
+      "questions": 841,
+      "correct": 792,
+      "accuracy": 0.9417360285374554
+    }
+  },
+  "readerUsage": {
+    "inputTokens": 6737532,
+    "outputTokens": 299776,
+    "requests": 3345,
+    "meanInputTokensPerQuestion": 4375.020779220779,
+    "meanOutputTokensPerQuestion": 194.65974025974026,
+    "scope": "Cumulative reader-model usage across all requests per question, including repeated history, instructions, tool schemas, queries and returned memories; excludes memory preparation, embedding and judge calls"
+  },
+  "retrievalUsage": {
+    "searches": 3505,
+    "meanDisclosedMemoriesPerQuestion": 22.618181818181817,
+    "meanDisclosedCharactersPerQuestion": 5964.715584415584
+  },
+  "completeness": {
+    "excludedSamples": 0,
+    "unrunQuestions": 0,
+    "failedQuestions": 0
+  },
+  "preparation": {
+    "quarantinedMessages": 0,
+    "archiveOnlyBatches": 4,
+    "unresolvedExtractionCandidates": 8,
+    "incompleteExtractionBatches": 4,
+    "failedMaintenancePasses": 2,
+    "pendingWork": 0,
+    "failedWork": 0,
+    "missingInputEvents": 0
+  },
+  "code": {
+    "manifest": "source-manifest.json",
+    "algorithm": "sha256-path-nul-lf-normalized-v1",
+    "sha256": "99ea9dbe0a7b15133db7ffca9e4f0b9ac9d561d5fb47b15530e5ce0737481d12",
+    "files": 426
+  }
+}

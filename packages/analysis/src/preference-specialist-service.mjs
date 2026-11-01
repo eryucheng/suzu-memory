@@ -1,11 +1,9 @@
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { preferenceEvidenceMemoryIds } from './preference-specialist-merge.mjs';
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations } from './related-analyzer-batch.mjs';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
 import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
 import {
@@ -86,86 +84,12 @@ function enforceSpecialistBoundary(role, analysis, snapshot) {
   return analysis;
 }
 
-async function appendSpecialistUsage({ usageLedgerPath, generation, role, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId,
-      provider: generation.metadata?.provider || "",
-      model: generation.model,
-      source: "memory-evaluation",
-      feature: `memory-preference-${role}`,
-      requestId: generation.requestId || "",
-      usage: generation.usage,
-      metadata: {
-        batchId,
-        durationMs: Number(generation.durationMs || 0),
-        ...generation.metadata,
-      },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(
-    path.join(path.resolve(promptDirectory), definition.promptFile),
-    "utf8",
-  ).replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildPreferenceSpecialistGenerationInput(snapshot, definition.role);
-  let generation = null;
-  try {
-    generation = await generator({
-      input,
-      systemPrompt: analysisSystemPrompt(systemPrompt),
-      schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-      analyzerRole: definition.role,
-    });
-    const parsed = parsePreferenceSpecialistGeneration(definition.role, generation?.output, {
-      maximumAnalyses,
-    });
-    const accepted = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, candidate] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(candidate.memoryId)) {
-          throw new Error("A specialist can analyze each memory at most once.");
-        }
-        const guarded = enforceSpecialistBoundary(definition.role, candidate, snapshot);
-        seen.add(candidate.memoryId);
-        accepted.push(guarded);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
-      }
-    }
-    return {
-      definition,
-      input,
-      generation,
-      analyses: accepted,
-      rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained",
-      error: "",
-    };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return {
-      definition,
-      input,
-      generation,
-      analyses: [],
-      rejected: [],
-      status: "failed",
-      error: error.message,
-    };
-  }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options,
+    buildInput: (snapshot, definition) => buildPreferenceSpecialistGenerationInput(snapshot, definition.role),
+    parseGeneration: parsePreferenceSpecialistGeneration, enforceBoundary: enforceSpecialistBoundary });
 }
 
 export async function evaluatePreferenceEvidenceSpecialists({
@@ -180,7 +104,7 @@ export async function evaluatePreferenceEvidenceSpecialists({
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
   snapshotOptions = {},
-  maximumAnalyses = 60,
+  maximumAnalyses = Infinity,
 } = {}) {
   if (!repository) throw new Error("Preference specialist evaluation requires a repository.");
   if (!clean(objectLabel)) {
@@ -230,70 +154,28 @@ export async function evaluatePreferenceEvidenceSpecialists({
       automaticMemoryWriteAllowed: false,
     };
   }
+  const previousRuns = snapshotOptions.reuseAnalysisRuns
+    ? repository.listStateAnalysisRuns(snapshot.agentId, { stateFamily: 'preference', batchId,
+      limit: definitions.length * 3 }) : [];
   const invocations = await Promise.all(definitions.map(([key, definition]) => invokeAnalyzer({
     definition,
     generator: analyzers[key],
     snapshot,
     promptDirectory,
-    maximumAnalyses,
+    maximumAnalyses, previousRuns,
   }).then((result) => [key, result])));
-  const sourceIds = [...new Set(snapshot.memories.flatMap((memory) => memory.sourceIds))].sort();
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
-  const warnings = [];
-  for (const [key, invocation] of invocations) {
-    const warning = await appendSpecialistUsage({
-      usageLedgerPath,
-      generation: invocation.generation,
-      role: invocation.definition.role,
-      agentId: clean(agentId),
-      batchId,
-    });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId),
-      batchId,
-      stateFamily: "preference",
-      analyzerRole: invocation.definition.role,
-      subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported",
-      promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName,
-      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
-      status: invocation.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id),
-      sourceIds,
-      output: invocation.generation?.output ?? {},
-      rejected: invocation.rejected,
-      usage: invocation.generation?.usage || {},
-      costAmount: Number(
-        invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0,
-      ) || 0,
-      costCurrency: clean(
-        invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency,
-      ),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error,
-      metadata: {
-        specialistKey: key,
-        automaticMemoryWriteAllowed: false,
-      },
-    });
-    analyses[key] = invocation.analyses;
-    rejected[key] = invocation.rejected;
-  }
-  const failedRoles = definitions
-    .map(([key]) => key)
-    .filter((key) => ["failed", "rejected"].includes(runs[key].status));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, stateFamily: 'preference', snapshot, invocations, usageLedgerPath,
+    metadata: key => ({ specialistKey: key, automaticMemoryWriteAllowed: false }),
+  });
+  const completeMemoryIds = preferenceEvidenceMemoryIds({ snapshot, analyses, runs });
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
+  const status = failedRoles.length ? (completeMemoryIds.length ? "partial" : "incomplete")
+    : hasAnyAnalysis ? "analyzed" : "abstained";
   return {
-    status: failedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
-    reason: failedRoles.length ? "required-specialist-failed-or-rejected" : "",
+    status,
+    reason: status === "incomplete" ? "required-specialist-failed-or-rejected"
+      : status === "partial" ? "partial-specialist-results-unavailable" : "",
     batchId,
     snapshot,
     runs,

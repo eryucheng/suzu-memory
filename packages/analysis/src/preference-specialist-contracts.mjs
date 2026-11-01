@@ -1,3 +1,4 @@
+import { analysisCountLimit } from "./analysis-output.mjs";
 import { PREFERENCE_EVIDENCE_ENUMS } from "./preference-contract.mjs";
 
 function clean(value) {
@@ -31,7 +32,6 @@ function resultSchema(required, properties) {
     properties: {
       analyses: {
         type: "array",
-        maxItems: 80,
         items: {
           type: "object",
           additionalProperties: false,
@@ -59,8 +59,8 @@ export const PREFERENCE_SPECIALIST_ANALYZERS = Object.freeze({
   }),
   explicitExpression: Object.freeze({
     role: "explicit-expression",
-    schemaName: "memory-preference-explicit-expression-v1",
-    promptVersion: "preference-explicit-expression-v1",
+    schemaName: "memory-preference-explicit-expression-v2",
+    promptVersion: "preference-explicit-expression-v2",
     promptFile: "preference-explicit-expression-system-prompt.md",
     schema: resultSchema(["expressionType", "directness"], {
       expressionType: {
@@ -75,8 +75,8 @@ export const PREFERENCE_SPECIALIST_ANALYZERS = Object.freeze({
   }),
   behaviorConditions: Object.freeze({
     role: "behavior-conditions",
-    schemaName: "memory-preference-behavior-conditions-v1",
-    promptVersion: "preference-behavior-conditions-v1",
+    schemaName: "memory-preference-behavior-conditions-v2",
+    promptVersion: "preference-behavior-conditions-v2",
     promptFile: "preference-behavior-conditions-system-prompt.md",
     schema: resultSchema([
       "behaviorType",
@@ -250,7 +250,7 @@ function parseRoleItem(role, value, index) {
   throw new Error(`Unknown preference specialist role: ${role || "(empty)"}.`);
 }
 
-export function parsePreferenceSpecialistGeneration(role, value, { maximumAnalyses = 60 } = {}) {
+export function parsePreferenceSpecialistGeneration(role, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -265,23 +265,24 @@ export function parsePreferenceSpecialistGeneration(role, value, { maximumAnalys
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Preference specialist output requires an analyses array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Preference specialist returned more than ${limit} analyses.`);
   }
-  return { analyses: parsed.analyses.map((item, index) => parseRoleItem(role, item, index)) };
+  const analyses = [];
+  parsed.analyses.forEach((item, index) => {
+    try { analyses.push(parseRoleItem(role, item, index)); }
+    catch (error) {
+      if (!onRejected) throw error;
+      onRejected({ index, memoryId: clean(item?.memoryId), error: error.message });
+    }
+  });
+  return { analyses };
 }
 
 export function buildPreferenceSpecialistGenerationInput(snapshot, analyzerRole) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Preference specialist generation requires a snapshot object.");
   }
-  return [
-    `当前专职角色：${clean(analyzerRole)}。`,
-    "只处理系统提示词规定的单一职责。不得输出最终偏好等级。",
-    "只引用快照内对应记忆自己的 sourceIds。没有证据时省略该记忆，不用猜测补齐。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

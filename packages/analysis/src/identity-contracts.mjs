@@ -1,3 +1,6 @@
+import { analysisCountLimit, parseAnalysisItems, CLAIM_RELATIONS_SCHEMA, parseClaimRelations } from "./analysis-output.mjs";
+import { STATE_IDENTITY_FIELDS } from "@suzu-memory/core";
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -23,7 +26,6 @@ function schema(required, properties) {
     properties: {
       analyses: {
         type: "array",
-        maxItems: 80,
         items: {
           type: "object",
           additionalProperties: false,
@@ -39,15 +41,16 @@ export const IDENTITY_ANALYZERS = Object.freeze({
   fieldValue: Object.freeze({
     stateFamily: "identity",
     role: "field-value",
-    schemaName: "memory-identity-field-value-v1",
-    promptVersion: "identity-field-value-v1",
+    schemaName: "memory-identity-field-value-v3",
+    promptVersion: "identity-field-value-v3",
     promptFile: "identity-field-value-system-prompt.md",
-    schema: schema(["targetMatch", "identityField", "valueText", "statementPolarity", "valueScope"], {
+    schema: schema(["targetMatch", "identityField", "valueText", "statementPolarity", "valueScope", "valueRelations"], {
       targetMatch: { type: "string", enum: ["exact", "subcategory", "broader_category", "contextual", "none", "unknown"] },
-      identityField: { type: "string", enum: ["name", "alias", "birth_date", "birth_year", "age", "gender", "pronouns", "occupation", "employer", "education", "residence", "hometown", "nationality", "biography", "other", "unknown"] },
+      identityField: { type: "string", enum: [...STATE_IDENTITY_FIELDS, "unknown"] },
       valueText: { type: "string" },
       statementPolarity: { type: "string", enum: ["asserts", "denies", "no_fact", "unknown"] },
       valueScope: { type: "string" },
+      valueRelations: CLAIM_RELATIONS_SCHEMA,
     }),
   }),
   subjectAttribution: Object.freeze({
@@ -64,8 +67,8 @@ export const IDENTITY_ANALYZERS = Object.freeze({
   familyBoundary: Object.freeze({
     stateFamily: "identity",
     role: "family-boundary",
-    schemaName: "memory-identity-family-boundary-v1",
-    promptVersion: "identity-family-boundary-v1",
+    schemaName: "memory-identity-family-boundary-v2",
+    promptVersion: "identity-family-boundary-v2",
     promptFile: "identity-family-boundary-system-prompt.md",
     schema: schema(["classification", "sensitivity"], {
       classification: { type: "string", enum: ["identity_fact", "transient_condition", "relationship_role", "self_concept", "preference", "capability", "value", "credential_or_secret", "no_identity_fact", "unknown"] },
@@ -75,8 +78,8 @@ export const IDENTITY_ANALYZERS = Object.freeze({
   timeRevision: Object.freeze({
     stateFamily: "identity",
     role: "time-revision",
-    schemaName: "memory-identity-time-revision-v1",
-    promptVersion: "identity-time-revision-v1",
+    schemaName: "memory-identity-time-revision-v2",
+    promptVersion: "identity-time-revision-v2",
     promptFile: "identity-time-revision-system-prompt.md",
     schema: schema(["factTime", "revisionCue", "timeReference"], {
       factTime: { type: "string", enum: ["current", "historical", "timeless", "future", "temporary", "unknown"] },
@@ -129,10 +132,11 @@ function parseItem(role, value, index) {
     return {
       ...base,
       targetMatch: enumValue(value.targetMatch, `analyses[${index}].targetMatch`, ["exact", "subcategory", "broader_category", "contextual", "none", "unknown"]),
-      identityField: enumValue(value.identityField, `analyses[${index}].identityField`, ["name", "alias", "birth_date", "birth_year", "age", "gender", "pronouns", "occupation", "employer", "education", "residence", "hometown", "nationality", "biography", "other", "unknown"]),
+      identityField: enumValue(value.identityField, `analyses[${index}].identityField`, [...STATE_IDENTITY_FIELDS, "unknown"]),
       valueText: clean(value.valueText),
       statementPolarity: enumValue(value.statementPolarity, `analyses[${index}].statementPolarity`, ["asserts", "denies", "no_fact", "unknown"]),
       valueScope: clean(value.valueScope),
+      valueRelations: parseClaimRelations(value.valueRelations, base.memoryId),
     };
   }
   if (role === "subject-attribution") {
@@ -171,7 +175,7 @@ function parseItem(role, value, index) {
   throw new Error(`Unknown identity analyzer role: ${role || "(empty)"}.`);
 }
 
-export function parseIdentityGeneration(role, value, { maximumAnalyses = 60 } = {}) {
+export function parseIdentityGeneration(role, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   if (!Object.values(IDENTITY_ANALYZERS).some((definition) => definition.role === role)) {
     throw new Error(`Unknown identity analyzer role: ${clean(role) || "(empty)"}.`);
   }
@@ -187,23 +191,16 @@ export function parseIdentityGeneration(role, value, { maximumAnalyses = 60 } = 
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Identity analyzer output requires an analyses array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Identity analyzer returned more than ${limit} analyses.`);
   }
-  return { analyses: parsed.analyses.map((item, index) => parseItem(role, item, index)) };
+  return { analyses: parseAnalysisItems(parsed.analyses, (item, index) => parseItem(role, item, index), onRejected) };
 }
 
 export function buildIdentityGenerationInput(snapshot, definition) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || !definition?.role) {
     throw new Error("Identity generation requires a snapshot and known analyzer.");
   }
-  return [
-    `当前专职角色：${definition.role}。`,
-    "只处理系统提示词规定的单一职责。主体、identityField、fieldCardinality、canonicalKey 和候选记忆均由调用方固定。",
-    "不得把短期条件、自我评价、关系称呼、偏好、能力、价值、凭证或模型推测改写成身份事实；currentState 只读。",
-    "只引用快照内对应记忆自己的 sourceIds；没有证据时省略。只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

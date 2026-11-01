@@ -84,22 +84,7 @@ function sharingSignal(sharing) {
   return "";
 }
 
-function crossRoleConflict(explicitSignal, behaviorSignalValue, sharing) {
-  if (explicitSignal === "explicit_preference" && behaviorSignalValue === "counter_behavior") {
-    return "explicit-support-conflicts-with-same-memory-avoidance";
-  }
-  if (explicitSignal === "explicit_rejection"
-    && ["active_choice", "voluntary_acceptance"].includes(behaviorSignalValue)) {
-    return "explicit-rejection-conflicts-with-same-memory-approach";
-  }
-  if (explicitSignal === "explicit_rejection"
-    && sharingSignal(sharing) === "active_sharing") {
-    return "explicit-rejection-conflicts-with-same-memory-positive-sharing";
-  }
-  return "";
-}
-
-function prerequisiteGate({ object, timeScope, signal, conflict, contextId }) {
+function prerequisiteGate({ object, timeScope, signal, contextId }) {
   if (!object) return { qualification: "unresolved", reason: "missing-object-grounding" };
   if (object.targetMatch === "none") {
     return { qualification: "excluded", reason: "object-does-not-match-target" };
@@ -117,7 +102,6 @@ function prerequisiteGate({ object, timeScope, signal, conflict, contextId }) {
   if (signal.startsWith("explicit_") && timeScope.stateTime === "unknown") {
     return { qualification: "unresolved", reason: "explicit-expression-time-unknown" };
   }
-  if (conflict) return { qualification: "unresolved", reason: conflict };
   if (!signal.startsWith("explicit_") && !clean(contextId)) {
     return { qualification: "unresolved", reason: "missing-behavior-context" };
   }
@@ -153,8 +137,8 @@ function buildMergedCandidates(evaluation) {
     const timeScope = maps.timeScope?.get(memory.id) || null;
     const selected = selectSignal({ explicit, behavior, sharing, timeScope });
     if (!selected.signal) return [];
-    const conflict = crossRoleConflict(selected.explicitSignal, selected.behaviorSignal, sharing);
-    const preGate = prerequisiteGate({ object, timeScope, signal: selected.signal, conflict, contextId: memory.contextId });
+    const preGate = prerequisiteGate({ object, timeScope, signal: selected.signal, contextId: memory.contextId });
+    const signalEvidence = selected.explicitSignal ? explicit : selected.behaviorSignal ? behavior : sharing;
     const sourceIds = [...new Set(
       [object, explicit, behavior, sharing, timeScope]
         .filter(Boolean)
@@ -169,7 +153,7 @@ function buildMergedCandidates(evaluation) {
       memoryId: memory.id,
       sourceIds,
       signal: selected.signal,
-      confidence: mergedConfidence([object, explicit, behavior, sharing, timeScope]),
+      confidence: mergedConfidence([object, signalEvidence, timeScope]),
       subjectRole: evaluation.snapshot.target.subjectRole,
       subjectKey: evaluation.snapshot.target.subjectKey,
       evidenceGroupId: memory.evidenceGroupId,
@@ -206,6 +190,12 @@ function buildMergedCandidates(evaluation) {
   });
 }
 
+// Each signal uses its own evidence path; unrelated specialist failures cannot
+// invalidate a complete explicit statement.
+export function preferenceEvidenceMemoryIds(evaluation) {
+  return buildMergedCandidates(evaluation).filter(item => !item.preGate).map(item => item.memory.id);
+}
+
 export function mergePreferenceSpecialistEvidence(repository, {
   evaluation,
   policy,
@@ -215,17 +205,6 @@ export function mergePreferenceSpecialistEvidence(repository, {
   if (!repository) throw new Error("Preference specialist merge requires a repository.");
   if (!evaluation?.snapshot || !evaluation?.analyses || !evaluation?.runs) {
     throw new Error("Preference specialist merge requires a specialist evaluation result.");
-  }
-  if (evaluation.status === "incomplete") {
-    return {
-      status: "blocked",
-      reason: "required-specialist-failed-or-rejected",
-      labels: [],
-      auditCandidates: [],
-      preview: null,
-      observations: [],
-      automaticMemoryWriteAllowed: false,
-    };
   }
   const persistedRequest = validatedAnalysisRequest(repository, evaluation, analysisRequest);
   const currentState = repository.getCurrentCanonicalMemory({

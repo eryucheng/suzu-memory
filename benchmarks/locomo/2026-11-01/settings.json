@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "generation": {
+    "model": "deepseek-v4-flash",
+    "maxOutputTokens": 32768,
+    "temperature": 0,
+    "extraBody": {
+      "thinking": {
+        "type": "disabled"
+      }
+    },
+    "providerReportedModels": [
+      "deepseek-flash"
+    ]
+  },
+  "judge": {
+    "model": "deepseek-v4-flash",
+    "maxOutputTokens": 32768,
+    "temperature": 0,
+    "extraBody": {
+      "thinking": {
+        "type": "disabled"
+      }
+    },
+    "providerReportedModels": [
+      "deepseek-flash"
+    ],
+    "metric": "LLM-as-a-Judge binary CORRECT/WRONG",
+    "reference": "https://github.com/mem0ai/mem0/tree/393a4fd5a6cfeb754857a2229726f567a9fadf36",
+    "promptFile": "judge-prompt.md",
+    "promptSha256": "44fb3d8f7a1f37b2430772cf90518a32172e4056b7a0dec085402763fd179b9f"
+  },
+  "embedding": {
+    "model": "text-embedding-v4",
+    "dimensions": 1024
+  },
+  "preparation": {
+    "language": "English",
+    "includeAvailableImageCaptions": true,
+    "input": "Original conversation messages only",
+    "serviceFactory": "createMemoryServiceFromConfig",
+    "hostAdapter": "createChatHostMemoryAdapter",
+    "flushTriggerCharacters": 12000,
+    "tailFlush": "Session end",
+    "defaults": {
+      "maximumCoreCharacters": 12000,
+      "maximumCoreMessages": 100,
+      "maximumContextCharacters": 12000,
+      "maximumRequestCharacters": 64000,
+      "maximumEventCharacters": 12000,
+      "maximumBatchCharacters": 48000,
+      "leaseSeconds": 1800
+    },
+    "worldFrame": "fictional",
+    "sessionTimestampOffset": "+08:00",
+    "databaseMode": "Prepared memories with complete embedding indexes; reused read-only for question answering"
+  },
+  "retrieval": {
+    "maximumContextMemories": 10,
+    "maximumContextChars": 10976,
+    "maximumSearches": 6,
+    "limitScope": "per-search-response",
+    "naturalDecay": {
+      "enabled": true,
+      "configurationVersion": "companion-natural-decay-v2",
+      "floor": 0.25,
+      "scaleDays": 30,
+      "decayExponent": 0.5,
+      "maximumScoreReduction": 0.12
+    },
+    "recallReactivation": {
+      "enabled": true,
+      "configurationVersion": "companion-recall-reactivation-v2",
+      "activationGain": 0.025,
+      "maximumActivation": 0.35,
+      "scaleDays": 10,
+      "decayExponent": 0.5,
+      "maximumScoreAdjustment": 0.03
+    },
+    "querySource": "Reader model tool calls",
+    "readOnly": true,
+    "recordDeduplicationScope": "Within each question across tool calls",
+    "anchorReferenceFormat": "Question-local m1, m2, ...",
+    "maximumAnchors": 3
+  },
+  "reader": {
+    "promptFile": "answer-prompt.md",
+    "promptSha256": "a8e295a2482cde1cb4b497fcaad2c0fcc964d3b126c39c71fda89e960368e250",
+    "toolInstructionFile": "tool-instruction.md",
+    "goldAnswersVisible": false,
+    "categoriesVisible": false,
+    "questionConcurrency": 2,
+    "sampleConcurrency": 1
+  },
+  "scoring": {
+    "includedCategories": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "excludedCategories": [
+      5
+    ],
+    "aggregation": "Question-level micro average",
+    "executionFailuresCountAsWrong": true,
+    "allSamplesIncluded": true
+  }
+}

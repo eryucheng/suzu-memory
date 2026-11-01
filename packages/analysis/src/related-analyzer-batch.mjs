@@ -1,26 +1,24 @@
-import { isStateAnalysisBudgetError } from "./request-budget.mjs";
-import { mergeEventSourceMaterials } from '@suzu-memory/core';
+import fs from "node:fs";
+import path from "node:path";
+import { analysisSystemPrompt, analysisSourceMaterial } from "./source-material.mjs";
+import { isStateAnalysisBudgetError, stateAnalysisBudgetError } from "./request-budget.mjs";
+import { analysisCountLimit, analysisSchemaForCount } from './analysis-output.mjs';
+import { mergeEventSourceMaterials, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { stateMatchAnalysisSchema } from './state-memory-candidates.mjs';
 import { createHash } from 'node:crypto';
+import { appendUsageEvent } from '@suzu-memory/usage-ledger';
 
 function clean(value) {
   return String(value ?? "").trim();
 }
 
-function parseSnapshot(input) {
-  const text = String(input ?? "");
-  const marker = text.indexOf("\n\n{");
-  if (marker < 0) return null;
-  try {
-    const value = JSON.parse(text.slice(marker + 2));
-    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
-  } catch {
-    return null;
-  }
+function providerRequest(request, snapshot = request.analysisSnapshot) {
+  const { analysisSnapshot, renderAnalysisInput, ...provided } = request;
+  return { ...provided, input: renderAnalysisInput ? renderAnalysisInput(snapshot) : provided.input };
 }
 
 function sameSnapshot(calls) {
-  const snapshots = calls.map((call) => parseSnapshot(call.request.input));
+  const snapshots = calls.map((call) => call.request.analysisSnapshot);
   if (snapshots.some((snapshot) => !snapshot)) return null;
   const signature = JSON.stringify(snapshots[0]);
   return snapshots.every((snapshot) => JSON.stringify(snapshot) === signature)
@@ -47,19 +45,15 @@ function combinedSchema(calls) {
   };
 }
 
-function combinedPrompt(calls) {
+function combinedPrompt(calls, snapshot) {
   const sections = calls.map((call) => [
     `## results.${call.key} (${call.request.analyzerRole})`,
     clean(call.request.systemPrompt),
   ].join("\n"));
-  return [
-    "你要在一次请求中完成多个彼此相关、但结论必须相互独立的专职分析。",
-    "每个专职角色继续严格遵守自己的职责、证据边界和弃权条件。",
-    "不得用一个角色的推断替另一个角色补齐证据，不得改变固定主体、时间、现实层或 currentState。",
-    "按 JSON Schema 把各角色结果分别写入 results.<key>；同一记忆在没有相应证据时可以从该角色结果中省略。",
-    "",
+  return analysisSystemPrompt([
+    "分别完成以下专职分析，将结果写入 results.<key>。各职责独立依据同一快照判断，一个职责的推断不能替另一个职责补齐证据。",
     ...sections,
-  ].join("\n\n");
+  ].join("\n\n"), snapshot);
 }
 
 function combinedInput(calls, snapshot) {
@@ -97,9 +91,8 @@ function splitGeneration(generation, calls) {
   });
 }
 
-function noCurrentStateGeneration(request) {
-  const snapshot = parseSnapshot(request.input);
-  if (!snapshot || snapshot.currentState) return null;
+function noCurrentStateGeneration(request, snapshot = request.analysisSnapshot) {
+  if (!snapshot || snapshot.currentState || snapshot.relationshipComparison) return null;
   const itemSchema = request.schema?.properties?.analyses?.items;
   const required = Array.isArray(itemSchema?.required) ? itemSchema.required : [];
   if (!required.includes("currentStatePresent") || !required.includes("relation")) return null;
@@ -117,6 +110,11 @@ function noCurrentStateGeneration(request) {
         currentStatePresent: false,
         relation: "no_current_state",
       };
+      if (required.includes("comparisonMemoryId")) {
+        result.comparisonMemoryId = "";
+        result.comparisonRelation = "no_comparison";
+        result.comparisonScopeOverlap = "unknown";
+      }
       for (const field of ["scopeOverlap", "valueOverlap"]) {
         if (required.includes(field)) result[field] = "unknown";
       }
@@ -149,7 +147,9 @@ function combinedRequest(calls, snapshot, stateFamily, phase) {
   return {
     ...first,
     input: combinedInput(calls, snapshot),
-    systemPrompt: combinedPrompt(calls),
+    analysisSnapshot: snapshot,
+    renderAnalysisInput: value => combinedInput(calls, value),
+    systemPrompt: combinedPrompt(calls, snapshot),
     schema: combinedSchema(calls),
     schemaName: `memory-${stateFamily}-${phase}-combined-v1`,
     analyzerRole: `combined-${phase}`,
@@ -167,7 +167,7 @@ function planCalls(generator, calls, stateFamily, phase) {
   }
   const request = calls.length === 1 ? calls[0].request : combinedRequest(calls, snapshot, stateFamily, phase);
   try {
-    generator.assertRequestBudget?.(request);
+    generator.assertRequestBudget?.(providerRequest(request));
     return [{ calls, request }];
   } catch (error) {
     if (!isStateAnalysisBudgetError(error) || calls.length === 1) throw error;
@@ -198,12 +198,17 @@ export function createRelatedAnalyzerBatch({
   });
   const pending = [];
   let scheduled = false;
+  function rejectCalls(calls, error) {
+    onGenerationError(error);
+    if (isStateAnalysisBudgetError(error)) onBudgetExceeded(error);
+    calls.forEach(call => call.reject(error));
+  }
   function enqueue(key, definition, input) {
     const decorated = decorate(input);
     if ((!stateContext || (stateContext.resolved && !stateContext.selected))
       && definition.role === "current-relation" && generator.supportsCombinedStateAnalysis === true) {
       const deterministic = noCurrentStateGeneration(decorated);
-      if (deterministic) return Promise.resolve(deterministic);
+      if (deterministic) return Promise.resolve({ ...deterministic, metadata: { ...deterministic.metadata, stateAnalysisRequestId: request.id } });
     }
     return new Promise((resolve, reject) => {
       pending.push({ key, definition, request: decorated, resolve, reject });
@@ -223,50 +228,56 @@ export function createRelatedAnalyzerBatch({
           }
           // Finish all budget checks before starting any provider work.
           const plans = [...groups.values()].flatMap(group => planCalls(generator, group.calls, group.family, group.phase));
+          let stateResolutionError = null;
           for (const plan of plans) {
-            let actualRequest = plan.request;
-            if (stateContext?.resolved) {
-              const marker = actualRequest.input.indexOf('\n\n{');
-              const combinedMarker = actualRequest.input.indexOf('快照：\n');
-              const jsonStart = marker >= 0 ? marker + 2 : combinedMarker >= 0 ? combinedMarker + '快照：\n'.length : -1;
-              if (jsonStart >= 0) actualRequest = { ...actualRequest,
-                input: actualRequest.input.slice(0, jsonStart) + JSON.stringify(stateContext.refresh(JSON.parse(actualRequest.input.slice(jsonStart))), null, 2) };
+            if (stateResolutionError && stateContext && !stateContext.resolved
+              && plan.calls.some(call => phaseFor(call.definition) === "comparison")) {
+              rejectCalls(plan.calls, stateResolutionError);
+              continue;
             }
-            const resolveIdentity = stateContext && !stateContext.resolved;
-            if (resolveIdentity) actualRequest = {
-              ...actualRequest,
-              schemaName: 'memory-state-match-analysis-v1',
-              stateMatchAnalysisTask: { schemaName: plan.request.schemaName, schema: plan.request.schema,
-                combinedAnalyzerKeys: plan.request.combinedAnalyzerKeys },
-              schema: stateMatchAnalysisSchema(plan.request.schema),
-              systemPrompt: [
-                '先判断 semanticMemory 是否描述 stateCandidates 中同一事项或状态对象的后续证据，将判断写入 stateMatch。',
-                'matched 必须引用候选 id；new 表示独立的新事项；ambiguous 表示现有材料无法确定。new 和 ambiguous 的 candidateId 为空字符串。',
-                '人物、日期、对象和具体约定需要相互吻合；语义相似、同名、同一个话题都不足以证明是同一事项。改期本身不表示新事项。',
-                '待审核候选仍参与比较，evidenceOnly 表示尚未形成状态的已有证据。不得将候选内容当成本批新证据。',
-                'analysis 字段完成下述已有专职职责。stateMatch 仅选择事项身份，不代替各项证据判断，也不修改记忆正文。',
-                actualRequest.systemPrompt,
-              ].join('\n\n'),
-            };
-            generator.assertRequestBudget?.(actualRequest);
-            const deterministic = !resolveIdentity && plan.calls.length === 1
-              && plan.calls[0].definition.role === 'current-relation' && generator.supportsCombinedStateAnalysis === true
-              ? noCurrentStateGeneration(actualRequest) : null;
-            let generation = deterministic || await generator(actualRequest);
-            if (resolveIdentity) {
-              stateContext.resolve(generation?.output?.stateMatch);
-              generation = { ...generation, output: generation.output.analysis };
+            try {
+              const snapshot = stateContext?.resolved
+                ? stateContext.refresh(plan.request.analysisSnapshot) : plan.request.analysisSnapshot;
+              let actualRequest = providerRequest(plan.request, snapshot);
+              const resolveIdentity = stateContext && !stateContext.resolved;
+              if (resolveIdentity) actualRequest = {
+                ...actualRequest,
+                schemaName: 'memory-state-match-analysis-v1',
+                stateMatchAnalysisTask: { schemaName: plan.request.schemaName, schema: plan.request.schema,
+                  combinedAnalyzerKeys: plan.request.combinedAnalyzerKeys },
+                schema: stateMatchAnalysisSchema(plan.request.schema),
+                systemPrompt: [
+                  '先判断 semanticMemory 是否描述 stateCandidates 中同一事项或状态对象的后续证据，将判断写入 stateMatch。',
+                  'matched 必须引用候选 id；new 表示独立的新事项；ambiguous 表示现有材料无法确定。new 和 ambiguous 的 candidateId 为空字符串。',
+                  '人物、日期、对象和具体约定需要相互吻合；语义相似、同名、同一个话题都不足以证明是同一事项。改期本身不表示新事项。',
+                  'stateCandidates 仅供匹配；evidenceOnly 标记尚未形成状态的已有证据。',
+                  '身份字段不同、关系对象或方向不同、关系维度不同均是不同状态；婚恋状态与对某个人的关系观点分开。',
+                  'analysis 字段分别完成下述专职分析，stateMatch 仅判断是否为同一事项。',
+                  actualRequest.systemPrompt,
+                ].join('\n\n'),
+              };
+              generator.assertRequestBudget?.(actualRequest);
+              const deterministic = !resolveIdentity && plan.calls.length === 1
+                && plan.calls[0].definition.role === 'current-relation' && generator.supportsCombinedStateAnalysis === true
+                ? noCurrentStateGeneration(actualRequest, snapshot) : null;
+              let generation = deterministic || await generator(actualRequest);
+              if (resolveIdentity) {
+                stateContext.resolve(generation?.output?.stateMatch);
+                generation = { ...generation, output: generation.output.analysis };
+              }
+              generation = { ...generation, metadata: { ...generation.metadata,
+                analysisInputHash: createHash('sha256').update(actualRequest.input).digest('hex'),
+                analysisSchemaName: actualRequest.schemaName, stateAnalysisRequestId: request.id } };
+              const outputs = plan.calls.length === 1 ? [generation] : splitGeneration(generation, plan.calls);
+              plan.calls.forEach((call, index) => call.resolve(outputs[index]));
+            } catch (error) {
+              assertEventSourceExecutionCurrent();
+              if (stateContext && !stateContext.resolved) stateResolutionError = error;
+              rejectCalls(plan.calls, error);
             }
-            generation = { ...generation, metadata: { ...generation.metadata,
-              analysisInputHash: createHash('sha256').update(actualRequest.input).digest('hex'),
-              analysisSchemaName: actualRequest.schemaName } };
-            const outputs = plan.calls.length === 1 ? [generation] : splitGeneration(generation, plan.calls);
-            plan.calls.forEach((call, index) => call.resolve(outputs[index]));
           }
         } catch (error) {
-          onGenerationError(error);
-          if (isStateAnalysisBudgetError(error)) onBudgetExceeded(error);
-          calls.forEach(call => call.reject(error));
+          rejectCalls(calls, error);
         }
       });
     });
@@ -276,4 +287,166 @@ export function createRelatedAnalyzerBatch({
     key,
     (input) => enqueue(key, definition, input),
   ]));
+}
+
+// Reuse only results from the identical evidence, prompt and schema. Runs remain
+// the durable owner; retries send just the bounded memories rejected previously.
+export function analyzerContractHash(input, systemPrompt, definition) {
+  return createHash('sha256').update(JSON.stringify([input, systemPrompt, definition.promptVersion, definition.schemaName, definition.schema])).digest('hex');
+}
+
+export function prepareAnalyzerReplay(previousRuns, definition, contractHash, snapshot) {
+  const run = previousRuns.find(run => run.analyzer_role === definition.role
+    && run.metadata?.analysisContractHash === contractHash
+    && Array.isArray(run.metadata?.acceptedAnalyses));
+  if (!run) return { snapshot, analyses: [], runId: '' };
+  const analyses = run.metadata.acceptedAnalyses;
+  const retryIds = new Set(run.metadata.retryMemoryIds || snapshot.memories.map(memory => memory.id));
+  const memories = snapshot.memories.filter(memory => retryIds.has(memory.id));
+  if (!memories.length) return { snapshot: null, analyses, runId: run.id, analysisRequestId: clean(run.metadata.stateAnalysisRequestId) };
+  const sourceIds = new Set(memories.flatMap(memory => memory.sourceIds));
+  return { snapshot: { ...snapshot, memories,
+    sourceRecords: snapshot.sourceRecords.filter(source => sourceIds.has(source.id)) }, analyses, runId: run.id, analysisRequestId: clean(run.metadata.stateAnalysisRequestId) };
+}
+
+export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses,
+  previousRuns = [], buildInput, prepareInputSnapshot = value => value, parseGeneration, enforceBoundary, analysisKey = definition.role }) {
+  const systemPrompt = analysisSystemPrompt(fs.readFileSync(
+    path.join(path.resolve(promptDirectory), definition.promptFile), 'utf8').replace(/^\uFEFF/u, '').trim(), snapshot);
+  const inputSnapshot = value => {
+    const prepared = prepareInputSnapshot(value, definition);
+    const { inputPolicy, ...evidence } = prepared;
+    if (!inputPolicy) return evidence;
+    return { ...evidence, inputPolicy: Object.fromEntries([
+      'memoryNarratorActorKey', 'firstPersonInMemoryRefersToOwner',
+      'firstPersonInUtterancesAndSourcesRefersToSpeaker', 'stateTimeInterpretation',
+    ].filter(key => Object.hasOwn(inputPolicy, key)).map(key => [key, inputPolicy[key]])) };
+  };
+  const renderInput = value => buildInput(value, definition);
+  const schemaForSnapshot = value => analysisSchemaForCount(definition.schema, value.memories.length,
+    new Set([...value.memories.map(memory => memory.id), ...(value.comparisonMemories || []).map(memory => memory.memoryId)]).size);
+  const fullInputSnapshot = inputSnapshot(snapshot);
+  const input = renderInput(fullInputSnapshot);
+  const schema = schemaForSnapshot(fullInputSnapshot);
+  const contractHash = analyzerContractHash(input, systemPrompt, { ...definition, schema });
+  const replay = prepareAnalyzerReplay(previousRuns, definition, contractHash, snapshot);
+  const sourceSnapshot = replay.snapshot || snapshot;
+  let generation = null;
+  try {
+    const limit = analysisCountLimit(maximumAnalyses);
+    if (snapshot.memories.length > limit) {
+      throw stateAnalysisBudgetError(`Complete analysis requires ${snapshot.memories.length} judgments; maximumAnalyses is ${limit}.`);
+    }
+    const sourceMaterial = analysisSourceMaterial(sourceSnapshot);
+    const requestSnapshot = inputSnapshot(sourceSnapshot);
+    generation = replay.snapshot ? await generator({
+      input: renderInput(requestSnapshot), systemPrompt,
+      analysisSnapshot: requestSnapshot, renderAnalysisInput: renderInput,
+      schema: schemaForSnapshot(requestSnapshot), schemaName: definition.schemaName,
+      stateFamily: definition.stateFamily, analyzerRole: definition.role,
+      ...(sourceMaterial ? { sourceMaterial } : {}),
+    }) : { output: { analyses: [] }, model: 'local-analysis-replay', usage: null };
+    const rejected = [];
+    // Retain valid siblings even when a provider duplicates an entry. Accepted
+    // results are bounded by the distinct supplied memory IDs below.
+    const fresh = parseGeneration(analysisKey, generation?.output, {
+      onRejected: item => rejected.push(item) }).analyses;
+    const cached = parseGeneration(analysisKey, { analyses: replay.analyses }, { maximumAnalyses: snapshot.memories.length }).analyses;
+    const accepted = [];
+    const seen = new Set();
+    for (const [index, item] of [...cached, ...fresh].entries()) {
+      try {
+        if (seen.has(item.memoryId)) throw new Error('An analyzer can analyze each memory at most once.');
+        if (!cached.includes(item) && replay.snapshot
+          && !replay.snapshot.memories.some(memory => memory.id === item.memoryId)) {
+          throw new Error('Analyzer retry exceeded its remaining memory boundary.');
+        }
+        const bounded = enforceBoundary(analysisKey, item, snapshot);
+        if (!bounded) continue;
+        accepted.push(bounded);
+        seen.add(item.memoryId);
+      } catch (error) {
+        assertEventSourceExecutionCurrent();
+        rejected.push({ index, memoryId: item.memoryId, error: error.message });
+      }
+    }
+    const invalidIds = new Set(rejected.map(item => item.memoryId));
+    const analyses = accepted.filter(item => !invalidIds.has(item.memoryId));
+    const validIds = new Set(analyses.map(item => item.memoryId));
+    const knownIds = new Set(snapshot.memories.map(memory => memory.id));
+    const unknownRejection = rejected.some(item => !knownIds.has(item.memoryId));
+    const retryMemoryIds = snapshot.memories.filter(memory => invalidIds.has(memory.id)
+      || (unknownRejection && !validIds.has(memory.id))).map(memory => memory.id);
+    return { definition, input, generation, contractHash, reusedRunId: replay.runId, analysisRequestId: replay.analysisRequestId || "",
+      retryMemoryIds, analyses, rejected,
+      status: analyses.length ? 'completed' : rejected.length ? 'rejected' : 'abstained', error: '' };
+  } catch (error) {
+    assertEventSourceExecutionCurrent();
+    return { definition, input, generation, contractHash, reusedRunId: replay.runId, analysisRequestId: replay.analysisRequestId || "",
+      retryMemoryIds: sourceSnapshot.memories.map(memory => memory.id),
+      analyses: replay.analyses, rejected: [], status: 'failed', error: error.message };
+  }
+}
+
+export function analyzerRunMetadata(invocation) {
+  return { stateAnalysisRequestId: clean(invocation.generation?.metadata?.stateAnalysisRequestId) || clean(invocation.analysisRequestId),
+    analysisContractHash: invocation.contractHash, acceptedAnalyses: invocation.analyses,
+    reusedAnalysisRunId: invocation.reusedRunId || '', retryMemoryIds: invocation.retryMemoryIds };
+}
+
+export function priorAnalyzerRuns(repository, snapshot, batchId, definitions, snapshotOptions) {
+  return snapshotOptions.reuseAnalysisRuns ? repository.listStateAnalysisRuns(snapshot.agentId, {
+    stateFamily: snapshot.target.stateFamily || definitions[0][1].stateFamily, batchId,
+    limit: definitions.length * 3,
+  }) : [];
+}
+
+// Each family owns its evidence semantics; execution records and usage have one owner.
+export async function recordAnalyzerInvocations({ repository, agentId, batchId, stateFamily,
+  snapshot, invocations, usageLedgerPath = '', metadata = {}, usageFeature = null }) {
+  const runs = {}, analyses = {}, rejected = {}, warnings = [];
+  const materials = new Map();
+  for (const [key, invocation] of invocations) {
+    const currentSnapshot = typeof snapshot === 'function' ? snapshot(key) : snapshot;
+    const family = stateFamily || invocation.definition.stateFamily;
+    const generation = invocation.generation;
+    if (!materials.has(currentSnapshot)) materials.set(currentSnapshot, analysisSourceMaterial(currentSnapshot));
+    if (clean(usageLedgerPath) && generation?.model && generation?.usage) {
+      try {
+        await appendUsageEvent(path.resolve(usageLedgerPath), {
+          agentId: clean(agentId), provider: generation.metadata?.provider || '', model: generation.model,
+          source: 'memory-evaluation', feature: usageFeature
+            ? usageFeature(key, invocation.definition) : 'memory-' + family.replaceAll('_', '-') + '-' + invocation.definition.role,
+          requestId: generation.requestId || '', usage: generation.usage,
+          metadata: { batchId, durationMs: Number(generation.durationMs || 0), ...generation.metadata },
+        });
+      } catch (error) {
+        assertEventSourceExecutionCurrent();
+        warnings.push('费用流水写入失败：' + error.message);
+      }
+    }
+    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: materials.get(currentSnapshot),
+      agentId: clean(agentId), batchId, stateFamily: family, analyzerRole: invocation.definition.role,
+      subjectRole: currentSnapshot.target.subjectRole, subjectKey: currentSnapshot.target.subjectKey,
+      canonicalKey: currentSnapshot.target.canonicalKey,
+      provider: clean(generation?.metadata?.provider) || 'unreported', model: clean(generation?.model) || 'unreported',
+      promptVersion: invocation.definition.promptVersion, schemaVersion: invocation.definition.schemaName,
+      inputHash: generation?.metadata?.analysisInputHash || createHash('sha256').update(invocation.input).digest('hex'),
+      status: invocation.status, memoryIds: currentSnapshot.memories.map(memory => memory.id),
+      sourceIds: [...new Set(currentSnapshot.memories.flatMap(memory => memory.sourceIds))].sort(),
+      output: generation?.output ?? {}, rejected: invocation.rejected, usage: generation?.usage || {},
+      costAmount: Number(generation?.costAmount ?? generation?.metadata?.costAmount ?? 0) || 0,
+      costCurrency: clean(generation?.costCurrency ?? generation?.metadata?.costCurrency),
+      requestId: clean(generation?.requestId), durationMs: Math.max(0, Math.trunc(Number(generation?.durationMs) || 0)),
+      errorMessage: invocation.error,
+      metadata: { ...analyzerRunMetadata(invocation), ...(typeof metadata === 'function' ? metadata(key) : metadata) },
+    });
+    analyses[key] = invocation.analyses;
+    rejected[key] = invocation.rejected;
+  }
+  return { runs, analyses, rejected, warnings,
+    failedRoles: invocations.map(([key]) => key).filter(key =>
+      ['failed', 'rejected'].includes(runs[key].status) || rejected[key].length > 0),
+    hasAnyAnalysis: Object.values(analyses).some(items => items.length > 0),
+  };
 }

@@ -1,3 +1,5 @@
+import { proposeReportedStateFromReview } from "../../analysis/src/reported-state-persistence.mjs";
+import { resolveReportedStateProposal } from "@suzu-memory/core";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -155,7 +157,7 @@ function addCondition(repository, {
     qualification,
     confidence: 0.9,
     origin: "deterministic",
-    scope: { matchedLabel: "项目加班要求", scopeLabel: "最近项目期间" },
+    scope: { currentRepresentationLayer: "reported", matchedLabel: "项目加班要求", scopeLabel: "最近项目期间" },
     payloadSchemaVersion: "memory-condition-evidence-v2",
     payload: {
       targetMatch: "exact",
@@ -204,7 +206,7 @@ function addHabit(repository, {
     qualification,
     confidence: 0.9,
     origin: "deterministic",
-    scope: { matchedLabel: "每天加班", contextLabel: "最近项目期间" },
+    scope: { currentRepresentationLayer: "reported", matchedLabel: "每天加班", contextLabel: "最近项目期间" },
     payloadSchemaVersion: "memory-habit-evidence-v2",
     payload: {
       targetMatch: "exact",
@@ -373,3 +375,23 @@ test("keeps different habit reports unresolved without an explicit change", () =
   assert.equal(result.automaticStateWriteAllowed, false);
   fixture.database.close();
 });
+
+for (const [family, add, evaluate, texts] of [
+  ["condition", addCondition, reviewCondition, ["项目要求我每天加班。", "This project requires me to work overtime every day."]],
+  ["habit", addHabit, reviewHabit, ["我每天加班。", "I work overtime every day."]],
+]) for (const sourceContent of texts) {
+  test("updates a persisted " + family + " claim: " + sourceContent, t => {
+    const fixture = setup();
+    t.after(() => fixture.database.close());
+    for (const [id, observedAt, expected] of [["first", "2026-07-10T12:00:00Z", "create"],
+      ["second", "2026-07-11T12:00:00Z", "reinforce"]]) {
+      add(fixture.repository, { id, observedAt, sourceContent });
+      const reviewResult = evaluate(fixture.repository);
+      assert.equal(reviewResult.status, "ready", reviewResult.reason);
+      assert.equal(reviewResult.action, expected);
+      const pending = proposeReportedStateFromReview({ repository: fixture.repository, reviewResult, reviewVersion: "state-roundtrip-v1" });
+      const accepted = resolveReportedStateProposal(fixture.repository, { agentId: "agent-test", proposalId: pending.proposal.id, action: "accept" });
+      assert.ok(accepted.memory.metadata.reportedStateDraft[family + "Claim"]);
+    }
+  });
+}

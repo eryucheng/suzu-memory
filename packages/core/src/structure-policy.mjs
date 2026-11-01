@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 
 import {
   MEMORY_ACTOR_ROLES,
@@ -118,6 +119,15 @@ function structureScope(members, target = null) {
     throw new Error("Structure members and target must share their reality and world scope.");
   }
   return { reality: origin.reality, worldId: origin.world_id, worldFrame: origin.world_frame };
+}
+
+// Organizing existing information does not make it newly learned. A container
+// becomes knowable when its latest member does; recorded_at tracks storage.
+export function structureKnownAt(members) {
+  const times = members.map(member => [member.known_at, member.recorded_at]
+    .map(value => Date.parse(value || '')).find(Number.isFinite));
+  return times.length && times.every(Number.isFinite)
+    ? new Date(Math.max(...times)).toISOString() : null;
 }
 
 function validateAttachTarget(repository, { agentId, kind, targetMemoryId }) {
@@ -349,6 +359,8 @@ export function materializeMemoryStructureProposal(repository, {
   }
 
   return repository.transaction(() => {
+    const knownAt = structureKnownAt(members);
+    if (!knownAt) throw new Error('Structure members require a valid known or recorded time.');
     const common = {
       ...scope,
       agentId: normalizedAgentId,
@@ -359,6 +371,7 @@ export function materializeMemoryStructureProposal(repository, {
       actorRoles: proposal.actorRoles,
       confidence: proposal.confidence,
       evidenceMode: "inferred",
+      knownAt,
       metadata: pendingStructureMetadata(proposal),
     };
     let memory = target || (proposal.kind === "episode"
@@ -395,10 +408,30 @@ export function materializeMemoryStructureProposal(repository, {
         memoryIds: members.map((member) => member.id),
       });
     }
+    if (target) {
+      const allMembers = repository.listContainerMembers({
+        agentId: normalizedAgentId, containerKind: proposal.kind, containerId: target.id,
+        relation: proposal.kind === 'episode' ? 'part_of_episode' : 'supports_topic',
+        statuses: ['active', 'superseded', 'disputed', 'archived'],
+      });
+      const attachedKnownAt = structureKnownAt(allMembers);
+      if (!attachedKnownAt) throw new Error('Structure members require a valid known or recorded time.');
+      if (Date.parse(target.known_at) !== Date.parse(attachedKnownAt)) {
+        repository.database.prepare(`UPDATE memory_nodes SET known_at = ?, updated_at = ?
+          WHERE agent_id = ? AND id = ?`).run(attachedKnownAt, new Date().toISOString(), normalizedAgentId, target.id);
+      }
+    }
     const pending = repository.setPendingStructureProposalResult({
       agentId: normalizedAgentId,
       proposalId: proposal.id,
       resultMemoryId: memory.id,
+    });
+    enqueueMemoryMaintenanceTasks({
+      repository,
+      agentId: normalizedAgentId,
+      batchId: proposal.batch_id || proposal.id,
+      memoryIds: [memory.id],
+      taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding],
     });
     return {
       status: "materialized-pending-review",

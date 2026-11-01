@@ -95,26 +95,26 @@ for (const [query, topic, content] of [
 
 for (const query of ['我的猫叫什么名字', '我家猫叫什么', '我家的猫名字是什么',
   '我家的猫 叫什么', '我家的猫叫 什么名字', '我家的 猫叫什么名字', '我家 猫叫什么', '我的猫名字 是什么']) {
-  test(`keeps the owner of a named pet: ${query}`, async () => {
+  test(`preserves each participant’s pet statement: ${query}`, async () => {
     const result = await recall(query);
     assert.equal(result.status, 'ready');
     assert.match(result.context, /小橘/u);
     assert.ok(result.candidates.some(candidate => candidate.memoryId === 'cat'));
-    assert.ok(!result.candidates.some(candidate => candidate.memoryId === 'agent-cat'));
-    assert.doesNotMatch(result.context, /大白/u);
+    assert.ok(result.candidates.some(candidate => candidate.memoryId === 'agent-cat'));
+    assert.match(result.context, /大白/u);
   });
 }
 
-test('resolves the other participant when asking for their pet name', async () => {
+test('returns the other participant’s pet statement with its original attribution', async () => {
   const result = await recall('你的猫叫什么名字');
   assert.equal(result.status, 'ready');
   assert.match(result.context, /大白/u);
   assert.ok(result.candidates.some(candidate => candidate.memoryId === 'agent-cat'));
-  assert.ok(!result.candidates.some(candidate => candidate.memoryId === 'cat'));
-  assert.doesNotMatch(result.context, /小橘/u);
+  assert.ok(result.candidates.some(candidate => candidate.memoryId === 'cat'));
+  assert.match(result.context, /小橘/u);
 });
 
-test('spaced naming questions respect an agent speaking perspective', async () => {
+test('spaced naming questions retain both statements for the reader', async () => {
   const perspective = { queryPerspective: { speakerRole: 'agent', speakerKey: agentId, addresseeRole: 'user', addresseeKey: 'user' } };
   for (const [query, expectedId, excludedId] of [
     ['我的猫 叫什么名字', 'agent-cat', 'cat'],
@@ -123,7 +123,7 @@ test('spaced naming questions respect an agent speaking perspective', async () =
     const result = await recall(query, undefined, perspective);
     assert.equal(result.status, 'ready', query);
     assert.ok(result.candidates.some(candidate => candidate.memoryId === expectedId));
-    assert.ok(!result.candidates.some(candidate => candidate.memoryId === excludedId));
+    assert.ok(result.candidates.some(candidate => candidate.memoryId === excludedId));
   }
 });
 

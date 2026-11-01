@@ -1,9 +1,5 @@
 import { createHash } from "node:crypto";
 import {
-  createConversationArchiveWindows,
-  groupConversationEventsByArchiveWindow,
-  packConversationArchiveWindows,
-  toProcessingArchiveWindows,
   DEFAULT_LENGTH_ARCHIVE_POLICY,
   logicalArchiveEventId,
 } from "@suzu-memory/ingestion";
@@ -238,35 +234,8 @@ export function buildConversationTurnEvents({
   ]);
 }
 
-function inputEventMatchesSession(event, hostId, sessionId) {
-  const host = plainObject(event?.metadata?.host);
-  return clean(host.id) === clean(hostId) && clean(host.sessionId) === clean(sessionId);
-}
-
 function pageItems(page) {
   return Array.isArray(page?.items) ? page.items : [];
-}
-
-async function listSessionInputEvents(memory, { hostId, sessionId }) {
-  const items = [];
-  let offset = 0;
-  const limit = 500;
-  for (let pageNumber = 0; pageNumber < 10_000; pageNumber += 1) {
-    const page = await memory.listInputEvents({
-      statuses: ["pending", "archived"],
-      lifecycles: ["active"],
-      hostId,
-      sessionId,
-      limit,
-      offset,
-    });
-    const received = pageItems(page);
-    items.push(...received.filter((event) => inputEventMatchesSession(event, hostId, sessionId)));
-    const total = Number(page?.total);
-    offset += received.length;
-    if (!received.length || (Number.isFinite(total) && offset >= total)) break;
-  }
-  return items;
 }
 
 async function listPendingHostSessionIds(memory, { hostId }) {
@@ -316,41 +285,6 @@ function memoryFailureDiagnostic(stage, error) {
   };
 }
 
-function inputEventId(event) {
-  return clean(event?.id);
-}
-
-function eventTextLength(event) {
-  return String(event?.content?.text ?? "").length;
-}
-
-function pendingCoreEventIds(windows) {
-  return [...new Set((windows || []).flatMap((window) => (window.coreEvents || [])
-    .filter((event) => clean(event?.status) === "pending")
-    .map(inputEventId)
-    .filter(Boolean)))];
-}
-
-function pendingArchiveWindow(window) {
-  const coreEvents = (window?.coreEvents || []).filter((event) => (
-    clean(event?.status) === "pending"
-  ));
-  if (!coreEvents.length) return null;
-  return {
-    ...window,
-    coreEvents,
-    coreCharacters: coreEvents.reduce(
-      (total, event) => total + eventTextLength(event),
-      0,
-    ),
-  };
-}
-
-function packCharacters(windows) {
-  return (windows || []).flatMap((window) => window.coreEvents || [])
-    .reduce((total, event) => total + eventTextLength(event), 0);
-}
-
 export class ChatHostMemoryAdapter {
   constructor({
     memory,
@@ -358,7 +292,6 @@ export class ChatHostMemoryAdapter {
     identity,
     sourceKind = "chat-host",
     interventionPolicy = null,
-    archiveMode = "windows",
   } = {}) {
     this.memory = assertMemoryClient(memory);
     this.hostId = required(hostId, "hostId");
@@ -366,8 +299,6 @@ export class ChatHostMemoryAdapter {
     this.sourceKind = clean(sourceKind) || "chat-host";
     this.interventionPolicy = normalizeInterventionPolicy(interventionPolicy);
     this.pendingSessionIds = new Set();
-    if (!["windows", "length"].includes(archiveMode)) throw new Error("Unknown archive mode.");
-    this.archiveMode = archiveMode;
   }
 
   async beforeReply({
@@ -599,125 +530,14 @@ export class ChatHostMemoryAdapter {
     });
   }
 
-  /**
-   * Converts one persisted host session into the shared archive-window plan
-   * before semantic maintenance runs in the window-based host mode.
-   */
-  async processSessionArchiveWindows({
-    sessionId,
-    maximumEvents = 100,
-    maximumContentCharacters = 48_000,
-    maximumPreviousContextMessages = 10,
-    maximumPreviousContextCharacters = 8_000,
-    maximumContinuationGuidanceMessages = 20,
-    maximumContinuationGuidanceCharacters = 12_000,
-    leaseSeconds,
-    generator,
-    systemPrompt = "",
-    now = new Date(),
-    memoriesOverride = null,
-  } = {}) {
-    const normalizedSessionId = required(sessionId, "sessionId");
-    const storedEvents = await listSessionInputEvents(this.memory, {
-      hostId: this.hostId,
-      sessionId: normalizedSessionId,
-    });
-    const plans = groupConversationEventsByArchiveWindow(storedEvents);
-    const processed = [];
-    for (const plan of plans) {
-      const windows = createConversationArchiveWindows(plan, {
-        maximumEvents,
-        maximumContentCharacters,
-        maximumPreviousContextMessages,
-        maximumPreviousContextCharacters,
-        maximumContinuationGuidanceMessages,
-        maximumContinuationGuidanceCharacters,
-      });
-      // The archive plan deliberately sees prior archived turns so it can
-      // preserve boundary context.  The ingestion claim, however, is only
-      // allowed to own pending rows.  Keep archived turns in contextual
-      // fields, but never emit them as core event ids for this processing
-      // request; otherwise companionArchiveWindows rightfully rejects an
-      // archive window that references rows the claim could not acquire.
-      const pendingWindows = windows.map(pendingArchiveWindow).filter(Boolean);
-      const packs = packConversationArchiveWindows(pendingWindows, {
-        maximumEvents,
-        maximumContentCharacters,
-      });
-      for (const pack of packs) {
-        const candidateEventIds = pendingCoreEventIds(pack.windows);
-        if (!candidateEventIds.length) continue;
-        const result = await this.memory.processPendingEvents({
-          maximumEvents: Math.max(Number(maximumEvents) || 100, candidateEventIds.length),
-          maximumContentCharacters: Math.max(
-            Number(maximumContentCharacters) || 48_000,
-            packCharacters(pack.windows),
-          ),
-          candidateEventIds,
-          leaseSeconds,
-          generator,
-          systemPrompt,
-          now,
-          memoriesOverride,
-          archiveWindows: toProcessingArchiveWindows(pack.windows),
-        });
-        processed.push({
-          memoryWindowId: plan.memoryWindowId,
-          windowIds: pack.windows.map((window) => window.id),
-          candidateEventIds,
-          result,
-        });
-      }
-    }
-    const remainingEvents = await listSessionInputEvents(this.memory, {
-      hostId: this.hostId,
-      sessionId: normalizedSessionId,
-    });
-    const pending = remainingEvents.filter((event) => clean(event?.status) === "pending").length;
-    if (!pending) this.pendingSessionIds.delete(normalizedSessionId);
-    return {
-      status: processed.length ? "processed" : "skipped",
-      reason: processed.length ? "" : "no-pending-session-events",
-      sessionId: normalizedSessionId,
-      events: storedEvents.length,
-      batches: processed,
-    };
-  }
-
   async pendingWork({ sessionId = "", minimumStructureMemories } = {}) {
     if (typeof this.memory.maintenanceStatus !== "function") return null;
     const status = await this.memory.maintenanceStatus({ limit: 1, minimumStructureMemories });
-    const providers = this.memory.providers || {};
-    const input = await this.memory.listInputEvents({ statuses: ["pending", "processing"], hostId: this.hostId, sessionId, limit: 1 });
-    let tasks = 0, failedTasks = 0, deferredTasks = 0, completedTasks = 0;
-    for (const [key, count] of Object.entries(status.taskCounts || {})) {
-      const [lane, type, state] = key.split(":");
-      const supported = lane === "embedding" && type === "memory-embedding" ? typeof providers.embedding === "function"
-        : type === "event-continuity" ? typeof providers.generator === "function" && typeof providers.embedding === "function"
-        : type === "retrieval-context" ? typeof providers.retrievalContextGenerator === "function" || providers.retrievalContextGenerator === null
-        : type === "structure-proposal" && typeof providers.structureGenerator === "function";
-      if (!supported) {
-        if (["pending", "running"].includes(state)) deferredTasks += Number(count);
-        continue;
-      }
-      if (["pending", "running"].includes(state)) {
-        const accumulating = type === "structure-proposal" && state === "pending"
-          ? Number(status.structureQueue?.accumulatingTaskCount || 0) : 0;
-        tasks += Number(count) - accumulating;
-        deferredTasks += accumulating;
-      }
-      if (state === "failed") failedTasks += Number(count);
-      if (state === "completed") completedTasks += Number(count);
-    }
-    const pending = { inputEvents: input.total, tasks,
-      stateRequests: providers.generator ? Number(status.pendingStateAnalysisRequests || 0) : 0,
-      consolidation: providers.structureGenerator ? Number(status.consolidationRuns?.planned || 0) + Number(status.consolidationRuns?.running || 0) : 0 };
-    const failures = failedTasks + (providers.generator ? Number(status.stateAnalysisRequests?.failed || 0) + Number(status.stateAnalysisRequests?.blocked || 0) : 0)
-      + (providers.structureGenerator ? Number(status.consolidationRuns?.failed || 0) : 0);
-    return { pending, total: Object.values(pending).reduce((sum, count) => sum + count, 0), failures,
-      completed: { tasks: completedTasks, stateRequests: Number(status.stateAnalysisRequests?.completed || 0),
-        consolidation: Number(status.consolidationRuns?.completed || 0) },
-      deferred: { tasks: deferredTasks } };
+    if (!status.work) return null;
+    const input = await this.memory.listInputEvents({ statuses: ['pending', 'processing'], hostId: this.hostId, sessionId, limit: 1 });
+    const pending = { inputEvents: input.total, ...status.work.pending };
+    return { ...status.work, pending, total: input.total + status.work.total };
+
   }
 
   async onIdle({ sessionId = "", processInputEvents = true, flush = false, ...options } = {}) {
@@ -731,71 +551,34 @@ export class ChatHostMemoryAdapter {
     const sessionIds = explicitSessionId
       ? [explicitSessionId]
       : [...new Set([...this.pendingSessionIds, ...persistedSessionIds])];
-    if (this.archiveMode === "length") {
-      const reports = [];
-      for (const pendingSessionId of processInputEvents && sessionIds.length ? sessionIds : [""]) {
-        const chunkPolicy = { ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...this.memory.defaults?.ingestion,
-          hostId: this.hostId, sessionId: pendingSessionId, flush,
-          resolveReply: row => row.metadata?.host?.role === "companion" ? {
-            id: row.metadata.host.turnId, complete: true, lastEventId: logicalArchiveEventId(row),
-          } : null };
+    const reports = [];
+    for (const pendingSessionId of processInputEvents && sessionIds.length ? sessionIds : [""]) {
+      const chunkPolicy = { ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...this.memory.defaults?.ingestion,
+        hostId: this.hostId, sessionId: pendingSessionId, flush,
+        resolveReply: row => row.metadata?.host?.role === "companion" ? {
+          id: row.metadata.host.turnId, complete: true, lastEventId: logicalArchiveEventId(row),
+        } : null };
+      try {
         reports.push({ sessionId: pendingSessionId, result: await this.memory.runMaintenance({
           ...options, processInputEvents: processInputEvents && Boolean(pendingSessionId), chunkPolicy,
         }) });
-      }
-      const progress = await this.pendingWork({ minimumStructureMemories: options.minimumStructureMemories });
-      if (progress?.pending.inputEvents === 0) this.pendingSessionIds.clear();
-      const failures = reports.flatMap(report => report.result.failures?.length
-        ? report.result.failures.map(failure => ({ ...failure, sessionId: report.sessionId }))
-        : ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(report.result.status)
-          ? [{ sessionId: report.sessionId, status: report.result.status, result: report.result }] : []);
-      return { status: failures.length || progress?.failures
-        ? "completed-with-failures" : "completed",
-        input: reports.map(report => ({ sessionId: report.sessionId, batches: report.result.semantic?.inputBatches || [] })),
-        maintenance: reports.at(-1)?.result, recovered, failures, progress };
-    }
-    const input = [];
-    const inputFailures = [];
-    if (processInputEvents) {
-      for (const pendingSessionId of sessionIds) {
-        try {
-          input.push(await this.processSessionArchiveWindows({
-            sessionId: pendingSessionId,
-            ...options,
-          }));
-        } catch (error) {
-          const diagnostic = memoryFailureDiagnostic("idle-session-archive", error);
-          input.push({
-            status: "failed",
-            reason: "session-archive-failed",
-            sessionId: pendingSessionId,
-            batches: [],
-            error: diagnostic,
-          });
-          inputFailures.push({ sessionId: pendingSessionId, ...diagnostic });
-        }
+      } catch (error) {
+        const diagnostic = memoryFailureDiagnostic('idle-session-archive', error);
+        reports.push({ sessionId: pendingSessionId,
+          result: { status: 'failed', error: diagnostic, failures: [diagnostic] } });
       }
     }
-    // Never let the lower-level generic maintenance call bypass the formal
-    // archive planner above. A host that has no session to offer can still run
-    // embedding/semantic maintenance, but it cannot silently use a weaker
-    // message splitting path.
-    const maintenance = await this.memory.runMaintenance({
-      ...options,
-      processInputEvents: false,
-    });
-    const maintenanceFailed = ["failed", "completed-with-failures"].includes(clean(maintenance?.status));
     const progress = await this.pendingWork({ minimumStructureMemories: options.minimumStructureMemories });
-    return {
-      status: inputFailures.length || maintenanceFailed || progress?.failures ? "completed-with-failures" : "completed",
-      input: processInputEvents
-        ? input
-        : [{ status: "skipped", reason: "host-input-processing-disabled" }],
-      recovered,
-      failures: inputFailures,
-      maintenance,
-      progress,
-    };
+    if (progress?.pending.inputEvents === 0) this.pendingSessionIds.clear();
+    const failures = reports.flatMap(report => report.result.failures?.length
+      ? report.result.failures.map(failure => ({ ...failure, sessionId: report.sessionId }))
+      : ['failed', 'partial-failure', 'completed-with-failures', 'degraded'].includes(report.result.status)
+        ? [{ sessionId: report.sessionId, status: report.result.status, result: report.result }] : []);
+    return { status: failures.length || progress?.failures
+      ? "completed-with-failures" : "completed",
+      input: reports.map(report => ({ sessionId: report.sessionId, status: report.result.status,
+        error: report.result.error || null, batches: report.result.semantic?.inputBatches || [] })),
+      maintenance: reports.at(-1)?.result, recovered, failures, progress };
   }
 
   onSessionEnd(options = {}) {

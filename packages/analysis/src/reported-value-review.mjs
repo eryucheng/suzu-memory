@@ -2,6 +2,8 @@ import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
+  compatibleReportedClaims,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -155,6 +157,7 @@ export function reviewReportedValueState({
     };
   }
   const selection = selectLatestReportedCandidate(candidates, {
+    compatible: (left, right) => compatibleReportedClaims("value", left, right),
     hasCurrentState: Boolean(snapshot.currentState),
     isExplicitChange: (candidate) => candidate.time.revisionCue === "changed",
   });
@@ -172,7 +175,7 @@ export function reviewReportedValueState({
     representationLayer: "reported",
     action,
     currentStateId: snapshot.currentState?.id || "",
-    proposedState: proposedState(selected, snapshot),
+    proposedState: withReportedEvidence(proposedState(selected, snapshot), selection),
     selectedObservationId: selected.observation.id,
     consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
     snapshot,

@@ -8,13 +8,19 @@ const SIMPLE_TARGET_FAMILIES = new Set([
   "self_concept",
   "condition",
 ]);
-const IDENTITY_FIELDS = new Set([
+export const STATE_IDENTITY_FIELDS = Object.freeze([
   "name", "alias", "birth_date", "birth_year", "age", "gender", "pronouns",
   "occupation", "employer", "education", "residence", "hometown", "nationality",
-  "biography", "other",
+  "relationship_status", "biography", "other",
+]);
+const IDENTITY_FIELDS = new Set(STATE_IDENTITY_FIELDS);
+export const RELATIONSHIP_DIMENSIONS = Object.freeze([
+  "role", "naming", "trust", "boundary", "permission", "expectation",
+  "closeness", "agreement", "support", "other",
 ]);
 const IDENTITY_CARDINALITIES = new Set(["single", "multi_item", "sequence"]);
-const OBJECT_ROLES = new Set(["user", "agent", "other", "world"]);
+export const STATE_TARGET_OBJECT_ROLES = Object.freeze(["user", "agent", "other", "world"]);
+const OBJECT_ROLES = new Set(STATE_TARGET_OBJECT_ROLES);
 const PERSONAL_ROLES = new Set(["user", "agent", "other"]);
 
 function clean(value) {
@@ -54,6 +60,7 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
     if (!IDENTITY_FIELDS.has(identityField) || !IDENTITY_CARDINALITIES.has(fieldCardinality)) {
       return invalid(family);
     }
+    if (identityField === "relationship_status" && fieldCardinality !== "single") return invalid(family);
     return { identityField, fieldCardinality };
   }
   if (family === "belief") {
@@ -70,6 +77,7 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
   if (family === "relationship") {
     if (!exactKeys(source, [
       "counterpartRole", "counterpartKey", "counterpartLabel", "direction",
+      ...(Object.hasOwn(source, "relationshipDimension") ? ["relationshipDimension"] : []),
     ])) return invalid(family);
     const counterpartRole = clean(source.counterpartRole);
     const counterpartKey = clean(source.counterpartKey);
@@ -77,14 +85,18 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
     const direction = clean(source.direction);
     if (!PERSONAL_ROLES.has(counterpartRole) || !counterpartKey || !counterpartLabel
       || direction !== "holder_to_counterpart") return invalid(family);
-    return { counterpartRole, counterpartKey, counterpartLabel, direction };
+    const relationshipDimension = clean(source.relationshipDimension);
+    if (Object.hasOwn(source, "relationshipDimension") && !RELATIONSHIP_DIMENSIONS.includes(relationshipDimension)) return invalid(family);
+    return { counterpartRole, counterpartKey, counterpartLabel, direction,
+      ...(relationshipDimension ? { relationshipDimension } : {}) };
   }
   if (family === "affective_association") {
     if (!exactKeys(source, ["triggerRole", "triggerKey", "triggerLabel"])) return invalid(family);
     const triggerRole = clean(source.triggerRole);
     const triggerKey = clean(source.triggerKey);
     const triggerLabel = clean(source.triggerLabel);
-    if (!PERSONAL_ROLES.has(triggerRole) || !triggerKey || !triggerLabel) return invalid(family);
+    if (!OBJECT_ROLES.has(triggerRole) || !triggerLabel
+      || (triggerRole === "world" ? triggerKey : !triggerKey)) return invalid(family);
     return { triggerRole, triggerKey, triggerLabel };
   }
   return invalid(family);

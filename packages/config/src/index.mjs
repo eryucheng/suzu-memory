@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   createOpenAiCompatibleEmbeddingProvider,
   createOpenAiCompatibleStructuredGenerator,
+  DEFAULT_GENERATION_MAX_OUTPUT_TOKENS,
 } from "@suzu-memory/providers";
 import { WORLD_FRAMES } from "@suzu-memory/core";
 import { createMemoryService } from "@suzu-memory/service";
@@ -92,7 +93,7 @@ function normalizeProvider(value, kind) {
     dimensions: finiteInteger(input.dimensions, 0, 0, 100_000, `providers.${kind}.dimensions`),
     maxOutputTokens: finiteInteger(
       input.maxOutputTokens,
-      kind === "intervention" ? 512 : 8_192,
+      kind === "generation" ? DEFAULT_GENERATION_MAX_OUTPUT_TOKENS : kind === "intervention" ? 512 : 8_192,
       256,
       64_000,
       `providers.${kind}.maxOutputTokens`,

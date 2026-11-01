@@ -1,16 +1,14 @@
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations } from './related-analyzer-batch.mjs';
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
 import {
   RELATIONSHIP_ANALYZERS,
   buildRelationshipGenerationInput,
+  isCounterpartRelationshipStatement,
   parseRelationshipGeneration,
 } from "./relationship-contracts.mjs";
 import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
@@ -39,6 +37,7 @@ function stableBatchId({
   counterpartKey,
   canonicalKey,
   currentRepresentationLayer,
+  relationshipDimension,
   memoryIds,
 }) {
   const signature = [
@@ -49,6 +48,7 @@ function stableBatchId({
     clean(counterpartKey),
     clean(canonicalKey).toLocaleLowerCase("en-US"),
     clean(currentRepresentationLayer),
+    clean(relationshipDimension),
     uniqueStrings(memoryIds).sort().join("\u001f"),
   ].join("\u001e");
   return `relationship-analysis-${createHash("sha256").update(signature).digest("hex").slice(0, 24)}`;
@@ -103,12 +103,18 @@ function assertRelationshipActors(role, analysis, memory, target, counterpart) {
     if (!memoryHasActor(memory, target, new Set(["speaker"]), { allowPrimary: false })) {
       throw new Error("Explicit relationship self statement requires the fixed holder as speaker.");
     }
+  } else if (role === "perspective-direction" && analysis.attribution === "explicit_counterpart_statement") {
+    if ((analysis.direction !== "unknown" && !isCounterpartRelationshipStatement(analysis))
+      || !memoryHasActor(memory, counterpart, new Set(["speaker"]), { allowPrimary: false })) {
+      throw new Error("Explicit counterpart statement requires the counterpart as speaker and a reverse or pair-directed claim.");
+    }
   } else if (!memoryHasActor(
     memory,
     target,
     new Set(["subject", "speaker", "participant", "experiencer"]),
-  )) {
-    throw new Error("Relationship analysis does not identify the fixed holder.");
+  ) && !(memory.kind === "utterance" && role !== "perspective-direction"
+    && memoryHasActor(memory, counterpart, new Set(["speaker"]), { allowPrimary: false }))) {
+    throw new Error("Relationship analysis does not identify the fixed holder or a counterpart context statement.");
   }
 
   // Raw utterances record speakers and observed participants, not every person
@@ -145,6 +151,13 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
     if (analysis.currentStatePresent !== hasCurrent) {
       throw new Error("Relationship current-state presence does not match the read-only snapshot.");
     }
+    const comparison = snapshot.relationshipComparison;
+    const hasComparison = comparison && comparison.memoryId !== memory.id;
+    if (hasComparison
+      ? analysis.comparisonMemoryId !== comparison.memoryId || analysis.comparisonRelation === "no_comparison"
+      : analysis.comparisonMemoryId || analysis.comparisonRelation !== "no_comparison") {
+      throw new Error("Relationship peer comparison does not match the fixed evidence reference.");
+    }
     if (hasCurrent && analysis.relation === "no_current_state") {
       throw new Error("Relationship relation cannot omit an available current state.");
     }
@@ -155,86 +168,16 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   return analysis;
 }
 
-async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId,
-      provider: generation.metadata?.provider || "",
-      model: generation.model,
-      source: "memory-evaluation",
-      feature: `memory-relationship-${definition.role}`,
-      requestId: generation.requestId || "",
-      usage: generation.usage,
-      metadata: {
-        batchId,
-        durationMs: Number(generation.durationMs || 0),
-        ...generation.metadata,
-      },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(
-    path.join(path.resolve(promptDirectory), definition.promptFile),
-    "utf8",
-  ).replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildRelationshipGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({
-      input,
-      systemPrompt: analysisSystemPrompt(systemPrompt),
-      schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-      stateFamily: "relationship",
-      analyzerRole: definition.role,
-    });
-    const parsed = parseRelationshipGeneration(definition.role, generation?.output, {
-      maximumAnalyses,
-    });
-    const accepted = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, candidate] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(candidate.memoryId)) {
-          throw new Error("A relationship analyzer can analyze each memory at most once.");
-        }
-        accepted.push(enforceAnalysisBoundary(definition.role, candidate, snapshot));
-        seen.add(candidate.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
-      }
-    }
-    return {
-      definition,
-      input,
-      generation,
-      analyses: accepted,
-      rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained",
-      error: "",
-    };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return {
-      definition,
-      input,
-      generation,
-      analyses: [],
-      rejected: [],
-      status: "failed",
-      error: error.message,
-    };
-  }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildRelationshipGenerationInput,
+    parseGeneration: parseRelationshipGeneration, enforceBoundary: (role, item, snapshot) => {
+      const bounded = enforceAnalysisBoundary(role, item, snapshot);
+      if (role === 'relation-grounding' && snapshot.target.relationshipDimension
+        && bounded.relationType !== snapshot.target.relationshipDimension) return null;
+      return bounded;
+    } });
 }
 
 function byMemory(items) {
@@ -277,16 +220,13 @@ function relationshipGate({ grounding, perspective, scopeTime, relation, current
   if (perspective.attribution === "quoted_or_roleplay") {
     return { qualification: "excluded", reason: "relationship-is-quoted-or-roleplay" };
   }
-  if (perspective.attribution !== "explicit_self_statement") {
-    return { qualification: "unresolved", reason: "relationship-is-not-the-holder-direct-expression" };
-  }
   if (perspective.direction === "counterpart_to_holder") {
     return { qualification: "excluded", reason: "relationship-direction-is-reversed" };
   }
-  if (["mutual_claim", "about_pair"].includes(perspective.direction)) {
-    return { qualification: "unresolved", reason: "single-side-claim-cannot-prove-a-shared-relationship" };
+  if (perspective.attribution !== "explicit_self_statement") {
+    return { qualification: "unresolved", reason: "relationship-is-not-the-holder-direct-expression" };
   }
-  if (perspective.direction !== "holder_to_counterpart") {
+  if (!["holder_to_counterpart", "mutual_claim", "about_pair"].includes(perspective.direction)) {
     return { qualification: "unresolved", reason: "relationship-direction-is-unknown" };
   }
 
@@ -378,17 +318,18 @@ function actionPreview({ qualification, scopeTime, relation, currentState }) {
   }[relation.relation] || base;
 }
 
-function mergeRelationshipAnalyses({ evaluation, persistEvidenceLedger }) {
+function mergeRelationshipAnalyses({ evaluation, persistEvidenceLedger, completeMemoryIds }) {
   const maps = Object.fromEntries(
     Object.entries(evaluation.analyses).map(([key, items]) => [key, byMemory(items)]),
   );
   const memoryIds = uniqueStrings(Object.values(evaluation.analyses).flat().map((item) => item.memoryId));
   const observations = [];
   const previews = [];
-  for (const memoryId of memoryIds) {
+  for (const memoryId of memoryIds.filter(id => completeMemoryIds.includes(id))) {
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const grounding = maps.relationGrounding?.get(memoryId) || null;
     const perspective = maps.perspectiveDirection?.get(memoryId) || null;
+    if (perspective?.attribution === "explicit_counterpart_statement") continue;
     const scopeTime = maps.scopeTime?.get(memoryId) || null;
     const relation = maps.currentRelation?.get(memoryId) || null;
     const gate = relationshipGate({
@@ -430,6 +371,7 @@ function mergeRelationshipAnalyses({ evaluation, persistEvidenceLedger }) {
           relationshipLabel: evaluation.snapshot.target.relationshipLabel,
           counterpartRole: evaluation.snapshot.counterpart.subjectRole,
           counterpartKey: evaluation.snapshot.counterpart.subjectKey,
+          relationshipDimension: evaluation.snapshot.target.relationshipDimension,
           relationType: grounding?.relationType || "unknown",
           scopeLabel: grounding?.scopeLabel || "",
           conditionLabel: grounding?.conditionLabel || "",
@@ -474,13 +416,14 @@ export async function evaluateRelationshipEvidence({
   counterpartLabel,
   canonicalKey,
   relationshipLabel,
+  relationshipDimension = "",
   currentRepresentationLayer = "",
   memoryIds = [],
   analyzers = {},
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
   snapshotOptions = {},
-  maximumAnalyses = 60,
+  maximumAnalyses = Infinity,
   persistEvidenceLedger = true,
 } = {}) {
   if (!repository) throw new Error("Relationship evaluation requires a repository.");
@@ -510,6 +453,7 @@ export async function evaluateRelationshipEvidence({
     counterpartKey,
     canonicalKey,
     currentRepresentationLayer,
+    relationshipDimension,
     memoryIds: normalizedMemoryIds,
   });
   const baseSnapshot = buildPreferenceEvidenceSnapshot({
@@ -528,6 +472,7 @@ export async function evaluateRelationshipEvidence({
       ...baseSnapshot.target,
       stateFamily: "relationship",
       relationshipLabel: clean(relationshipLabel),
+      relationshipDimension: clean(relationshipDimension),
       currentRepresentationLayer: clean(currentRepresentationLayer),
     },
     counterpart: {
@@ -580,85 +525,54 @@ export async function evaluateRelationshipEvidence({
   }
 
   const definitions = Object.entries(RELATIONSHIP_ANALYZERS);
-  const invocations = await Promise.all(definitions.map(async ([key, definition]) => [
-    key,
-    await invokeAnalyzer({
-      definition,
-      generator: analyzers[key],
-      snapshot,
-      promptDirectory,
-      maximumAnalyses,
-    }),
-  ]));
-  const sourceIds = uniqueStrings(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
-  const warnings = [];
-  for (const [key, invocation] of invocations) {
-    const warning = await appendAnalyzerUsage({
-      usageLedgerPath,
-      generation: invocation.generation,
-      definition: invocation.definition,
-      agentId: clean(agentId),
-      batchId,
-    });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId),
-      batchId,
-      stateFamily: "relationship",
-      analyzerRole: invocation.definition.role,
-      subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported",
-      promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName,
-      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
-      status: invocation.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id),
-      sourceIds,
-      output: invocation.generation?.output ?? {},
-      rejected: invocation.rejected,
-      usage: invocation.generation?.usage || {},
-      costAmount: Number(
-        invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0,
-      ) || 0,
-      costCurrency: clean(
-        invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency,
-      ),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error,
-      metadata: {
-        relationshipLabel: clean(relationshipLabel),
-        counterpartRole: snapshot.counterpart.subjectRole,
-        counterpartKey: snapshot.counterpart.subjectKey,
-        currentRepresentationLayer: snapshot.target.currentRepresentationLayer,
-        automaticStateWriteAllowed: false,
-      },
-    });
-    analyses[key] = invocation.analyses;
-    rejected[key] = invocation.rejected;
+  const previousRuns = snapshotOptions.reuseAnalysisRuns
+    ? repository.listStateAnalysisRuns(snapshot.agentId, { stateFamily: 'relationship', batchId,
+      limit: definitions.length * 3 }) : [];
+  const invoke = async ([key, definition]) => [key, await invokeAnalyzer({
+    definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses, previousRuns,
+  })];
+  const invocations = await Promise.all(definitions.filter(([key]) => key !== "currentRelation").map(invoke));
+  const evidenceMaps = Object.fromEntries(invocations.map(([key, result]) => [key, byMemory(result.analyses)]));
+  snapshot.relationshipEvidence = snapshot.memories.flatMap(memory => {
+    const grounding = evidenceMaps.relationGrounding.get(memory.id);
+    const perspective = evidenceMaps.perspectiveDirection.get(memory.id);
+    const scopeTime = evidenceMaps.scopeTime.get(memory.id);
+    if (!grounding || !perspective || !scopeTime) return [];
+    const gate = relationshipGate({ grounding, perspective, scopeTime,
+      currentState: snapshot.currentState,
+      relation: { currentStatePresent: Boolean(snapshot.currentState),
+        relation: snapshot.currentState ? "supports" : "no_current_state", scopeOverlap: "exact" } });
+    return gate ? [] : [{ memoryId: memory.id, grounding, perspective, scopeTime,
+      observedAt: memory.eventStart || memory.eventDate || memory.knownAt || "" }];
+  }).sort((a, b) => b.observedAt.localeCompare(a.observedAt) || a.memoryId.localeCompare(b.memoryId));
+  snapshot.relationshipComparison = snapshot.relationshipEvidence.length > 1
+    ? { memoryId: snapshot.relationshipEvidence[0].memoryId } : null;
+  if (JSON.stringify(snapshot).length > snapshotLimit) {
+    throw new Error(`Relationship comparison snapshot exceeds the ${snapshotLimit}-character privacy budget.`);
   }
-  const failedRoles = definitions
-    .map(([key]) => key)
-    .filter((key) => ["failed", "rejected"].includes(runs[key].status));
+  invocations.push(await invoke(definitions.find(([key]) => key === "currentRelation")));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, stateFamily: 'relationship', snapshot, invocations, usageLedgerPath,
+    metadata: { relationshipLabel: clean(relationshipLabel), counterpartRole: snapshot.counterpart.subjectRole, counterpartKey: snapshot.counterpart.subjectKey, currentRepresentationLayer: snapshot.target.currentRepresentationLayer, automaticStateWriteAllowed: false },
+  });
 
   const evaluation = { repository, batchId, snapshot, runs, analyses };
-  let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) {
-    merged = repository.transaction(() => mergeRelationshipAnalyses({
-      evaluation,
-      persistEvidenceLedger,
-    }));
-  }
+  const completeMemoryIds = snapshot.memories.filter(memory =>
+    definitions.every(([key]) => analyses[key].some(item => item.memoryId === memory.id))).map(memory => memory.id);
+  const pendingComparisonMemoryIds = snapshot.relationshipEvidence
+    .filter(item => !analyses.currentRelation.some(relation => relation.memoryId === item.memoryId))
+    .map(item => item.memoryId);
+  const merged = repository.transaction(() => mergeRelationshipAnalyses({
+    evaluation, persistEvidenceLedger, completeMemoryIds,
+  }));
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
+  const status = failedRoles.length
+    ? (completeMemoryIds.length && !pendingComparisonMemoryIds.length ? "partial" : "incomplete")
+    : hasAnyAnalysis ? "analyzed" : "abstained";
   return {
-    status: failedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
-    reason: failedRoles.length ? "required-relationship-analyzer-failed-or-rejected" : "",
+    status,
+    reason: status === "incomplete" ? "required-relationship-analyzer-failed-or-rejected"
+      : status === "partial" ? "partial-relationship-results-unavailable" : "",
     batchId,
     snapshot,
     runs,
@@ -667,6 +581,7 @@ export async function evaluateRelationshipEvidence({
     observations: merged.observations,
     actionPreviews: merged.previews,
     failedRoles,
+    pendingComparisonMemoryIds,
     warnings,
     automaticStateWriteAllowed: false,
   };

@@ -10,6 +10,7 @@ import {
   buildStructureGenerationInput,
   MEMORY_STRUCTURE_OUTPUT_SCHEMA,
   parseStructureGeneration,
+  DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit, proposalSchemaForLimit,
 } from "./prompt.mjs";
 import { buildStructureSnapshot } from "./snapshot.mjs";
 import { canProposeStructure, enforceStructureCandidatePolicy } from "./policy.mjs";
@@ -57,8 +58,10 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
 
 export function prepareStructureGeneration({
   repository, agentId, batchId, memoryIds, nearbyContainerIds = [], candidatePolicy = {},
-  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator,
+  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator, maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
 }) {
+  const limit = proposalCountLimit(maximumProposals);
+  if (limit === 0) return { snapshot: null, request: null, reason: 'proposal-budget-zero' };
   const snapshot = buildStructureSnapshot({
     repository,
     agentId: agentId,
@@ -73,7 +76,7 @@ export function prepareStructureGeneration({
   const request = {
     input,
     systemPrompt,
-    schema: MEMORY_STRUCTURE_OUTPUT_SCHEMA,
+    schema: proposalSchemaForLimit(MEMORY_STRUCTURE_OUTPUT_SCHEMA, limit),
     schemaName: "memory-structure-proposals-v1",
     ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
   };
@@ -92,7 +95,7 @@ export async function proposeStructuresForBatch({
   systemPromptPath = DEFAULT_PROMPT_PATH,
   snapshotOptions = {},
   candidatePolicy = {},
-  maximumProposals = 20,
+  maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
   preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory structurer requires a repository.");
@@ -103,13 +106,15 @@ export async function proposeStructuresForBatch({
     (Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean),
   )];
   const normalizedBatchId = clean(batchId) || stableBatchId(normalizedAgentId, normalizedMemoryIds);
-  const prepared = preparedGeneration || prepareStructureGeneration({
+  const limit = proposalCountLimit(maximumProposals);
+  const prepared = (limit > 0 ? preparedGeneration : null) || prepareStructureGeneration({
     repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
-    nearbyContainerIds, candidatePolicy, snapshotOptions, systemPromptPath, generator,
+    nearbyContainerIds, candidatePolicy, snapshotOptions, systemPromptPath, generator, maximumProposals: limit,
   });
   const { snapshot, request } = prepared;
   if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
     snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
+  if (request.schema.properties.proposals.maxItems !== limit) throw new Error('Prepared structure request does not match maximumProposals.');
   generator.assertRequestBudget?.(request);
   const generation = await generator(request);
   const warnings = [];

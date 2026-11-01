@@ -202,7 +202,7 @@ export async function applyEventContinuity({ repository, agentId, prepared, gene
     const materials = [...new Map(focused.flatMap(item => [item.memory, ...item.candidates]).map(memory => [memory.id, memory])).values()];
     const originalInput = JSON.parse(request.input);
     const repairRequest = { ...request,
-      systemPrompt: request.systemPrompt + ' 本次只修复 validationErrors 指出的判断，其他判断已保留，不得重新生成。按各端自己的 sources.id 修正举证。allowNew=false 时只核对已选的候选；无法支持该关联就返回 ambiguous 撤回关联，不能据此断言不存在其他关联。',
+      systemPrompt: request.systemPrompt + ' 逐条修正 validationErrors 中列出的判断，按各端自己的 sources.id 举证。allowNew=false 时仅比较所选候选，证据不足用 ambiguous；候选不全时无法判断为 new。',
       input: JSON.stringify({ memoryOwner: originalInput.memoryOwner, narrativePolicy: originalInput.narrativePolicy,
         events: focused.map(item => ({ memoryId: item.memory.id, candidateIds: item.candidates.map(candidate => candidate.id), allowNew: item.allowNew })),
         memories: materials, validationErrors: invalid.map(({ item, match, problems }) => ({ memoryId: item.memory.id,

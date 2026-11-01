@@ -1,12 +1,9 @@
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
 import {
   CAPABILITY_ANALYZERS,
@@ -98,51 +95,11 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   return analysis;
 }
 
-async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId, provider: generation.metadata?.provider || "", model: generation.model,
-      source: "memory-evaluation", feature: `memory-capability-${definition.role}`,
-      requestId: generation.requestId || "", usage: generation.usage,
-      metadata: { batchId, durationMs: Number(generation.durationMs || 0), ...generation.metadata },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8")
-    .replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildCapabilityGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({ input, systemPrompt: analysisSystemPrompt(systemPrompt), schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}), stateFamily: "capability", analyzerRole: definition.role });
-    const parsed = parseCapabilityGeneration(definition.role, generation?.output, { maximumAnalyses });
-    const accepted = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, candidate] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(candidate.memoryId)) throw new Error("A capability analyzer can analyze each memory at most once.");
-        accepted.push(enforceAnalysisBoundary(definition.role, candidate, snapshot));
-        seen.add(candidate.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
-      }
-    }
-    return { definition, input, generation, analyses: accepted, rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message };
-  }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildCapabilityGenerationInput,
+    parseGeneration: parseCapabilityGeneration, enforceBoundary: enforceAnalysisBoundary });
 }
 
 function byMemory(items) {
@@ -185,8 +142,8 @@ function capabilityGate({ skill, holder, performance, conditions, timeRelation, 
     if (performance.failureCause !== "skill_gap") return { qualification: "unresolved", reason: "failed-attempt-has-no-skill-gap" };
   }
 
-  if (!conditions) return { qualification: "unresolved", reason: "missing-capability-condition-analysis" };
   if (performance.evidenceType === "demonstrated_result") {
+    if (!conditions) return { qualification: "unresolved", reason: "missing-capability-condition-analysis" };
     if (conditions.independence === "unknown") return { qualification: "unresolved", reason: "capability-independence-unknown" };
     if (["assisted", "tool_dependent"].includes(conditions.independence) && !conditions.dependencyLabel) {
       return { qualification: "unresolved", reason: "capability-dependency-is-missing" };
@@ -267,6 +224,8 @@ function mergeCapabilityAnalyses({ evaluation, persistEvidenceLedger }) {
   const observations = [];
   const previews = [];
   for (const memoryId of memoryIds) {
+    if (Object.entries(maps).some(([key, map]) => !map.has(memoryId)
+      && !(key === "independenceConditions" && maps.performanceEvidence?.get(memoryId)?.evidenceType === "self_report"))) continue;
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const skill = maps.skillGrounding?.get(memoryId) || null;
     const holder = maps.holderAttribution?.get(memoryId) || null;
@@ -277,7 +236,8 @@ function mergeCapabilityAnalyses({ evaluation, persistEvidenceLedger }) {
       currentState: evaluation.snapshot.currentState });
     const qualification = gate?.qualification || "qualified";
     const claimedDirection = directionFor(performance, timeRelation, evaluation.snapshot.currentState);
-    const analyses = [skill, holder, performance, conditions, timeRelation].filter(Boolean);
+    const analyses = [skill, holder, performance,
+      ...(performance?.evidenceType === "demonstrated_result" ? [conditions] : []), timeRelation].filter(Boolean);
     const sourceIds = uniqueStrings(analyses.flatMap((item) => item.sourceIds)).sort();
     const analysisRunIds = Object.entries(maps).filter(([, map]) => map.has(memoryId))
       .map(([key]) => evaluation.runs[key]).filter((run) => run?.status === "completed")
@@ -319,7 +279,7 @@ function mergeCapabilityAnalyses({ evaluation, persistEvidenceLedger }) {
 export async function evaluateCapabilityEvidence({
   repository, agentId, subjectRole, subjectKey, canonicalKey, capabilityLabel,
   memoryIds = [], analyzers = {}, usageLedgerPath = "", promptDirectory = DEFAULT_PROMPT_DIRECTORY,
-  snapshotOptions = {}, maximumAnalyses = 60, persistEvidenceLedger = true,
+  snapshotOptions = {}, maximumAnalyses = Infinity, persistEvidenceLedger = true,
   currentRepresentationLayer = "",
 } = {}) {
   if (!repository) throw new Error("Capability evaluation requires a repository.");
@@ -357,48 +317,21 @@ export async function evaluateCapabilityEvidence({
   };
 
   const definitions = Object.entries(CAPABILITY_ANALYZERS);
+  const previousRuns = priorAnalyzerRuns(repository, snapshot, batchId, definitions, snapshotOptions);
   const invocations = await Promise.all(definitions.map(async ([key, definition]) => [key,
-    await invokeAnalyzer({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses })]));
-  const sourceIds = uniqueStrings(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
-  const warnings = [];
-  for (const [key, invocation] of invocations) {
-    const warning = await appendAnalyzerUsage({ usageLedgerPath, generation: invocation.generation,
-      definition: invocation.definition, agentId: clean(agentId), batchId });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId), batchId, stateFamily: "capability", analyzerRole: invocation.definition.role,
-      subjectRole: snapshot.target.subjectRole, subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported",
-      promptVersion: invocation.definition.promptVersion, schemaVersion: invocation.definition.schemaName,
-      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"), status: invocation.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id), sourceIds,
-      output: invocation.generation?.output ?? {}, rejected: invocation.rejected,
-      usage: invocation.generation?.usage || {},
-      costAmount: Number(invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0) || 0,
-      costCurrency: clean(invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error,
-      metadata: { capabilityLabel: clean(capabilityLabel),
-        currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false },
-    });
-    analyses[key] = invocation.analyses;
-    rejected[key] = invocation.rejected;
-  }
-  const failedRoles = definitions.map(([key]) => key)
-    .filter((key) => ["failed", "rejected"].includes(runs[key].status));
+    await invokeAnalyzer({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses, previousRuns })]));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, stateFamily: 'capability', snapshot, invocations, usageLedgerPath,
+    metadata: { capabilityLabel: clean(capabilityLabel), currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false },
+  });
   const evaluation = { repository, batchId, snapshot, runs, analyses };
-  let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) merged = repository.transaction(() => mergeCapabilityAnalyses({ evaluation, persistEvidenceLedger }));
+  const merged = repository.transaction(() => mergeCapabilityAnalyses({ evaluation, persistEvidenceLedger }));
+  const requiredFailedRoles = failedRoles.filter(key => key !== "independenceConditions"
+    || snapshot.memories.some(memory => analyses.performanceEvidence.find(item => item.memoryId === memory.id)?.evidenceType !== "self_report"));
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
   return {
-    status: failedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
-    reason: failedRoles.length ? "required-capability-analyzer-failed-or-rejected" : "",
+    status: requiredFailedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
+    reason: requiredFailedRoles.length ? "required-capability-analyzer-failed-or-rejected" : "",
     batchId, snapshot, runs, analyses, rejected, observations: merged.observations,
     actionPreviews: merged.previews, failedRoles, warnings, automaticStateWriteAllowed: false,
   };

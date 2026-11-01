@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
-import { evaluateGoalEvidence } from "../src/index.mjs";
+import { evaluateGoalEvidence, reviewReportedGoalState } from "../src/index.mjs";
+import { proposeReportedStateFromReview } from "../../analysis/src/reported-state-persistence.mjs";
 
 const KEY = "user:goal:publish-memory-project";
 
@@ -363,4 +364,86 @@ test("compares goal evidence against the explicitly selected representation laye
   assert.equal(result.snapshot.currentState.representationLayer, "reported");
   assert.equal(result.observations[0].scope.currentRepresentationLayer, "reported");
   fixture.database.close();
+});
+
+for (const sourceContent of ["我决定整理并发布记忆系统。", "I decided to finish and publish the memory project."]) {
+  for (const defect of ["format", "source", "duplicate"]) {
+    test("preserves goal siblings and retries only the rejected item: " + defect + sourceContent, async t => {
+      const fixture = setup();
+      t.after(() => fixture.database.close());
+      const records = ["good", "bad"].map(id => fixture.add({ id, content: sourceContent, sourceContent }));
+      const calls = {}; let broken = true;
+      const analyzers = Object.fromEntries(Object.keys(analyzersFor(records[0])).map(key => [key, async request => {
+        const snapshot = JSON.parse(request.input.slice(request.input.indexOf("{")));
+        (calls[key] ||= []).push({ memories: snapshot.memories.map(memory => memory.id),
+          sources: snapshot.sourceRecords.map(source => source.id) });
+        const analyses = [];
+        for (const record of records.filter(record => snapshot.memories.some(memory => memory.id === record.memory.id))) {
+          const generated = await analyzersFor(record)[key]();
+          const item = generated.output.analyses[0];
+          if (!broken && key === "targetIntent" && snapshot.memories.length === 1) {
+            assert.deepEqual(snapshot.comparisonMemories.map(memory => memory.memoryId), ["good"]);
+            item.peerRelations = [{ memoryId: "good", relation: "complementary" }];
+          }
+          if (broken && key === "targetIntent" && record.memory.id === "bad") {
+            if (defect === "format") item.targetMatch = "invalid-match";
+            if (defect === "source") item.sourceIds = [records[0].source.id];
+            if (defect === "duplicate") analyses.push({ ...item });
+          }
+          analyses.push(item);
+        }
+        return { output: { analyses } };
+      }]));
+      const options = { memoryIds: records.map(record => record.memory.id), snapshotOptions: { reuseAnalysisRuns: true } };
+      const first = await evaluate(fixture, records[0], analyzers, options);
+      assert.equal(first.status, "incomplete");
+      assert.deepEqual(first.analyses.targetIntent.map(item => item.memoryId), ["good"]);
+      assert.deepEqual(first.observations.map(item => [item.memory_id, item.qualification]), [["good", "qualified"]]);
+      broken = false;
+      const second = await evaluate(fixture, records[0], analyzers, options);
+      assert.equal(second.status, "analyzed");
+      assert.equal(second.observations.filter(item => item.qualification === "qualified").length, 2);
+      assert.deepEqual(calls.targetIntent[1], { memories: ["bad"], sources: [records[1].source.id] });
+      for (const [key, requests] of Object.entries(calls)) assert.equal(requests.length, key === "targetIntent" ? 2 : 1);
+      fixture.repository.upsertSource({ agentId: "agent-test", sourceKind: "conversation", externalId: "source-bad",
+        occurredAt: "2026-07-10T12:00:00Z", speaker: "User", content: sourceContent + " Updated detail." });
+      await evaluate(fixture, records[0], analyzers, options);
+      for (const [key, requests] of Object.entries(calls)) assert.equal(requests.length, key === "targetIntent" ? 3 : 2);
+    });
+  }
+}
+
+for (const relation of ["complementary", "conflicting", "outside"]) test(`goal evidence retains bounded semantic peer comparison: ${relation}`, async t => {
+  const f = setup(); t.after(() => f.database.close());
+  const records = [f.add({ id: "plan", content: "I plan to publish the notes.", sourceContent: "I plan to publish the notes." }),
+    f.add({ id: "detail", occurredAt: "2026-07-11T12:00:00Z", content: "I am proofreading the notes for publication.", sourceContent: "I am proofreading the notes for publication." })];
+  let calls = 0;
+  const analyzers = Object.fromEntries(Object.keys(analyzersFor(records[0])).map(key => [key, async request => {
+    calls++;
+    const analyses = await Promise.all(records.map(async (record, index) => {
+      const item = (await analyzersFor(record, { goalText: index ? "Proofread the notes for publication" : "Publish the notes" })[key](request)).output.analyses[0];
+      if (key === "targetIntent" && index) item.peerRelations = [{ memoryId: relation === "outside" ? "not-in-snapshot" : records[0].memory.id,
+        relation: relation === "outside" ? "complementary" : relation }];
+      return item;
+    }));
+    return { output: { analyses } };
+  }]));
+  const evaluation = await evaluate(f, records[0], analyzers, { memoryIds: records.map(item => item.memory.id), currentRepresentationLayer: "reported" });
+  assert.equal(calls, 4, "peer comparison adds no analyzer role or call");
+  if (relation === "outside") {
+    assert.equal(evaluation.status, "incomplete");
+    assert.deepEqual(evaluation.observations.map(item => item.memory_id), ["plan"]);
+    return;
+  }
+  const result = reviewReportedGoalState({ repository: f.repository, agentId: "agent-test", subjectRole: "user", subjectKey: "user",
+    canonicalKey: KEY, subjectLabel: "User", goalLabel: "Publish the notes" });
+  assert.equal(result.status, relation === "conflicting" ? "review_required" : "ready");
+  if (relation === "complementary") {
+    const persisted = proposeReportedStateFromReview({ repository: f.repository, reviewResult: result, reviewVersion: "test-peer" });
+    const [memory] = f.repository.listPendingProvisionalMemories("agent-test");
+    assert.equal(persisted.status, "pending");
+    assert.match(memory.content, /plan to publish/);
+    assert.match(memory.content, /proofreading/);
+    assert.equal(f.repository.getMemoryDetail("agent-test", memory.id).sources.length, 2);
+  }
 });

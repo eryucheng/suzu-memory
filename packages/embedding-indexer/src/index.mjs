@@ -105,12 +105,12 @@ function utteranceRetrievalContext(repository, agentId, memory, sourceView) {
   };
 }
 
-function listActiveMemories(repository, agentId) {
+function listSearchableMemories(repository, agentId) {
   const result = [];
   let offset = 0;
   while (true) {
     const page = repository.listMemories(agentId, {
-      statuses: ["active"],
+      statuses: ["active", "superseded", "disputed"],
       limit: 200,
       offset,
     });
@@ -122,7 +122,8 @@ function listActiveMemories(repository, agentId) {
 }
 
 function listIndexableMemories(repository, agentId) {
-  const active = listActiveMemories(repository, agentId);
+  const searchable = listSearchableMemories(repository, agentId);
+  const active = searchable.filter(memory => memory.status === 'active');
   const provisional = typeof repository.listPendingProvisionalMemories === "function"
     ? repository.listPendingProvisionalMemories(agentId, { limit: 5_000 })
     : [];
@@ -130,7 +131,7 @@ function listIndexableMemories(repository, agentId) {
     active,
     provisional,
     all: [...new Map(
-      [...active, ...provisional].map((memory) => [memory.id, memory]),
+      [...searchable, ...provisional].map((memory) => [memory.id, memory]),
     ).values()],
   };
 }
@@ -217,6 +218,29 @@ async function recordUsage({
   return errors;
 }
 
+function storePreparedEmbeddings({ repository, agentId, model, items, vectors, sourceView }) {
+  if (!items.length) return { stored: [], skipped: [], failures: [] };
+  return repository.transaction(() => {
+    const stored = [], skipped = [], failures = [];
+    for (let index = 0; index < items.length; index++) {
+      assertEventSourceExecutionCurrent();
+      const item = items[index], current = repository.getMemory(item.memory.id);
+      if (!current || current.status === 'deleted') { skipped.push(item.memory.id); continue; }
+      const document = prepareMemoryEmbeddingDocument(repository, current, { sourceView });
+      if (current.agent_id !== agentId || (sourceView && !sourceView.allows(current))
+        || document.contentHash !== item.contentHash) {
+        failures.push({ memoryIds: [item.memory.id], error: 'Embedding source changed before persistence.',
+          errorCode: 'MEMORY_EMBEDDING_SOURCE_CHANGED' });
+        continue;
+      }
+      repository.upsertEmbedding({ memoryId: current.id, model, vector: vectors[index], contentHash: document.contentHash,
+        sourceMemoryIds: document.retrievalContext?.sourceMemoryIds || [current.id] });
+      stored.push(current.id);
+    }
+    return { stored, skipped, failures };
+  });
+}
+
 export async function syncMemoryEmbeddings({
   repository,
   agentId,
@@ -285,9 +309,6 @@ export async function syncMemoryEmbeddings({
     if (canReuse(item)) return false;
     const cached = !force && byContent.get(item.contentHash);
     if (!cached) return true;
-    if (!dryRun) repository.upsertEmbedding({ memoryId: item.memory.id, model: normalizedModel,
-      vector: cached.vector, contentHash: item.contentHash,
-      sourceMemoryIds: item.retrievalContext?.sourceMemoryIds || [item.memory.id] });
     copied.push(item);
     return false;
   });
@@ -295,6 +316,9 @@ export async function syncMemoryEmbeddings({
     0,
     Math.max(0, Number.isFinite(Number(limit)) ? Math.trunc(Number(limit)) : prepared.length),
   );
+  const copies = dryRun ? { stored: copied.map(item => item.memory.id), skipped: [], failures: [] }
+    : storePreparedEmbeddings({ repository, agentId: normalizedAgentId, model: normalizedModel, sourceView,
+      items: copied, vectors: copied.map(item => byContent.get(item.contentHash).vector) });
   const report = {
     status: dryRun ? "planned" : "ready",
     agentId: normalizedAgentId,
@@ -307,15 +331,17 @@ export async function syncMemoryEmbeddings({
     totalEligible: eligible.length,
     excludedByKind: all.length - longTerm.length,
     notSelected: selectedIds.size ? longTerm.length - eligible.length : 0,
-    reused: reusable.length + copied.length,
-    copied: copied.length,
+    reused: reusable.length + copies.stored.length,
+    copied: copies.stored.length,
     pending: pending.length,
     deferred: allPending.length - pending.length,
     added: 0,
-    failed: 0,
-    failures: [],
+    skipped: copies.skipped.length,
+    failed: copies.failures.length,
+    failures: copies.failures,
     usageLoggingErrors: [],
   };
+  if (!dryRun && report.failed) report.status = report.copied ? 'partial' : 'error';
   if (dryRun || !pending.length) return report;
 
   const effectiveBatchSize = typeof embeddingProvider.embedMany === "function"
@@ -348,18 +374,12 @@ export async function syncMemoryEmbeddings({
           throw new Error(`Embedding 维度发生变化：预期 ${expectedDimensions}，实际 ${vector.length}。`);
         }
       }
-      repository.transaction(() => {
-        for (let index = 0; index < batch.length; index += 1) {
-          repository.upsertEmbedding({
-            memoryId: batch[index].memory.id,
-            model: normalizedModel,
-            vector: vectors[index],
-            contentHash: batch[index].contentHash,
-            sourceMemoryIds: batch[index].retrievalContext?.sourceMemoryIds || [batch[index].memory.id],
-          });
-        }
-      });
-      report.added += batch.length;
+      const written = storePreparedEmbeddings({ repository, agentId: normalizedAgentId,
+        model: normalizedModel, items: batch, vectors, sourceView });
+      report.added += written.stored.length;
+      report.skipped += written.skipped.length;
+      report.failed += written.failures.length;
+      report.failures.push(...written.failures);
       report.usageLoggingErrors.push(...await recordUsage({
         ledgerPath,
         requests: response.requests,
@@ -387,7 +407,7 @@ export async function syncMemoryEmbeddings({
       });
     }
   }
-  report.status = report.failed ? (report.added ? "partial" : "error") : "ready";
+  report.status = report.failed ? (report.added || report.copied ? "partial" : "error") : "ready";
   return report;
 }
 

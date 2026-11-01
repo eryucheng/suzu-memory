@@ -209,22 +209,9 @@ export function parsePreferenceStateCritic(value) {
 }
 
 export function buildPreferenceStateSynthesisInput(snapshot) {
-  return [
-    "对代码整理出的完整同键证据提出一个影子状态方案。不得读取数据库或创建正式记忆。",
-    "evidenceDecisions 必须逐条且仅覆盖 snapshot.requiredDecisionObservationIds。",
-    "只能从 snapshot.allowedLevels 选择 proposedLevel；不能改变主体、canonicalKey、策略或确定性统计。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }
 
 export function buildPreferenceStateCriticInput(snapshot, synthesis) {
-  return [
-    "独立审查结构化偏好状态方案。你看不到综合器的隐藏推理，只能依据证据快照、代码统计和最终方案找问题。",
-    "不得改写方案或创建正式记忆；无法排除风险时选择 human_review。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify({ snapshot, synthesis }, null, 2),
-  ].join("\n");
+  return JSON.stringify({ snapshot, synthesis }, null, 2);
 }

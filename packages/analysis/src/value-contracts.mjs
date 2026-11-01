@@ -1,3 +1,4 @@
+import { analysisCountLimit, parseAnalysisItems } from "./analysis-output.mjs";
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -23,7 +24,6 @@ function resultSchema(required, properties) {
     properties: {
       analyses: {
         type: "array",
-        maxItems: 80,
         items: {
           type: "object",
           additionalProperties: false,
@@ -276,7 +276,7 @@ function parseRoleItem(role, value, index) {
   throw new Error(`Unknown value analyzer role: ${role || "(empty)"}.`);
 }
 
-export function parseValueGeneration(role, value, { maximumAnalyses = 60 } = {}) {
+export function parseValueGeneration(role, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   if (!Object.values(VALUE_ANALYZERS).some((item) => item.role === role)) {
     throw new Error(`Unknown value analyzer role: ${clean(role) || "(empty)"}.`);
   }
@@ -292,12 +292,12 @@ export function parseValueGeneration(role, value, { maximumAnalyses = 60 } = {})
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Value analyzer output requires an analyses array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Value analyzer returned more than ${limit} analyses.`);
   }
   return {
-    analyses: parsed.analyses.map((item, index) => parseRoleItem(role, item, index)),
+    analyses: parseAnalysisItems(parsed.analyses, (item, index) => parseRoleItem(role, item, index), onRejected),
   };
 }
 
@@ -305,12 +305,5 @@ export function buildValueGenerationInput(snapshot, definition) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || !definition?.role) {
     throw new Error("Value generation requires a snapshot and known analyzer.");
   }
-  return [
-    `当前专职角色：${definition.role}。`,
-    "只处理系统提示词规定的单一职责。主体、canonicalKey、价值标签和候选记忆均由调用方固定。",
-    "不得把口号、被迫行为、普通频率、偏好或目标改写成价值；currentState 只读。",
-    "只引用快照内对应记忆自己的 sourceIds；没有证据时省略。只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

@@ -68,7 +68,6 @@ export function rankTemporalCandidates(candidates, temporal, { timeZone, tempora
   const weight = Number.isFinite(Number(temporalWeight)) ? Math.max(0, Number(temporalWeight)) : 0.35;
   const unique = new Map();
   for (const candidate of candidates) {
-    if (temporal.ordering === 'latest' && today && memoryCalendarDate(candidate.node, timeZone) > today) continue;
     const existing = unique.get(candidate.node.id);
     if (!existing || Number(candidate.score) > Number(existing.score)) unique.set(candidate.node.id, candidate);
   }
@@ -90,7 +89,7 @@ export function rankTemporalCandidates(candidates, temporal, { timeZone, tempora
     const [leftDay, leftInstant] = dateOrder(a, timeZone);
     const [rightDay, rightInstant] = dateOrder(b, timeZone);
     const byDate = rightDay.localeCompare(leftDay) || rightInstant - leftInstant;
-    return (topicless || temporal.ordering === 'latest' ? byDate : b.score - a.score)
+    return (topicless ? byDate : b.score - a.score)
       || Number(b.node.importance || 0) - Number(a.node.importance || 0)
       || byDate || clean(a.node.id).localeCompare(clean(b.node.id));
   });
@@ -102,7 +101,7 @@ export function rankTemporalCandidates(candidates, temporal, { timeZone, tempora
 export function temporalOverviewCandidates(nodes, temporal, options) {
   const today = options.today;
   let eligible = nodes.filter(node => !['topic', 'reflection'].includes(node.kind)
-    && memoryCalendarDate(node, options.timeZone) && memoryCalendarDate(node, options.timeZone) <= today);
+    && memoryCalendarDate(node, options.timeZone));
   if (temporal.toleranceWindow) eligible = eligible.filter(node => {
     const date = memoryCalendarDate(node, options.timeZone);
     return date >= temporal.toleranceWindow.startDate && date <= temporal.toleranceWindow.endDate;

@@ -44,6 +44,7 @@ import { BELIEF_ANALYZERS } from "./belief-contracts.mjs";
 import { reviewReportedBeliefState } from "./reported-belief-review.mjs";
 import { evaluateRelationshipEvidence } from "./relationship-service.mjs";
 import { RELATIONSHIP_ANALYZERS } from "./relationship-contracts.mjs";
+import { queueCounterpartRelationshipRequests } from "./relationship-requests.mjs";
 import { reviewReportedRelationshipState } from "./reported-relationship-review.mjs";
 import { evaluateAffectiveAssociationEvidence } from "./affective-association-service.mjs";
 import { AFFECTIVE_ASSOCIATION_ANALYZERS } from "./affective-association-contracts.mjs";
@@ -53,8 +54,8 @@ import { isStateAnalysisBudgetError } from "./request-budget.mjs";
 import { accumulateInferredPreference, DEFAULT_PREFERENCE_FORMATION_POLICY } from "./inferred-preference.mjs";
 import { prepareStateMemoryCandidates } from './state-memory-candidates.mjs';
 
-export const STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION = "state-analysis-request-v3";
-export const REPORTED_PREFERENCE_REVIEW_VERSION = "reported-preference-review-v1";
+export const STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION = "state-analysis-request-v8";
+export const REPORTED_PREFERENCE_REVIEW_VERSION = "reported-preference-review-v2";
 export const REPORTED_STATE_REQUEST_REVIEW_VERSIONS = Object.freeze({
   preference: REPORTED_PREFERENCE_REVIEW_VERSION,
   goal: "reported-goal-review-v1",
@@ -64,10 +65,10 @@ export const REPORTED_STATE_REQUEST_REVIEW_VERSIONS = Object.freeze({
   condition: "reported-condition-review-v1",
   habit: "reported-habit-review-v1",
   disposition: "reported-disposition-review-v1",
-  identity: "reported-identity-review-v1",
+  identity: "reported-identity-review-v2",
   belief: "reported-belief-review-v1",
-  relationship: "reported-relationship-review-v1",
-  affective_association: "reported-affective-association-review-v1",
+  relationship: "reported-relationship-review-v2",
+  affective_association: "reported-affective-association-review-v2",
 });
 
 function clean(value) {
@@ -84,7 +85,7 @@ function sameMembers(left, right) {
 }
 
 function supportedRequest(request) {
-  if (request?.state_family === "preference" && request.representation_layer === "inferred"
+  if (Boolean(REPORTED_STATE_REQUEST_REVIEW_VERSIONS[request?.state_family]) && request.representation_layer === "inferred"
     && ["observed", "inferred"].includes(request.evidence_mode)) {
     return isStateAnalysisTargetComplete(request.state_family, request.targetSpec);
   }
@@ -139,7 +140,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     evaluate: (common, analyzers, request) => evaluateGoalEvidence({
       ...common,
       goalLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedGoalState({
@@ -154,7 +155,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     evaluate: (common, analyzers, request) => evaluateValueEvidence({
       ...common,
       valueLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedValueState({
@@ -169,7 +170,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     evaluate: (common, analyzers, request) => evaluateCapabilityEvidence({
       ...common,
       capabilityLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedCapabilityState({
@@ -184,7 +185,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     evaluate: (common, analyzers, request) => evaluateSelfConceptEvidence({
       ...common,
       selfConceptLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedSelfConceptState({
@@ -205,7 +206,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
       identityField: request.targetSpec.identityField,
       identityLabel: request.target_label,
       fieldCardinality: request.targetSpec.fieldCardinality,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedIdentityState({
@@ -220,7 +221,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
     evaluate: (common, analyzers, request) => evaluateBeliefEvidence({
       ...common,
       topicLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedBeliefState({
@@ -241,7 +242,8 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
       counterpartKey: request.targetSpec.counterpartKey,
       counterpartLabel: request.targetSpec.counterpartLabel,
       relationshipLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      relationshipDimension: request.targetSpec.relationshipDimension,
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedRelationshipState({
@@ -262,7 +264,7 @@ const SIMPLE_REPORTED_REQUEST_ADAPTERS = {
       triggerKey: request.targetSpec.triggerKey,
       triggerLabel: request.targetSpec.triggerLabel,
       associationLabel: request.target_label,
-      currentRepresentationLayer: "reported",
+      currentRepresentationLayer: request.representation_layer,
       analyzers,
     }),
     review: (common, request, snapshotOptions) => reviewReportedAffectiveAssociationState({
@@ -293,7 +295,7 @@ for (const [stateFamily, review] of [
         [stateFamily]: {
           canonicalKey: request.canonical_key,
           conceptLabel: request.target_label,
-          currentRepresentationLayer: "reported",
+          currentRepresentationLayer: request.representation_layer,
         },
       },
       analyzers,
@@ -326,9 +328,10 @@ function validatePreflight(request, snapshot) {
   if (!sameMembers(visibleSourceIds, exactSet(request.sourceIds))) {
     return "request-source-boundary-mismatch";
   }
-  if (request.state_family === "identity" && snapshot.memories.some(memory => (
+  if (snapshot.memories.some(memory => (
     memory.kind === "utterance"
-    && !(memory.subjectRole === request.subject_role && memory.subjectKey === request.subject_key)
+    && !((memory.storedSubjectRole ?? memory.subjectRole) === request.subject_role
+      && (memory.storedSubjectKey ?? memory.subjectKey) === request.subject_key)
     && !memory.actorRoles.some(role => ["subject", "speaker", "participant"].includes(role.role)
       && role.actorRole === request.subject_role && role.actorKey === request.subject_key)
   ))) {
@@ -455,8 +458,13 @@ async function processStateAnalysisRequestInternal({
   });
   const boundaryProblem = validatePreflight(request, preflight);
   if (boundaryProblem) return fallbackRequest(repository, request, boundaryProblem);
-  const stateContext = await prepareStateMemoryCandidates({ repository, request, embeddingProvider, usageLedgerPath });
+  const evidenceOnly = request.representation_layer === "inferred" && request.state_family !== "preference";
+  const stateContext = evidenceOnly ? null
+    : await prepareStateMemoryCandidates({ repository, request, embeddingProvider, usageLedgerPath });
   if (stateContext) boundedSnapshotOptions.prepareStateSnapshot = snapshot => stateContext.attach(snapshot);
+  // An unresolved state binding requires a fresh identity decision before replay.
+  boundedSnapshotOptions.reuseAnalysisRuns = Number(request.metadata?.attemptCount || 0) > 0
+    && (!stateContext || stateContext.resolved);
 
   let evaluation;
   let merged;
@@ -521,6 +529,9 @@ async function processStateAnalysisRequestInternal({
       requestAnalyzers(adapter.definitions, generator, request, onBudgetExceeded, stateContext),
       request,
     );
+    if (request.state_family === 'relationship' && request.representation_layer === "reported") {
+      evaluation.counterpartRequests = queueCounterpartRelationshipRequests(repository, request, evaluation);
+    }
     if (stateContext?.ambiguous && evaluation.status !== 'incomplete') {
       return { ...fallbackRequest(repository, request, 'state-identity-needs-human-resolution'), evaluation };
     }
@@ -532,7 +543,7 @@ async function processStateAnalysisRequestInternal({
           : evaluation.observations?.[request.state_family] || [],
         previews: evaluation.actionPreviews || [],
       };
-      review = observationIds.length
+      review = request.representation_layer === "reported" && observationIds.length
         ? adapter.review({
           repository,
           agentId: normalizedAgentId,
@@ -566,6 +577,21 @@ async function processStateAnalysisRequestInternal({
       analysisBatchId: clean(evaluation.batchId),
     });
     return { ...retry, evaluation };
+  }
+
+  if (evidenceOnly) {
+    const observations = merged?.observations || [];
+    // Use the existing provisional evidence owner so the result is immediately
+    // retrievable and reviewable, without fabricating a reported state.
+    const result = fallbackRequest(repository, request, request.evidence_mode === "observed"
+      ? "observed-state-evidence-awaits-formation" : "inferred-state-evidence-awaits-formation");
+    if (result.provisional) repository.updateMemoryMetadata({ agentId: normalizedAgentId, memoryId: result.provisional.id,
+      metadata: { ...result.provisional.metadata, evidenceAnalysis: {
+        stateFamily: request.state_family, observationIds: observations.map(item => item.id),
+        qualified: observations.filter(item => item.qualification === "qualified").length,
+        stateFormation: "not-established",
+      } }, reason: "Retain analyzed evidence without asserting a reported or established state." });
+    return { ...result, evaluation, merged, review: null, proposal: null };
   }
 
   const resolvedReviewVersion = clean(reviewVersion)

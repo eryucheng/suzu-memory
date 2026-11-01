@@ -32,7 +32,7 @@ const chunkPolicy = {
 
 ## 聊天宿主适配器
 
-`createChatHostMemoryAdapter({ memory, hostId, identity, archiveMode: "length" })` 使用相同的分批规则。设置来自正式配置的 `defaults.ingestion.maximumCoreCharacters`、`maximumCoreMessages`、`maximumContextCharacters`、`maximumRequestCharacters`，默认分别为 12000、100、12000、64000；未选用长度模式的宿主保持原窗口接口。宿主在内容足量后调用 `onIdle`；`onSessionEnd` 会处理尾批。返回的 `progress` 包含待处理输入、维护任务、状态请求、整合任务及失败数量。
+`createChatHostMemoryAdapter({ memory, hostId, identity })` 使用相同的分批规则。设置来自正式配置的 `defaults.ingestion.maximumCoreCharacters`、`maximumCoreMessages`、`maximumContextCharacters`、`maximumRequestCharacters`，默认分别为 12000、100、12000、64000。宿主在内容足量后调用 `onIdle`；`onSessionEnd` 会处理尾批。返回的 `progress` 包含待处理输入、维护任务、状态请求、整合任务及失败数量。
 
 `afterReply` 可以只提供一侧消息，另一侧不会被补造。`beforeReply({ ..., recall: { enabled: true, readOnly: true } })` 返回正式记忆上下文，同时跳过反馈观察、召回轨迹持久化、召回激活及会话头更新，适合独立查询或测评。
 

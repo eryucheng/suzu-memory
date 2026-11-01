@@ -220,6 +220,26 @@ test("creates only a reported affective association and keeps activation bias di
   fixture.database.close();
 });
 
+test('reads an accepted world trigger from the reported-state draft when reinforcing it', async t => {
+  const fixture = setup({ currentLayer: 'reported' });
+  t.after(() => fixture.database.close());
+  const claim = structuredClone(fixture.current.metadata.affectiveClaim);
+  claim.trigger.role = 'world';
+  claim.trigger.key = '';
+  fixture.database.prepare('UPDATE memory_nodes SET metadata_json=? WHERE id=?')
+    .run(JSON.stringify({ reportedStateDraft: { affectiveClaim: claim } }), fixture.current.id);
+  const record = addSourceMemory(fixture, { id: 'world-trigger-reinforce',
+    sourceContent: '每次想到科技馆，我还是会怀念那次出行。' });
+  await evaluate(fixture, record, { currentStatePresent: true, relation: 'equivalent',
+    recurrence: 'repeated_claim', scopeOverlap: 'exact' }, { triggerRole: 'world', triggerKey: '' });
+  linkCurrent(fixture, record);
+  const result = review(fixture);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.action, 'reinforce');
+  assert.equal(result.proposedState.affectiveClaim.trigger.role, 'world');
+  assert.equal(result.proposedState.affectiveClaim.trigger.key, '');
+});
+
 test("does not promote cooccurrence, mood, preference, or model inference into a direct report", async () => {
   const fixture = setup();
   const cases = [
@@ -276,7 +296,7 @@ test("rejects evidence that was not analyzed against the reported layer", async 
   fixture.database.close();
 });
 
-test("keeps different direct affective reports unresolved without an explicit change cue", async () => {
+test("retains coexisting direct feelings without requiring an emotion replacement", async () => {
   const fixture = setup();
   const first = addSourceMemory(fixture, {
     id: "first-affect",
@@ -291,8 +311,8 @@ test("keeps different direct affective reports unresolved without an explicit ch
   await evaluate(fixture, first);
   await evaluate(fixture, second, { emotionLabel: "平静" });
   const result = review(fixture);
-  assert.equal(result.status, "review_required");
-  assert.equal(result.reason, "multiple-unresolved-direct-states-without-change-cue");
+  assert.equal(result.status, "ready");
+  assert.equal(result.proposedState.evidenceSourceIds.length, 2);
   fixture.database.close();
 });
 

@@ -1,6 +1,7 @@
 import {
   PREFERENCE_EVIDENCE_ENUMS,
   PREFERENCE_EVIDENCE_SIGNALS,
+  analysisCountLimit,
 } from "@suzu-memory/analysis";
 
 function clean(value) {
@@ -30,7 +31,6 @@ export const MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA = Object.freeze({
   properties: {
     evidence: {
       type: "array",
-      maxItems: 80,
       items: {
         type: "object",
         additionalProperties: false,
@@ -76,12 +76,7 @@ export function buildPreferenceEvidenceGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Preference evidence generation requires a snapshot object.");
   }
-  return [
-    "请只针对快照中已经固定的主体与偏好对象标注证据。只输出符合 Schema 的 JSON。",
-    "无法由给定记忆及其原始来源证明的条件必须标为 unknown，或直接不输出该记忆。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }
 
 function requireEnum(value, field, allowed) {
@@ -153,7 +148,7 @@ function normalizeEvidence(value, index) {
   };
 }
 
-export function parsePreferenceEvidenceGeneration(value, { maximumEvidence = 60 } = {}) {
+export function parsePreferenceEvidenceGeneration(value, { maximumEvidence = Infinity } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -170,7 +165,7 @@ export function parsePreferenceEvidenceGeneration(value, { maximumEvidence = 60 
   if (!Array.isArray(parsed.evidence)) {
     throw new Error("Preference evidence generator output requires an evidence array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumEvidence) || 60)));
+  const limit = analysisCountLimit(maximumEvidence, 'maximumEvidence');
   if (parsed.evidence.length > limit) {
     throw new Error(`Preference evidence generator returned more than ${limit} items.`);
   }

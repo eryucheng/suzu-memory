@@ -1,3 +1,4 @@
+import { analysisCountLimit, parseAnalysisItems, CLAIM_RELATIONS_SCHEMA, parseClaimRelations } from "./analysis-output.mjs";
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -22,7 +23,6 @@ function resultSchema(required, properties) {
     properties: {
       analyses: {
         type: "array",
-        maxItems: 80,
         items: {
           type: "object",
           additionalProperties: false,
@@ -38,15 +38,16 @@ export const GOAL_ANALYZERS = Object.freeze({
   targetIntent: Object.freeze({
     stateFamily: "goal",
     role: "target-intent",
-    schemaName: "memory-goal-target-intent-v1",
-    promptVersion: "goal-target-intent-v1",
+    schemaName: "memory-goal-target-intent-v2",
+    promptVersion: "goal-target-intent-v2",
     promptFile: "goal-target-intent-system-prompt.md",
-    schema: resultSchema(["targetMatch", "goalText", "intentionLevel", "specificity"], {
+    schema: resultSchema(["targetMatch", "goalText", "intentionLevel", "specificity", "peerRelations"], {
       targetMatch: {
         type: "string",
         enum: ["exact", "subcategory", "broader_category", "contextual", "none", "unknown"],
       },
       goalText: { type: "string" },
+      peerRelations: CLAIM_RELATIONS_SCHEMA,
       intentionLevel: {
         type: "string",
         enum: [
@@ -154,6 +155,7 @@ function parseRoleItem(role, value, index) {
         "exact", "subcategory", "broader_category", "contextual", "none", "unknown",
       ]),
       goalText: clean(value.goalText),
+      peerRelations: parseClaimRelations(value.peerRelations, common.memoryId),
       intentionLevel: requireEnum(value.intentionLevel, `analyses[${index}].intentionLevel`, [
         "wish", "considering", "intention", "plan", "commitment",
         "open_loop", "external_requirement", "no_goal", "unknown",
@@ -204,7 +206,7 @@ function parseRoleItem(role, value, index) {
   throw new Error(`Unknown goal analyzer role: ${role || "(empty)"}.`);
 }
 
-export function parseGoalGeneration(role, value, { maximumAnalyses = 60 } = {}) {
+export function parseGoalGeneration(role, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   if (!Object.values(GOAL_ANALYZERS).some((definition) => definition.role === role)) {
     throw new Error(`Unknown goal analyzer role: ${clean(role) || "(empty)"}.`);
   }
@@ -222,11 +224,11 @@ export function parseGoalGeneration(role, value, { maximumAnalyses = 60 } = {}) 
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Goal analyzer output requires an analyses array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Goal analyzer returned more than ${limit} analyses.`);
   }
-  return { analyses: parsed.analyses.map((item, index) => parseRoleItem(role, item, index)) };
+  return { analyses: parseAnalysisItems(parsed.analyses, (item, index) => parseRoleItem(role, item, index), onRejected) };
 }
 
 export function buildGoalGenerationInput(snapshot, definition) {
@@ -234,14 +236,5 @@ export function buildGoalGenerationInput(snapshot, definition) {
     throw new Error("Goal generation requires a snapshot object.");
   }
   if (!definition?.role) throw new Error("Goal generation requires a known analyzer definition.");
-  return [
-    `当前专职角色：${definition.role}。`,
-    "只处理系统提示词规定的单一职责，不要替其他专职角色作结论。",
-    "目标主体、canonicalKey、目标名称和候选记忆由调用方固定；不得改变主体、发现新任务或扫描快照外信息。",
-    "currentState 只读；不得创建任务、写记忆、设置提醒或改变生命周期。",
-    "只引用快照内对应记忆自己的 sourceIds。没有证据时省略该记忆，不要猜测补齐。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

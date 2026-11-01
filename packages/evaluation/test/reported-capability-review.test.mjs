@@ -327,3 +327,13 @@ test("rejects capability evidence whose current-state comparison targeted anothe
   assert.equal(result.reason, "no-qualified-direct-current-capability-claim");
   fixture.database.close();
 });
+
+for (const language of ["en", "zh"]) test(`records an ability without inventing proficiency: ${language}`, t => {
+  const f = setup(); t.after(() => f.database.close());
+  addObservation(f.repository, { id: "ability", sourceContent: language === "en" ? "I can write scripts." : "我会写脚本。",
+    proficiencyClaim: "none", independence: "unknown", repeatability: "unknown" });
+  const result = review(f.repository);
+  assert.equal(result.status, "ready");
+  assert.equal(result.proposedState.capabilityClaim.claimedProficiency, "unknown");
+  assert.equal(result.automaticVerifiedCapabilityWriteAllowed, false);
+});

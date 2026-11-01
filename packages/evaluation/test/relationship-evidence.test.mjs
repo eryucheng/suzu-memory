@@ -159,6 +159,7 @@ function analyzersFor(record, {
       currentStatePresent,
       relation,
       scopeOverlap,
+      comparisonMemoryId: "", comparisonRelation: "no_comparison", comparisonScopeOverlap: "unknown",
     }] } }),
   };
 }
@@ -320,11 +321,10 @@ test("does not treat one side saying we are close as bilateral confirmation", as
     relationLabel: "亲近",
     direction: "mutual_claim",
   }));
-  assert.equal(result.observations[0].qualification, "unresolved");
-  assert.equal(
-    result.observations[0].excluded_reason,
-    "single-side-claim-cannot-prove-a-shared-relationship",
-  );
+  assert.equal(result.observations[0].qualification, "qualified");
+  assert.equal(result.observations[0].payload.perspective.direction, "mutual_claim");
+  assert.equal(result.actionPreviews[0].action, "create");
+  assert.equal(result.automaticStateWriteAllowed, false);
   fixture.database.close();
 });
 

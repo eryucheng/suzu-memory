@@ -102,6 +102,7 @@ function buildObservationView(repository, agentId, observation, limits, requestL
     memory: {
       id: memory.id,
       kind: memory.kind,
+      worldId: memory.world_id, worldFrame: memory.world_frame, reality: memory.reality,
       content: requireCompleteText(
         memory.content,
         limits.maxMemoryContentChars,

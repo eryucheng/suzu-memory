@@ -1,3 +1,5 @@
+import { proposeReportedStateFromReview } from "../../analysis/src/reported-state-persistence.mjs";
+import { resolveReportedStateProposal } from "@suzu-memory/core";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -135,7 +137,7 @@ function addObservation(repository, {
     qualification,
     confidence: 0.9,
     origin: "deterministic",
-    scope: { matchedLabel, situationLabel, responseLabel, timeState, crossContext },
+    scope: { currentRepresentationLayer: "reported", matchedLabel, situationLabel, responseLabel, timeState, crossContext },
     payloadSchemaVersion: "memory-disposition-evidence-v2",
     payload: {
       targetMatch,
@@ -301,3 +303,20 @@ test("denial of an old attribution remains a reviewable correction, not an autom
   assert.equal(fixture.repository.getMemory(fixture.current.id).status, "active");
   fixture.database.close();
 });
+
+for (const sourceContent of ["我做决定前通常先查资料。", "I usually research before making decisions."]) {
+  test("updates a persisted disposition claim: " + sourceContent, t => {
+    const fixture = setup();
+    t.after(() => fixture.database.close());
+    for (const [id, observedAt, expected] of [["first", "2026-07-10T12:00:00Z", "create"],
+      ["second", "2026-07-11T12:00:00Z", "reinforce"]]) {
+      addObservation(fixture.repository, { id, observedAt, sourceContent });
+      const reviewResult = review(fixture.repository);
+      assert.equal(reviewResult.status, "ready", reviewResult.reason);
+      assert.equal(reviewResult.action, expected);
+      const pending = proposeReportedStateFromReview({ repository: fixture.repository, reviewResult, reviewVersion: "state-roundtrip-v1" });
+      const accepted = resolveReportedStateProposal(fixture.repository, { agentId: "agent-test", proposalId: pending.proposal.id, action: "accept" });
+      assert.ok(accepted.memory.metadata.reportedStateDraft.dispositionClaim);
+    }
+  });
+}

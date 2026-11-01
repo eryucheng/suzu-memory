@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
-import { evaluateCapabilityEvidence } from "../src/index.mjs";
+import { evaluateCapabilityEvidence, reviewReportedCapabilityState } from "../src/index.mjs";
 
 const KEY = "user:capability:node-scripting";
 
@@ -258,3 +258,26 @@ test("compares a reported capability only against the reported current layer", a
   assert.equal(result.observations[0].scope.currentRepresentationLayer, "reported");
   fixture.database.close();
 });
+
+for (const sourceContent of ["我会写 Node.js 脚本。", "I can write Node.js scripts."]) {
+  test("records a capability self-report without independence proof: " + sourceContent, async t => {
+    const fixture = setup();
+    t.after(() => fixture.database.close());
+    const record = fixture.add({ id: "claim", content: sourceContent, sourceContent });
+    for (const failure of [false, true]) {
+      const analyzers = analyzersFor(record);
+      analyzers.independenceConditions = async () => {
+        if (failure) throw new Error("independence provider unavailable");
+        return { output: { analyses: [] } };
+      };
+      const result = await evaluate(fixture, record, analyzers, { currentRepresentationLayer: "reported" });
+      assert.equal(result.status, "analyzed");
+      assert.equal(result.observations[0].qualification, "qualified");
+      assert.equal(result.observations[0].confidence, 0.9);
+      const reviewed = reviewReportedCapabilityState({ repository: fixture.repository, agentId: "agent-test",
+        subjectRole: "user", subjectKey: "user", subjectLabel: "User", canonicalKey: KEY, capabilityLabel: "Node.js scripts" });
+      assert.equal(reviewed.status, "ready", reviewed.reason);
+      assert.equal(reviewed.proposedState.capabilityClaim.independence, "not_applicable");
+    }
+  });
+}

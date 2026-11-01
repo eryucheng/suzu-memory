@@ -1,7 +1,10 @@
 import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.mjs";
+import { normalizeStateAnalysisTargetSpec, readReportedStateDraft } from "@suzu-memory/core";
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
+  compatibleReportedClaims,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -22,6 +25,14 @@ function clean(value) {
 
 function normalized(value) {
   return normalizeReportedClaim(value);
+}
+
+function validTriggerTarget(trigger) {
+  try {
+    normalizeStateAnalysisTargetSpec("affective_association", { triggerRole: trigger?.role,
+      triggerKey: trigger?.key, triggerLabel: trigger?.label }, { allowEmpty: false });
+    return true;
+  } catch { return false; }
 }
 
 function candidateFromObservation(observation) {
@@ -61,7 +72,7 @@ function candidateFromObservation(observation) {
     valence: trigger.valence,
     intensity: trigger.intensity,
   };
-  if (!triggerClaim.role || !triggerClaim.key) return null;
+  if (!validTriggerTarget(triggerClaim)) return null;
   return {
     observation,
     trigger,
@@ -87,14 +98,11 @@ function candidateFromObservation(observation) {
 function currentClaim(repository, snapshot) {
   if (!snapshot.currentState) return null;
   const memory = repository.getMemory(snapshot.currentState.id);
-  const stored = memory?.metadata?.reportedAffectiveAssociation
-    || memory?.metadata?.affectiveClaim
-    || null;
+  const stored = readReportedStateDraft(memory).affectiveClaim;
   const trigger = stored?.trigger;
   const emotion = stored?.emotion;
   if (!trigger || !emotion
-    || !clean(trigger.role)
-    || !clean(trigger.key)
+    || !validTriggerTarget(trigger)
     || !clean(trigger.type)
     || !clean(trigger.label)
     || !clean(emotion.label)
@@ -122,10 +130,7 @@ function sameClaim(candidate, current) {
   return normalized(candidate.triggerClaim.role) === normalized(current.trigger.role)
     && normalized(candidate.triggerClaim.key) === normalized(current.trigger.key)
     && normalized(candidate.triggerClaim.type) === normalized(current.trigger.type)
-    && normalized(candidate.triggerClaim.label) === normalized(current.trigger.label)
-    && normalized(candidate.emotion.label) === normalized(current.emotion.label)
-    && candidate.emotion.valence === current.emotion.valence
-    && candidate.emotion.intensity === current.emotion.intensity;
+    && candidate.emotion.valence === current.emotion.valence;
 }
 
 function actionAgainstCurrent(candidate, current) {
@@ -235,6 +240,7 @@ export function reviewReportedAffectiveAssociationState({
     };
   }
   const selection = selectLatestReportedCandidate(candidates, {
+    compatible: (left, right) => compatibleReportedClaims("affective_association", left, right),
     hasCurrentState: Boolean(snapshot.currentState),
     isExplicitChange: (candidate) => CHANGE_CUES.has(candidate.time.changeCue),
   });
@@ -273,7 +279,7 @@ export function reviewReportedAffectiveAssociationState({
     currentStateId: snapshot.currentState?.id || "",
     proposedState: ["retire", "correct_attribution"].includes(action)
       ? null
-      : proposedState(selected, snapshot),
+      : withReportedEvidence(proposedState(selected, snapshot), selection),
     selectedObservationId: selected.observation.id,
     consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
     snapshot,

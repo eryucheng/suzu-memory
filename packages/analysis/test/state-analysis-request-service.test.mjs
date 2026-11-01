@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createRelatedAnalyzerBatch } from '../src/related-analyzer-batch.mjs';
 import { stateAnalysisBudgetError } from "../src/request-budget.mjs";
 
 import {
@@ -7,10 +8,13 @@ import {
   openMemoryDatabase,
   resolveReportedStateProposal,
   memoryRetrievalContextSourceHash,
+  normalizeStateAnalysisTargetSpec,
 } from "@suzu-memory/core";
 import { syncMemoryEmbeddings } from '@suzu-memory/embedding-indexer';
+import { fallbackStateAnalysisToProvisionalReview } from '@suzu-memory/extraction';
+import { runEmbeddingMaintenance } from '@suzu-memory/maintenance';
 import { prepareStateMemoryCandidates } from '../src/state-memory-candidates.mjs';
-import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
+import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
 import {
   processPendingStateAnalysisRequests,
@@ -189,13 +193,13 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
       assert.ok(snapshot.stateCandidates.some(candidate => candidate.id === old.id));
       output = { stateMatch: { resolution: scenario === 'ambiguous' ? 'ambiguous' : 'matched',
         candidateId: scenario === 'ambiguous' ? '' : scenario === 'invalid' ? 'not-a-candidate' : old.id, rationale: '比较具体约定。' }, analysis: { results: {
-        targetIntent: { analyses: [{ ...common, targetMatch: 'exact', goalText: '整理小说书单', intentionLevel: 'plan', specificity: 'actionable' }] },
+        targetIntent: { analyses: [{ ...common, targetMatch: 'exact', goalText: '整理小说书单', intentionLevel: 'plan', specificity: 'actionable', peerRelations: [] }] },
         holderResponsibility: { analyses: [{ ...common, holderMatch: 'yes', attribution: 'explicit_self_statement', responsibility: 'subject', agency: 'self_chosen', acceptsResponsibility: 'yes' }] },
         lifecycle: { analyses: [{ ...common, lifecycle: 'cancelled', completionBasis: 'direct_cancellation', timeReference: '' }] },
       } } };
     } else {
       assert.equal(request.analyzerRole, 'current-relation');
-      const snapshot = JSON.parse(request.input.slice(request.input.indexOf('\n\n{') + 2));
+      const snapshot = JSON.parse(request.input.slice(request.input.indexOf('{')));
       assert.equal(snapshot.currentState.id, old.id);
       output = { analyses: [{ ...common, currentStatePresent: true, relation: 'cancels' }] };
     }
@@ -227,8 +231,15 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
   }
   const pending = first.repository.listPendingProvisionalMemories('agent-test').filter(memory => memory.id !== old.id);
   if (pending.length) {
-    await syncMemoryEmbeddings({ repository: first.repository, agentId: 'agent-test', embeddingProvider,
-      memoryIds: pending.map(memory => memory.id) });
+    const queuedIds = new Set(first.repository.listMaintenanceTasks('agent-test', {
+      taskTypes: ['memory-embedding'], statuses: ['pending'], limit: 100,
+    }).flatMap(task => task.payload.memoryIds));
+    for (const memory of pending) assert.ok(queuedIds.has(memory.id), 'pending evidence must enter the embedding queue');
+    await runEmbeddingMaintenance({ repository: first.repository, agentId: 'agent-test', embeddingProvider,
+      maximumTasks: 100 });
+    for (const memory of pending) assert.ok(first.repository.listEmbeddings('agent-test', 'test-embedding', {
+      includeArchived: true,
+    }).some(row => row.memory_id === memory.id));
     assert.equal(embeddingCalls.length, 2);
   }
   if (scenario === 'active') {
@@ -246,7 +257,7 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
         output = { stateMatch: { resolution: 'matched', candidateId: old.id, rationale: '明确恢复原来取消的安排。' },
           analysis: (await activeEvidence(request)).output };
       } else {
-        const snapshot = JSON.parse(request.input.slice(request.input.indexOf('\n\n{') + 2));
+        const snapshot = JSON.parse(request.input.slice(request.input.indexOf('{')));
         assert.equal(snapshot.currentState.id, old.id);
         assert.equal(snapshot.currentState.statePhase, 'cancelled');
         output = { analyses: [{ memoryId: third.memory.id, sourceIds: [third.source.id], confidence: 0.98,
@@ -370,6 +381,7 @@ function directGoalGenerator(fixture) {
         goalText: fixture.request.target_label,
         intentionLevel: "plan",
         specificity: "actionable",
+        peerRelations: [],
       }] },
       "holder-responsibility": { analyses: [{
         ...common,
@@ -397,6 +409,39 @@ function directGoalGenerator(fixture) {
       metadata: { provider: "test" },
     };
   };
+}
+
+for (const stateFamily of ['identity', 'relationship']) {
+  test(`semantic state candidates respect ${stateFamily} target dimensions even with identical vectors`, async t => {
+    const targetSpec = stateFamily === 'identity' ? { identityField: 'relationship_status', fieldCardinality: 'single' }
+      : { counterpartRole: 'agent', counterpartKey: 'agent-test', counterpartLabel: 'Agent',
+        direction: 'holder_to_counterpart', relationshipDimension: 'trust' };
+    const f = setupRequest({ stateFamily, targetSpec, targetLabel: 'Current state' });
+    t.after(() => f.database.close());
+    const records = stateFamily === 'identity'
+      ? [['matching', { identityClaim: { identityField: 'relationship_status' } }],
+        ['different-field', { identityClaim: { identityField: 'occupation' } }]]
+      : [['matching', { counterpart: { role: 'agent', key: 'agent-test' }, relationshipView: { relationType: 'trust' } }],
+        ['different-dimension', { counterpart: { role: 'agent', key: 'agent-test' }, relationshipView: { relationType: 'support' } }],
+        ['different-counterpart', { counterpart: { role: 'agent', key: 'another-agent' }, relationshipView: { relationType: 'trust' } }]];
+    for (const [id, draft] of records) f.repository.upsertMemory({ id, agentId: 'agent-test',
+      kind: stateFamily === 'identity' ? 'fact' : 'relationship', layer: 'semantic',
+      content: 'Current personal state', subjectRole: 'user', subjectKey: 'user', canonicalKey: id,
+      stateFamily, representationLayer: 'reported', evidenceMode: 'explicit', reality: 'real',
+      temporalState: 'current', metadata: { reportedStateDraft: draft } });
+    let calls = 0;
+    const embeddingProvider = Object.assign(async () => {
+      calls++;
+      return { model: 'target-isolation', vector: [1, 0] };
+    }, { model: 'target-isolation', dimensions: 2 });
+    await syncMemoryEmbeddings({ repository: f.repository, agentId: 'agent-test', embeddingProvider,
+      memoryIds: records.map(([id]) => id) });
+    const before = calls;
+    const prepared = await prepareStateMemoryCandidates({ repository: f.repository, request: f.request, embeddingProvider });
+    assert.deepEqual(prepared.candidates.map(candidate => candidate.id), ['matching']);
+    assert.equal(calls, before + 1, 'only the new draft needs an embedding');
+    assert.ok(prepared.candidates[0].targetSpec);
+  });
 }
 
 function directConditionGenerator(fixture) {
@@ -490,6 +535,7 @@ function combinedGoalGenerator(fixture, calls) {
             goalText: fixture.request.target_label,
             intentionLevel: "plan",
             specificity: "actionable",
+        peerRelations: [],
           }] },
           holderResponsibility: { analyses: [{
             ...common,
@@ -516,8 +562,8 @@ function combinedGoalGenerator(fixture, calls) {
   return generator;
 }
 
-test("an indivisible specialist budget overflow preserves evidence for review without provider retries", async t => {
-  const fixture = setupRequest();
+for (const language of ['zh', 'en']) test(`specialist fallback queues searchable evidence without provider retries: ${language}`, async t => {
+  const fixture = setupRequest({ content: language === 'en' ? 'I have always enjoyed puzzle games.' : '我一直很喜欢解谜游戏。' });
   t.after(() => fixture.database.close());
   let calls = 0;
   const generator = async () => { calls += 1; throw new Error("Provider must not be called"); };
@@ -533,8 +579,41 @@ test("an indivisible specialist budget overflow preserves evidence for review wi
   const pending = fixture.repository.listPendingProvisionalMemories("agent-test");
   assert.equal(pending.length, 1);
   assert.equal(pending[0].content, fixture.source.content);
+  const tasks = fixture.repository.listMaintenanceTasks('agent-test', { taskTypes: ['memory-embedding'] });
+  assert.equal(tasks.length, 1);
+  assert.deepEqual(tasks[0].payload.memoryIds, [pending[0].id]);
+  let embeddingCalls = 0;
+  const embeddingProvider = Object.assign(async () => {
+    embeddingCalls++;
+    return { model: 'fallback-test', vector: [1, 0] };
+  }, { model: 'fallback-test', dimensions: 2 });
+  const indexed = await runEmbeddingMaintenance({ repository: fixture.repository, agentId: 'agent-test', embeddingProvider });
+  assert.equal(indexed.status, 'completed');
+  assert.equal(embeddingCalls, 1);
+  assert.ok(fixture.repository.listEmbeddings('agent-test', 'fallback-test', { includeArchived: true })
+    .some(row => row.memory_id === pending[0].id));
+  assert.equal(fixture.repository.getMemory(pending[0].id).layer, 'provisional');
+  assert.equal(fixture.repository.listPendingProvisionalMemories('agent-test').length, 1);
   assert.equal((await processPendingStateAnalysisRequests({ repository: fixture.repository, agentId: "agent-test",
     generator, maxRequests: 10 })).selected, 0);
+  assert.equal((await runEmbeddingMaintenance({ repository: fixture.repository, agentId: 'agent-test', embeddingProvider })).selected, 0);
+  assert.equal(embeddingCalls, 1);
+});
+
+test('fallback evidence and its embedding task commit together', t => {
+  const fixture = setupRequest();
+  t.after(() => fixture.database.close());
+  const enqueue = fixture.repository.enqueueMaintenanceTask;
+  fixture.repository.enqueueMaintenanceTask = () => { throw new Error('Queue unavailable'); };
+  assert.throws(() => fallbackStateAnalysisToProvisionalReview({ repository: fixture.repository, request: fixture.request }),
+    /Queue unavailable/);
+  assert.equal(fixture.repository.getStateAnalysisRequest('agent-test', fixture.request.id).status, 'pending');
+  assert.equal(fixture.repository.listPendingProvisionalMemories('agent-test').length, 0);
+  assert.equal(fixture.database.prepare("SELECT COUNT(*) AS count FROM memory_nodes WHERE layer='provisional'").get().count, 0);
+  fixture.repository.enqueueMaintenanceTask = enqueue;
+  const result = fallbackStateAnalysisToProvisionalReview({ repository: fixture.repository, request: fixture.request });
+  assert.equal(result.request.status, 'completed');
+  assert.equal(fixture.repository.listMaintenanceTasks('agent-test', { taskTypes: ['memory-embedding'] }).length, 1);
 });
 
 test("oversized complete evidence snapshots enter review without repeated preparation", async t => {
@@ -761,6 +840,53 @@ test("dispatches structured-target reported families without inventing missing e
   }
 });
 
+for (const [label, content] of [
+  ['flowers', 'Flowers always remind me of my wedding and bring me joy.'],
+  ['花朵', '看到花朵总让我想起婚礼，心里很开心。'],
+]) test(`world affective triggers retain object identity through reported-state acceptance: ${label}`, async t => {
+  const f = setupRequest({ stateFamily: 'affective_association', targetLabel: label, content,
+    targetSpec: { triggerRole: 'world', triggerKey: '', triggerLabel: label } });
+  t.after(() => f.database.close());
+  let calls = 0;
+  const generator = Object.assign(async request => {
+    calls++;
+    assertMemoryTaskRequest(request);
+    const common = { memoryId: f.memory.id, sourceIds: [f.source.id], confidence: 0.95, rationale: 'Direct self report.' };
+    const output = { results: {
+      triggerEmotion: { analyses: [{ ...common, targetMatch: 'exact', triggerType: 'object',
+        triggerLabel: label, emotionLabel: 'joy', valence: 'positive', intensity: 'medium' }] },
+      experiencerAttribution: { analyses: [{ ...common, experiencerMatch: 'yes', attribution: 'explicit_self_report' }] },
+      associationBasis: { analyses: [{ ...common, associationType: 'explicit_trigger_link', causality: 'explicit', recurrence: 'repeated_claim' }] },
+      timeRevision: { analyses: [{ ...common, stateTime: 'current', changeCue: 'none' }] },
+    } };
+    validateMemoryTaskOutput(request, output);
+    return { output, model: 'test-world-trigger' };
+  }, { supportsCombinedStateAnalysis: true });
+  const result = await processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test',
+    requestId: f.request.id, generator });
+  assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
+  assert.equal(calls, 1);
+  assert.equal(result.proposal.draft.affectiveClaim.trigger.role, 'world');
+  assert.equal(result.proposal.draft.affectiveClaim.trigger.key, '');
+  const accepted = resolveReportedStateProposal(f.repository, { agentId: 'agent-test',
+    proposalId: result.proposal.id, action: 'accept' });
+  assert.equal(accepted.memory.metadata.reportedStateDraft.affectiveClaim.trigger.label, label);
+  assert.equal(accepted.memory.metadata.reportedStateDraft.affectiveClaim.activationBiasStatus, 'disabled');
+  const second = setupRequest({ database: f.database, repository: f.repository, suffix: 'world-music',
+    stateFamily: 'affective_association', targetLabel: 'music', content: 'Music makes me feel peaceful.',
+    targetSpec: { triggerRole: 'world', triggerKey: '', triggerLabel: 'music' } });
+  const embeddingProvider = Object.assign(async () => ({ model: 'test-world-embedding', vector: [1, 0] }),
+    { model: 'test-world-embedding', dimensions: 2 });
+  const context = await prepareStateMemoryCandidates({ repository: f.repository, request: second.request, embeddingProvider });
+  assert.equal(context.candidates.some(candidate => candidate.canonicalKey === result.proposal.canonical_key), false);
+  assert.throws(() => normalizeStateAnalysisTargetSpec('affective_association', {
+    triggerRole: 'world', triggerKey: 'person-id', triggerLabel: label,
+  }), /targetSpec/);
+  assert.throws(() => normalizeStateAnalysisTargetSpec('affective_association', {
+    triggerRole: 'user', triggerKey: '', triggerLabel: 'User',
+  }), /targetSpec/);
+});
+
 test("processes only the explicitly bounded number of supported pending requests", async () => {
   const first = setupRequest({
     suffix: "1",
@@ -803,16 +929,6 @@ test("retries a failed specialist three times, then routes it to review without 
     targetLabel: "科幻小说",
     createdAt: "2026-07-11T02:02:00.000Z",
   });
-  setupRequest({
-    database: first.database,
-    repository: first.repository,
-    suffix: "3",
-    targetLabel: "散步",
-    stateFamily: "goal",
-    evidenceMode: "observed",
-    representationLayer: "inferred",
-    createdAt: "2026-07-11T02:03:00.000Z",
-  });
   const fixtures = new Map([
     [first.request.id, first],
     [second.request.id, second],
@@ -850,7 +966,7 @@ test("retries a failed specialist three times, then routes it to review without 
   assert.equal(first.repository.listStateAnalysisRequests("agent-test", {
     statuses: ["pending"],
     representationLayer: "inferred",
-  }).length, 1);
+  }).length, 0);
   first.database.close();
 });
 
@@ -911,22 +1027,33 @@ test("keeps base evidence and routes a required specialist failure to review aft
   fixture.database.close();
 });
 
-test("leaves inferred families without an implemented processor pending", async () => {
-  const fixture = setupRequest({ stateFamily: "goal", evidenceMode: "observed", representationLayer: "inferred" });
+for (const evidenceMode of ["observed", "inferred"]) test(`analyzes ${evidenceMode} condition evidence without turning it into a self-report`, async t => {
+  const f = setupRequest({ stateFamily: "condition", evidenceMode, representationLayer: "inferred",
+    content: evidenceMode === "observed" ? "Her hands were visibly shaking." : "She may be feeling anxious." });
+  t.after(() => f.database.close());
+  f.database.prepare("UPDATE memory_nodes SET subject_role=?, subject_key=? WHERE id=?").run("agent", "agent-test", f.memory.id);
+  f.database.prepare("UPDATE memory_actor_roles SET actor_role=?, actor_key=? WHERE memory_id=? AND role='speaker'").run("agent", "agent-test", f.memory.id);
   let calls = 0;
-  const result = await processStateAnalysisRequest({
-    repository: fixture.repository,
-    agentId: "agent-test",
-    requestId: fixture.request.id,
-    generator: async () => {
-      calls += 1;
-      return { output: { analyses: [] } };
-    },
-  });
-  assert.equal(result.status, "unsupported");
-  assert.equal(result.request.status, "pending");
-  assert.equal(calls, 0);
-  fixture.database.close();
+  const result = await processStateAnalysisRequest({ repository: f.repository, agentId: "agent-test", requestId: f.request.id,
+    generator: async request => {
+      calls++;
+      const output = { analyses: [{ memoryId: f.memory.id, sourceIds: [f.source.id], confidence: 0.8, rationale: "Source-limited observation.",
+        targetMatch: "exact", matchedLabel: "Shaking hands", conditionPresence: "present", conditionKind: "health", effect: "none",
+        temporality: "current", evidenceBasis: evidenceMode === "observed" ? "direct_observation" : "inferred",
+        scopeLabel: "This conversation", revisionCue: "none" }] };
+      validateMemoryTaskOutput(request, output); return { output };
+    } });
+  assert.equal(result.status, "provisional-review", JSON.stringify(result));
+  assert.equal(result.request.status, "completed");
+  assert.equal(calls, 1);
+  const memory = f.repository.getMemory(result.provisional.id);
+  assert.equal(memory.evidence_mode, evidenceMode);
+  assert.equal(memory.representation_layer, evidenceMode === "inferred" ? "inferred" : "unspecified");
+  assert.ok(f.repository.listPendingProvisionalMemories("agent-test").some(item => item.id === memory.id));
+  assert.equal(memory.metadata.evidenceAnalysis.stateFormation, "not-established");
+  assert.equal(result.merged.observations.length, 1);
+  assert.equal(result.merged.observations[0].qualification, evidenceMode === "observed" ? "qualified" : "unresolved");
+  assert.equal(f.repository.listReportedStateProposals("agent-test").length, 0);
 });
 
 for (const [stateFamily, kind, targetSpec] of [
@@ -961,23 +1088,225 @@ for (const [stateFamily, kind, targetSpec] of [
     const snapshots = [];
     await processStateAnalysisRequest({
       repository: fixture.repository, agentId: "agent-test", requestId: fixture.request.id,
-      generator: async ({ input }) => {
-        snapshots.push(JSON.parse(input.slice(input.indexOf("\n\n{") + 2)));
-        return { output: { analyses: [] }, model: "test-complete-evidence" };
+      generator: async request => {
+        const snapshot = JSON.parse(request.input.slice(request.input.indexOf("{")));
+        snapshots.push(snapshot);
+        return { output: request.stateMatchAnalysisTask ? {
+          stateMatch: { resolution: 'matched', candidateId: 'current-' + stateFamily,
+            rationale: 'The fixture supplies this same state for the fixed target.' }, analysis: { analyses: [] },
+        } : { analyses: [] }, model: "test-complete-evidence" };
       },
     });
     // Assert outside the generator: production catches provider failures.
-    assert.ok(snapshots.length > 0);
+    assert.ok(snapshots.length > 1);
+    assert.ok(snapshots.slice(1).every(snapshot => snapshot.currentState?.id === "current-" + stateFamily));
     for (const snapshot of snapshots) {
       assert.equal(snapshot.memories[0].content, content);
       assert.equal(snapshot.sourceRecords[0].content, content);
-      assert.equal(snapshot.currentState.content, previous);
+      const current = snapshot.currentState || snapshot.stateCandidates.find(candidate => candidate.id === 'current-' + stateFamily);
+      assert.equal(current.content, previous);
       if (untrusted) {
         assert.doesNotMatch(JSON.stringify(snapshot), /2000-01-02/);
-        assert.equal(snapshot.currentState.knownAt, null);
+        assert.equal(current.knownAt, null);
         assert.equal(snapshot.sourceRecords[0].occurredAt, null);
         assert.equal(snapshot.memories[0].contextBasis, 'unknown');
       }
     }
   });
 }
+
+for (const content of ['我以前喜欢解谜游戏。', 'I used to like puzzle games.']) {
+  test('preserves the source of a historical statement when no current state is established: ' + content, async t => {
+    const f = setupRequest({ content });
+    t.after(() => f.database.close());
+    const base = directPreferenceGenerator(f);
+    const generator = async request => {
+      const result = await base(request);
+      if (request.analyzerRole === 'time-scope') result.output.analyses[0].stateTime = 'historical';
+      return result;
+    };
+    const result = await processStateAnalysisRequest({ repository: f.repository,
+      agentId: 'agent-test', requestId: f.request.id, generator });
+    assert.equal(result.status, 'provisional-review');
+    assert.equal(result.provisional.evidence_mode, 'explicit');
+    assert.equal(result.provisional.metadata.epistemicStatus, 'source_record');
+    assert.equal(result.provisional.representation_layer, 'unspecified');
+    const sources = f.repository.listMemorySources(result.provisional.id);
+    assert.deepEqual(sources.map(source => source.authority), ['subject_firsthand']);
+    assert.equal(f.repository.listReportedStateProposals('agent-test').length, 0);
+  });
+}
+
+test('direct expression stays usable when the unrelated behavior role fails', async t => {
+  const f = setupRequest();
+  t.after(() => f.database.close());
+  const result = await processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test',
+    requestId: f.request.id, generator: directPreferenceGenerator(f, { failRole: 'behavior-conditions' }) });
+  assert.equal(result.status, 'proposal-pending');
+  assert.equal(result.evaluation.status, 'partial');
+  assert.equal(result.proposal.draft.preferenceClaim.polarity, 'positive');
+});
+
+test('retries only a failed essential role and reuses the identical successful analyses', async t => {
+  const f = setupRequest();
+  t.after(() => f.database.close());
+  const calls = [];
+  const base = directPreferenceGenerator(f);
+  let failed = false;
+  const generator = async request => {
+    calls.push(request.analyzerRole);
+    if (!failed && request.analyzerRole === 'object-grounding') {
+      failed = true;
+      throw new Error('temporary-provider-failure');
+    }
+    return base(request);
+  };
+  const options = { repository: f.repository, agentId: 'agent-test', requestId: f.request.id, generator };
+  assert.equal((await processStateAnalysisRequest(options)).status, 'retry-pending');
+  const result = await processStateAnalysisRequest(options);
+  assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
+  assert.deepEqual(calls.reduce((counts, role) => ({ ...counts, [role]: (counts[role] || 0) + 1 }), {}), {
+    'object-grounding': 2, 'explicit-expression': 1, 'behavior-conditions': 1, 'sharing-affect': 1, 'time-scope': 1,
+  });
+});
+
+test('does not reuse an analysis after its evidence text changes', async t => {
+  const f = setupRequest();
+  t.after(() => f.database.close());
+  const counts = {};
+  const base = directPreferenceGenerator(f);
+  let first = true;
+  const generator = async request => {
+    counts[request.analyzerRole] = (counts[request.analyzerRole] || 0) + 1;
+    if (request.analyzerRole === 'object-grounding' && first) {
+      first = false;
+      throw new Error('temporary-provider-failure');
+    }
+    const result = await base(request);
+    if (!f.memory.content.includes('喜欢')) {
+      if (request.analyzerRole === 'explicit-expression') result.output.analyses[0].expressionType = 'dislikes';
+    }
+    return result;
+  };
+  const options = { repository: f.repository, agentId: 'agent-test', requestId: f.request.id, generator };
+  assert.equal((await processStateAnalysisRequest(options)).status, 'retry-pending');
+  const content = 'I dislike puzzle games.';
+  f.database.prepare('UPDATE memory_nodes SET content=? WHERE id=?').run(content, f.memory.id);
+  f.database.prepare('UPDATE source_records SET content=? WHERE id=?').run(content, f.source.id);
+  f.memory.content = content;
+  const result = await processStateAnalysisRequest(options);
+  assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
+  assert.equal(result.proposal.draft.preferenceClaim.polarity, 'negative');
+  assert.deepEqual(Object.values(counts), [2, 2, 2, 2, 2]);
+});
+
+for (const accept of [false, true]) test(`fictional reported states retain scope through materialization and later matching; accepted=${accept}`, async t => {
+  const f = setupRequest({ content: "I like stargazing in our story." });
+  t.after(() => f.database.close());
+  const scope = fixture => {
+    fixture.database.prepare("UPDATE memory_nodes SET world_id=?, world_frame=? WHERE id=?").run("story-a", "fictional", fixture.memory.id);
+    fixture.database.prepare("UPDATE source_records SET world_id=?, world_frame=? WHERE id=?").run("story-a", "fictional", fixture.source.id);
+    fixture.database.prepare("UPDATE memory_ingestion_decisions SET candidate_json=json_set(candidate_json, '$.reality', 'fictional') WHERE batch_id=?")
+      .run(fixture.request.batch_id);
+  };
+  scope(f);
+  const result = await processStateAnalysisRequest({ repository: f.repository, agentId: "agent-test", requestId: f.request.id, generator: directPreferenceGenerator(f) });
+  assert.equal(result.status, "proposal-pending", JSON.stringify(result));
+  let memory = f.repository.listPendingProvisionalMemories("agent-test")[0];
+  assert.equal(memory.reality, "fictional");
+  if (accept) memory = resolveReportedStateProposal(f.repository, { agentId: "agent-test", proposalId: result.proposal.id, action: "accept" }).memory;
+  assert.equal(memory.reality, "fictional");
+  assert.equal(memory.world_id, "story-a");
+  assert.equal(memory.world_frame, "fictional");
+  const provider = Object.assign(async () => ({ model: "test", vector: [1, 0] }), { model: "test", dimensions: 2 });
+  await syncMemoryEmbeddings({ repository: f.repository, agentId: "agent-test", embeddingProvider: provider, memoryIds: [memory.id] });
+  f.repository.upsertMemory({ ...memory, id: "other-world", agentId: "agent-test", subjectRole: "user", subjectKey: "user",
+    stateFamily: "preference", representationLayer: "reported", canonicalKey: "other-world", reality: "fictional", worldId: "story-b", worldFrame: "fictional" });
+  const next = setupRequest({ database: f.database, repository: f.repository, suffix: "2", content: "Stargazing is still my favorite." });
+  scope(next);
+  const context = await prepareStateMemoryCandidates({ repository: f.repository, request: next.request, embeddingProvider: provider });
+  assert.ok(context.candidates.some(candidate => candidate.id === memory.id));
+  assert.equal(context.candidates.some(candidate => candidate.id === "other-world"), false);
+});
+
+for (const override of [false, true]) test(`public state analysis uses the configured embedding provider; override=${override}`, async t => {
+  const f = setupRequest({ stateFamily: "goal", targetLabel: "整理书单" }); t.after(() => f.database.close());
+  let configuredCalls = 0, overrideCalls = 0;
+  const configured = Object.assign(async () => { configuredCalls++; return { model: "configured", vector: [1, 0] }; }, { model: "configured", dimensions: 2 });
+  const custom = Object.assign(async () => { overrideCalls++; return { model: "override", vector: [1, 0] }; }, { model: "override", dimensions: 2 });
+  const result = await MemoryService.prototype.analyzePendingState.call({ agentId: "agent-test", providers: { embedding: configured, generator: combinedGoalGenerator(f, []) },
+    paths: { usageLedgerPath: "" }, withRepository: callback => callback(f.repository) }, override ? { embeddingProvider: custom } : {});
+  assert.equal(result.counts["proposal-pending"], 1, JSON.stringify(result));
+  assert.equal(configuredCalls, override ? 0 : 1);
+  assert.equal(overrideCalls, override ? 1 : 0);
+});
+
+
+test('all state analyzer requests satisfy strict provider object contracts', async () => {
+  const { readdir } = await import('node:fs/promises');
+  const { createOpenAiCompatibleStructuredGenerator } = await import('@suzu-memory/providers');
+  function assertStrictObjects(schema, location) {
+    if (!schema || typeof schema !== 'object') return;
+    if (schema.properties) {
+      assert.equal(schema.additionalProperties, false, location);
+      assert.deepEqual(new Set(schema.required), new Set(Object.keys(schema.properties)), location);
+    }
+    for (const [key, value] of Object.entries(schema)) {
+      if (value && typeof value === 'object') assertStrictObjects(value, location + '.' + key);
+    }
+  }
+  let requests = 0;
+  const generate = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool', maximumTransportAttempts: 1 },
+    fetchImpl: async (_url, options) => {
+      const tool = JSON.parse(options.body).tools[0].function;
+      assertStrictObjects(tool.parameters, tool.name);
+      requests++;
+      return new Response(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: {
+        tool_calls: [{ type: 'function', function: { name: tool.name, arguments: '{"analyses":[]}' } }],
+      } }] }), { status: 200 });
+    },
+  });
+  for (const file of await readdir(new URL('../src/', import.meta.url))) {
+    if (!file.endsWith('-contracts.mjs')) continue;
+    const module = await import(new URL('../src/' + file, import.meta.url));
+    for (const [name, definitions] of Object.entries(module)) {
+      if (!name.endsWith('_ANALYZERS')) continue;
+      for (const definition of Object.values(definitions)) {
+        await generate({ input: 'evidence', schema: definition.schema, schemaName: definition.schemaName });
+      }
+    }
+  }
+  assert.ok(requests > 0);
+});
+
+test('related analysis groups structured snapshots independently of prompt whitespace and keeps provider requests clean', async () => {
+  const definitions = { holder: { stateFamily: 'goal', role: 'holder' }, target: { stateFamily: 'goal', role: 'target' } };
+  const snapshot = { target: { stateFamily: 'goal' }, memories: [{ id: 'evidence-1', content: 'Prepare an exhibition.' }] };
+  const checked = [];
+  for (const separator of ['\n', '\n\n']) {
+    const calls = [];
+    const assertClean = request => {
+      assert.equal(Object.hasOwn(request, 'analysisSnapshot'), false);
+      assert.equal(Object.hasOwn(request, 'renderAnalysisInput'), false);
+      assert.equal(typeof request.input, 'string');
+      checked.push(request.schemaName);
+    };
+    const generator = Object.assign(async request => {
+      assertClean(request); calls.push(request);
+      return { output: request.combinedAnalyzerKeys
+        ? { results: Object.fromEntries(request.combinedAnalyzerKeys.map(key => [key, { analyses: [] }])) }
+        : { analyses: [] } };
+    }, { supportsCombinedStateAnalysis: true, assertRequestBudget: assertClean });
+    const batch = createRelatedAnalyzerBatch({ definitions, generator, request: { id: 'format-check' } });
+    const request = value => ({ analysisSnapshot: value, renderAnalysisInput: data => 'Snapshot:'+separator+JSON.stringify(data),
+      systemPrompt: 'Inspect the supplied evidence.', schema: { type: 'object' }, schemaName: 'format-check' });
+    await Promise.all([batch.holder(request(snapshot)), batch.target(request(structuredClone(snapshot)))]);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].combinedAnalyzerKeys, ['holder', 'target']);
+    const changed = { ...snapshot, memories: [{ id: 'evidence-2', content: 'Finish the exhibition.' }] };
+    await Promise.all([batch.holder(request(snapshot)), batch.target(request(changed))]);
+    assert.equal(calls.length, 3, 'Distinct source material remains separate.');
+  }
+  assert.ok(checked.length > 0);
+});

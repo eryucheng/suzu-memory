@@ -1,3 +1,5 @@
+import { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES, memoryMaintenanceTaskPayload as taskPayload, enqueueMemoryMaintenanceTasks } from '@suzu-memory/core';
+export { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES } from '@suzu-memory/core';
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { randomUUID } from "node:crypto";
 import { claimAccumulatedStructureTasks, inspectAccumulatedStructureTasks, deferSmallConsolidationRuns,
@@ -26,17 +28,6 @@ import {
   memoryBudgetError,
 } from "@suzu-memory/structurer";
 
-export const MAINTENANCE_LANES = Object.freeze({
-  embedding: "embedding",
-  semantic: "semantic",
-});
-
-export const MAINTENANCE_TASK_TYPES = Object.freeze({
-  memoryEmbedding: "memory-embedding",
-  retrievalContext: "retrieval-context",
-  structureProposal: "structure-proposal",
-  eventContinuity: "event-continuity",
-});
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -56,48 +47,9 @@ function boundedInteger(value, fallback, minimum, maximum, label) {
   return parsed;
 }
 
-function taskPayload({ repository, agentId, batchId, memoryIds }) {
-  const memories = memoryIds.map((memoryId) => repository.getMemory(memoryId))
-    .filter((memory) => memory?.agent_id === agentId);
-  return {
-    batchId: clean(batchId),
-    memoryIds,
-    memoryVersions: memories.map((memory) => ({
-      id: memory.id,
-      updatedAt: memory.updated_at,
-    })).sort((left, right) => left.id.localeCompare(right.id)),
-    retrievalContextVersions: memories.map((memory) => {
-      const context = repository.getCurrentMemoryRetrievalContext(memory.id);
-      return {
-        memoryId: memory.id,
-        contextId: clean(context?.id),
-        sourceHash: clean(context?.source_hash),
-        updatedAt: clean(context?.updated_at),
-      };
-    }).sort((left, right) => left.memoryId.localeCompare(right.memoryId)),
-    worldIds: uniqueStrings(memories.map((memory) => memory.world_id)).sort(),
-    subjects: [...new Map(memories.map((memory) => {
-      const role = clean(memory.subject_role);
-      const key = clean(memory.subject_key);
-      return [`${role}\u001f${key}`, { role, key }];
-    }).filter(([, subject]) => subject.role || subject.key)).values()],
-  };
-}
 
-function enqueueFollowUpTasks({ repository, agentId, payload, taskTypes }) {
-  const definitions = [
-    [MAINTENANCE_LANES.embedding, MAINTENANCE_TASK_TYPES.memoryEmbedding],
-    [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.retrievalContext],
-    [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.structureProposal],
-    [MAINTENANCE_LANES.semantic, MAINTENANCE_TASK_TYPES.eventContinuity],
-  ].filter(([, taskType]) => taskTypes.includes(taskType));
-  return definitions.map(([lane, taskType]) => repository.enqueueMaintenanceTask({
-    agentId,
-    lane,
-    taskType,
-    payload,
-  }));
-}
+
+
 
 /**
  * Runs only deterministic work for newly stored memories. It never scans old
@@ -180,7 +132,7 @@ export function runImmediateMemoryMaintenance({
   try {
     if (normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.memoryEmbedding)) {
       if (normalizedEmbeddingMemoryIds.length) {
-        queued.push(...enqueueFollowUpTasks({
+        queued.push(...enqueueMemoryMaintenanceTasks({
           repository,
           agentId: normalizedAgentId,
           payload: taskPayload({
@@ -197,14 +149,14 @@ export function runImmediateMemoryMaintenance({
       const memory = repository.getMemory(id);
       return memory?.kind === 'event' && memory.status === 'active' && !memory.metadata?.eventContinuity;
     });
-    if (eventIds.length && normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.eventContinuity)) queued.push(...enqueueFollowUpTasks({ repository, agentId: normalizedAgentId,
+    if (eventIds.length && normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.eventContinuity)) queued.push(...enqueueMemoryMaintenanceTasks({ repository, agentId: normalizedAgentId,
       payload: taskPayload({ repository, agentId: normalizedAgentId, batchId, memoryIds: eventIds }),
       taskTypes: [MAINTENANCE_TASK_TYPES.eventContinuity] }));
     const semanticTaskTypes = normalizedFollowUpTaskTypes.filter((taskType) => (
       taskType !== MAINTENANCE_TASK_TYPES.memoryEmbedding && taskType !== MAINTENANCE_TASK_TYPES.eventContinuity
     ));
     if (formalMemoryIds.length && semanticTaskTypes.length) {
-      queued.push(...enqueueFollowUpTasks({
+      queued.push(...enqueueMemoryMaintenanceTasks({
         repository,
         agentId: normalizedAgentId,
         payload: taskPayload({
@@ -634,7 +586,7 @@ async function processRetrievalContextTasks({
     .filter((item) => item.status === "added")
     .map((item) => item.memoryId));
   const queuedEmbedding = changedMemoryIds.length
-    ? enqueueFollowUpTasks({
+    ? enqueueMemoryMaintenanceTasks({
       repository,
       agentId,
       payload: taskPayload({
@@ -666,7 +618,7 @@ async function processStructureTasks({ repository, agentId, tasks, batch,
           .map(proposal => proposal.result_memory_id));
         const queued = provisionalMemoryIds.length ? runImmediateMemoryMaintenance({
           repository, agentId, batchId: `pending-structure:${part.id}`, memoryIds: provisionalMemoryIds,
-          followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding], planConsolidation: false,
+          followUpTaskTypes: [], planConsolidation: false,
         }) : { queued: [], warnings: [] };
         return { ...structureTaskResult(report), queued: queued.queued, maintenanceWarnings: queued.warnings };
       },
@@ -912,15 +864,6 @@ export async function runSemanticMemoryMaintenance({
   });
   const eventContinuity = await runEventContinuityMaintenance({ repository, agentId: normalizedAgentId,
     generator, embeddingProvider, maximumTasks, usageLedgerPath, maximumRequestCharacters });
-  const pendingStateMemories = repository.listPendingProvisionalMemories(normalizedAgentId, { limit: 5_000 })
-    .filter(memory => memory.metadata?.reportedStateProposalId || memory.metadata?.preferenceProposalId);
-  for (const memory of pendingStateMemories) {
-    runImmediateMemoryMaintenance({
-      repository, agentId: normalizedAgentId, batchId: `pending-reported-state:${memory.id}`,
-      memoryIds: [memory.id], followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding],
-      planConsolidation: false,
-    });
-  }
   if (typeof structureGenerator === "function") deferSmallConsolidationRuns({
     repository, agentId: normalizedAgentId, minimumMemories: minimumStructureMemories,
   });
@@ -1029,4 +972,54 @@ export function inspectMaintenance({ repository, agentId, limit = 100,
       failed: Number(consolidationTotals.failed || 0),
     },
   };
+}
+
+/** Provider-aware progress is shared by every host; adapters supply triggers only. */
+export function maintenanceWorkStatus(status, providers = {}, { lane = 'all' } = {}) {
+  if (!['all', 'embedding', 'semantic'].includes(lane)) throw new Error('Unknown maintenance lane.');
+  const supported = type => type === MAINTENANCE_TASK_TYPES.memoryEmbedding
+    ? typeof providers.embedding === 'function'
+    : type === MAINTENANCE_TASK_TYPES.eventContinuity
+      ? typeof providers.generator === 'function' && typeof providers.embedding === 'function'
+      : type === MAINTENANCE_TASK_TYPES.retrievalContext
+        ? typeof providers.retrievalContextGenerator === 'function' || providers.retrievalContextGenerator === null
+        : type === MAINTENANCE_TASK_TYPES.structureProposal && typeof providers.structureGenerator === 'function';
+  const pending = { tasks: 0, stateRequests: 0, consolidation: 0 };
+  const completed = { tasks: 0, stateRequests: 0, consolidation: 0 };
+  let allPending = 0, failures = 0, deferredTasks = 0;
+  for (const [key, value] of Object.entries(status.taskCounts || {})) {
+    const [taskLane, type, state] = key.split(':');
+    const count = Number(value) || 0;
+    const selected = lane === 'all' || taskLane === lane;
+    if (!supported(type)) {
+      if (selected && ['pending', 'running'].includes(state)) deferredTasks += count;
+      continue;
+    }
+    if (['pending', 'running'].includes(state)) {
+      const accumulating = type === MAINTENANCE_TASK_TYPES.structureProposal && state === 'pending'
+        ? Number(status.structureQueue?.accumulatingTaskCount || 0) : 0;
+      const runnable = Math.max(0, count - accumulating);
+      allPending += runnable;
+      if (selected) { pending.tasks += runnable; deferredTasks += Math.min(count, accumulating); }
+    }
+    if (selected && state === 'completed') completed.tasks += count;
+    if (selected && state === 'failed') failures += count;
+  }
+  const stateRequests = typeof providers.generator === 'function' ? Number(status.pendingStateAnalysisRequests || 0) : 0;
+  const consolidation = typeof providers.structureGenerator === 'function'
+    ? Number(status.consolidationRuns?.planned || 0) + Number(status.consolidationRuns?.running || 0) : 0;
+  allPending += stateRequests + consolidation;
+  if (lane !== 'embedding') {
+    Object.assign(pending, { stateRequests, consolidation });
+    if (typeof providers.generator === 'function') {
+      completed.stateRequests = Number(status.stateAnalysisRequests?.completed || 0);
+      failures += Number(status.stateAnalysisRequests?.failed || 0) + Number(status.stateAnalysisRequests?.blocked || 0);
+    }
+    if (typeof providers.structureGenerator === 'function') {
+      completed.consolidation = Number(status.consolidationRuns?.completed || 0);
+      failures += Number(status.consolidationRuns?.failed || 0);
+    }
+  }
+  return { pending, total: Object.values(pending).reduce((sum, value) => sum + value, 0),
+    allPending, completed, failures, deferred: { tasks: deferredTasks } };
 }

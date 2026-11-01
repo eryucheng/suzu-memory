@@ -139,6 +139,7 @@ export function buildPreferenceEvidenceSnapshot({
   maxSnapshotChars = 64_000,
   allowUtteranceEvidence = false,
   allowedSourceIds = [],
+  analysisRequestId = "",
 } = {}) {
   if (!repository) throw new Error("Preference evidence snapshot requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -159,6 +160,14 @@ export function buildPreferenceEvidenceSnapshot({
   const snapshotCharLimit = Math.min(250_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 64_000)));
   const sourceRecords = new Map();
   const sourceBoundary = new Set(uniqueStrings(allowedSourceIds));
+  const analysisRequest = clean(analysisRequestId) ? repository.getStateAnalysisRequest(normalizedAgentId, clean(analysisRequestId)) : null;
+  if (clean(analysisRequestId) && (!analysisRequest || !["pending", "completed"].includes(analysisRequest.status)
+    || analysisRequest.subject_role !== normalizedSubjectRole || analysisRequest.subject_key !== normalizedSubjectKey
+    || analysisRequest.canonical_key !== normalizedCanonicalKey
+    || requestedIds.some(id => !analysisRequest.memoryIds.includes(id))
+    || !sourceBoundary.size || [...sourceBoundary].some(id => !analysisRequest.sourceIds.includes(id)))) {
+    throw new Error("State analysis snapshot exceeds its fixed request target or evidence boundary.");
+  }
   const memories = [];
   const excluded = [];
 
@@ -214,10 +223,15 @@ export function buildPreferenceEvidenceSnapshot({
       kind: memory.kind,
       title: String(memory.title ?? ""),
       content: requireCompleteText(memory.content, memoryCharLimit, `Memory ${memory.id}`),
-      subjectRole: memory.subject_role,
-      subjectKey: memory.subject_key,
+      storedSubjectRole: memory.subject_role, storedSubjectKey: memory.subject_key,
+      // The described person is request-bound; actorRoles retain the actual speaker.
+      subjectRole: requestBoundUtterance && analysisRequest ? normalizedSubjectRole : memory.subject_role,
+      subjectKey: requestBoundUtterance && analysisRequest ? normalizedSubjectKey : memory.subject_key,
       reality: memory.reality,
-      evidenceMode: memory.evidence_mode,
+      worldId: memory.world_id,
+      worldFrame: memory.world_frame,
+      evidenceMode: requestBoundUtterance && analysisRequest ? analysisRequest.evidence_mode : memory.evidence_mode,
+      storedEvidenceMode: memory.evidence_mode,
       // An utterance's archival time is not the validity of the state it expresses.
       ...(requestBoundUtterance ? {} : { temporalState: memory.temporal_state }),
       ...modelCalendarFields(memory, ['eventDate', 'eventStart', 'eventEnd', 'knownAt'], sources),

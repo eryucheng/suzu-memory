@@ -1,6 +1,28 @@
+import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 import { createHash } from "node:crypto";
 import { assertEventSourceExecutionCurrent } from "./event-source-execution.mjs";
 import { modelCalendarFields } from './calendar-time.mjs';
+
+// Read the format written by this module; accept the existing legacy claim fields
+// at this boundary so consumers do not each implement their own storage contract.
+export function readReportedStateDraft(memory) {
+  const metadata = memory?.metadata || {};
+  if (Object.hasOwn(metadata, "reportedStateDraft")) return { ...(metadata.reportedStateDraft || {}) };
+  const draft = {};
+  for (const [field, legacy] of [
+    ["preferenceClaim", "reportedPreference"],
+    ["identityClaim", "reportedIdentity"],
+    ["affectiveClaim", "reportedAffectiveAssociation"],
+    ["conditionClaim", "reportedCondition"],
+    ["habitClaim", "reportedHabit"],
+    ["dispositionClaim", "reportedDisposition"],
+  ]) {
+    if (!draft[field] && (metadata[field] || metadata[legacy])) {
+      draft[field] = metadata[field] || metadata[legacy];
+    }
+  }
+  return draft;
+}
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -50,6 +72,10 @@ const TERMINAL_ACTIONS = Object.freeze({
   revoke: Object.freeze({ statePhase: "ended", temporalState: "historical" }),
 });
 
+export const REPORTED_STATE_TERMINAL_PHASES = Object.freeze([
+  ...new Set(Object.values(TERMINAL_ACTIONS).map(value => value.statePhase)),
+]);
+
 const PENDING_TRANSITION_ACTIONS = new Set([
   ...Object.keys(TERMINAL_ACTIONS), ...[...NEW_STATE_ACTIONS].filter(action => action !== 'create'),
 ]);
@@ -97,6 +123,7 @@ function reviewedEvidence(repository, proposal) {
     evidenceSnapshot.observations.map((item) => [clean(item.observationId), item]),
   );
   let selected = null;
+  const contributions = [];
   for (const observationId of proposal.consideredObservationIds) {
     const observation = repository.getStateEvidenceObservation(proposal.agent_id, observationId);
     if (!observation || observation.lifecycle !== "current"
@@ -160,6 +187,10 @@ function reviewedEvidence(repository, proposal) {
         throw new Error("Reported state proposal evidence source changed after review.");
       }
     }
+    if (proposal.draft?.evidenceObservationIds?.includes(observation.id)) {
+      if (observation.qualification !== "qualified") throw new Error("Aggregated state evidence is no longer qualified.");
+      contributions.push({ observation, detail });
+    }
     if (observation.id === proposal.selectedObservationId) {
       if (observation.qualification !== "qualified") {
         throw new Error("Reported state proposal selected evidence is no longer qualified.");
@@ -179,6 +210,16 @@ function reviewedEvidence(repository, proposal) {
       || selected.observation.sourceIds.some((sourceId) => !draft.evidenceSourceIds.includes(sourceId))) {
       throw new Error("Reported state draft does not preserve its selected evidence chain.");
     }
+  }
+  if (contributions.length) {
+    const ids = new Set(contributions.map(item => item.observation.id));
+    const memories = new Set(contributions.map(item => item.detail.memory.id));
+    const sources = new Set(contributions.flatMap(item => item.observation.sourceIds));
+    if (draft.evidenceObservationIds.some(id => !ids.has(id))
+      || draft.evidenceMemoryIds.some(id => !memories.has(id)) || draft.evidenceSourceIds.some(id => !sources.has(id))) {
+      throw new Error("Aggregated state evidence escapes the reviewed snapshot.");
+    }
+    selected.contributions = contributions;
   }
   return selected;
 }
@@ -223,6 +264,18 @@ function actorRoles(proposal, { provisional = false } = {}) {
   return roles;
 }
 
+function reportedStateContent(proposal, evidence, semantic) {
+  const values = proposal.state_family === "identity" ? proposal.draft?.identityClaim?.values : null;
+  if (values?.length > 1) {
+    return [clean(proposal.metadata?.target?.subjectLabel), clean(proposal.metadata?.target?.stateLabel)]
+      .filter(Boolean).join(" · ") + "：\n" + values.map(item => clean(item.valueScope)
+        ? clean(item.valueText) + " (" + clean(item.valueScope) + ")" : clean(item.valueText)).filter(Boolean).join("; ");
+  }
+  if (semantic) return semantic.content;
+  const statements = [...new Set((evidence.contributions || []).map(item => clean(item.detail.memory.content)).filter(Boolean))];
+  return statements.length > 1 ? statements.join("\n") : evidence.contentSnapshot;
+}
+
 function materializeState(repository, proposal, evidence) {
   const validityStart = iso(proposal.draft.validFrom, "validity start");
   const pending = repository.getMemory(provisionalStateId(proposal));
@@ -234,19 +287,20 @@ function materializeState(repository, proposal, evidence) {
     .digest("hex")
     .slice(0, 24)}`;
   const stateLabel = clean(proposal.metadata?.target?.stateLabel);
+  const semantic = semanticDraft(repository, proposal);
   return repository.upsertMemory({
     id: memoryId,
     agentId: proposal.agent_id,
     kind: proposal.proposed_kind,
     layer: memoryLayer(proposal.state_family),
-    title: semanticDraft(repository, proposal)?.title ?? stateLabel,
-    content: semanticDraft(repository, proposal)?.content ?? evidence.contentSnapshot,
+    title: semantic?.title ?? stateLabel,
+    content: reportedStateContent(proposal, evidence, semantic),
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
     canonicalKey: proposal.canonical_key,
-    reality: "real",
-    worldId: pending?.world_id || evidence.detail.memory.world_id,
-    worldFrame: pending?.world_frame || evidence.detail.memory.world_frame,
+    reality: semantic?.reality || pending?.reality || evidence.detail.memory.reality,
+    worldId: semantic?.world_id || pending?.world_id || evidence.detail.memory.world_id,
+    worldFrame: semantic?.world_frame || pending?.world_frame || evidence.detail.memory.world_frame,
     evidenceMode: "explicit",
     representationLayer: "reported",
     stateFamily: proposal.state_family,
@@ -280,40 +334,48 @@ function materializeState(repository, proposal, evidence) {
 function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
   challenged = false,
   provisional = false,
+  reuseExisting = false,
 } = {}) {
-  const sourceById = new Map(evidence.detail.sources.map((source) => [source.id, source]));
-  for (const sourceId of evidence.observation.sourceIds) {
-    const source = sourceById.get(sourceId);
-    repository.linkSource(targetMemory.id, sourceId, `reported_state_${proposal.action}`, {
-      authority: clean(source?.authority) || "subject_firsthand",
-      sourceTrust: bounded(source?.source_trust, 0.8),
-      evidenceStrength: bounded(evidence.observation.confidence, 0.75),
-      provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
-      metadata: {
-        reportedStateProposalId: proposal.id,
-        stateFamily: proposal.state_family,
-        action: proposal.action,
-        observationId: evidence.observation.id,
-      },
-    });
-  }
-  if (targetMemory.id !== evidence.detail.memory.id) {
-    repository.upsertEdge({
-      agentId: proposal.agent_id,
-      fromMemoryId: targetMemory.id,
-      toMemoryId: evidence.detail.memory.id,
-      relation: challenged ? "challenged_by" : "supported_by",
-      direction: "directed",
-      weight: challenged ? 0.8 : 0.9,
-      confidence: bounded(evidence.observation.confidence, 0.75),
-      provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
-      metadata: {
-        reportedStateProposalId: proposal.id,
-        stateFamily: proposal.state_family,
-        action: proposal.action,
-        observationId: evidence.observation.id,
-      },
-    });
+  const existingDraft = reuseExisting ? readReportedStateDraft(targetMemory) : {};
+  const existingObservations = new Set(existingDraft.evidenceObservationIds || []);
+  const existingSources = new Set(existingDraft.evidenceSourceIds || []);
+  for (const contribution of evidence.contributions || [evidence]) {
+    if (existingObservations.has(contribution.observation.id)) continue;
+    const sourceById = new Map(contribution.detail.sources.map((source) => [source.id, source]));
+    for (const sourceId of contribution.observation.sourceIds) {
+      if (existingSources.has(sourceId)) continue;
+      const source = sourceById.get(sourceId);
+      repository.linkSource(targetMemory.id, sourceId, `reported_state_${proposal.action}`, {
+        authority: clean(source?.authority) || "subject_firsthand",
+        sourceTrust: bounded(source?.source_trust, 0.8),
+        evidenceStrength: bounded(contribution.observation.confidence, 0.75),
+        provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
+        metadata: {
+          reportedStateProposalId: proposal.id,
+          stateFamily: proposal.state_family,
+          action: proposal.action,
+          observationId: contribution.observation.id,
+        },
+      });
+    }
+    if (targetMemory.id !== contribution.detail.memory.id) {
+      repository.upsertEdge({
+        agentId: proposal.agent_id,
+        fromMemoryId: targetMemory.id,
+        toMemoryId: contribution.detail.memory.id,
+        relation: challenged ? "challenged_by" : "supported_by",
+        direction: "directed",
+        weight: challenged ? 0.8 : 0.9,
+        confidence: bounded(contribution.observation.confidence, 0.75),
+        provenance: provisional ? "pending-reported-state-proposal-v1" : "accepted-reported-state-proposal-v1",
+        metadata: {
+          reportedStateProposalId: proposal.id,
+          stateFamily: proposal.state_family,
+          action: proposal.action,
+          observationId: contribution.observation.id,
+        },
+      });
+    }
   }
 }
 
@@ -370,15 +432,18 @@ export function materializeReportedStateProposal(repository, { agentId, proposal
         transition = { memoryId: current.id, before: fields(current), applied: fields(closed) };
       }
     }
+    const semantic = semanticDraft(repository, proposal);
     const memory = repository.upsertMemory({
       id: provisionalStateId(proposal), agentId: proposal.agent_id,
       kind: proposal.proposed_kind || previous?.kind,
       layer: "provisional", status: "archived",
-      title: semanticDraft(repository, proposal)?.title ?? (clean(proposal.metadata?.target?.stateLabel) || previous?.title || ""),
-      content: semanticDraft(repository, proposal)?.content ?? evidence.contentSnapshot,
+      title: semantic?.title ?? (clean(proposal.metadata?.target?.stateLabel) || previous?.title || ""),
+      content: reportedStateContent(proposal, evidence, semantic),
       subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
-      canonicalKey: proposal.canonical_key, reality: "real", evidenceMode: "explicit",
-      worldId: evidence.detail.memory.world_id, worldFrame: evidence.detail.memory.world_frame,
+      canonicalKey: proposal.canonical_key, evidenceMode: "explicit",
+      reality: semantic?.reality || evidence.detail.memory.reality,
+      worldId: semantic?.world_id || evidence.detail.memory.world_id,
+      worldFrame: semantic?.world_frame || evidence.detail.memory.world_frame,
       representationLayer: "reported", stateFamily: proposal.state_family,
       stateScopeKey: proposal.proposed_scope_key,
       statePhase: terminal?.statePhase || proposal.state_phase || previous?.state_phase,
@@ -405,6 +470,9 @@ export function materializeReportedStateProposal(repository, { agentId, proposal
       provenance: 'pending-reported-state-proposal-v1',
       metadata: { reportedStateProposalId: proposal.id, transition: proposal.action },
     });
+    enqueueMemoryMaintenanceTasks({ repository, agentId: proposal.agent_id,
+      batchId: 'pending-reported-state:' + memory.id, memoryIds: [memory.id],
+      taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding] });
     return { status: "created", proposal, memory };
   });
 }
@@ -594,7 +662,18 @@ export function resolveReportedStateProposal(repository, {
     rejectUnsafeRootTransition(repository, proposal, current);
 
     if (SAME_STATE_ACTIONS.has(proposal.action)) {
-      attachSelectedEvidence(repository, proposal, current, evidence);
+      attachSelectedEvidence(repository, proposal, current, evidence, { reuseExisting: true });
+      {
+        const draft = readReportedStateDraft(current);
+        const evidenceFields = ["evidenceObservationIds", "evidenceMemoryIds", "evidenceSourceIds"];
+        if (evidenceFields.some(field => (proposal.draft[field] || []).some(id => !draft[field]?.includes(id)))) {
+          repository.updateMemoryMetadata({ agentId: proposal.agent_id, memoryId: current.id,
+            metadata: { ...current.metadata, reportedStateDraft: { ...draft,
+              ...Object.fromEntries(evidenceFields.map(field => [field,
+                [...new Set([...(draft[field] || []), ...(proposal.draft[field] || [])])]])),
+            } }, reason: "Retain accepted state confirmation evidence." });
+        }
+      }
       return finish(
         repository,
         proposal,

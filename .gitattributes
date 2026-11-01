@@ -12,3 +12,5 @@
 *.html text eol=lf
 *.css text eol=lf
 *.svg text eol=lf
+SHA256SUMS text eol=lf
+benchmarks/locomo/2026-11-01/judge-prompt.md whitespace=-blank-at-eol

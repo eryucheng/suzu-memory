@@ -1,7 +1,8 @@
+import { proposeReportedStateFromReview } from '../../analysis/src/reported-state-persistence.mjs';
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { MemoryRepository, openMemoryDatabase, resolveReportedStateProposal } from "@suzu-memory/core";
 import { reviewReportedPreferenceState } from "../src/index.mjs";
 
 const KEY = "user:preference:fish";
@@ -29,10 +30,10 @@ function setup({ withCurrent = false, withEstablished = false } = {}) {
       knownAt: "2026-07-01T08:00:00.000Z",
       validFrom: "2026-07-01T08:00:00.000Z",
       metadata: {
-        reportedPreference: {
+        reportedStateDraft: { preferenceClaim: {
           polarity: "positive",
           scope: { kind: "category", label: "鱼", context: "" },
-        },
+        } },
       },
     });
   }
@@ -125,7 +126,7 @@ function addObservation(repository, {
     qualification,
     confidence: 0.9,
     origin: "deterministic",
-    scope: { kind: targetMatch, label: scopeLabel, context: contextLabel },
+    scope: { kind: targetMatch, label: scopeLabel, context: contextLabel, currentRepresentationLayer: "reported" },
     payloadSchemaVersion: "preference-specialist-merged-v2",
     payload: {
       objectGrounding: { targetMatch, matchedLabel },
@@ -339,3 +340,22 @@ test("denial of prior attribution does not silently rewrite the current state", 
   assert.equal(fixture.repository.getMemory(fixture.current.id).status, "active");
   fixture.database.close();
 });
+
+for (const sourceContent of ['我喜欢吃鱼。', 'I like fish.']) {
+  test('reinforces a preference after the real proposal has been accepted: ' + sourceContent, t => {
+    const fixture = setup();
+    t.after(() => fixture.database.close());
+    for (const [id, observedAt, action] of [['first', '2026-07-10T12:00:00.000Z', 'create'],
+      ['second', '2026-07-11T12:00:00.000Z', 'reinforce']]) {
+      addObservation(fixture.repository, { id, observedAt, sourceContent });
+      const result = review(fixture.repository);
+      assert.equal(result.status, 'ready', result.reason);
+      assert.equal(result.action, action);
+      const pending = proposeReportedStateFromReview({ repository: fixture.repository,
+        reviewResult: result, reviewVersion: 'reported-preference-roundtrip-v1' });
+      const accepted = resolveReportedStateProposal(fixture.repository, { agentId: 'agent-test',
+        proposalId: pending.proposal.id, action: 'accept' });
+      assert.ok(accepted.memory.metadata.reportedStateDraft.preferenceClaim);
+    }
+  });
+}

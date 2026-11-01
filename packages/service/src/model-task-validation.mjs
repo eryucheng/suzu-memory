@@ -1,15 +1,16 @@
 import { isDeepStrictEqual } from 'node:util';
-import { LONG_TERM_EXTRACTION_SCHEMA, normalizeGeneratedLongTermExtraction, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, normalizeGeneratedExtractionRepair, parseGeneratedExtractionRepair,
+  normalizeGeneratedLongTermExtraction, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import * as analysis from '@suzu-memory/analysis';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA,
-  parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration } from '@suzu-memory/structurer';
+  parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration, proposalSchemaForLimit } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA,
   parseMemoryRetrievalContextProposal, parseMemoryRetrievalContextCritique } from '@suzu-memory/embedding-indexer';
 
 const tasks = new Map([
   ['memory-event-continuity-v2', [analysis.EVENT_CONTINUITY_SCHEMA, analysis.parseEventContinuity]],
   ['long-term-memory-extraction-v2', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
-  ['long-term-memory-extraction-repair-v2', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
+  ['long-term-memory-extraction-repair-v3', [LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair]],
   ['memory-structure-proposals-v1', [MEMORY_STRUCTURE_OUTPUT_SCHEMA, parseStructureGeneration]],
   ['memory-relation-proposals-v1', [MEMORY_RELATION_OUTPUT_SCHEMA, parseRelationGeneration]],
   ['memory-subject-attribution-v1', [MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA, parseSubjectAttributionGeneration]],
@@ -29,6 +30,29 @@ for (const { definition, parse } of definitions) tasks.set(definition.schemaName
 const invalid = message => Object.assign(new Error(message), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
 const objectSchema = properties => ({ type: 'object', additionalProperties: false,
   required: Object.keys(properties), properties });
+
+function declaredAnalysisSchema(definition, declared) {
+  const count = declared?.properties?.analyses?.maxItems;
+  let expected = definition.schema;
+  if (count !== undefined) {
+    const properties = definition.schema.properties.analyses.items.properties;
+    const relationField = ['peerRelations', 'valueRelations'].find(key => Object.hasOwn(properties, key));
+    const comparisonCount = relationField
+      ? declared?.properties?.analyses?.items?.properties?.[relationField]?.maxItems + 1 : count;
+    try { expected = analysis.analysisSchemaForCount(definition.schema, count, comparisonCount); }
+    catch { throw invalid('A specialist request requires a finite non-negative input count.'); }
+  }
+  if (!isDeepStrictEqual(declared, expected)) throw invalid('Specialist analysis changed its result contract.');
+  return expected;
+}
+
+function declaredProposalSchema(template, declared) {
+  let expected;
+  try { expected = proposalSchemaForLimit(template, declared?.properties?.proposals?.maxItems); }
+  catch { throw invalid('A proposal request requires a finite non-negative budget.'); }
+  if (!isDeepStrictEqual(declared, expected)) throw invalid('Proposal generation changed its result contract.');
+  return expected;
+}
 
 // Only the keywords used by the registered owner contracts are supported.
 // This checks the declared wire shape before the existing domain parser (some
@@ -80,15 +104,27 @@ function resolveTaskParser(request) {
   }
   const task = tasks.get(request?.schemaName);
   if (task) {
-    if (!isDeepStrictEqual(request.schema, task[0])) throw invalid('The Memory task schema changed without a version change.');
+    if (task[1] === parseStructureGeneration || task[1] === parseRelationGeneration) {
+      const schema = declaredProposalSchema(task[0], request.schema);
+      return output => task[1](output, { maximumProposals: schema.properties.proposals.maxItems });
+    }
+    const specialist = definitions.find(item => item.definition.schemaName === request.schemaName);
+    if (specialist) declaredAnalysisSchema(specialist.definition, request.schema);
+    else if (!isDeepStrictEqual(request.schema, task[0])) throw invalid('The Memory task schema changed without a version change.');
     return task[1];
   }
   if (request?.schemaName === 'memory-consolidation-combined-v1') {
-    const schemas = { structure: MEMORY_STRUCTURE_OUTPUT_SCHEMA, relations: MEMORY_RELATION_OUTPUT_SCHEMA };
+    const schemas = {
+      structure: declaredProposalSchema(MEMORY_STRUCTURE_OUTPUT_SCHEMA, request.schema?.properties?.structure),
+      relations: declaredProposalSchema(MEMORY_RELATION_OUTPUT_SCHEMA, request.schema?.properties?.relations),
+    };
     if (!isDeepStrictEqual(request.schema, objectSchema(schemas))) {
       throw invalid('Combined consolidation requires exactly structure and relations.');
     }
-    return output => ({ structure: parseStructureGeneration(output.structure), relations: parseRelationGeneration(output.relations) });
+    return output => ({
+      structure: parseStructureGeneration(output.structure, { maximumProposals: schemas.structure.properties.proposals.maxItems }),
+      relations: parseRelationGeneration(output.relations, { maximumProposals: schemas.relations.properties.proposals.maxItems }),
+    });
   }
   const combined = /^memory-([a-z_]+)-(evidence|comparison)-combined-v1$/u.exec(request?.schemaName || '');
   if (combined) {
@@ -98,7 +134,9 @@ function resolveTaskParser(request) {
       && (item.definition.stateFamily || 'state') === combined[1]
       && (['current-relation', 'time-current-relation'].includes(item.definition.role) ? 'comparison' : 'evidence') === combined[2]));
     if (selected.some(item => !item)) throw invalid('Combined analysis contains an unknown analyzer or phase.');
-    const schemas = Object.fromEntries(selected.map(item => [item.key, item.definition.schema]));
+    const schemas = Object.fromEntries(selected.map(item => [item.key,
+      declaredAnalysisSchema(item.definition, request.schema?.properties?.results?.properties?.[item.key]),
+    ]));
     if (!isDeepStrictEqual(request.schema, objectSchema({ results: objectSchema(schemas) }))) throw invalid('Combined analysis changed its result contract.');
     return output => ({ results: Object.fromEntries(selected.map(item => [item.key, item.parse(output.results[item.key])])) });
   }
@@ -117,6 +155,7 @@ export function isMemoryStateAnalysisRequest(request) {
 export function validateMemoryTaskOutput(request, output) {
   const parse = resolveTaskParser(request);
   if (parse === parseGeneratedLongTermExtraction) output = normalizeGeneratedLongTermExtraction(output);
+  if (parse === parseGeneratedExtractionRepair) output = normalizeGeneratedExtractionRepair(output);
   validateWireShape(request.schema, output);
   return parse(output);
 }

@@ -35,7 +35,7 @@ test("structure generation receives full memories, titles and existing container
   const topic = args.repository.upsertTopic({ agentId: args.agentId, title: "展览", content: previous });
   let received;
   await proposeStructuresForBatch({ ...args, nearbyContainerIds: [topic.id], generator: async ({ input }) => {
-    received = JSON.parse(input.slice(input.indexOf("\n\n{") + 2));
+    received = JSON.parse(input.slice(input.indexOf("{")));
     return { output: { proposals: [] } };
   } });
   assert.equal(received.currentMemories[0].content, content);
@@ -51,7 +51,7 @@ test("relation generation receives complete evidence including its final causal 
   const args = fixture(t, { content, sourceContent });
   let received;
   await proposeRelationsForBatch({ ...args, generator: async ({ input }) => {
-    received = JSON.parse(input.slice(input.indexOf("\n\n{") + 2));
+    received = JSON.parse(input.slice(input.indexOf("{")));
     return { output: { proposals: [] } };
   } });
   assert.equal(received.memories[0].content, content);

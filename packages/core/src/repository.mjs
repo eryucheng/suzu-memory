@@ -1,3 +1,5 @@
+import { retirePendingMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
+import { readReportedStateDraft } from "./reported-state-policy.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from './calendar-time.mjs';
 import { normalizedSearchDocument, removeSearchRows } from './search-index.mjs';
@@ -4354,9 +4356,9 @@ export class MemoryRepository {
       requestIds.add(clean(run.metadata?.stateAnalysisRequestId));
     }
     if (!targetIsPrimarySubject && !targetHasStructuredRole) {
-      // Raw speech retains its real speaker. A pending identity task can bind
+      // Raw speech retains its real speaker. A pending state task can bind
       // that speech to a different analysis target without changing the archive.
-      const request = normalizedFamily === 'identity' && memory.kind === 'utterance'
+      const request = memory.kind === 'utterance'
         && memory.status === 'active' && requestIds.size === 1 && !requestIds.has('')
         ? this.getStateAnalysisRequest(normalizedAgentId, [...requestIds][0]) : null;
       const verbatimIds = new Set(memoryDetail.sources.filter(source => source.relation === 'verbatim').map(source => source.id));
@@ -6432,6 +6434,16 @@ export class MemoryRepository {
       SELECT * FROM memory_ingestion_decisions
       WHERE agent_id = ? AND batch_id = ? AND candidate_index = ?
     `).get(normalizedAgentId, normalizedBatchId, index));
+  }
+
+  getNextIngestionCandidateIndex(agentId, batchId) {
+    const normalizedAgentId = clean(agentId), normalizedBatchId = clean(batchId);
+    if (!normalizedAgentId || !normalizedBatchId) throw new Error('Reading the next ingestion index requires agentId and batchId.');
+    const row = this.database.prepare(`
+      SELECT candidate_index FROM memory_ingestion_decisions
+      WHERE agent_id = ? AND batch_id = ? ORDER BY candidate_index DESC LIMIT 1
+    `).get(normalizedAgentId, normalizedBatchId);
+    return row ? Number(row.candidate_index) + 1 : 0;
   }
 
   listIngestionDecisions(agentId, {
@@ -9510,9 +9522,7 @@ export class MemoryRepository {
       throw new Error("Affective activation decision requires an affective state for the same Agent.");
     }
     if (enabled) {
-      const claim = memory.metadata?.reportedStateDraft?.affectiveClaim
-        || memory.metadata?.affectiveClaim
-        || null;
+      const claim = readReportedStateDraft(memory).affectiveClaim;
       if (memory.status !== "active" || memory.temporal_state !== "current"
         || !clean(claim?.trigger?.key) || !clean(claim?.trigger?.label)
         || !clean(claim?.emotion?.label)
@@ -9905,6 +9915,7 @@ export class MemoryRepository {
         after = this.getMemory(memoryId);
       }
       if (deleted) {
+        retirePendingMemoryMaintenanceTasks(this, { agentId, memoryId });
         this.database.prepare(`
           DELETE FROM memory_edges
           WHERE agent_id = ? AND provenance = 'association-builder-v1'
@@ -11449,6 +11460,8 @@ export class MemoryRepository {
     layers = [],
     worldId = "",
     worldFrame = "",
+    eligibleMemoryIds = null,
+    acceptMatch = null,
   } = {}) {
     const text = clean(query);
     if (!text) return [];
@@ -11460,6 +11473,8 @@ export class MemoryRepository {
     const normalizedLayers = [...new Set(layers.map(clean).filter(Boolean))];
     const normalizedWorldId = clean(worldId);
     const normalizedWorldFrame = clean(worldFrame);
+    const eligibleClause = eligibleMemoryIds === null
+      ? "" : "AND node.id IN (SELECT value FROM json_each(?))";
     const kindClause = normalizedKinds.length
       ? `AND node.kind IN (${normalizedKinds.map(() => "?").join(", ")})`
       : "";
@@ -11469,49 +11484,82 @@ export class MemoryRepository {
     const worldIdClause = normalizedWorldId ? "AND node.world_id = ?" : "";
     const worldFrameClause = normalizedWorldFrame ? "AND node.world_frame = ?" : "";
     const filters = [
+      ...(eligibleMemoryIds === null ? [] : [JSON.stringify([...eligibleMemoryIds])]),
       ...(normalizedWorldId ? [normalizedWorldId] : []),
       ...(normalizedWorldFrame ? [normalizedWorldFrame] : []),
       ...normalizedKinds,
       ...normalizedLayers,
     ];
+    // The limit counts accepted matches. Iterate the indexed result prefix
+    // so rejected word fragments cannot spend another memory's result slot.
+    const readMatches = (statement, parameters) => {
+      const matches = [];
+      let readAny = false;
+      function* rows(database) {
+        if (typeof statement.iterate === 'function') return yield* statement.iterate(...parameters);
+        if (!acceptMatch) return yield* statement.all(...parameters);
+        // Node 22.5–22.12 has no statement iterator; keep its reads paged.
+        const page = database.prepare(`${statement.sourceSQL} LIMIT ? OFFSET ?`);
+        database.exec('SAVEPOINT memory_search_read');
+        try {
+          for (let offset = 0;; offset += maximum) {
+            const batch = page.all(...parameters, maximum, offset);
+            yield* batch;
+            if (batch.length < maximum) break;
+          }
+        } finally { database.exec('RELEASE memory_search_read'); }
+      }
+      for (const raw of rows(this.database)) {
+        readAny = true;
+        const { search_document: document, ...row } = raw;
+        const memory = normalizeNode(row);
+        if (acceptMatch && !acceptMatch(memory, document)) continue;
+        matches.push(memory);
+        if (matches.length >= maximum) break;
+      }
+      return { matches, readAny };
+    };
+    const limitClause = acceptMatch ? "" : "LIMIT ?";
+    const limitParameters = acceptMatch ? [] : [maximum];
     try {
-      const matches = this.database.prepare(`
-        SELECT node.*, bm25(memory_fts) AS search_rank
+      const { matches, readAny } = readMatches(this.database.prepare(`
+        SELECT node.*, bm25(memory_fts) AS search_rank,
+          memory_fts.title || char(10) || memory_fts.content AS search_document
         FROM memory_fts
         JOIN memory_nodes AS node ON node.id = memory_fts.memory_id
         WHERE memory_fts MATCH ?
           AND memory_fts.agent_id = ?
           AND ${statusClause}
+          ${eligibleClause}
           ${worldIdClause}
           ${worldFrameClause}
           ${kindClause}
           ${layerClause}
         ORDER BY search_rank ASC, node.importance DESC
-        LIMIT ?
-      `).all(`"${text.replaceAll('"', '""')}"`, agentId, ...filters, maximum)
-        .map((row) => ({
-          ...normalizeNode(row),
-          search_rank: Number(row.search_rank),
-        }));
-      if (matches.length) return matches;
-    } catch {
+        ${limitClause}
+      `), [`"${text.replaceAll('"', '""')}"`, agentId, ...filters, ...limitParameters]);
+      if (readAny) return matches;
+    } catch (error) {
+      if (error.code !== 'ERR_SQLITE_ERROR') throw error;
       // Short queries and builds without the preferred tokenizer use LIKE below.
     }
     const pattern = `%${text.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
-    return this.database.prepare(`
-      SELECT node.*, 0 AS search_rank
+    return readMatches(this.database.prepare(`
+      SELECT node.*, 0 AS search_rank,
+        fts_row.title || char(10) || fts_row.content AS search_document
       FROM memory_nodes AS node
       JOIN memory_fts AS fts_row ON fts_row.memory_id = node.id
         WHERE node.agent_id = ?
           AND ${statusClause}
+          ${eligibleClause}
           ${worldIdClause}
           ${worldFrameClause}
           ${kindClause}
         ${layerClause}
         AND (fts_row.title LIKE ? ESCAPE '\\' OR fts_row.content LIKE ? ESCAPE '\\')
       ORDER BY node.importance DESC, node.recorded_at DESC
-      LIMIT ?
-    `).all(agentId, ...filters, pattern, pattern, maximum).map(normalizeNode);
+      ${limitClause}
+    `), [agentId, ...filters, pattern, pattern, ...limitParameters]).matches;
   }
 
   expand(agentId, seedIds, {

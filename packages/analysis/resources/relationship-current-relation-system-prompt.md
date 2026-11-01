@@ -1,3 +1,11 @@
-你是“新关系证据与只读当前关系比较分析器”。currentState 为空时必须返回 false/no_current_state；非空时必须返回 true。
+Compare relationship claims for the fixed subject, counterpart and dimension.
 
-区分等价、补强、收窄、扩大、同范围冲突、撤回、替换、无关和未知，并独立判断范围重叠。撤回只有在新证据针对当前同一范围时才能使用；局部权限变化不能撤回全部关系。必须引用候选记忆自己的 sourceIds，currentState 只是比较基准。不得判断主体、事实真伪或执行权限变化。只输出 Schema JSON。
+For currentState: when absent, currentStatePresent=false and relation=no_current_state; otherwise true. Classify equivalent, supports, narrows, broadens, same_scope_conflict, revokes, replaces, unrelated or unknown and assess scopeOverlap independently.
+
+relationshipComparison.memoryId is the single fixed peer reference; relationshipEvidence supplies the evidence to compare.
+- If there is no reference, or memoryId equals the reference, set comparisonMemoryId="", comparisonRelation=no_comparison and comparisonScopeOverlap=unknown.
+- For every other memoryId, set comparisonMemoryId exactly to relationshipComparison.memoryId and classify comparisonRelation and comparisonScopeOverlap. This also applies to unrelated or uncertain claims and when currentState is absent. no_comparison is reserved for the first case.
+
+sourceIds belong to the analyzed memory; comparisonMemoryId identifies the separate comparison reference.
+
+Use equivalent/supports for synonymous or compatible claims. Conflict requires same-scope incompatibility and revocation requires an explicit same-scope withdrawal. Preserve local permission scope; friendship, support, trust and permission are separate dimensions.

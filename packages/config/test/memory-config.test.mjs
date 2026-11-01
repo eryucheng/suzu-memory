@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 
 import {
   createMemoryServiceFromConfig,
@@ -15,6 +16,29 @@ import {
 function temporaryDirectory() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-config-"));
 }
+
+test('generation output defaults agree across config and direct providers while explicit budgets remain effective', async () => {
+  const connection = { baseUrl: 'https://provider.test/v1', model: 'fixture', apiKey: 'fixture-key' };
+  for (const maximum of [undefined, 2048]) {
+    const expected = maximum ?? 32768;
+    const config = normalizeMemoryConfig({ version: 1, agentId: 'agent-test', providers: {
+      generation: { ...connection, ...(maximum === undefined ? {} : { maxOutputTokens: maximum }) },
+      intervention: connection,
+    } });
+    assert.equal(config.providers.generation.maxOutputTokens, expected);
+    assert.equal(config.providers.intervention.maxOutputTokens, 512);
+    const requests = [];
+    const fetchImpl = async (_url, request) => {
+      requests.push(JSON.parse(request.body));
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200 });
+    };
+    const configured = createProvidersFromMemoryConfig(config, { fetchImpl }).generator;
+    const direct = createOpenAiCompatibleStructuredGenerator({ connection, fetchImpl,
+      ...(maximum === undefined ? {} : { maxOutputTokens: maximum }) });
+    for (const generator of [configured, direct]) assert.deepEqual((await generator({ input: 'evidence' })).output, { ok: true });
+    assert.deepEqual(requests.map(request => request.max_tokens), [expected, expected]);
+  }
+});
 
 test("config resolves portable paths relative to its own file", () => {
   const directory = temporaryDirectory();

@@ -1,11 +1,8 @@
-import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
+import { modelCalendarFields, STATE_IDENTITY_FIELDS, normalizeStateAnalysisTargetSpec } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import {
   IDENTITY_ANALYZERS,
   buildIdentityGenerationInput,
@@ -15,11 +12,6 @@ import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_DIRECTORY = path.join(ROOT, "resources");
-const FIELDS = new Set([
-  "name", "alias", "birth_date", "birth_year", "age", "gender", "pronouns",
-  "occupation", "employer", "education", "residence", "hometown", "nationality",
-  "biography", "other",
-]);
 const CARDINALITIES = new Set(["single", "multi_item", "sequence"]);
 
 function clean(value) {
@@ -88,6 +80,9 @@ function enforce(role, item, snapshot) {
   if (item.sourceIds.some((sourceId) => !sourceIds.has(sourceId))) {
     throw new Error("Identity analysis source must directly support its memory.");
   }
+  if (role === "field-value" && item.valueRelations.some(peer => !snapshot.memories.some(memory => memory.id === peer.memoryId))) {
+    throw new Error("Identity value relation must stay within the bounded evidence snapshot.");
+  }
   if (role === "field-value" && item.identityField !== snapshot.target.identityField) {
     throw new Error("Identity analyzer changed the caller-fixed identityField.");
   }
@@ -117,78 +112,15 @@ function enforce(role, item, snapshot) {
   return item;
 }
 
-async function appendUsage({ usageLedgerPath, generation, definition, agentId, batch }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId,
-      provider: generation.metadata?.provider || "",
-      model: generation.model,
-      source: "memory-evaluation",
-      feature: `memory-identity-${definition.role}`,
-      requestId: generation.requestId || "",
-      usage: generation.usage,
-      metadata: { batchId: batch, durationMs: Number(generation.durationMs || 0), ...generation.metadata },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invoke({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(
-    path.join(path.resolve(promptDirectory), definition.promptFile),
-    "utf8",
-  ).replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildIdentityGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({
-      input,
-      systemPrompt: analysisSystemPrompt(systemPrompt),
-      schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-      stateFamily: "identity",
-      analyzerRole: definition.role,
-    });
-    const parsed = parseIdentityGeneration(definition.role, generation?.output, { maximumAnalyses });
-    const analyses = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, item] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(item.memoryId)) throw new Error("Duplicate identity memory analysis.");
-        analyses.push(enforce(definition.role, item, snapshot));
-        seen.add(item.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: item.memoryId, error: error.message });
-      }
-    }
-    return {
-      definition,
-      input,
-      generation,
-      analyses,
-      rejected,
-      status: analyses.length ? "completed" : rejected.length ? "rejected" : "abstained",
-      error: "",
-    };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return {
-      definition,
-      input,
-      generation,
-      analyses: [],
-      rejected: [],
-      status: "failed",
-      error: error.message,
-    };
-  }
+
+async function invoke(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildIdentityGenerationInput, prepareInputSnapshot: (view, definition) => {
+    const ids = new Set(view.memories.map(memory => memory.id));
+    const peers = definition.role === "field-value" ? options.snapshot.memories
+      .filter(memory => !ids.has(memory.id)).map(memory => ({ memoryId: memory.id, content: memory.content })) : [];
+    return peers.length ? { ...view, comparisonMemories: peers } : view;
+  }, parseGeneration: parseIdentityGeneration, enforceBoundary: enforce });
 }
 
 function mapBy(items) {
@@ -274,9 +206,9 @@ function action({ qualification, field, time, relation, current, cardinality }) 
     return { ...base, action: "reinforce", reason: "same-identity-fact-supports-current-state" };
   }
   if (relation.relation === "additional_value") {
-    return { ...base, action: "review_required", reason: cardinality === "multi_item"
-      ? "multi-value-identity-item-requires-a-value-scoped-canonical-key"
-      : "additional-value-does-not-match-field-cardinality" };
+    return { ...base, action: cardinality === "multi_item" ? "accumulate_evidence" : "review_required",
+      reason: cardinality === "multi_item" ? "additional-identity-value-awaits-lossless-set-review"
+        : "additional-value-does-not-match-field-cardinality" };
   }
   if (relation.relation === "value_changed") {
     return { ...base, action: "supersede", reason: "subject-explicitly-reports-a-current-identity-change" };
@@ -307,6 +239,7 @@ function merge({ evaluation, persistEvidenceLedger }) {
   const observations = [];
   const previews = [];
   for (const memoryId of memoryIds) {
+    if (Object.values(maps).some(map => !map.has(memoryId))) continue;
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const field = maps.fieldValue?.get(memoryId) || null;
     const subject = maps.subjectAttribution?.get(memoryId) || null;
@@ -407,19 +340,20 @@ export async function evaluateIdentityEvidence({
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
   snapshotOptions = {},
-  maximumAnalyses = 60,
+  maximumAnalyses = Infinity,
   persistEvidenceLedger = true,
 } = {}) {
   if (!repository) throw new Error("Identity evaluation requires a repository.");
   if (clean(subjectRole) === "shared") {
     throw new Error("Identity evaluation requires an individual fixed subject.");
   }
-  if (!FIELDS.has(clean(identityField)) || !clean(identityLabel)) {
+  if (!STATE_IDENTITY_FIELDS.includes(clean(identityField)) || !clean(identityLabel)) {
     throw new Error("Identity evaluation requires a fixed identity field and readable label.");
   }
   if (!CARDINALITIES.has(clean(fieldCardinality))) {
     throw new Error("Identity evaluation requires an explicit field cardinality policy.");
   }
+  normalizeStateAnalysisTargetSpec("identity", { identityField: clean(identityField), fieldCardinality: clean(fieldCardinality) }, { allowEmpty: false });
   for (const key of Object.keys(IDENTITY_ANALYZERS)) {
     if (typeof analyzers[key] !== "function") {
       throw new Error(`Identity evaluation requires analyzers.${key}.`);
@@ -506,6 +440,7 @@ export async function evaluateIdentityEvidence({
     };
   }
   const definitions = Object.entries(IDENTITY_ANALYZERS);
+  const previousRuns = priorAnalyzerRuns(repository, snapshot, batch, definitions, snapshotOptions);
   const invocations = await Promise.all(definitions.map(async ([key, definition]) => [
     key,
     await invoke({
@@ -513,66 +448,15 @@ export async function evaluateIdentityEvidence({
       generator: analyzers[key],
       snapshot,
       promptDirectory,
-      maximumAnalyses,
+      maximumAnalyses, previousRuns,
     }),
   ]));
-  const sourceIds = unique(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
-  const warnings = [];
-  for (const [key, call] of invocations) {
-    const warning = await appendUsage({
-      usageLedgerPath,
-      generation: call.generation,
-      definition: call.definition,
-      agentId: clean(agentId),
-      batch,
-    });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId),
-      batchId: batch,
-      stateFamily: "identity",
-      analyzerRole: call.definition.role,
-      subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(call.generation?.metadata?.provider) || "unreported",
-      model: clean(call.generation?.model) || "unreported",
-      promptVersion: call.definition.promptVersion,
-      schemaVersion: call.definition.schemaName,
-      inputHash: createHash("sha256").update(call.input).digest("hex"),
-      status: call.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id),
-      sourceIds,
-      output: call.generation?.output ?? {},
-      rejected: call.rejected,
-      usage: call.generation?.usage || {},
-      costAmount: Number(call.generation?.costAmount ?? call.generation?.metadata?.costAmount ?? 0) || 0,
-      costCurrency: clean(call.generation?.costCurrency ?? call.generation?.metadata?.costCurrency),
-      requestId: clean(call.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(call.generation?.durationMs) || 0)),
-      errorMessage: call.error,
-      metadata: {
-        stateAnalysisRequestId: clean(snapshotOptions.analysisRequestId),
-        identityField: clean(identityField),
-        fieldCardinality: clean(fieldCardinality),
-        currentRepresentationLayer: clean(currentRepresentationLayer),
-        automaticStateWriteAllowed: false,
-      },
-    });
-    analyses[key] = call.analyses;
-    rejected[key] = call.rejected;
-  }
-  const failedRoles = definitions
-    .map(([key]) => key)
-    .filter((key) => ["failed", "rejected"].includes(runs[key].status));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId: batch, stateFamily: 'identity', snapshot, invocations, usageLedgerPath,
+    metadata: { stateAnalysisRequestId: clean(snapshotOptions.analysisRequestId), identityField: clean(identityField), fieldCardinality: clean(fieldCardinality), currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false },
+  });
   const evaluation = { repository, batchId: batch, snapshot, runs, analyses };
-  let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) {
-    merged = repository.transaction(() => merge({ evaluation, persistEvidenceLedger }));
-  }
+  const merged = repository.transaction(() => merge({ evaluation, persistEvidenceLedger }));
   const any = Object.values(analyses).some((items) => items.length);
   return {
     status: failedRoles.length ? "incomplete" : any ? "analyzed" : "abstained",

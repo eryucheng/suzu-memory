@@ -1,3 +1,4 @@
+import { repairExtractionCandidates } from './extraction-repair.mjs';
 import {
   archiveLongTermEvidence,
   buildLongTermExtractionInput,
@@ -38,7 +39,7 @@ function looseExtractionObject(output) {
   }
 }
 
-function retainValidExtractionCandidates(output) {
+function retainValidExtractionCandidates(output, context) {
   const parsed = looseExtractionObject(output);
   if (!parsed || !Array.isArray(parsed.memories)) return null;
   const memories = [];
@@ -46,7 +47,7 @@ function retainValidExtractionCandidates(output) {
   const invalidCandidates = [];
   parsed.memories.forEach((candidate, index) => {
     try {
-      memories.push(parseGeneratedLongTermExtraction({ memories: [candidate] }).memories[0]);
+      memories.push(parseGeneratedLongTermExtraction({ memories: [candidate] }, context).memories[0]);
     } catch (error) {
       rejected.push({ index, reason: clean(error?.message).slice(0, 500) });
       invalidCandidates.push(candidate);
@@ -58,34 +59,6 @@ function retainValidExtractionCandidates(output) {
     invalidCandidates,
     originalCount: parsed.memories.length,
   };
-}
-
-function mergeExtractionCandidates(...groups) {
-  const merged = [];
-  const seen = new Set();
-  for (const candidate of groups.flat()) {
-    const key = JSON.stringify(candidate);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(candidate);
-  }
-  return merged;
-}
-
-function extractionRepairLanguageInstruction(messages = []) {
-  const references = messages
-    .map((message) => ({
-      ref: clean(message?.memoryRef),
-      language: clean(message?.sourceLanguage).toLowerCase(),
-    }))
-    .filter((item) => item.ref && ["zh", "en", "mixed"].includes(item.language));
-  if (!references.length) return [];
-  return [
-    "Preserve each candidate's source language while repairing it.",
-    "Use sourceRefs and this source-language map; do not translate a candidate merely to make the batch uniform.",
-    "If every sourceRef is zh, write title, content, and stateLabel in Chinese. If every sourceRef is en, write them in English. Use mixed wording only when the candidate's own direct sources are mixed.",
-    `Source-language map: ${references.map((item) => `${item.ref}=${item.language}`).join(", ")}.`,
-  ];
 }
 
 function companionEventFragment(event) {
@@ -333,8 +306,10 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
   memoriesOverride = null, systemPrompt = '', timeZone }) {
   const { built, request: generationRequest } = buildCompanionExtractionRequest({ events,
     previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt, timeZone });
+  const timeContext = { messages: built.messages, timeZone: built.timeZone };
   if (Array.isArray(memoriesOverride)) {
     return {
+      timeZone: built.timeZone,
       participants: built.participants,
       messages: built.messages,
       archiveWindows: built.archiveWindows,
@@ -342,7 +317,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       continuationGuidanceMessages: built.continuationGuidanceMessages,
       input: built.input,
       generation: {
-        output: parseGeneratedLongTermExtraction({ memories: memoriesOverride }),
+        output: parseGeneratedLongTermExtraction({ memories: memoriesOverride }, timeContext),
         usage: {},
         model: "",
         requestId: "",
@@ -366,110 +341,55 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
   assertEventSourceExecutionCurrent();
   let parsedOutput;
   try {
-    parsedOutput = parseGeneratedLongTermExtraction(generation.output);
+    parsedOutput = parseGeneratedLongTermExtraction(generation.output, timeContext);
   } catch (validationError) {
-    const initialSalvage = retainValidExtractionCandidates(generation.output);
-    let repair = null;
-    let repairError = null;
-    const initialFullyRecoverable = initialSalvage
-      && initialSalvage.rejected.length === 0
-      && initialSalvage.originalCount === initialSalvage.output.memories.length;
-    if (initialFullyRecoverable) {
-      parsedOutput = initialSalvage.output;
-    } else {
+    const salvage = retainValidExtractionCandidates(generation.output, timeContext);
+    const initialRequestId = generation.requestId;
+    const valid = salvage?.output.memories || [];
+    let repair = { memories: [], recoveredCount: 0, rejected: [], failures: [], returnedCount: 0, generations: [], state: null };
+    const candidates = salvage ? salvage.invalidCandidates.map((candidate, index) => ({
+      index: salvage.rejected[index].index, candidate, reason: salvage.rejected[index].reason,
+    })) : [{ index: 0, candidate: null, rawOutput: generation.output, reason: clean(validationError.message) }];
+    if (candidates.length) {
       try {
-        const invalidOutput = initialSalvage
-          ? { memories: initialSalvage.invalidCandidates }
-          : generation.output;
-        repair = await generator({
-          input: JSON.stringify({
-            validationError: clean(validationError?.message),
-            validationErrors: initialSalvage?.rejected.map((item, index) => ({
-              index, originalIndex: item.index, reason: item.reason,
-            })) || [],
-            invalidOutput,
-            preservedValidCandidates: initialSalvage?.output.memories.length || 0,
-          }),
-          systemPrompt: [
-            "Repair only the supplied invalid long-term-memory extraction candidates.",
-            "Return valid json only and follow the supplied schema exactly.",
-            "Valid candidates from the initial response are preserved by code and are not included here.",
-            "Preserve supported facts and sourceRefs; do not add memories, facts, people, dates, or evidence.",
-            "Change only fields required to satisfy the validation error and schema.",
-            "Each validationErrors index identifies one candidate in invalidOutput.memories. Fix every listed error, not only the first one.",
-            "Omit stateTarget entirely for families whose schema branch forbids it; do not reuse belief targets for preference, value, or goal.",
-            "If a candidate cannot be repaired without inferring a missing target or fact, omit that candidate.",
-            ...extractionRepairLanguageInstruction(built.messages),
-          ].join("\n"),
-          schema: LONG_TERM_EXTRACTION_SCHEMA,
-          schemaName: "long-term-memory-extraction-repair-v2",
-          ...(generationRequest.sourceMaterial ? { sourceMaterial: generationRequest.sourceMaterial } : {}),
+        repair = await repairExtractionCandidates({
+          state: { candidates, messages: built.messages, participants: built.participants, timeZone: built.timeZone }, generator,
+          sourceMaterial: generationRequest.sourceMaterial,
         });
-        assertEventSourceExecutionCurrent();
-        const repairedOnly = parseGeneratedLongTermExtraction(repair.output);
-        parsedOutput = {
-          memories: mergeExtractionCandidates(
-            initialSalvage?.output.memories || [],
-            repairedOnly.memories,
-          ),
-        };
       } catch (error) {
-        assertEventSourceExecutionCurrent();
-        repairError = error;
+        error.usage = combinedNumericUsage(generation.usage, ...(error.repairGenerations || []).map(item => item.usage));
+        error.metadata = { ...generation.metadata, ...error.metadata, initialRequestId };
+        throw error;
       }
     }
-
-    const repairSalvage = repair ? retainValidExtractionCandidates(repair.output) : null;
-    if (repairError) {
-      const salvagedMemories = mergeExtractionCandidates(
-        initialSalvage?.output.memories || [],
-        repairSalvage?.output.memories || [],
-      );
-      if (repairError?.code === 'MAX_TOKENS' || !salvagedMemories.length) {
-        Object.assign(repairError, { usage: combinedNumericUsage(generation.usage, repair?.usage, repairError.usage),
-          model: repairError.model || repair?.model || generation.model,
-          metadata: { ...(repairError.metadata || repair?.metadata || generation.metadata),
-            initialRequestId: generation.requestId } });
-        throw repairError;
-      }
-      parsedOutput = { memories: salvagedMemories };
-    }
-
-    const numericUsage = combinedNumericUsage(generation.usage, repair?.usage, repairError?.usage);
-    const recoveredCount = mergeExtractionCandidates(initialSalvage?.output.memories || [],
-      repairSalvage?.output.memories || []).length - mergeExtractionCandidates(initialSalvage?.output.memories || []).length;
-    const unresolvedCandidateCount = initialSalvage
-      ? Math.max(0, initialSalvage.rejected.length - recoveredCount) : null;
-    const rejectedCandidates = [
-      ...(initialSalvage?.rejected || []).map((item) => ({ ...item, stage: "initial" })),
-      ...(repairSalvage?.rejected || []).map((item) => ({ ...item, stage: "repair" })),
-    ];
+    parsedOutput = { memories: [...valid, ...repair.memories] };
+    const last = repair.generations.at(-1);
+    const usage = combinedNumericUsage(generation.usage, ...repair.generations.map(item => item.usage));
+    const durationMs = Number(generation.durationMs || 0) + repair.generations.reduce((sum, item) => sum + Number(item.durationMs || 0), 0);
     Object.assign(generation, {
-      ...(repair || {}),
-      output: parsedOutput,
-      usage: numericUsage,
-      durationMs: Number(generation.durationMs || 0) + Number(repair?.durationMs || 0),
+      ...(last || {}), output: parsedOutput, usage, durationMs,
       metadata: {
-        ...(repair?.metadata || generation.metadata || {}),
-        repaired: Boolean(repair && !repairError),
-        salvaged: Boolean(initialSalvage?.output.memories.length || repairError),
-        salvageSource: initialSalvage?.output.memories.length && repairSalvage?.output.memories.length
-          ? "initial+repair"
-          : repairSalvage?.output.memories.length ? "repair"
-            : initialSalvage?.output.memories.length ? "initial" : "",
-        initialCandidateCount: initialSalvage?.originalCount ?? null,
-        initialValidCandidateCount: initialSalvage?.output.memories.length || 0,
-        initialInvalidCandidateCount: initialSalvage?.rejected.length || 0,
-        repairCandidateCount: repairSalvage?.originalCount ?? null,
-        repairValidCandidateCount: repairSalvage?.output.memories.length || 0,
+        ...(last?.metadata || generation.metadata || {}),
+        repaired: Boolean(repair.generations.length && !repair.state),
+        salvaged: Boolean(valid.length),
+        salvageSource: valid.length && repair.memories.length ? 'initial+repair' : repair.memories.length ? 'repair' : valid.length ? 'initial' : '',
+        initialCandidateCount: salvage?.originalCount ?? null,
+        initialValidCandidateCount: valid.length,
+        initialInvalidCandidateCount: candidates.length,
+        repairCandidateCount: repair.returnedCount,
+        repairValidCandidateCount: repair.recoveredCount,
+        repairRejectedCandidateCount: repair.rejected.length,
+        repairRejectedCandidates: repair.rejected,
+        repairAttempts: repair.generations.length,
         finalCandidateCount: parsedOutput.memories.length,
-        unresolvedCandidateCount,
-        candidateValidationIncomplete: unresolvedCandidateCount === null || unresolvedCandidateCount > 0,
-        rejectedCandidates,
-        initialSchemaName: clean(generation.metadata?.schemaName) || generationRequest.schemaName,
-        initialRequestId: clean(generation.requestId),
-        initialValidationError: clean(validationError?.message),
-        repairValidationError: clean(repairError?.message),
+        unresolvedCandidateCount: repair.state?.candidates.length || 0,
+        candidateValidationIncomplete: Boolean(repair.state),
+        extractionRepair: repair.state,
+        rejectedCandidates: [...(salvage?.rejected || []).map(item => ({ ...item, stage: 'initial' })), ...repair.failures],
+        initialSchemaName: generationRequest.schemaName,
+        initialRequestId,
+        initialValidationError: clean(validationError.message),
+        repairValidationError: repair.state ? repair.state.candidates.map(item => item.reason).join('; ') : '',
       },
     });
   }
@@ -489,6 +409,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     knownParticipantRoleCorrections: participantNormalization.corrections,
   };
   return {
+    timeZone: built.timeZone,
     messages: built.messages,
     participants: built.participants,
     archiveWindows: built.archiveWindows,
@@ -500,6 +421,92 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       output: parsedOutput,
     },
   };
+}
+
+export function extractionRepairFailure(generation) {
+  const metadata = generation.metadata || {};
+  if (!metadata.extractionRepair?.candidates.length) return null;
+  return { errorCode: 'MEMORY_EXTRACTION_REPAIR_INCOMPLETE',
+    errorMessage: 'Extraction repair left ' + metadata.extractionRepair.candidates.length + ' candidates unresolved.',
+    attempts: Math.max(1, metadata.repairAttempts || 0),
+    details: { candidateIndices: metadata.extractionRepair.candidates.map(item => item.index),
+      rejectedCandidates: metadata.repairRejectedCandidates || [] } };
+}
+
+function recordExtractionFailure({ repository, agentId, batchId, generated, archive, terminalFailure, completedAt, parentTaskId }) {
+  if (!terminalFailure) return null;
+  const sourceMessages = generated.generation.metadata?.extractionRepair?.messages || generated.messages;
+  const sourceMessageIds = new Set(sourceMessages.map(message => message.id));
+  const memoryIds = archive.utteranceMemoryIds.filter((_, index) => sourceMessageIds.has(generated.messages[index].id));
+  const eventIds = [...new Set(sourceMessages
+    .flatMap(message => message.inputEventIds || [message.inputEventId]).map(clean).filter(Boolean))];
+  const attempts = Math.max(1, Math.trunc(Number(terminalFailure.attempts) || 1));
+  const errorMessage = clean(terminalFailure.errorMessage) || 'Long-term extraction failed.';
+  return repository.recordExhaustedMaintenanceFailure({
+    agentId, lane: 'semantic', taskType: 'long-term-extraction',
+    payload: { batchId, memoryIds, eventIds, stage: 'long-term-extraction',
+      ...(parentTaskId ? { parentTaskId } : {}),
+      ...(generated.generation.metadata?.extractionRepair ? { extractionRepair: generated.generation.metadata.extractionRepair } : {}) },
+    result: { status: 'manual-review-required', failures: [{ stage: 'long-term-extraction',
+      memoryIds, eventIds, errorCode: clean(terminalFailure.errorCode),
+      error: errorMessage, details: terminalFailure.details || {} }] },
+    errorMessage, errorDetails: { code: clean(terminalFailure.errorCode), stage: 'long-term-extraction', ...(terminalFailure.details || {}) },
+    attempts, failedAt: completedAt,
+  });
+}
+
+export async function retryCompanionExtractionRepair({ repository, agentId, task, generator, identity,
+  completedAt, usageLedgerPath, executionTime, reviewedBy = 'human', reviewNote = '' }) {
+  const state = task.payload.extractionRepair;
+  const assertSourcesAvailable = () => {
+    if (task.payload.eventIds.some(id => {
+      const event = repository.getInputEvent(agentId, id);
+      return !event || event.status !== 'archived' || event.lifecycle !== 'active';
+    })) {
+      throw new Error('Only active archived input events can be retried from human review.');
+    }
+  };
+  assertSourcesAvailable();
+  const execution = currentEventSourceExecution();
+  const sourceMaterial = execution?.sourceScope ? eventSourceMaterial(repository, agentId, [], [], task.payload.eventIds) : undefined;
+  const repair = await repairExtractionCandidates({ state, generator, sourceMaterial });
+  const normalized = normalizeExtractionParticipantRoles({ memories: repair.memories }, state.participants);
+  const generation = { output: normalized.output,
+    usage: combinedNumericUsage(...repair.generations.map(item => item.usage)),
+    durationMs: repair.generations.reduce((sum, item) => sum + Number(item.durationMs || 0), 0),
+    model: repair.generations.at(-1)?.model, requestId: repair.generations.at(-1)?.requestId,
+    metadata: { extractionRepair: repair.state, repairAttempts: repair.generations.length,
+      repairRejectedCandidates: repair.rejected, repairRejectedCandidateCount: repair.rejected.length,
+      unresolvedCandidateCount: repair.state?.candidates.length || 0, candidateValidationIncomplete: Boolean(repair.state) } };
+  const failure = extractionRepairFailure(generation);
+  const result = repository.transaction(() => {
+    assertSourcesAvailable();
+    const current = repository.getMaintenanceTask(agentId, task.id);
+    if (current?.status !== 'failed' || current.review_state !== 'pending') throw new Error('Extraction repair review is no longer pending.');
+    const archive = archiveLongTermEvidence({ repository, agentId, messages: state.messages,
+      timeZone: state.timeZone,
+      generatedMemories: generation.output.memories,
+      candidateIndexOffset: repository.getNextIngestionCandidateIndex(agentId, task.payload.batchId), batchId: task.payload.batchId,
+      conversationTopology: state.messages.some(message => message.eventSource) ? '' : DIRECT_USER_AGENT_DM_TOPOLOGY,
+      recordedAt: completedAt, identity: { ...identity, participants: state.participants } });
+    const failureReviewTask = recordExtractionFailure({ repository, agentId, batchId: task.payload.batchId,
+      generated: { messages: state.messages, generation }, archive, terminalFailure: failure, completedAt, parentTaskId: task.id });
+    const memoryIds = [...new Set(archive.candidateResults.flatMap(item => [item.memoryId, item.provisionalMemoryId]).filter(Boolean))];
+    const postProcessing = runCompanionEventPostProcessing({ repository, agentId,
+      batchId: task.payload.batchId, memoryIds, embeddingMemoryIds: [...new Set([...memoryIds, ...archive.utteranceMemoryIds])],
+      requiredFollowUpEnqueue: true });
+    const note = [clean(reviewNote) || 'Extraction candidate repair was retried.',
+      ...repair.rejected.map(item => 'Candidate ' + item.index + ' rejected: ' + item.reason)].join('\n');
+    if (!failureReviewTask || failureReviewTask.id !== task.id) repository.reviewMaintenanceTaskFailure({
+      agentId, taskId: task.id, action: 'accept', reviewedBy, note, reviewedAt: completedAt,
+    });
+    return { status: 'processed', ...archive, failureReviewTask, postProcessing,
+      generationDiagnostics: { ...generation.metadata, degraded: Boolean(failure) } };
+  });
+  const warning = await recordCompanionEventGenerationUsage({ usageLedgerPath, executionTime,
+    agentId, batchId: task.payload.batchId, generation });
+  result.warnings = [...(result.postProcessing.warnings || []), ...(warning ? [warning] : [])];
+  return result;
 }
 
 export function archiveCompanionEventBatch({
@@ -536,50 +543,14 @@ export function archiveCompanionEventBatch({
       sourceLocator: "",
       sourceKind: "input-event",
       messages: generated.messages,
+      timeZone: generated.timeZone,
       generatedMemories: generated.generation.output.memories,
       batchId,
       recordedAt: completedAt,
       conversationTopology: generated.messages.some(message => message.eventSource) ? '' : DIRECT_USER_AGENT_DM_TOPOLOGY,
       identity: { ...identity, participants: generated.participants },
     });
-    if (terminalFailure) {
-      const eventIds = [...new Set(generated.messages
-        .flatMap((message) => message.inputEventIds || [message.inputEventId])
-        .map(clean)
-        .filter(Boolean))];
-      const attempts = Math.max(1, Math.trunc(Number(terminalFailure.attempts) || 1));
-      const errorMessage = clean(terminalFailure.errorMessage) || "Long-term extraction failed.";
-      failureReviewTask = repository.recordExhaustedMaintenanceFailure({
-        agentId,
-        lane: "semantic",
-        taskType: "long-term-extraction",
-        payload: {
-          batchId,
-          memoryIds: archive.utteranceMemoryIds,
-          eventIds,
-          stage: "long-term-extraction",
-        },
-        result: {
-          status: "manual-review-required",
-          failures: [{
-            stage: "long-term-extraction",
-            memoryIds: archive.utteranceMemoryIds,
-            eventIds,
-            errorCode: clean(terminalFailure.errorCode),
-            error: errorMessage,
-            details: terminalFailure.details || {},
-          }],
-        },
-        errorMessage,
-        errorDetails: {
-          code: clean(terminalFailure.errorCode),
-          stage: "long-term-extraction",
-          ...(terminalFailure.details || {}),
-        },
-        attempts,
-        failedAt: completedAt,
-      });
-    }
+    failureReviewTask = recordExtractionFailure({ repository, agentId, batchId, generated, archive, terminalFailure, completedAt });
     const memoryIds = [...new Set(archive.candidateResults
       .flatMap((result) => [result.memoryId, result.provisionalMemoryId])
       .filter(Boolean))];
@@ -602,6 +573,9 @@ export function archiveCompanionEventBatch({
         messagesArchived: archive.messagesArchived,
         inputCharacters: generated.input.length,
         degraded: Boolean(terminalFailure),
+        candidateValidationIncomplete: Boolean(generated.generation.metadata?.candidateValidationIncomplete),
+        unresolvedCandidateCount: generated.generation.metadata?.unresolvedCandidateCount || 0,
+        repairRejectedCandidates: generated.generation.metadata?.repairRejectedCandidates || [],
         failureReviewTaskId: clean(failureReviewTask?.id),
         generationErrorCode: clean(terminalFailure?.errorCode),
         generationError: clean(terminalFailure?.errorMessage),

@@ -1,5 +1,8 @@
 import {
   DIRECT_INGESTION_MEMORY_KINDS,
+  STATE_IDENTITY_FIELDS,
+  STATE_TARGET_OBJECT_ROLES,
+  RELATIONSHIP_DIMENSIONS,
   DEFAULT_MEMORY_TIME_ZONE,
   EVIDENCE_MODES,
   MEMORY_ACTOR_ROLES,
@@ -14,6 +17,7 @@ import {
   timestampInTimeZone,
 } from "@suzu-memory/core";
 import { buildExtractionParticipants } from './participant-identity.mjs';
+import { createExtractionTimeValidator } from './temporal-evidence.mjs';
 
 export const RETENTION_REASONS = Object.freeze([
   "identity",
@@ -62,28 +66,42 @@ const GENERATED_EVIDENCE_MODES = EVIDENCE_MODES.filter((mode) => [
   "inferred",
 ].includes(mode));
 
-const GENERATED_IDENTITY_FIELDS = Object.freeze([
-  "name", "alias", "birth_date", "birth_year", "age", "gender", "pronouns",
-  "occupation", "employer", "education", "residence", "hometown", "nationality",
-  "biography", "other",
-]);
 const personRole = { type: "string", enum: ["user", "agent", "other"] };
+const objectRole = { type: "string", enum: STATE_TARGET_OBJECT_ROLES };
 const personName = { type: "string", minLength: 1 };
 const GENERATED_TARGET_PROPERTIES = Object.freeze({
   identity: {
-    identityField: { type: "string", enum: GENERATED_IDENTITY_FIELDS },
-    fieldCardinality: { type: "string", enum: ["single", "multi_item", "sequence"] },
+    identityField: { type: "string", enum: STATE_IDENTITY_FIELDS,
+      description: "主体本人的身份维度；relationship_status 表示主体的婚恋状态。" },
+    fieldCardinality: { type: "string", enum: ["single", "multi_item", "sequence"],
+      description: "single=同一时间和范围内的单值，婚恋状态使用此值；multi_item=可同时成立的多项；sequence=按时间排列的经历。" },
   },
   belief: {
-    objectRole: { type: "string", enum: ["user", "agent", "other", "world"] },
+    objectRole,
     objectName: personName,
   },
-  relationship: { counterpartRole: personRole, counterpartName: personName },
-  affective_association: { triggerRole: personRole, triggerName: personName },
+  relationship: { counterpartRole: personRole, counterpartName: personName,
+    relationshipDimension: { type: "string", enum: RELATIONSHIP_DIMENSIONS } },
+  affective_association: { triggerRole: objectRole, triggerName: personName },
 });
 const TARGET_SPEC_FAMILIES = new Set(Object.keys(GENERATED_TARGET_PROPERTIES));
 const kindsForFamily = family => DIRECT_INGESTION_MEMORY_KINDS.filter(kind => family === 'not_applicable'
   ? !isStatefulMemoryKind(kind) : isMemoryKindAllowedForStateFamily(kind, family));
+
+function branchProperties(kinds, families) {
+  const reasons = Object.entries(RETENTION_KINDS)
+    .filter(([, compatibleKinds]) => kinds.some(kind => compatibleKinds.includes(kind)));
+  return {
+    kind: { type: 'string', enum: kinds },
+    stateFamily: { type: 'string', enum: families,
+      description: families.map(family => `${family}=${family === 'not_applicable'
+        ? '具体经历和已表达的反思' : MEMORY_STATE_FAMILY_DEFINITIONS[family].description}`).join('；') },
+    retentionReason: { type: 'string', enum: reasons.map(([reason]) => reason),
+      description: reasons.map(([reason, compatibleKinds]) =>
+        `${reason}: ${compatibleKinds.filter(kind => kinds.includes(kind)).join(', ')}`).join('; ') },
+  };
+}
+
 const targetlessFamilies = new Map();
 for (const family of ['not_applicable', ...MEMORY_STATE_FAMILIES.filter(family => !TARGET_SPEC_FAMILIES.has(family))]) {
   const key = kindsForFamily(family).join(',');
@@ -93,15 +111,13 @@ const targetAlternatives = [
   ...Object.entries(GENERATED_TARGET_PROPERTIES).map(([family, properties]) => ({
     type: "object",
     properties: {
-      kind: { type: 'string', enum: kindsForFamily(family) },
-      stateFamily: { type: "string", enum: [family] },
+      ...branchProperties(kindsForFamily(family), [family]),
       stateTarget: { type: "object", additionalProperties: false, properties, required: Object.keys(properties) },
     },
     required: ["stateTarget"],
   })),
   ...[...targetlessFamilies].map(([kinds, families]) => ({ type: "object", properties: {
-    kind: { type: 'string', enum: kinds.split(',') },
-    stateFamily: { type: "string", enum: families },
+    ...branchProperties(kinds.split(','), families),
     stateTarget: false,
   } })),
 ];
@@ -116,7 +132,8 @@ function normalizedGeneratedStateTarget(candidate, index) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`memories[${index}].stateTarget 必须是 ${candidate.stateFamily} 的目标对象。`);
   }
-  const expected = Object.keys(properties);
+  const expected = Object.keys(properties).filter(key => key !== "relationshipDimension"
+    || candidate.stateFamily !== "relationship" || Object.hasOwn(value, key));
   const missing = expected.filter(key => !Object.hasOwn(value, key));
   const unexpected = Object.keys(value).filter(key => !Object.hasOwn(properties, key));
   if (missing.length || unexpected.length) throw new Error(
@@ -185,7 +202,7 @@ function languageInstruction(language) {
     return ["【本窗口输出语言：English】"];
   }
   if (language === "mixed") {
-    return ["【本窗口输出语言：逐候选跟随直接证据；混合输入不要求混合输出】"];
+    return ["【本窗口输出语言：逐候选跟随直接证据】"];
   }
   if (language === "unknown") {
     return ["【本窗口输出语言：保持原文】"];
@@ -217,9 +234,6 @@ function formatMessages(messages, {
       message.worldFrame ? `[world=${message.worldFrame}:${message.worldId || "primary"}] ` : ""
     }${language === "mixed" && message.sourceLanguage && message.sourceLanguage !== "unknown"
       ? `[source-language=${message.sourceLanguage}] ` : ""
-    }${message.logicalEvent?.complete && Number(message.logicalEvent.fragmentCount) > 1
-      ? `[同一原始事件已完整重组，共${message.logicalEvent.fragmentCount}段] `
-      : ""
     }${context ? `[来源 ${JSON.stringify(context)}] ${participant?.name || source.sender.name || source.sender.kind}` : roleLabel(message.role, language)}${
       source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${timestampInTimeZone(message.knownAt, timeZone) || message.knownAt}]` : ''
     }：${message.text}`;
@@ -232,7 +246,7 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
   properties: {
     memories: {
       type: "array",
-      description: "本批真实对话中值得长期检索的结构化记忆；没有时返回空数组。",
+      description: "本批对话中提取的记忆候选；没有时返回空数组。",
       items: {
         type: "object",
         additionalProperties: false,
@@ -240,24 +254,25 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           kind: {
             type: "string",
             enum: DIRECT_INGESTION_MEMORY_KINDS,
+            description: "event=具体经历；reflection=已表达的反思；plan=未来打算；commitment=已答应的责任；open_loop=尚待跟进的事项。人物事实、认识、喜好和关系按对应分析家族选择兼容类型。",
           },
-          title: { type: "string" },
-          content: { type: "string" },
+          title: { type: "string", description: "简短具体的标题。" },
+          content: { type: "string", description: "可独立理解的记忆正文；文字字段遵循窗口指定的输出语言。" },
           subjectRole: {
             type: "string",
             enum: SUBJECT_ROLES,
             description: "使用输入人物表中的角色：agent 为记忆拥有者，user 为实际出现的已知人类用户，other 为其他 Agent 或人物；shared 为多个实际主体的共同事件，unknown 为无法确定。",
           },
-          subjectName: { type: "string", description: "已知人物使用人物表中的完整 name；未知人物只用直接证据支持的名称。" },
+          subjectName: { type: "string", description: "记忆主体的名称。" },
           actorRoles: {
             type: "array",
-            description: "只填写直接证据明确支持的人物角色；不确定时留空数组。",
-            maxItems: 8,
+            description: "标记所述事情中有直接证据的人物角色；无法确定的条目省略。",
             items: {
               type: "object",
               additionalProperties: false,
               properties: {
-                role: { type: "string", enum: GENERATED_ACTOR_ROLES },
+                role: { type: "string", enum: GENERATED_ACTOR_ROLES,
+                  description: "experiencer=经历者；observer=直接观察事件者；participant=参与事情的行动或决策者；belief_holder=观念持有者；preference_holder=偏好持有者。" },
                 actorRole: { type: "string", enum: GENERATED_ACTOR_IDENTITIES },
                 actorName: { type: "string" },
                 confidence: { type: "number", minimum: 0, maximum: 1 },
@@ -272,13 +287,6 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           stateFamily: {
             type: "string",
             enum: ["not_applicable", ...MEMORY_STATE_FAMILIES],
-            description: `分析家族含义：${JSON.stringify(Object.fromEntries(
-              MEMORY_STATE_FAMILIES.map(family => [family, MEMORY_STATE_FAMILY_DEFINITIONS[family].description]),
-            ))}。按 kind 选择兼容的分析家族：${JSON.stringify(Object.fromEntries(
-              DIRECT_INGESTION_MEMORY_KINDS.map(kind => [kind, isStatefulMemoryKind(kind)
-                ? MEMORY_STATE_FAMILIES.filter(family => isMemoryKindAllowedForStateFamily(kind, family))
-                : ['not_applicable']]),
-            ))}。`,
           },
           stateLabel: {
             type: "string",
@@ -286,13 +294,13 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
           },
           stateTarget: {
             type: "object",
-            description: "按 stateFamily 选择对应的目标分支：identity 为身份字段，belief 为观念对象，relationship 为关系对象，affective_association 为触发对象；其他分类省略 stateTarget。",
+            description: `状态对应的对象或身份维度，仅 ${[...TARGET_SPEC_FAMILIES].join('、')} 使用；其他分类省略整个字段。`,
           },
           reality: { type: "string", enum: REALITY_STATES },
           evidenceMode: {
             type: "string",
             enum: GENERATED_EVIDENCE_MODES,
-            description: "explicit=候选主体在引用原话中明确表达；observed=引用内容直接记录可观察事实但不是主体自述；inferred=超出原话表述的可撤销推断。不得输出 manual 或 imported。",
+            description: "explicit=原文明示支持的事实、感受、看法或计划；observed=直接观察的结果；inferred=基于行为或其他证据形成的可撤销推断。转述保留实际陈述者与被描述主体的区别。",
           },
           temporalState: { type: "string", enum: TEMPORAL_STATES },
           revisionAction: { type: "string", enum: REVISION_ACTIONS },
@@ -309,10 +317,11 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
             type: "string",
             description: "有直接证据的 ISO 8601 结束时间；未结束或无法确定时为空字符串。",
           },
-          confidence: { type: "number", minimum: 0, maximum: 1 },
-          importance: { type: "number", minimum: 0, maximum: 1 },
+          confidence: { type: "number", minimum: 0, maximum: 1, description: "证据可靠程度。" },
+          importance: { type: "number", minimum: 0, maximum: 1, description: "对记忆拥有者的重要程度。" },
           sourceRefs: {
             type: "array",
+            description: "支持本条内容的正文消息编号；多条消息共同提供证据时全部引用。",
             minItems: 1,
             items: { type: "string", pattern: "^M[0-9]{4}$" },
           },
@@ -400,8 +409,7 @@ export function buildLongTermExtractionInput({
   const parts = [
     `记忆拥有者：${owner?.name || memoryOwner}`,
     `时间基准时区：${timeZone}。消息时间按该时区显示并带 UTC 偏移；相对日期以对应消息的当地日期为准。`,
-    '记忆以拥有者的经历为中心；标题和正文叙述使用人物完整姓名，包括拥有者。原消息与引语中的人称按实际说话者解释。',
-    '【程序提供的人物身份】',
+    '【人物表】',
     JSON.stringify(participants.map(({ actorRole, name }) => ({ role: actorRole, name }))),
   ];
   for (const window of standardizedWindows) {
@@ -456,6 +464,7 @@ export function buildLongTermExtractionInput({
       (window) => window.continuationGuidanceMessages,
     ),
     participants,
+    timeZone,
   };
 }
 
@@ -487,7 +496,7 @@ export function normalizeGeneratedLongTermExtraction(value) {
   }) };
 }
 
-export function parseGeneratedLongTermExtraction(value) {
+export function parseGeneratedLongTermExtraction(value, { messages, timeZone } = {}) {
   let parsed = value;
   if (typeof value === "string") {
     try {
@@ -505,6 +514,7 @@ export function parseGeneratedLongTermExtraction(value) {
   }
   if (!Array.isArray(parsed.memories)) throw new Error("memories 必须是数组。");
   parsed = normalizeGeneratedLongTermExtraction(parsed);
+  const validateTime = messages ? createExtractionTimeValidator(messages, timeZone) : null;
   const allowedKinds = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.kind.enum);
   const allowedRoles = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.subjectRole.enum);
   const allowedReality = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.reality.enum);
@@ -552,7 +562,12 @@ export function parseGeneratedLongTermExtraction(value) {
     for (const field of ["kind", "content", "subjectRole", "reality", "evidenceMode", "temporalState", "revisionAction"]) {
       if (!clean(candidate[field])) throw new Error(`memories[${index}].${field} 不能为空。`);
     }
-    if (!allowedKinds.has(candidate.kind)) throw new Error(`memories[${index}].kind 无效。`);
+    if (!allowedKinds.has(candidate.kind)) {
+      let targetProblem = "";
+      try { normalizedGeneratedStateTarget(candidate, index); }
+      catch (error) { targetProblem = ` ${error.message}`; }
+      throw new Error(`memories[${index}].kind 无效。${targetProblem}`);
+    }
     if (!allowedRoles.has(candidate.subjectRole)) throw new Error(`memories[${index}].subjectRole 无效。`);
     if (!allowedReality.has(candidate.reality)) throw new Error(`memories[${index}].reality 无效。`);
     if (!allowedEvidence.has(candidate.evidenceMode)) throw new Error(`memories[${index}].evidenceMode 无效。`);
@@ -568,12 +583,12 @@ export function parseGeneratedLongTermExtraction(value) {
     const stateLabel = clean(candidate.stateLabel);
     const stateTarget = normalizedGeneratedStateTarget(candidate, index);
     if (stateful) {
-      if (!clean(candidate.canonicalKey)) {
-        throw new Error(`memories[${index}].canonicalKey 不能为空。`);
-      }
       if (!MEMORY_STATE_FAMILIES.includes(candidate.stateFamily)
         || !isMemoryKindAllowedForStateFamily(candidate.kind, candidate.stateFamily)) {
         throw new Error(`memories[${index}] 的 kind 与 stateFamily 不兼容；${candidate.stateFamily} 允许的 kind：${kindsForFamily(candidate.stateFamily).join(', ')}。`);
+      }
+      if (!clean(candidate.canonicalKey)) {
+        throw new Error(`memories[${index}].canonicalKey 不能为空。`);
       }
       if (!stateLabel) throw new Error(`memories[${index}].stateLabel 不能为空。`);
     } else if (candidate.stateFamily !== "not_applicable" || stateLabel) {
@@ -599,8 +614,8 @@ export function parseGeneratedLongTermExtraction(value) {
     if (eventStart && eventEnd && eventEnd < eventStart) {
       throw new Error(`memories[${index}].eventEnd 不能早于 eventStart。`);
     }
-    if (!Array.isArray(candidate.actorRoles) || candidate.actorRoles.length > 8) {
-      throw new Error(`memories[${index}].actorRoles 必须是最多 8 项的数组。`);
+    if (!Array.isArray(candidate.actorRoles)) {
+      throw new Error(`memories[${index}].actorRoles 必须是数组。`);
     }
     const actorRoles = candidate.actorRoles.map((actor, actorIndex) => {
       if (!actor || typeof actor !== "object" || Array.isArray(actor)) {
@@ -644,7 +659,7 @@ export function parseGeneratedLongTermExtraction(value) {
         throw new Error(`memories[${index}].${field} 必须在 0 到 1 之间。`);
       }
     }
-    return {
+    const memory = {
       ...candidate,
       title: clean(candidate.title),
       content: clean(candidate.content),
@@ -661,6 +676,8 @@ export function parseGeneratedLongTermExtraction(value) {
       confidence: Number(candidate.confidence),
       importance: Number(candidate.importance),
     };
+    validateTime?.(memory);
+    return memory;
   });
   return {
     memories,

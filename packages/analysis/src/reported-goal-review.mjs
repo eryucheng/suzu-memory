@@ -2,6 +2,8 @@ import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
+  compatibleReportedClaims,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -19,6 +21,10 @@ function candidateFromObservation(observation, currentStatePresent) {
   const lifecycle = observation.analysis?.lifecycle;
   const relation = observation.analysis?.relation;
   const comparisonLayer = clean(observation.scope?.currentRepresentationLayer);
+  const ownsGoal = holder?.responsibility === "subject" && holder?.acceptsResponsibility === "yes"
+    && ["self_chosen", "external_requirement"].includes(holder?.agency);
+  const participatesInGoal = holder?.responsibility === "shared" && holder?.agency === "shared_agreement"
+    && holder?.acceptsResponsibility !== "no";
   if (observation.qualification !== "qualified"
     || observation.memory?.evidenceMode !== "explicit"
     || comparisonLayer !== "reported"
@@ -27,9 +33,7 @@ function candidateFromObservation(observation, currentStatePresent) {
     || !GOAL_INTENTIONS.has(target?.intentionLevel)
     || holder?.holderMatch !== "yes"
     || holder?.attribution !== "explicit_self_statement"
-    || holder?.responsibility !== "subject"
-    || holder?.acceptsResponsibility !== "yes"
-    || !["self_chosen", "external_requirement"].includes(holder?.agency)
+    || (!ownsGoal && !participatesInGoal)
     || (!OPEN_LIFECYCLES.has(lifecycle?.lifecycle)
       && !CLOSED_LIFECYCLES.has(lifecycle?.lifecycle))
     || (lifecycle?.lifecycle === "completed"
@@ -86,26 +90,24 @@ function statePhaseForLifecycle(lifecycle) {
   return "unspecified";
 }
 
-function actionAgainstCurrent(candidate) {
-  const relation = candidate.relation.relation;
-  if (relation === "same_goal") return "reinforce";
-  if (["progress_update", "narrower_step"].includes(relation)) return "progress_update";
-  if (relation === "pauses") return "pause";
-  if (relation === "resumes") return "resume";
-  if (relation === "completes"
-    && candidate.lifecycle.lifecycle === "completed"
-    && candidate.lifecycle.completionBasis === "explicit_self_report") {
-    return "complete";
-  }
-  if (relation === "cancels"
-    && ["cancelled", "abandoned"].includes(candidate.lifecycle.lifecycle)
-    && ["explicit_self_report", "direct_cancellation"].includes(
-      candidate.lifecycle.completionBasis,
-    )) {
-    return "cancel";
-  }
-  if (relation === "replaces") return "supersede";
-  return "review_required";
+export function goalTransitionDecision({ relation, lifecycle }) {
+  if (relation.relation === 'completes'
+    && (lifecycle.lifecycle !== 'completed' || lifecycle.completionBasis !== 'explicit_self_report')) return null;
+  if (relation.relation === 'cancels'
+    && (!['cancelled', 'abandoned'].includes(lifecycle.lifecycle)
+      || !['explicit_self_report', 'direct_cancellation'].includes(lifecycle.completionBasis))) return null;
+  return {
+    same_goal: { action: "reinforce", reason: "same-goal-without-state-change" },
+    progress_update: { action: "progress_update", reason: "direct-progress-on-current-goal" },
+    pauses: { action: "pause", reason: "current-goal-paused-or-blocked" },
+    resumes: { action: "resume", reason: "current-goal-resumed" },
+    completes: { action: "complete", reason: "completion-directly-proven" },
+    cancels: { action: "cancel", reason: "cancellation-directly-proven" },
+    narrower_step: { action: "progress_update", reason: "new-item-is-a-step-not-a-replacement" },
+    broader_goal: { action: "review_required", reason: "broader-goal-cannot-replace-current-automatically" },
+    replaces: { action: "supersede", reason: "new-goal-explicitly-replaces-current" },
+    conflict: { action: "review_required", reason: "conflicting-goal-state" },
+  }[relation.relation] || null;
 }
 
 function proposedState(candidate, snapshot) {
@@ -129,6 +131,7 @@ function proposedState(candidate, snapshot) {
       lifecycle: candidate.lifecycle.lifecycle,
       timeReference: clean(candidate.lifecycle.timeReference),
       holderStatementStatus: "directly-reported",
+      sharedConfirmation: candidate.holder.responsibility === "shared" ? "unconfirmed" : "not-applicable",
       executionStatus: "unverified",
       completionStatus: "not-established",
     },
@@ -206,6 +209,7 @@ export function reviewReportedGoalState({
     };
   }
   const selection = selectLatestReportedCandidate(candidates, {
+    compatible: (left, right) => compatibleReportedClaims("goal", left, right),
     hasCurrentState: Boolean(snapshot.currentState),
     isExplicitChange: (candidate) => candidate.relation.relation === "replaces",
   });
@@ -222,7 +226,7 @@ export function reviewReportedGoalState({
       );
     }
   }
-  const action = snapshot.currentState ? actionAgainstCurrent(selected) : "create";
+  const action = snapshot.currentState ? goalTransitionDecision(selected)?.action || "review_required" : "create";
   if (action === "review_required") {
     return reviewRequired(
       snapshot,
@@ -237,7 +241,7 @@ export function reviewReportedGoalState({
     representationLayer: "reported",
     action,
     currentStateId: snapshot.currentState?.id || "",
-    proposedState: stateActions.has(action) ? proposedState(selected, snapshot) : null,
+    proposedState: stateActions.has(action) ? withReportedEvidence(proposedState(selected, snapshot), selection) : null,
     selectedObservationId: selected.observation.id,
     consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
     snapshot,

@@ -212,7 +212,7 @@ test("runs five bounded specialists and audits each call without writing persona
   fixture.database.close();
 });
 
-test("keeps a failed required specialist visible and refuses to call the batch complete", async () => {
+test("retains a direct preference when an unrelated behavior specialist fails", async () => {
   const fixture = setup();
   const result = await evaluatePreferenceEvidenceSpecialists({
     repository: fixture.repository,
@@ -228,11 +228,14 @@ test("keeps a failed required specialist visible and refuses to call the batch c
       },
     }),
   });
-  assert.equal(result.status, "incomplete");
+  assert.equal(result.status, "partial");
   assert.deepEqual(result.failedRoles, ["behaviorConditions"]);
   assert.equal(result.runs.behaviorConditions.status, "failed");
   assert.equal(result.runs.behaviorConditions.error_message, "provider unavailable");
   assert.equal(Object.keys(result.runs).length, Object.keys(PREFERENCE_SPECIALIST_ANALYZERS).length);
+  const merged = mergePreferenceSpecialistEvidence(fixture.repository, { evaluation: result });
+  assert.ok(merged.observations.some(item => item.memory_id === fixture.explicit.memory.id
+    && item.qualification === "qualified" && item.signal === "explicit_preference"));
   fixture.database.close();
 });
 
@@ -440,7 +443,7 @@ test("keeps constrained routine evidence out of preference state even when the o
   fixture.database.close();
 });
 
-test("holds a same-memory specialist conflict as unresolved instead of voting", async () => {
+test("an avoidance behavior does not negate an explicit preference", async () => {
   const fixture = setup();
   const analyzers = analyzerSet(fixture, {
     objectGrounding: async () => ({
@@ -486,12 +489,60 @@ test("holds a same-memory specialist conflict as unresolved instead of voting", 
     analyzers,
   });
   const merged = mergePreferenceSpecialistEvidence(fixture.repository, { evaluation, policy });
-  assert.equal(merged.labels.length, 0);
-  assert.equal(merged.observations[0].qualification, "unresolved");
-  assert.equal(
-    merged.observations[0].excluded_reason,
-    "explicit-support-conflicts-with-same-memory-avoidance",
-  );
-  assert.equal(merged.observations[0].effective_direction, "neutral");
+  assert.equal(merged.labels.length, 1);
+  assert.equal(merged.observations[0].qualification, "qualified");
+  assert.equal(merged.observations[0].payload.behaviorConditions.behaviorType, "avoidance");
+  assert.equal(merged.observations[0].effective_direction, "support");
+  assert.equal(merged.preview.status, "direct-preference");
   fixture.database.close();
 });
+
+for (const expressionType of ['likes', 'dislikes']) {
+  for (const weakRole of ['behaviorConditions', 'sharingAffect', 'objectGrounding', 'timeScope']) {
+    test(`explicit ${expressionType} depends on its own grounding, not unrelated ${weakRole}`, async t => {
+      const f = setup();
+      t.after(() => f.database.close());
+      const analyzers = analyzerSet(f);
+      for (const key of Object.keys(analyzers)) {
+        const original = analyzers[key];
+        analyzers[key] = async input => {
+          const result = await original(input);
+          result.output.analyses = result.output.analyses.filter(item => item.memoryId === f.explicit.memory.id);
+          return result;
+        };
+      }
+      const explicitBase = analyzers.explicitExpression;
+      analyzers.explicitExpression = async input => {
+        const result = await explicitBase(input);
+        result.output.analyses[0].expressionType = expressionType;
+        result.output.analyses[0].confidence = 0.95;
+        return result;
+      };
+      if (weakRole === 'behaviorConditions') analyzers.behaviorConditions = async () => ({ output: { analyses: [{
+        ...common(f.explicit), confidence: 0.2, behaviorType: 'routine', agency: 'unknown',
+        constraint: 'unknown', alternatives: 'unknown', instrumentalGoal: 'unknown',
+        opportunityCost: 'unknown', canDecline: 'unknown',
+      }] } });
+      else if (weakRole === 'sharingAffect') analyzers.sharingAffect = async () => ({ output: { analyses: [{
+        ...common(f.explicit), confidence: 0.2, interactionType: 'unknown', affectiveExpression: 'unknown',
+      }] } });
+      else {
+        const base = analyzers[weakRole];
+        analyzers[weakRole] = async input => {
+          const result = await base(input);
+          result.output.analyses[0].confidence = 0.2;
+          return result;
+        };
+      }
+      const evaluation = await evaluatePreferenceEvidenceSpecialists({ repository: f.repository,
+        agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user', canonicalKey: 'user:preference:puzzle',
+        objectLabel: '解谜游戏', memoryIds: [f.explicit.memory.id], analyzers });
+      assert.equal(evaluation.status, 'analyzed');
+      const merged = mergePreferenceSpecialistEvidence(f.repository, { evaluation, policy });
+      const relevant = ['objectGrounding', 'timeScope'].includes(weakRole);
+      assert.equal(merged.observations[0].qualification, relevant ? 'excluded' : 'qualified');
+      assert.equal(merged.labels[0].confidence, relevant ? 0.2 : 0.9);
+      if (!relevant) assert.equal(merged.observations[0].effective_direction, expressionType === 'likes' ? 'support' : 'opposition');
+    });
+  }
+}

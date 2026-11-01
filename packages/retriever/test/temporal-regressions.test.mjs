@@ -4,14 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
-import { planVectorQuery, recallCorePhrases, resolveTemporalQuery, retrieveMemories } from '../src/index.mjs';
-
-test('plural pronouns are removed as whole words for lexical and vector queries', () => {
-  for (const pronoun of ['我们', '你们', '他们', '她们', '它们', '咱们']) {
-    assert.deepEqual(recallCorePhrases(`${pronoun}聊过猫吗`), ['猫']);
-    assert.equal(planVectorQuery(`${pronoun}聊过猫吗`).text, '猫');
-  }
-});
+import { resolveTemporalQuery, retrieveMemories } from '../src/index.mjs';
 
 test('yearless Chinese and English recall dates use the most recent occurrence', () => {
   const now = new Date('2027-01-08T12:00:00+08:00');

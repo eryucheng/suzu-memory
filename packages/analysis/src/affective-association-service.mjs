@@ -1,11 +1,9 @@
+import { normalizeStateAnalysisTargetSpec } from '@suzu-memory/core';
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import { AFFECTIVE_ASSOCIATION_ANALYZERS, buildAffectiveAssociationGenerationInput,
   parseAffectiveAssociationGeneration } from "./affective-association-contracts.mjs";
 import { buildPreferenceEvidenceSnapshot } from "./preference-snapshot.mjs";
@@ -14,7 +12,7 @@ const DEFAULT_PROMPT_DIRECTORY = path.join(ROOT, "resources");
 function clean(v) { return String(v ?? "").trim(); }
 function unique(v) { return [...new Set((Array.isArray(v) ? v : []).map(clean).filter(Boolean))]; }
 function batchId(args) { const raw = [args.agentId, args.subjectRole, args.subjectKey, args.triggerRole,
-  args.triggerKey, clean(args.canonicalKey).toLocaleLowerCase("en-US"), args.currentRepresentationLayer,
+  args.triggerKey, args.triggerLabel, clean(args.canonicalKey).toLocaleLowerCase("en-US"), args.currentRepresentationLayer,
   unique(args.memoryIds).sort().join("\u001f")]
   .map(clean).join("\u001e"); return `affective-analysis-${createHash("sha256").update(raw).digest("hex").slice(0, 24)}`; }
 function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer) {
@@ -53,31 +51,10 @@ function enforce(role, item, snapshot) {
   }
   return item;
 }
-async function usage({ pathValue, generation, definition, agentId, batch }) {
-  if (!clean(pathValue) || !generation?.model || !generation?.usage) return "";
-  try { await appendUsageEvent(path.resolve(pathValue), { agentId, provider: generation.metadata?.provider || "",
-    model: generation.model, source: "memory-evaluation", feature: `memory-affective-${definition.role}`,
-    requestId: generation.requestId || "", usage: generation.usage,
-    metadata: { batchId: batch, durationMs: Number(generation.durationMs || 0), ...generation.metadata } }); return ""; }
-  catch (error) {
-      assertEventSourceExecutionCurrent(); return `费用流水写入失败：${error.message}`; }
-}
-async function invoke({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(path.join(path.resolve(promptDirectory), definition.promptFile), "utf8").replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildAffectiveAssociationGenerationInput(snapshot, definition); let generation = null;
-  try { generation = await generator({ input, systemPrompt: analysisSystemPrompt(systemPrompt), schema: definition.schema, schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-    stateFamily: "affective_association", analyzerRole: definition.role });
-    const parsed = parseAffectiveAssociationGeneration(definition.role, generation?.output, { maximumAnalyses });
-    const analyses = []; const rejected = []; const seen = new Set();
-    for (const [index, item] of parsed.analyses.entries()) { try { if (seen.has(item.memoryId)) throw new Error("Duplicate memory analysis.");
-      analyses.push(enforce(definition.role, item, snapshot)); seen.add(item.memoryId); }
-    catch (error) {
-      assertEventSourceExecutionCurrent(); rejected.push({ index, memoryId: item.memoryId, error: error.message }); } }
-    return { definition, input, generation, analyses, rejected,
-      status: analyses.length ? "completed" : rejected.length ? "rejected" : "abstained", error: "" }; }
-  catch (error) {
-      assertEventSourceExecutionCurrent(); return { definition, input, generation, analyses: [], rejected: [], status: "failed", error: error.message }; }
+
+async function invoke(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildAffectiveAssociationGenerationInput,
+    parseGeneration: parseAffectiveAssociationGeneration, enforceBoundary: enforce });
 }
 function mapBy(items) { return new Map((items || []).map((x) => [x.memoryId, x])); }
 function gate({ trigger, experiencer, basis, time, relation, current }) {
@@ -142,7 +119,8 @@ function action({ qualification, time, relation, current }) {
 function merge({ evaluation, persistEvidenceLedger }) {
   const maps = Object.fromEntries(Object.entries(evaluation.analyses).map(([k, v]) => [k, mapBy(v)]));
   const ids = unique(Object.values(evaluation.analyses).flat().map((x) => x.memoryId)); const observations = []; const previews = [];
-  for (const memoryId of ids) { const memory = evaluation.snapshot.memories.find((m) => m.id === memoryId);
+  for (const memoryId of ids) {
+    if (Object.values(maps).some(map => !map.has(memoryId))) continue; const memory = evaluation.snapshot.memories.find((m) => m.id === memoryId);
     const trigger = maps.triggerEmotion?.get(memoryId) || null; const experiencer = maps.experiencerAttribution?.get(memoryId) || null;
     const basis = maps.associationBasis?.get(memoryId) || null; const time = maps.timeRevision?.get(memoryId) || null;
     const relation = maps.currentRelation?.get(memoryId) || null; const blocked = gate({ trigger, experiencer, basis, time, relation, current: evaluation.snapshot.currentState });
@@ -174,21 +152,23 @@ function merge({ evaluation, persistEvidenceLedger }) {
 }
 export async function evaluateAffectiveAssociationEvidence({ repository, agentId, subjectRole, subjectKey,
   triggerRole, triggerKey, triggerLabel, canonicalKey, associationLabel, memoryIds = [], analyzers = {},
-  usageLedgerPath = "", promptDirectory = DEFAULT_PROMPT_DIRECTORY, snapshotOptions = {}, maximumAnalyses = 60,
+  usageLedgerPath = "", promptDirectory = DEFAULT_PROMPT_DIRECTORY, snapshotOptions = {}, maximumAnalyses = Infinity,
   persistEvidenceLedger = true, currentRepresentationLayer = "" } = {}) {
   if (!repository) throw new Error("Affective evaluation requires a repository.");
   if (clean(subjectRole) === "shared") throw new Error("Affective evaluation requires an individual fixed subject.");
-  if (!clean(triggerRole) || !clean(triggerKey) || !clean(triggerLabel)) throw new Error("Affective evaluation requires a fixed trigger.");
+  const trigger = normalizeStateAnalysisTargetSpec("affective_association", {
+    triggerRole, triggerKey, triggerLabel,
+  }, { allowEmpty: false });
   if (!clean(associationLabel)) throw new Error("Affective evaluation requires a readable associationLabel.");
   for (const key of Object.keys(AFFECTIVE_ASSOCIATION_ANALYZERS)) if (typeof analyzers[key] !== "function") throw new Error(`Affective evaluation requires analyzers.${key}.`);
   const normalizedIds = unique(memoryIds); const batch = batchId({ agentId, subjectRole, subjectKey, triggerRole,
-    triggerKey, canonicalKey, currentRepresentationLayer, memoryIds: normalizedIds });
+    triggerKey, triggerLabel, canonicalKey, currentRepresentationLayer, memoryIds: normalizedIds });
   const base = buildPreferenceEvidenceSnapshot({ repository, agentId, subjectRole, subjectKey, canonicalKey,
     memoryIds: normalizedIds, ...snapshotOptions });
   const snapshot = { ...base, agentId: clean(agentId), target: { ...base.target, stateFamily: "affective_association",
     associationLabel: clean(associationLabel), currentRepresentationLayer: clean(currentRepresentationLayer) },
-    trigger: { subjectRole: clean(triggerRole), subjectKey: clean(triggerKey),
-    label: clean(triggerLabel) }, currentState: currentView(repository, clean(agentId), base.target.subjectRole,
+    trigger: { subjectRole: trigger.triggerRole, subjectKey: trigger.triggerKey,
+    label: trigger.triggerLabel }, currentState: currentView(repository, clean(agentId), base.target.subjectRole,
     base.target.subjectKey, base.target.canonicalKey, clean(currentRepresentationLayer)),
     inputPolicy: { ...base.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
@@ -200,29 +180,15 @@ export async function evaluateAffectiveAssociationEvidence({ repository, agentId
     snapshot, runs: {}, analyses: {}, rejected: {}, observations: [], actionPreviews: [], failedRoles: [], warnings: [],
     automaticStateWriteAllowed: false, activationBiasAllowed: false };
   const definitions = Object.entries(AFFECTIVE_ASSOCIATION_ANALYZERS);
+  const previousRuns = priorAnalyzerRuns(repository, snapshot, batch, definitions, snapshotOptions);
   const invocations = await Promise.all(definitions.map(async ([key, definition]) => [key,
-    await invoke({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses })]));
-  const sourceIds = unique(snapshot.memories.flatMap((m) => m.sourceIds)).sort(); const runs = {}; const analyses = {};
-  const rejected = {}; const warnings = [];
-  for (const [key, call] of invocations) { const warning = await usage({ pathValue: usageLedgerPath, generation: call.generation,
-    definition: call.definition, agentId: clean(agentId), batch }); if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot), agentId: clean(agentId), batchId: batch, stateFamily: "affective_association",
-      analyzerRole: call.definition.role, subjectRole: snapshot.target.subjectRole, subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey, provider: clean(call.generation?.metadata?.provider) || "unreported",
-      model: clean(call.generation?.model) || "unreported", promptVersion: call.definition.promptVersion,
-      schemaVersion: call.definition.schemaName, inputHash: call.generation?.metadata?.analysisInputHash || createHash("sha256").update(call.input).digest("hex"),
-      status: call.status, memoryIds: snapshot.memories.map((m) => m.id), sourceIds, output: call.generation?.output ?? {},
-      rejected: call.rejected, usage: call.generation?.usage || {},
-      costAmount: Number(call.generation?.costAmount ?? call.generation?.metadata?.costAmount ?? 0) || 0,
-      costCurrency: clean(call.generation?.costCurrency ?? call.generation?.metadata?.costCurrency),
-      requestId: clean(call.generation?.requestId), durationMs: Math.max(0, Math.trunc(Number(call.generation?.durationMs) || 0)),
-      errorMessage: call.error, metadata: { associationLabel: clean(associationLabel), triggerRole: clean(triggerRole),
-        triggerKey: clean(triggerKey), currentRepresentationLayer: clean(currentRepresentationLayer),
-        automaticStateWriteAllowed: false, activationBiasAllowed: false } });
-    analyses[key] = call.analyses; rejected[key] = call.rejected; }
-  const failedRoles = definitions.map(([key]) => key).filter((key) => ["failed", "rejected"].includes(runs[key].status));
-  const evaluation = { repository, batchId: batch, snapshot, runs, analyses }; let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) merged = repository.transaction(() => merge({ evaluation, persistEvidenceLedger }));
+    await invoke({ definition, generator: analyzers[key], snapshot, promptDirectory, maximumAnalyses, previousRuns })]));
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId: batch, stateFamily: 'affective_association', snapshot, invocations, usageLedgerPath,
+    metadata: { associationLabel: clean(associationLabel), triggerRole: clean(triggerRole), triggerKey: clean(triggerKey), currentRepresentationLayer: clean(currentRepresentationLayer), automaticStateWriteAllowed: false, activationBiasAllowed: false },
+    usageFeature: (_key, definition) => 'memory-affective-' + definition.role,
+  });
+  const evaluation = { repository, batchId: batch, snapshot, runs, analyses }; const merged = repository.transaction(() => merge({ evaluation, persistEvidenceLedger }));
   const any = Object.values(analyses).some((items) => items.length);
   return { status: failedRoles.length ? "incomplete" : any ? "analyzed" : "abstained",
     reason: failedRoles.length ? "required-affective-analyzer-failed-or-rejected" : "", batchId: batch, snapshot,

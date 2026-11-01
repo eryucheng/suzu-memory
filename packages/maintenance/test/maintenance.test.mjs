@@ -1,3 +1,4 @@
+import { maintenanceWorkStatus } from '../src/index.mjs';
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -152,6 +153,52 @@ test("immediate lane can index evidence without sending it through semantic main
     JSON.stringify(task.payload.memoryIds) === JSON.stringify(["event-1"])
   )), true);
   database.close();
+});
+
+for (const [status, content] of [['superseded', 'I used to enjoy swimming.'], ['disputed', '这条旧记录的归属仍有争议。']])
+test(`embedding tasks retain searchable historical evidence after status changes: ${status}`, async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  seedMemory(repository, 'historical', content);
+  runImmediateMemoryMaintenance({ repository, agentId: AGENT_ID, batchId: 'history', memoryIds: ['historical'],
+    followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding], planConsolidation: false });
+  database.prepare('UPDATE memory_nodes SET status=? WHERE id=?').run(status, 'historical');
+  const embeddingProvider = Object.assign(async () => ({ model: 'history-test', vector: [1, 0] }), { model: 'history-test', dimensions: 2 });
+  const result = await runEmbeddingMaintenance({ repository, agentId: AGENT_ID, embeddingProvider });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.report.added, 1, 'a completed task must have indexed the still-searchable historical record');
+  assert.ok(repository.listEmbeddings(AGENT_ID, 'history-test', { includeArchived: true })
+    .some(row => row.memory_id === 'historical'));
+});
+
+test('a changed item retries without discarding a completed peer embedding', async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  for (const id of ['edited', 'stable']) {
+    seedMemory(repository, id, id + ' 原来的记忆内容。');
+    runImmediateMemoryMaintenance({ repository, agentId: AGENT_ID, batchId: id, memoryIds: [id],
+      followUpTaskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding], planConsolidation: false });
+  }
+  const calls = [];
+  const provider = Object.assign(async () => { throw new Error('Use batched embeddings'); }, { model: 'edit-test', dimensions: 2 });
+  provider.embedMany = async texts => {
+    calls.push(texts);
+    if (calls.length === 1) repository.editMemoryManually({ agentId: AGENT_ID, memoryId: 'edited',
+      patch: { content: 'edited 修正后的记忆内容。' }, reason: 'A concurrent correction' });
+    return { model: provider.model, vectors: texts.map(() => [1, 0]) };
+  };
+  const first = await runEmbeddingMaintenance({ repository, agentId: AGENT_ID, embeddingProvider: provider });
+  assert.equal(first.tasksCompleted, 1);
+  assert.equal(first.tasksRetried, 1);
+  assert.equal(first.report.added, 1);
+  assert.equal(first.report.failed, 1);
+  assert.deepEqual(repository.listEmbeddings(AGENT_ID, provider.model).map(row => row.memory_id), ['stable']);
+  const recovered = await runEmbeddingMaintenance({ repository, agentId: AGENT_ID, embeddingProvider: provider });
+  assert.equal(recovered.tasksCompleted, 1);
+  assert.equal(recovered.tasksRetried, 0);
+  assert.equal(calls[1].length, 1, 'the successful peer must not be embedded again');
+  assert.match(calls[1][0], /修正后/);
+  assert.equal(repository.listEmbeddings(AGENT_ID, provider.model).length, 2);
 });
 
 test("embedding lane combines queued memory ids and reuses completed vectors", async () => {
@@ -620,4 +667,22 @@ test(`semantic maintenance accepts a request-bound self report from ${subjectRol
   assert.equal(deferred.deferred[0].reason, "state-transition-requires-review");
   assert.equal(repository.getReportedStateProposal(AGENT_ID, transition.id).review_state, "pending");
   database.close();
+});
+
+
+test('work status consistently accounts for providers, accumulating tasks and completed progress', () => {
+  const status = { taskCounts: { 'semantic:event-continuity:pending': 2,
+    'semantic:structure-proposal:pending': 3, 'semantic:structure-proposal:failed': 1,
+    'semantic:retrieval-context:pending': 4, 'embedding:memory-embedding:pending': 5 },
+    structureQueue: { accumulatingTaskCount: 3 } };
+  const providers = { generator() {}, structureGenerator() {}, retrievalContextGenerator: null, embedding: null };
+  const before = maintenanceWorkStatus(status, providers);
+  assert.equal(before.pending.tasks, 4); assert.equal(before.failures, 1); assert.equal(before.deferred.tasks, 10);
+  providers.embedding = () => {};
+  const after = maintenanceWorkStatus(status, providers);
+  assert.equal(after.pending.tasks, 11); assert.equal(after.deferred.tasks, 3);
+  assert.equal(maintenanceWorkStatus(status, providers, { lane: 'embedding' }).total, 5);
+  status.taskCounts['semantic:retrieval-context:completed'] = 1;
+  const progressed = maintenanceWorkStatus(status, providers);
+  assert.equal(progressed.total, after.total); assert.equal(progressed.completed.tasks, 1);
 });

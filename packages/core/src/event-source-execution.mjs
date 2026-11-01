@@ -18,7 +18,7 @@ export function withEventSourceExecution(repository, callback, { sourceScope = n
     assertEventSourceScope(repository, scope, scope.agentId);
     assertCurrent();
   }
-  const execution = { repository, assertCurrent, sourceScoped, sourceScope: scope, signal: abortSignal, active: true };
+  const execution = { repository, assertCurrent, sourceScoped, sourceScope: scope, signal: abortSignal, active: true, views: parent?.views || new WeakMap() };
   return executions.run(execution, () => {
     try {
       const result = callback();
@@ -29,8 +29,8 @@ export function withEventSourceExecution(repository, callback, { sourceScope = n
   });
 }
 
-/** A fresh view is made at each owner material/claim boundary. It uses the
- * same fixed scope while including already committed in-scope derivatives. */
+/** Reuse a read view while its fixed scope and database versions remain current.
+ * Committed derivatives and cleanup invalidate it before the next material/claim. */
 export function executionEventSourceView(repository, agentId) {
   const execution = currentEventSourceExecution();
   execution?.assertCurrent();
@@ -38,7 +38,22 @@ export function executionEventSourceView(repository, agentId) {
   if (execution.sourceScope.agentId !== agentId) {
     throw eventSourceError('EVENT_SOURCE_AGENT_CONFLICT', 'Execution scope belongs to another Memory Agent.');
   }
-  return createEventSourceView(repository, execution.sourceScope, agentId);
+  let cached = execution.views.get(repository);
+  if (!cached) {
+    const dataVersion = repository.database.prepare('PRAGMA data_version');
+    const localChanges = repository.database.prepare('SELECT total_changes() AS changes');
+    cached = { dataVersion, localChanges, signature: '', view: null };
+    execution.views.set(repository, cached);
+  }
+  // data_version covers other connections; total_changes covers this connection,
+  // including writes later rolled back. Scope changes always get a new view.
+  const signature = JSON.stringify([execution.sourceScope,
+    cached.dataVersion.get().data_version, cached.localChanges.get().changes]);
+  if (cached.signature !== signature) {
+    cached.view = createEventSourceView(repository, execution.sourceScope, agentId);
+    cached.signature = signature;
+  }
+  return cached.view;
 }
 
 export function assertEventSourceExecutionCurrent() {

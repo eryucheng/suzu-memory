@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { processStateAnalysisRequest } from "@suzu-memory/analysis";
+import { retrieveMemories } from "@suzu-memory/retriever";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { validateMemoryTaskOutput } from '@suzu-memory/service';
 
 import {
   MemoryRepository,
@@ -27,6 +30,33 @@ function temporaryDatabase() {
   const database = openMemoryDatabase(databasePath);
   return { root, database, repository: new MemoryRepository(database) };
 }
+
+for (const language of ['en', 'zh']) test(`archives all directly named participants beyond eight: ${language}`, t => {
+  const database = openMemoryDatabase(':memory:');
+  t.after(() => database.close());
+  const repository = new MemoryRepository(database);
+  const names = Array.from({ length: 10 }, (_, index) => language === 'en' ? `Guest ${index + 1}` : `来宾${index + 1}`);
+  const text = language === 'en' ? `Suzu visited the museum with ${names.join(', ')}.` : `Suzu 和${names.join('、')}一起参观了博物馆。`;
+  const identity = { companionId: 'agent-test', companionName: 'Suzu', primaryUserId: 'human-test', primaryUserName: 'User' };
+  const built = buildLongTermExtractionInput({ identity, memoryOwner: 'Suzu', userName: 'User',
+    messages: [{ id: 'museum-visit', role: 'assistant', speaker: 'Suzu', text, timestamp: '2026-08-04T08:00:00Z' }] });
+  const candidate = { kind: 'event', title: 'Museum visit', content: text, subjectRole: 'agent', subjectName: 'Suzu',
+    actorRoles: names.map(actorName => ({ role: 'participant', actorRole: 'other', actorName, confidence: 1 })),
+    canonicalKey: '', stateFamily: 'not_applicable', stateLabel: '', reality: 'real', evidenceMode: 'observed', temporalState: 'historical',
+    eventDate: '', eventStart: '', eventEnd: '', revisionAction: 'add', retentionReason: 'episodic_event',
+    confidence: 1, importance: 0.5, sourceRefs: [built.messages[0].memoryRef] };
+  const generated = validateMemoryTaskOutput({ schemaName: 'long-term-memory-extraction-v2', schema: LONG_TERM_EXTRACTION_SCHEMA }, { memories: [candidate] });
+  assert.equal(generated.memories[0].actorRoles.length, 10);
+  const archived = archiveLongTermEvidence({ repository, agentId: 'agent-test', identity, messages: built.messages,
+    generatedMemories: generated.memories, batchId: 'museum-visitors', recordedAt: '2026-08-04T08:01:00Z' });
+  assert.equal(archived.memoriesStored, 1, JSON.stringify(archived));
+  const saved = repository.getMemoryDetail('agent-test', archived.candidateResults[0].memoryId);
+  const participants = saved.roles.filter(role => role.role === 'participant');
+  assert.equal(participants.length, 10);
+  assert.equal(new Set(participants.map(role => role.actor_key)).size, 10);
+  assert.deepEqual(participants.map(role => role.metadata.actorName).sort(), [...names].sort());
+  assert.equal(saved.sources.length, 1);
+});
 
 test('apostrophe folding resolves known names without collapsing distinct host identities', () => {
   const participants = buildExtractionParticipants([
@@ -264,3 +294,37 @@ test("keeps episodic events separate from unsupported stable-state inference", (
   assert.equal(isRetentionReasonCompatible("belief_state", "episodic_event"), false);
 
 });
+
+for (const [language, text] of [["en", "Xia's hands were shaking."], ["zh", "小夏的双手在发抖。"]]) {
+  for (const evidenceMode of ["observed", "inferred"]) test(`routes ${language} ${evidenceMode} state evidence to its specialist`, async t => {
+    const { root, database, repository } = temporaryDatabase();
+    t.after(() => { database.close(); fs.rmSync(root, { recursive: true, force: true }); });
+    const name = language === "en" ? "Xia" : "小夏";
+    const identity = { primaryUserId: "human-xia", primaryUserName: name, companionId: "agent-test", companionName: "Suzu" };
+    const built = buildLongTermExtractionInput({ memoryOwner: "Suzu", userName: name, identity,
+      messages: [{ id: "observation", role: "assistant", speaker: "Suzu", timestamp: "2026-08-04T08:00:00Z", text }] });
+    const generated = parseGeneratedLongTermExtraction({ memories: [{ kind: "fact", title: text, content: text, subjectRole: "user", subjectName: name,
+      actorRoles: [{ role: "experiencer", actorRole: "user", actorName: name, confidence: 0.9 }],
+      canonicalKey: "user:condition:shaking", stateFamily: "condition", stateLabel: "shaking hands", reality: "real", evidenceMode,
+      temporalState: "current", eventDate: "", eventStart: "", eventEnd: "", revisionAction: "add", retentionReason: "state_change", confidence: 0.8, importance: 0.5, sourceRefs: [built.messages[0].memoryRef] }] }).memories;
+    const result = archiveLongTermEvidence({ repository, agentId: "agent-test", messages: built.messages, generatedMemories: generated,
+      batchId: "observation-batch", recordedAt: "2026-08-04T08:01:00Z", identity });
+    assert.equal(result.stateAnalysisRequestsQueued, 1, JSON.stringify(result));
+    assert.equal(result.memoriesForReview, 0);
+    const [request] = repository.listStateAnalysisRequests("agent-test", { statuses: ["pending"] });
+    assert.equal(request.evidence_mode, evidenceMode);
+    assert.equal(request.representation_layer, "inferred");
+    assert.deepEqual(request.memoryIds, result.utteranceMemoryIds);
+    const processed = await processStateAnalysisRequest({ repository, agentId: "agent-test", requestId: request.id, embeddingProvider: async () => { throw new Error("Evidence-only analysis must not pre-embed a temporary semantic draft."); }, generator: async () => ({ output: { analyses: [{
+      memoryId: request.memoryIds[0], sourceIds: request.sourceIds, confidence: 0.8, rationale: "The source describes the fixed person.",
+      targetMatch: "exact", matchedLabel: "shaking hands", conditionPresence: "present", conditionKind: "health", effect: "none", temporality: "current",
+      evidenceBasis: evidenceMode === "observed" ? "direct_observation" : "inferred", scopeLabel: "this moment", revisionCue: "none",
+    }] } }) });
+    assert.equal(processed.status, "provisional-review", JSON.stringify(processed));
+    assert.equal(processed.merged.observations.length, 1);
+    assert.equal(processed.merged.observations[0].qualification, evidenceMode === "observed" ? "qualified" : "unresolved");
+    const recalled = await retrieveMemories({ databasePath: path.join(root, "memory.db"), agentId: "agent-test", query: language === "en" ? "shaking hands" : "双手在发抖",
+      now: new Date("2026-08-04T08:05:00Z"), options: { topK: 5, maximumContextChars: 4000 } });
+    assert.ok(recalled.candidates.some(item => item.memoryId === processed.provisional.id), JSON.stringify(recalled.candidates));
+  });
+}

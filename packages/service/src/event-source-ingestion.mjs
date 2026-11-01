@@ -1,10 +1,11 @@
 import { appendCompanionEvents } from '@suzu-memory/ingestion';
 import { normalizeEventSource, normalizeEventSourceScope, observeEventSourceScope, recordEventSourceConsumption,
   eventSourceEligible, eventSourceError, sourceSnapshot } from '@suzu-memory/core';
-import { parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { parseGeneratedLongTermExtraction, parseGeneratedExtractionRepair } from '@suzu-memory/extraction';
 
 export function validateMemoryExtractionOutput(request, output) {
-  if (!['long-term-memory-extraction-v2', 'long-term-memory-extraction-repair-v2'].includes(request?.schemaName)) {
+  if (request?.schemaName === 'long-term-memory-extraction-repair-v3') return parseGeneratedExtractionRepair(output);
+  if (request?.schemaName !== 'long-term-memory-extraction-v2') {
     throw eventSourceError('MEMORY_EXTRACTION_SCHEMA_UNKNOWN', 'The extraction validator does not own this task schema.');
   }
   return parseGeneratedLongTermExtraction(output);

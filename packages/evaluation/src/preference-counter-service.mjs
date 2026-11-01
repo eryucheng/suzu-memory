@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
+import { analysisCountLimit, analysisSchemaForCount } from '@suzu-memory/analysis';
 
 import {
   buildPreferenceCounterMatchGenerationInput,
@@ -276,7 +277,7 @@ export async function evaluatePreferenceCounterEvidence({
   generator,
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
-  maximumAnalyses = 40,
+  maximumAnalyses = Infinity,
   snapshotOptions = {},
 } = {}) {
   if (!repository) throw new Error("Preference counter evaluation requires a repository.");
@@ -321,14 +322,18 @@ export async function evaluatePreferenceCounterEvidence({
   const rejected = [];
   let errorMessage = "";
   try {
+    const count = snapshot.candidates.length;
+    if (count > analysisCountLimit(maximumAnalyses)) {
+      throw new Error(`Complete counter matching requires ${count} judgments; maximumAnalyses is ${maximumAnalyses}.`);
+    }
     generation = await generator({
       input,
       systemPrompt,
-      schema: PREFERENCE_COUNTER_MATCH_CONTRACT.schema,
+      schema: analysisSchemaForCount(PREFERENCE_COUNTER_MATCH_CONTRACT.schema, count),
       schemaName: PREFERENCE_COUNTER_MATCH_CONTRACT.schemaName,
       analyzerRole: PREFERENCE_COUNTER_MATCH_CONTRACT.role,
     });
-    const parsed = parsePreferenceCounterMatchGeneration(generation?.output, { maximumAnalyses });
+    const parsed = parsePreferenceCounterMatchGeneration(generation?.output, { maximumAnalyses: count });
     const seen = new Set();
     for (const [index, item] of parsed.analyses.entries()) {
       try {

@@ -1,11 +1,11 @@
+import { analysisCountLimit, parseAnalysisItems } from "./analysis-output.mjs";
 function clean(value) { return String(value ?? "").trim(); }
 const COMMON_REQUIRED = ["memoryId", "sourceIds", "confidence", "rationale"];
 const COMMON_PROPERTIES = { memoryId: { type: "string", minLength: 1 },
   sourceIds: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } },
   confidence: { type: "number", minimum: 0, maximum: 1 }, rationale: { type: "string", minLength: 1 } };
 function schema(required, properties) { return Object.freeze({ type: "object", additionalProperties: false,
-  required: ["analyses"], properties: { analyses: { type: "array", maxItems: 80,
-    items: { type: "object", additionalProperties: false, required: [...COMMON_REQUIRED, ...required],
+  required: ["analyses"], properties: { analyses: { type: "array", items: { type: "object", additionalProperties: false, required: [...COMMON_REQUIRED, ...required],
       properties: { ...COMMON_PROPERTIES, ...properties } } } } }); }
 export const AFFECTIVE_ASSOCIATION_ANALYZERS = Object.freeze({
   triggerEmotion: Object.freeze({ stateFamily: "affective_association", role: "trigger-emotion",
@@ -79,17 +79,15 @@ function parseItem(role, value, index) {
       scopeOverlap: enumValue(value.scopeOverlap, `analyses[${index}].scopeOverlap`, ["exact", "partial", "none", "unknown"]) }; }
   throw new Error(`Unknown affective analyzer role: ${role || "(empty)"}.`);
 }
-export function parseAffectiveAssociationGeneration(role, value, { maximumAnalyses = 60 } = {}) {
+export function parseAffectiveAssociationGeneration(role, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   if (!Object.values(AFFECTIVE_ASSOCIATION_ANALYZERS).some((item) => item.role === role)) throw new Error(`Unknown affective analyzer role: ${clean(role) || "(empty)"}.`);
   let parsed = value; if (typeof parsed === "string") { try { parsed = JSON.parse(parsed.replace(/^\uFEFF/u, "").trim()); } catch (error) { throw new Error(`Affective analyzer did not return valid JSON: ${error.message}`); } }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.analyses)) throw new Error("Affective analyzer output requires an analyses array.");
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) throw new Error(`Affective analyzer returned more than ${limit} analyses.`);
-  return { analyses: parsed.analyses.map((item, index) => parseItem(role, item, index)) };
+  return { analyses: parseAnalysisItems(parsed.analyses, (item, index) => parseItem(role, item, index), onRejected) };
 }
 export function buildAffectiveAssociationGenerationInput(snapshot, definition) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) || !definition?.role) throw new Error("Affective generation requires a snapshot and known analyzer.");
-  return [`当前专职角色：${definition.role}。`, "只处理系统提示词规定的单一职责。主体、触发对象、canonicalKey、联结标签和候选记忆均由调用方固定。",
-    "不得把当前心情、单次共现、偏好、关系或模型推测改写成稳定情绪联结；currentState 只读。",
-    "只引用快照内对应记忆自己的 sourceIds；没有证据时省略。只输出符合 Schema 的 JSON。", "", JSON.stringify(snapshot, null, 2)].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

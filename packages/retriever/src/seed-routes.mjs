@@ -1,6 +1,5 @@
-import { boundedOccurrences, lexicalCoverage, lexicalScore, prepareLexicalQuery, recallCorePhrases } from "./query.mjs";
-import { maskQuotedText, utteranceStatements } from './query-text.mjs';
-import { memoryCalendarDate } from './temporal-ranking.mjs';
+import { lexicalCoverage, lexicalScore, prepareLexicalQuery, recallCorePhrases } from "./query.mjs";
+import { utteranceStatements } from './query-text.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -8,126 +7,6 @@ function clean(value) {
 
 function unit(value) {
   return Math.max(0, Math.min(1, Number(value) || 0));
-}
-
-function memoryAllowed(node, intent) {
-  if (intent === "utterance") return node.kind === "utterance";
-  if (intent === "event") return node.kind !== "reflection";
-  return true;
-}
-
-function actorEquals(actor, target) {
-  return actor?.actor_role === target.role && actor?.actor_key === target.key;
-}
-
-function primaryEquals(node, target) {
-  return node.subject_role === target.role && node.subject_key === target.key;
-}
-
-function stateNode(node) {
-  return !["", "not_applicable", "unspecified"].includes(clean(node.state_family));
-}
-
-function hasSpeakerStatement(node, statements) {
-  if (!statements.hasQuestion) return true;
-  const text = maskQuotedText(statements.text).normalize('NFKC').toLowerCase();
-  return /\b(?:i|me|my|mine|we|our|ours)\b|我|咱|自己/u.test(text)
-    || (clean(node.metadata?.speaker) && boundedOccurrences(text, node.metadata.speaker).length > 0);
-}
-
-export function buildSubjectConstraint({
-  subjectQuery,
-  nodes,
-  actorRolesByMemory = new Map(),
-}) {
-  const routeByMemory = new Map();
-  const hardExcludedMemoryIds = new Set();
-  if (!subjectQuery?.matched) {
-    return { subjectQuery, routeByMemory, hardExcludedMemoryIds };
-  }
-  for (const node of nodes) {
-    const roles = actorRolesByMemory.get(node.id) || [];
-    let matched = false;
-    let strength = "";
-    if (subjectQuery.mode === "shared") {
-      const memberMatches = (subjectQuery.members || []).map((member) => (
-        primaryEquals(node, member) || roles.some((actor) => actorEquals(actor, member))
-      ));
-      matched = node.subject_role === "shared" || (
-        memberMatches.length >= 2 && memberMatches.every(Boolean)
-      );
-      strength = node.subject_role === "shared" ? "exact-holder" : "shared-participants";
-    } else {
-      const target = { role: subjectQuery.role, key: subjectQuery.key };
-      if (stateNode(node)) {
-        matched = primaryEquals(node, target);
-        strength = "exact-holder";
-      } else if (node.kind === "utterance") {
-        matched = primaryEquals(node, target) || roles.some((actor) => (
-          actor.role === "speaker" && actorEquals(actor, target)
-        ));
-        strength = "exact-speaker";
-      } else if (subjectQuery.focus === "state") {
-        matched = primaryEquals(node, target);
-        strength = "primary-subject";
-      } else {
-        matched = primaryEquals(node, target) || roles.some((actor) => actorEquals(actor, target));
-        strength = primaryEquals(node, target) ? "primary-subject" : "structured-participant";
-      }
-      const declaredOwnerRole = clean(node.subject_role);
-      const hasKnownOwner = Boolean(
-        declaredOwnerRole
-        && declaredOwnerRole !== "unknown"
-        && (declaredOwnerRole === "world" || clean(node.subject_key)),
-      );
-      const exclusiveOwnedFact = node.kind === "fact" && hasKnownOwner;
-      if (!matched && (
-        stateNode(node)
-        || node.kind === "utterance"
-        || subjectQuery.focus === "state"
-        || exclusiveOwnedFact
-      )) {
-        if (subjectQuery.focus === "state" || hasKnownOwner) {
-          hardExcludedMemoryIds.add(node.id);
-        }
-      }
-    }
-    if (!matched) continue;
-    routeByMemory.set(node.id, {
-      route: "subject",
-      strength,
-      independentlyAdmissible: false,
-      rawScore: 1,
-      normalizedScore: 1,
-      contribution: 0,
-    });
-  }
-  return { subjectQuery, routeByMemory, hardExcludedMemoryIds };
-}
-
-export function applySubjectConstraint(candidates, constraint) {
-  const rejectedMemoryIds = [];
-  const values = [];
-  for (const candidate of candidates) {
-    if (constraint.hardExcludedMemoryIds.has(candidate.node.id)) {
-      rejectedMemoryIds.push(candidate.node.id);
-      continue;
-    }
-    const subjectRoute = constraint.routeByMemory.get(candidate.node.id);
-    if (!subjectRoute) {
-      values.push(candidate);
-      continue;
-    }
-    values.push({
-      ...candidate,
-      routeMatches: [...(candidate.routeMatches || []), subjectRoute],
-      routeContributions: {
-        ...(candidate.routeContributions || {}),
-        subject: 0,
-      },
-    });
-  }
-  return { candidates: values, rejectedMemoryIds };
 }
 
 export function lexicalRoute(lexical, options, indexedMatches = false) {
@@ -208,32 +87,8 @@ function entityRoute(score) {
   };
 }
 
-function isCurrentStructuredState(node) {
-  return stateNode(node)
-    && clean(node.temporal_state) === "current"
-    && clean(node.status) === "active"
-    && clean(node.subject_role)
-    && clean(node.subject_key)
-    && clean(node.canonical_key)
-    && !["", "unspecified"].includes(clean(node.representation_layer));
-}
-
-function priorContribution(node, intent, query, asksForHistoricalState, querySubject) {
-  let contribution = Math.min(0.05, Math.max(0, Number(node.importance)) * 0.05);
-  if (intent === "event" && node.kind !== "utterance") contribution += 0.08;
-  if (intent === "event" && node.kind === "event" && node.event_date) contribution += 0.08;
-  if (intent === "utterance" && node.kind === "utterance") contribution += 0.08;
-  if (intent === "evidence" && node.kind !== "utterance") contribution += 0.08;
-  if (
-    intent === "auto"
-    && querySubject?.matched
-    && querySubject.mode === "personal"
-    && querySubject.focus === "state"
-    && isCurrentStructuredState(node)
-  ) contribution += 0.1;
-  if (node.status === "active") contribution += 0.08;
-  else if (!asksForHistoricalState(query)) contribution -= 0.12;
-  return contribution;
+function priorContribution(node) {
+  return Math.min(0.05, Math.max(0, Number(node.importance)) * 0.05) + (node.status === 'active' ? 0.08 : 0);
 }
 
 // Share base lexical scores only within one query and node snapshot. Route
@@ -243,32 +98,40 @@ export function createSeedLexicalScorer(preparedQuery, { includeQuestions = fals
   const prepare = node => {
     let entry = scores.get(node);
     if (!entry) {
-      const statements = node.kind === 'utterance' ? utteranceStatements(node.content) : null;
+      const content = node.content;
+      const statements = node.kind === 'utterance' ? utteranceStatements(content) : null;
       const lexical = lexicalScore(
         preparedQuery,
-        [node.event_date || "", node.title || "", statements && !includeQuestions ? statements.text : node.content]
+        [node.event_date || "", node.title || "", statements && !includeQuestions ? statements.text : content]
           .filter(Boolean).join("\n"),
       );
-      entry = { lexical, hasSpeakerStatement: !statements || hasSpeakerStatement(node, statements) };
+      entry = { lexical, statements };
       scores.set(node, entry);
     }
     return entry;
   };
-  return Object.assign(node => prepare(node).lexical,
-    { hasSpeakerStatement: node => prepare(node).hasSpeakerStatement });
+  return Object.assign(node => prepare(node).lexical, {
+    dialogue(node) {
+      const entry = prepare(node);
+      if (!entry.statements?.hasQuestion) return { hasQuestion: false };
+      entry.statementLexical ??= includeQuestions ? lexicalScore(preparedQuery,
+        [node.event_date || '', node.title || '', entry.statements.text].filter(Boolean).join('\n')) : entry.lexical;
+      entry.questionLexical ??= lexicalScore(preparedQuery, entry.statements.questions);
+      return { ...entry.statements, statementRelevance: lexicalCoverage(entry.statementLexical),
+        questionRelevance: lexicalCoverage(entry.questionLexical) };
+    },
+  });
 }
 
 export function buildOrdinarySeedCandidates({
   nodes,
   query,
-  intent,
   bm25Scores = new Map(),
   vectorScores = new Map(),
   entityScores = new Map(),
+  subjectOnlyEntityMemoryIds = new Set(),
   options,
   includeWeakLexical = false,
-  asksForHistoricalState = () => false,
-  querySubject = null,
   accessibilityAdjustments = new Map(),
   recallReactivationAdjustments = new Map(),
   naturalDecayAdjustments = new Map(),
@@ -276,17 +139,11 @@ export function buildOrdinarySeedCandidates({
   naturalDecaySpecificityByMemory = new Map(),
   affectiveAdjustments = new Map(),
   preparedQuery = prepareLexicalQuery(query),
-  scoreLexical = createSeedLexicalScorer(preparedQuery, {
-    includeQuestions: ['utterance', 'evidence', 'counterevidence', 'evidence-review'].includes(intent),
-  }),
+  scoreLexical = createSeedLexicalScorer(preparedQuery, { includeQuestions: true }),
 }) {
   const values = [];
   for (const node of nodes) {
-    if (!memoryAllowed(node, intent)) continue;
     const lexical = scoreLexical(node);
-    if (node.kind === 'utterance' && querySubject?.mode === 'personal'
-      && !['utterance', 'evidence', 'counterevidence', 'evidence-review'].includes(intent)
-      && scoreLexical.hasSpeakerStatement?.(node) === false) continue;
     const bm25 = bm25Scores.get(node.id) || null;
     const similarity = vectorScores.get(node.id) ?? Number.NEGATIVE_INFINITY;
     const entityScore = entityScores.get(node.id) || 0;
@@ -296,6 +153,12 @@ export function buildOrdinarySeedCandidates({
       vectorRoute(similarity, options),
       entityRoute(entityScore),
     ].filter(Boolean);
+    // A person's name identifies the search subject. It may admit a record,
+    // but cannot replace a match to what is being asked about that person.
+    if (preparedQuery.topicTerms?.length && subjectOnlyEntityMemoryIds.has(node.id)) {
+      routeMatches = routeMatches.map(route => route.route === 'entity'
+        ? { ...route, contribution: 0 } : route);
+    }
     const independentRoutes = routeMatches.filter((route) => route.independentlyAdmissible);
     // One text score: prefer BM25 where available. A per-memory index miss
     // must not receive a larger fallback than the indexed matches it lost to.
@@ -325,13 +188,7 @@ export function buildOrdinarySeedCandidates({
       && includeWeakLexical
       && lexical.overlap > 0;
     if (!independentRoutes.length && !corroborated && !convergenceOnly) continue;
-    const prior = priorContribution(
-      node,
-      intent,
-      query,
-      asksForHistoricalState,
-      querySubject,
-    );
+    const prior = priorContribution(node);
     const baseScore = routeMatches.reduce((sum, route) => sum + route.contribution, 0) + prior;
     const accessibility = accessibilityAdjustments.get(node.id) || null;
     const accessibilityAdjustment = Number(accessibility?.scoreAdjustment || 0);
@@ -391,39 +248,6 @@ export function buildOrdinarySeedCandidates({
   ));
 }
 
-export function buildEpisodicEvidenceSeedCandidates({
-  nodes,
-  query,
-  temporal = null,
-  intent = "auto",
-  options = {},
-  ...routes
-}) {
-  const restrictToDate = temporal?.matched && temporal.precision === 'exact'
-    && !recallCorePhrases(temporal.remainingQuery).length;
-  const inTemporalRange = (node) => {
-    if (!restrictToDate) return true;
-    const eventDate = memoryCalendarDate(node, options.timeZone);
-    return Boolean(
-      eventDate
-      && eventDate >= clean(temporal.startDate)
-      && eventDate <= clean(temporal.endDate)
-    );
-  };
-  return buildOrdinarySeedCandidates({
-    ...routes,
-    options,
-    nodes: (Array.isArray(nodes) ? nodes : []).filter((node) => (
-      node.kind === "utterance" && inTemporalRange(node)
-    )),
-    query,
-    intent,
-  }).map((candidate) => ({
-    ...candidate,
-    retrievalLane: "episodic-evidence",
-  }));
-}
-
 export function seedRoutingAudit({
   plannedRoutes = [],
   executedRoutes = [],
@@ -431,8 +255,6 @@ export function seedRoutingAudit({
   convergenceCandidates = [],
   primaryMemoryId = "",
   routeStatus = {},
-  subjectRouting = {},
-  stateRouting = {},
   bm25Routing = {},
 }) {
   const directIds = new Set(candidates.map((candidate) => candidate.node.id));
@@ -512,12 +334,6 @@ export function seedRoutingAudit({
     plannedRoutes: [...plannedRoutes],
     executedRoutes: [...executedRoutes],
     routeStatus: { ...routeStatus },
-    subjectRouting: subjectRouting && typeof subjectRouting === "object"
-      ? { ...subjectRouting }
-      : {},
-    stateRouting: stateRouting && typeof stateRouting === "object"
-      ? { ...stateRouting }
-      : {},
     bm25Routing: bm25Routing && typeof bm25Routing === "object"
       ? { ...bm25Routing }
       : {},

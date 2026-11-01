@@ -2,6 +2,8 @@ import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.
 import {
   normalizeReportedClaim,
   selectLatestReportedCandidate,
+  withReportedEvidence,
+  compatibleReportedClaims,
 } from "./reported-state-review-core.mjs";
 
 const SUBJECT_ROLES = new Set(["user", "agent", "other"]);
@@ -28,7 +30,8 @@ function candidateFromObservation(observation, currentStatePresent) {
     || holder?.holderMatch !== "yes"
     || holder?.attribution !== "explicit_self_statement"
     || performance?.evidenceType !== "self_report"
-    || (!POSITIVE_PROFICIENCY.has(performance?.proficiencyClaim) && !retiresCurrent)
+    || (!POSITIVE_PROFICIENCY.has(performance?.proficiencyClaim)
+      && !["none", "unknown"].includes(performance?.proficiencyClaim) && !retiresCurrent)
     || timeRelation?.stateTime !== "current"
     || Boolean(timeRelation?.currentStatePresent) !== currentStatePresent) {
     return null;
@@ -83,7 +86,8 @@ function proposedState(candidate, snapshot) {
       skillLabel: clean(candidate.skill.skillLabel),
       scopeLabel: clean(candidate.skill.scopeLabel),
       taskDifficulty: candidate.skill.taskDifficulty,
-      claimedProficiency: candidate.performance.proficiencyClaim,
+      claimedProficiency: ["none", "unknown"].includes(candidate.performance.proficiencyClaim)
+        ? "unknown" : candidate.performance.proficiencyClaim,
       independence: candidate.conditions?.independence || "not_applicable",
       dependencyLabel: clean(candidate.conditions?.dependencyLabel),
       repeatability: candidate.conditions?.repeatability || "not_applicable",
@@ -162,6 +166,7 @@ export function reviewReportedCapabilityState({
     };
   }
   const selection = selectLatestReportedCandidate(candidates, {
+    compatible: (left, right) => compatibleReportedClaims("capability", left, right),
     hasCurrentState: Boolean(snapshot.currentState),
     isExplicitChange: (candidate) => EXPLICIT_CHANGES.has(candidate.timeRelation.changeCue),
   });
@@ -182,7 +187,7 @@ export function reviewReportedCapabilityState({
     representationLayer: "reported",
     action,
     currentStateId: snapshot.currentState?.id || "",
-    proposedState: action === "retire" ? null : proposedState(selected, snapshot),
+    proposedState: action === "retire" ? null : withReportedEvidence(proposedState(selected, snapshot), selection),
     selectedObservationId: selected.observation.id,
     consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
     snapshot,

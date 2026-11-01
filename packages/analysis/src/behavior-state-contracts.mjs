@@ -1,3 +1,4 @@
+import { analysisCountLimit, parseAnalysisItems } from "./analysis-output.mjs";
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -42,7 +43,6 @@ function resultSchema(required, properties) {
     properties: {
       analyses: {
         type: "array",
-        maxItems: 80,
         items: {
           type: "object",
           additionalProperties: false,
@@ -263,7 +263,7 @@ function parseFamilyItem(stateFamily, value, index) {
   throw new Error(`Unknown behavior state family: ${stateFamily || "(empty)"}.`);
 }
 
-export function parseBehaviorStateGeneration(stateFamily, value, { maximumAnalyses = 60 } = {}) {
+export function parseBehaviorStateGeneration(stateFamily, value, { maximumAnalyses = Infinity, onRejected } = {}) {
   if (!BEHAVIOR_STATE_ANALYZERS[stateFamily]) {
     throw new Error(`Unknown behavior state family: ${clean(stateFamily) || "(empty)"}.`);
   }
@@ -281,11 +281,11 @@ export function parseBehaviorStateGeneration(stateFamily, value, { maximumAnalys
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Behavior state analyzer output requires an analyses array.");
   }
-  const limit = Math.min(80, Math.max(0, Math.trunc(Number(maximumAnalyses) || 60)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Behavior state analyzer returned more than ${limit} analyses.`);
   }
-  return { analyses: parsed.analyses.map((item, index) => parseFamilyItem(stateFamily, item, index)) };
+  return { analyses: parseAnalysisItems(parsed.analyses, (item, index) => parseFamilyItem(stateFamily, item, index), onRejected) };
 }
 
 export function buildBehaviorStateGenerationInput(snapshot, definition) {
@@ -295,13 +295,5 @@ export function buildBehaviorStateGenerationInput(snapshot, definition) {
   if (!definition?.stateFamily || !definition?.role) {
     throw new Error("Behavior state generation requires a known analyzer definition.");
   }
-  return [
-    `当前状态家族：${definition.stateFamily}。当前专职角色：${definition.role}。`,
-    "只处理系统提示词规定的单一职责，不要推断其他状态家族，也不要输出最终人物结论。",
-    "目标主体、canonicalKey 和候选记忆均由调用方固定；不得修改主体、发明新目标或扫描快照之外的信息。",
-    "只引用快照内对应记忆自己的 sourceIds。没有证据时省略该记忆，不要猜测补齐。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

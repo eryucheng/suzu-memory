@@ -2,6 +2,21 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+export const DEFAULT_MAXIMUM_PROPOSALS = 20;
+
+export function proposalCountLimit(value = DEFAULT_MAXIMUM_PROPOSALS) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('maximumProposals must be a non-negative safe integer.');
+  }
+  return value;
+}
+
+export function proposalSchemaForLimit(schema, maximumProposals = DEFAULT_MAXIMUM_PROPOSALS) {
+  return { ...schema, properties: { ...schema.properties,
+    proposals: { ...schema.properties.proposals, maxItems: proposalCountLimit(maximumProposals) },
+  } };
+}
+
 const nullableString = Object.freeze({ type: ["string", "null"] });
 
 const actorRoleSchema = Object.freeze({
@@ -33,7 +48,7 @@ export const MEMORY_STRUCTURE_OUTPUT_SCHEMA = Object.freeze({
   properties: {
     proposals: {
       type: "array",
-      maxItems: 20,
+      maxItems: DEFAULT_MAXIMUM_PROPOSALS,
       items: {
         type: "object",
         additionalProperties: false,
@@ -75,14 +90,10 @@ export function buildStructureGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Memory structure generation requires a snapshot object.");
   }
-  return [
-    "请根据以下受限记忆快照提出结构候选。只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2),
-  ].join("\n");
+  return JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2);
 }
 
-export function parseStructureGeneration(value, { maximumProposals = 20 } = {}) {
+export function parseStructureGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -99,7 +110,7 @@ export function parseStructureGeneration(value, { maximumProposals = 20 } = {}) 
   if (!Array.isArray(parsed.proposals)) {
     throw new Error("Memory structure generator output requires a proposals array.");
   }
-  const limit = Math.min(100, Math.max(0, Math.trunc(Number(maximumProposals) || 20)));
+  const limit = proposalCountLimit(maximumProposals);
   if (parsed.proposals.length > limit) {
     throw new Error(`Memory structure generator returned more than ${limit} proposals.`);
   }

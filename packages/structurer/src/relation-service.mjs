@@ -13,6 +13,7 @@ import {
   parseRelationGeneration,
 } from "./relation-prompt.mjs";
 import { buildRelationSnapshot } from "./relation-snapshot.mjs";
+import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit, proposalSchemaForLimit } from './prompt.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "relation-system-prompt.md");
@@ -57,8 +58,10 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
 
 export function prepareRelationGeneration({
   repository, agentId, batchId, memoryIds,
-  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator,
+  snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator, maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
 }) {
+  const limit = proposalCountLimit(maximumProposals);
+  if (limit === 0) return { snapshot: null, request: null, reason: 'proposal-budget-zero' };
   const snapshot = buildRelationSnapshot({
     repository,
     agentId: agentId,
@@ -71,7 +74,7 @@ export function prepareRelationGeneration({
   const request = {
     input: buildRelationGenerationInput(snapshot),
     systemPrompt,
-    schema: MEMORY_RELATION_OUTPUT_SCHEMA,
+    schema: proposalSchemaForLimit(MEMORY_RELATION_OUTPUT_SCHEMA, limit),
     schemaName: "memory-relation-proposals-v1",
     ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
   };
@@ -89,7 +92,7 @@ export async function proposeRelationsForBatch({
   systemPromptPath = DEFAULT_PROMPT_PATH,
   snapshotOptions = {},
   candidatePolicy = {},
-  maximumProposals = 20,
+  maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
   preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory relation structurer requires a repository.");
@@ -102,13 +105,15 @@ export async function proposeRelationsForBatch({
     (Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean),
   )];
   const normalizedBatchId = clean(batchId) || stableBatchId(normalizedAgentId, normalizedMemoryIds);
-  const prepared = preparedGeneration || prepareRelationGeneration({
+  const limit = proposalCountLimit(maximumProposals);
+  const prepared = (limit > 0 ? preparedGeneration : null) || prepareRelationGeneration({
     repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
-    snapshotOptions, systemPromptPath, generator,
+    snapshotOptions, systemPromptPath, generator, maximumProposals: limit,
   });
   const { snapshot, request } = prepared;
   if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
     snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
+  if (request.schema.properties.proposals.maxItems !== limit) throw new Error('Prepared relation request does not match maximumProposals.');
   generator.assertRequestBudget?.(request);
   const generation = await generator(request);
   const warnings = [];

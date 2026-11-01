@@ -1,11 +1,8 @@
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
 import {
   BEHAVIOR_STATE_ANALYZERS,
@@ -92,91 +89,11 @@ function enforceAnalysisBoundary(stateFamily, analysis, snapshot) {
   return analysis;
 }
 
-async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId,
-      provider: generation.metadata?.provider || "",
-      model: generation.model,
-      source: "memory-evaluation",
-      feature: `memory-${definition.stateFamily}-evidence`,
-      requestId: generation.requestId || "",
-      usage: generation.usage,
-      metadata: {
-        batchId,
-        analyzerRole: definition.role,
-        durationMs: Number(generation.durationMs || 0),
-        ...generation.metadata,
-      },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(
-    path.join(path.resolve(promptDirectory), definition.promptFile),
-    "utf8",
-  ).replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildBehaviorStateGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({
-      input,
-      systemPrompt: analysisSystemPrompt(systemPrompt),
-      schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-      stateFamily: definition.stateFamily,
-      analyzerRole: definition.role,
-    });
-    const parsed = parseBehaviorStateGeneration(definition.stateFamily, generation?.output, {
-      maximumAnalyses,
-    });
-    const accepted = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, candidate] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(candidate.memoryId)) {
-          throw new Error("A behavior state analyzer can analyze each memory at most once.");
-        }
-        accepted.push(enforceAnalysisBoundary(
-          definition.stateFamily,
-          candidate,
-          snapshot,
-        ));
-        seen.add(candidate.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
-      }
-    }
-    return {
-      definition,
-      input,
-      generation,
-      analyses: accepted,
-      rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained",
-      error: "",
-    };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return {
-      definition,
-      input,
-      generation,
-      analyses: [],
-      rejected: [],
-      status: "failed",
-      error: error.message,
-    };
-  }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildBehaviorStateGenerationInput,
+    parseGeneration: parseBehaviorStateGeneration, enforceBoundary: enforceAnalysisBoundary, analysisKey: options.definition.stateFamily });
 }
 
 function targetGate(analysis) {
@@ -427,7 +344,7 @@ export async function evaluateBehaviorStateEvidence({
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
   snapshotOptions = {},
-  maximumAnalyses = 60,
+  maximumAnalyses = Infinity,
   persistEvidenceLedger = true,
 } = {}) {
   if (!repository) throw new Error("Behavior state evaluation requires a repository.");
@@ -500,64 +417,19 @@ export async function evaluateBehaviorStateEvidence({
       snapshot: snapshots[stateFamily],
       promptDirectory,
       maximumAnalyses,
+      previousRuns: priorAnalyzerRuns(repository, snapshots[stateFamily], batchId, [[stateFamily, definition]], snapshotOptions),
     });
     return [stateFamily, invocation];
   }));
 
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
   const observations = {};
-  const warnings = [];
-  for (const [stateFamily, invocation] of invocations) {
-    const snapshot = snapshots[stateFamily];
-    const sourceIds = uniqueStrings(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-    const warning = await appendAnalyzerUsage({
-      usageLedgerPath,
-      generation: invocation.generation,
-      definition: invocation.definition,
-      agentId: clean(agentId),
-      batchId,
-    });
-    if (warning) warnings.push(warning);
-    runs[stateFamily] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId),
-      batchId,
-      stateFamily,
-      analyzerRole: invocation.definition.role,
-      subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported",
-      promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName,
-      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
-      status: invocation.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id),
-      sourceIds,
-      output: invocation.generation?.output ?? {},
-      rejected: invocation.rejected,
-      usage: invocation.generation?.usage || {},
-      costAmount: Number(
-        invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0,
-      ) || 0,
-      costCurrency: clean(
-        invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency,
-      ),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error,
-      metadata: {
-        conceptLabel: selectedTargets[stateFamily].conceptLabel,
-        currentRepresentationLayer: selectedTargets[stateFamily].currentRepresentationLayer,
-        automaticStateProposalAllowed: false,
-        evidenceObservationWriteAllowed: Boolean(persistEvidenceLedger),
-      },
-    });
-    analyses[stateFamily] = invocation.analyses;
-    rejected[stateFamily] = invocation.rejected;
-  }
+  const { runs, analyses, rejected, warnings, failedRoles: failedFamilies, hasAnyAnalysis } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, snapshot: family => snapshots[family], invocations, usageLedgerPath,
+    usageFeature: (_key, definition) => 'memory-' + definition.stateFamily + '-evidence',
+    metadata: family => ({ conceptLabel: selectedTargets[family].conceptLabel,
+      currentRepresentationLayer: selectedTargets[family].currentRepresentationLayer,
+      automaticStateProposalAllowed: false, evidenceObservationWriteAllowed: Boolean(persistEvidenceLedger) }),
+  });
 
   if (persistEvidenceLedger) {
     repository.transaction(() => {
@@ -575,9 +447,6 @@ export async function evaluateBehaviorStateEvidence({
     for (const stateFamily of Object.keys(selectedTargets)) observations[stateFamily] = [];
   }
 
-  const failedFamilies = Object.keys(selectedTargets)
-    .filter((stateFamily) => ["failed", "rejected"].includes(runs[stateFamily].status));
-  const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
   return {
     status: failedFamilies.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",
     reason: failedFamilies.length ? "one-or-more-family-analyzers-failed-or-rejected" : "",

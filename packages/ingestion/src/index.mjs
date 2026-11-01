@@ -21,3 +21,5 @@ export {
   packConversationArchiveWindows,
   toProcessingArchiveWindows,
 } from "./archive-windows.mjs";
+
+export { retryCompanionExtractionRepair } from './processing-stages.mjs';

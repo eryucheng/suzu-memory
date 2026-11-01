@@ -1,3 +1,4 @@
+import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 import { createHash } from "node:crypto";
 
 import {
@@ -580,6 +581,9 @@ export function materializePreferenceStateProposal(repository, { agentId, propos
         preferenceMetrics: proposal.metrics, preferencePolicyVersion: proposal.policy_version },
     });
     attachEvidence(repository, proposal, memory, { pending: true });
+    enqueueMemoryMaintenanceTasks({ repository, agentId: proposal.agent_id,
+      batchId: 'pending-reported-state:' + memory.id, memoryIds: [memory.id],
+      taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding] });
     return { status: "created", proposal, memory };
   });
 }

@@ -134,47 +134,10 @@ test("read-only recall leaves feedback and session bindings untouched, including
   assert.deepEqual(memory.calls, []);
 });
 
-test('pending work excludes unavailable providers and accumulating structures while retaining actual failures', async () => {
-  const memory = fakeMemory();
-  memory.providers = { generator() {}, structureGenerator() {}, retrievalContextGenerator: null, embedding: null };
-  memory.maintenanceStatus = async () => ({ taskCounts: {
-    'semantic:event-continuity:pending': 2,
-    'semantic:structure-proposal:pending': 3,
-    'semantic:structure-proposal:failed': 1,
-    'semantic:retrieval-context:pending': 4,
-    'embedding:memory-embedding:pending': 5,
-  }, structureQueue: { accumulatingTaskCount: 3 } });
-  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
-  const progress = await adapter.pendingWork();
-  assert.equal(progress.pending.tasks, 4); // Disabled retrieval contexts still need the formal skip/cleanup pass.
-  assert.equal(progress.failures, 1);
-  assert.equal(progress.deferred.tasks, 10);
-  memory.providers.embedding = () => {};
-  const withVectors = await adapter.pendingWork();
-  assert.equal(withVectors.pending.tasks, 11);
-  assert.equal(withVectors.deferred.tasks, 3);
-});
-
-test('progress changes when completed work is replaced by equally many new tasks', async () => {
-  const memory = fakeMemory();
-  memory.providers = { retrievalContextGenerator: null };
-  let completed = 0;
-  memory.maintenanceStatus = async () => ({ taskCounts: {
-    'semantic:retrieval-context:pending': 1, 'semantic:retrieval-context:completed': completed,
-  } });
-  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
-  const first = await adapter.pendingWork();
-  completed++;
-  const second = await adapter.pendingWork();
-  assert.equal(first.total, second.total);
-  assert.equal(second.completed.tasks, 1);
-  assert.notEqual(JSON.stringify(first), JSON.stringify(second));
-});
-
 test('length maintenance releases drained sessions instead of repeating a pass for each old session', async () => {
   const memory = fakeMemory();
-  memory.maintenanceStatus = async () => ({});
-  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY, archiveMode: 'length' });
+  memory.maintenanceStatus = async () => ({ work: { pending: { tasks: 0, stateRequests: 0, consolidation: 0 }, total: 0, completed: {}, failures: 0, deferred: { tasks: 0 } } });
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
   for (const sessionId of ['one', 'two']) await adapter.afterReply({ sessionId, turnId: '1',
     userMessage: { text: '消息' }, assistantMessage: { text: '回复' } });
   await adapter.onSessionEnd();
@@ -185,11 +148,11 @@ test('length maintenance releases drained sessions instead of repeating a pass f
 
 test('length maintenance retains failures from an earlier session when the last session succeeds', async () => {
   const memory = fakeMemory();
-  memory.maintenanceStatus = async () => ({});
+  memory.maintenanceStatus = async () => ({ work: { pending: { tasks: 0, stateRequests: 0, consolidation: 0 }, total: 0, completed: {}, failures: 0, deferred: { tasks: 0 } } });
   memory.runMaintenance = async options => options.chunkPolicy.sessionId === 'one'
     ? { status: 'completed-with-failures', failures: [], semantic: { status: 'completed-with-failures', error: 'materialization failed' } }
     : { status: 'completed', failures: [] };
-  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY, archiveMode: 'length' });
+  const adapter = createChatHostMemoryAdapter({ memory, hostId: 'test', identity: IDENTITY });
   for (const sessionId of ['one', 'two']) await adapter.afterReply({ sessionId, turnId: '1', assistantMessage: { text: '回复' } });
   const result = await adapter.onSessionEnd();
   assert.equal(result.maintenance.status, 'completed');
@@ -316,62 +279,6 @@ test("turn event ids are deterministic and host-scoped", () => {
   assert.match(first[0].source.locator, /^host:\/\/codex\/sessions\//u);
   assert.equal(first[0].metadata.memoryWindow.id, first[1].metadata.memoryWindow.id);
   assert.equal(first[0].metadata.memoryWindow.unitId, first[1].metadata.memoryWindow.unitId);
-});
-
-test("host window maintenance preserves the shared archive boundaries", async () => {
-  const memory = fakeMemory();
-  const adapter = createChatHostMemoryAdapter({ memory, hostId: "codex", identity: IDENTITY });
-  const stored = [
-    ...buildConversationTurnEvents({
-      identity: IDENTITY,
-      hostId: "codex",
-      sessionId: "archive-session",
-      turnId: "turn-1",
-      userMessage: { text: "我去科技馆了", occurredAt: "2026-08-05T01:00:00.000Z" },
-      assistantMessage: { text: "玩得怎么样？", occurredAt: "2026-08-05T01:00:01.000Z" },
-    }),
-    ...buildConversationTurnEvents({
-      identity: IDENTITY,
-      hostId: "codex",
-      sessionId: "archive-session",
-      turnId: "turn-2",
-      userMessage: { text: "看了机器人展", occurredAt: "2026-08-05T01:01:00.000Z" },
-      assistantMessage: { text: "那一定很有意思", occurredAt: "2026-08-05T01:01:01.000Z" },
-    }),
-  ].map((event, index) => ({
-    ...event,
-    id: `input-${index + 1}`,
-    external_id: event.eventId,
-    actor_role: event.actor.role,
-    actor_key: event.actor.id,
-    occurred_at: event.occurredAt,
-    known_at: event.knownAt,
-    recorded_at: event.recordedAt,
-    status: "pending",
-  }));
-  memory.inputEvents.push(...stored);
-
-  const result = await adapter.onSessionEnd({
-    sessionId: "archive-session",
-    maximumEvents: 2,
-    maximumContentCharacters: 10_000,
-    maximumPreviousContextMessages: 2,
-    maximumPreviousContextCharacters: 10_000,
-    maximumContinuationGuidanceMessages: 2,
-    maximumContinuationGuidanceCharacters: 10_000,
-  });
-  assert.equal(result.input.length, 1);
-  assert.equal(result.input[0].batches.length, 2);
-  const processCalls = memory.calls.filter(([name]) => name === "process-events");
-  assert.equal(processCalls.length, 2);
-  assert.deepEqual(processCalls[0][1].candidateEventIds, ["input-1", "input-2"]);
-  assert.deepEqual(processCalls[1][1].candidateEventIds, ["input-3", "input-4"]);
-  assert.equal(processCalls[0][1].archiveWindows[0].previousContextEvents.length, 0);
-  assert.equal(processCalls[0][1].archiveWindows[0].continuationGuidanceEvents.length, 2);
-  assert.equal(processCalls[1][1].archiveWindows[0].previousContextEvents.length, 2);
-  assert.equal(processCalls[1][1].archiveWindows[0].continuationGuidanceEvents.length, 0);
-  const maintenance = memory.calls.find(([name]) => name === "maintenance");
-  assert.equal(maintenance[1].processInputEvents, false);
 });
 
 test("nested source locators are preserved while legacy sourceLocator remains the explicit override", () => {
@@ -729,7 +636,7 @@ test("adapter lifecycle persists events, response use, and next-message feedback
   }
 });
 
-test("real host session maintenance applies the shared archive planner before semantic maintenance", async () => {
+test("host flush uses the shared length planner and preserves the two batch boundaries", async () => {
   const dataRoot = temporaryDirectory();
   const service = createMemoryService({
     dataRoot,
@@ -739,6 +646,7 @@ test("real host session maintenance applies the shared archive planner before se
       userName: IDENTITY.primaryUserName,
       companionId: IDENTITY.companionId,
       memoryOwner: IDENTITY.companionName,
+      ingestion: { maximumCoreMessages: 2 },
     },
   });
   service.initialize();
@@ -757,10 +665,8 @@ test("real host session maintenance applies the shared archive planner before se
   });
   const completed = await adapter.onSessionEnd({
     sessionId: "windowed-real-session",
-    lane: "embedding",
-    maximumEvents: 2,
-    maximumContentCharacters: 10_000,
-    memoriesOverride: [],
+    maximumInputBatches: 2,
+    generator: async () => ({ output: { memories: [] } }), structureGenerator: null,
   });
   assert.equal(completed.input[0].batches.length, 2);
   const pending = service.listInputEvents({
@@ -771,8 +677,7 @@ test("real host session maintenance applies the shared archive planner before se
     statuses: ["archived"], hostId: "codex", sessionId: "windowed-real-session",
   });
   assert.equal(archived.total, 4);
-  const windows = completed.input[0].batches.map((batch) => batch.windowIds);
-  assert.equal(windows.length, 2);
+  assert.ok(completed.input[0].batches.every(batch => batch.chunk.coreMessages === 2));
 });
 
 test("a later host turn can be archived after earlier turns are already archived", async () => {
@@ -795,10 +700,10 @@ test("a later host turn can be archived after earlier turns are already archived
     userMessage: { text: "第一轮已经归档。", occurredAt: "2026-08-05T01:00:00.000Z" },
     assistantMessage: { text: "第一轮回复。", occurredAt: "2026-08-05T01:00:01.000Z" },
   });
-  const first = await adapter.onIdle({
+  const first = await adapter.onSessionEnd({
     sessionId: "continued-real-session",
-    lane: "embedding",
-    memoriesOverride: [],
+
+    generator: async () => ({ output: { memories: [] } }), structureGenerator: null,
   });
   assert.equal(first.status, "completed");
 
@@ -808,10 +713,10 @@ test("a later host turn can be archived after earlier turns are already archived
     userMessage: { text: "第二轮应该不会被第一轮阻塞。", occurredAt: "2026-08-05T01:02:00.000Z" },
     assistantMessage: { text: "第二轮回复。", occurredAt: "2026-08-05T01:02:01.000Z" },
   });
-  const second = await adapter.onIdle({
+  const second = await adapter.onSessionEnd({
     sessionId: "continued-real-session",
-    lane: "embedding",
-    memoriesOverride: [],
+
+    generator: async () => ({ output: { memories: [] } }), structureGenerator: null,
   });
   assert.equal(second.status, "completed");
   assert.equal(second.input[0].batches.length, 1);
@@ -850,12 +755,12 @@ test("a fresh adapter discovers persisted pending host sessions after restart", 
     createdAt: "2026-08-05T04:01:00.000Z",
   }));
   const restarted = createChatHostMemoryAdapter({ memory: service, hostId: "codex", identity: IDENTITY });
-  const completed = await restarted.onIdle({
-    lane: "embedding",
+  const completed = await restarted.onSessionEnd({
+
     now: "2026-08-05T04:03:00.000Z",
     maximumEvents: 10,
     maximumContentCharacters: 10_000,
-    memoriesOverride: [],
+    generator: async () => ({ output: { memories: [] } }), structureGenerator: null,
   });
   assert.equal(completed.recovered.recovered, 1);
   assert.equal(completed.input.length, 1);
@@ -888,16 +793,14 @@ test("idle isolates one session archive failure and still maintains later sessio
     ...failingTurn.events.map((event) => ({ ...event, id: event.eventId, status: "pending" })),
     ...healthyTurn.events.map((event) => ({ ...event, id: event.eventId, status: "pending" })),
   );
-  const originalProcessPendingEvents = memory.processPendingEvents;
   let attempts = 0;
-  memory.processPendingEvents = async (options) => {
-    attempts += 1;
-    if (attempts === 1) {
-      const error = new Error("Temporary extraction transport failure.");
-      error.code = "TEMPORARY_EXTRACTION_FAILURE";
-      throw error;
-    }
-    return originalProcessPendingEvents(options);
+  memory.runMaintenance = async options => {
+    memory.calls.push(['maintenance', options]);
+    attempts++;
+    if (attempts === 1) throw Object.assign(new Error('Temporary extraction transport failure.'), { code: 'TEMPORARY_EXTRACTION_FAILURE' });
+    memory.inputEvents.filter(event => event.metadata.host.sessionId === options.chunkPolicy.sessionId)
+      .forEach(event => { event.status = 'archived'; });
+    return { status: 'completed', semantic: { inputBatches: [{ status: 'processed' }] } };
   };
 
   const completed = await adapter.onIdle({ lane: "embedding" });
@@ -907,10 +810,10 @@ test("idle isolates one session archive failure and still maintains later sessio
   assert.equal(completed.input[0].status, "failed");
   assert.equal(completed.input[0].sessionId, "temporarily-failing-session");
   assert.equal(completed.input[0].error.code, "TEMPORARY_EXTRACTION_FAILURE");
-  assert.equal(completed.input[1].status, "processed");
+  assert.equal(completed.input[1].status, "completed");
   assert.equal(completed.input[1].sessionId, "healthy-session");
   assert.deepEqual(completed.failures.map((item) => item.sessionId), ["temporarily-failing-session"]);
-  assert.equal(memory.calls.filter((item) => item[0] === "maintenance").length, 1);
+  assert.equal(memory.calls.filter((item) => item[0] === "maintenance").length, 2);
   assert.equal(
     memory.inputEvents.filter((event) => event.metadata.host.sessionId === "temporarily-failing-session"
       && event.status === "pending").length,

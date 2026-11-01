@@ -43,7 +43,8 @@ async function roundEnds(groups, resolveReply, maximum, reverse = false) {
 
 const characters = rows => rows.reduce((sum, row) => sum + String(row.content?.text || '').length, 0);
 
-async function planLengthChunk({ pending, previous, resolveReply, measure, maximumCoreCharacters, maximumCoreMessages = 100,
+export async function planReplyChunk({ pending, previous = [], resolveReply, measure,
+  maximumCoreCharacters = DEFAULT_LENGTH_ARCHIVE_POLICY.maximumCoreCharacters, maximumCoreMessages = 100,
   maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false }) {
   for (const value of [maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Archive character limits must be positive integers.');
@@ -104,62 +105,7 @@ async function planLengthChunk({ pending, previous, resolveReply, measure, maxim
     estimatedRequestCharacters: requestCharacters(count), maximumRequestCharacters };
 }
 
-export async function planReplyChunk({ pending, previous = [], resolveReply, measure,
-  coreRounds = 5, maximumRequestTokens = 16_384, scanFull = false, maximumCoreCharacters = null,
-  maximumRequestCharacters, maximumContextCharacters, maximumCoreMessages = 100, flush = false }) {
-  if (maximumCoreCharacters !== null) return planLengthChunk({ pending, previous, resolveReply, measure,
-    maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters, flush, scanFull });
-  const groups = logicalGroups(pending);
-  if (!groups.length) return { status: pending.length ? 'blocked' : 'skipped',
-    reason: pending.length ? 'incomplete-logical-event' : 'no-pending-events',
-    inputEventIds: pending.length ? [pending[0].id] : [], eventsProcessed: 0 };
-  const ends = await roundEnds(groups, resolveReply, coreRounds + 1);
-  // A bounded reverse read may start in the middle of an older fragment group.
-  const historyStart = previous.findIndex(row => !row.metadata?.suzuMemoryFragment || row.metadata.suzuMemoryFragment.index === 1);
-  const history = logicalGroups(previous.slice(historyStart < 0 ? previous.length : historyStart));
-  const historyEnds = await roundEnds(history, resolveReply, 2, true);
-  let before = historyEnds.length ? history.slice(historyEnds.at(-2) || 0, historyEnds.at(-1)).flat() : [];
-  const target = ends[coreRounds - 1] ?? groups.length;
-  const followingEnd = ends[coreRounds];
-  let after = followingEnd ? groups.slice(target, followingEnd).flat() : [];
-  const requestTokens = (count, preceding = before, following = after) => measure({
-    events: groups.slice(0, count).flat(), previousContextEvents: preceding, continuationGuidanceEvents: following,
-  });
-  const complete = followingEnd !== undefined;
-  // While waiting, measure all accumulated material, including an unfinished
-  // following round. A long ongoing conversation may trigger the token guard.
-  const waitingTokens = complete ? requestTokens(target) : requestTokens(groups.length, before, []);
-  if (!complete && !scanFull && waitingTokens < maximumRequestTokens) {
-    return { status: 'waiting', reason: 'reply-rounds', completedRounds: ends.length,
-      requiredRounds: coreRounds + 1, estimatedRequestTokens: waitingTokens, eventsProcessed: 0 };
-  }
-  let count = target;
-  let reason = 'reply-rounds';
-  if (!complete || requestTokens(count) > maximumRequestTokens) {
-    reason = waitingTokens >= maximumRequestTokens ? 'token-limit' : 'input-window-limit';
-    // Find the longest complete-message prefix that fits without overlap first.
-    let low = 0, high = target;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      if (requestTokens(middle, [], []) <= maximumRequestTokens) low = middle;
-      else high = middle - 1;
-    }
-    count = low;
-    if (!count) return { status: 'blocked', reason: 'input-event-exceeds-token-limit',
-      inputEventIds: groups[0].map(row => row.id), maximumRequestTokens,
-      estimatedRequestTokens: requestTokens(1, [], []), eventsProcessed: 0 };
-    // Prefer a completed reply boundary over cutting a reply's bubbles apart.
-    count = ends.filter(end => end <= count).at(-1) || count;
-    const nextEnd = ends.find(end => end > count);
-    after = nextEnd ? groups.slice(count, nextEnd).flat() : [];
-    // Full overlap rounds are optional only when the upper bound forces it.
-    if (requestTokens(count) > maximumRequestTokens) after = [];
-    if (requestTokens(count) > maximumRequestTokens) before = [];
-  }
-  return { status: 'ready', reason, events: groups.slice(0, count).flat(),
-    previousContextEvents: before, continuationGuidanceEvents: after,
-    estimatedRequestTokens: requestTokens(count), maximumRequestTokens };
-}
+
 
 export async function selectReplyChunk({ repository, agentId, identity, systemPrompt, timeZone, policy }) {
   const eligibleIds = executionEventSourceView(repository, agentId)?.inputIds ?? null;
@@ -176,8 +122,6 @@ export async function selectReplyChunk({ repository, agentId, identity, systemPr
       const request = buildCompanionExtractionRequest({
       ...selection, identity, systemPrompt, timeZone,
       }).request;
-      return policy.maximumCoreCharacters != null
-        ? String(request.input).length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100
-        : policy.estimateRequestTokens(request);
+      return String(request.input).length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100;
     } });
 }

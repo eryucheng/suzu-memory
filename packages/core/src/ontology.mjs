@@ -217,15 +217,15 @@ export const MEMORY_STATE_FAMILY_ALLOWED_KINDS = Object.freeze({
 });
 
 export const MEMORY_STATE_FAMILY_DEFINITIONS = Object.freeze({
-  identity: Object.freeze({ status: "transitional", description: "身份与生平事实。" }),
+  identity: Object.freeze({ status: "transitional", description: "身份、生平事实与主体本人的婚恋状态（单身、恋爱中、已婚等）；与指向特定对象的关系观点分开。" }),
   belief: Object.freeze({ status: "transitional", description: "主体当前或历史的观念与看法。" }),
-  preference: Object.freeze({ status: "transitional", description: "可选择条件下的喜好与厌恶。" }),
+  preference: Object.freeze({ status: "transitional", description: "对具体对象、活动或情境的喜好、厌恶与选择倾向。" }),
   habit: Object.freeze({ status: "transitional", description: "有条件和场景范围的重复行为规律。" }),
   disposition: Object.freeze({ status: "transitional", description: "跨情境的行为、交流、决策与应对倾向。" }),
-  value: Object.freeze({ status: "transitional", description: "由明确原则和真实取舍共同校准的价值与优先级。" }),
+  value: Object.freeze({ status: "transitional", description: "主体认为重要、值得维护或应优先考虑的原则与价值。" }),
   goal: Object.freeze({ status: "transitional", description: "目标、意图、承诺与未完事项。" }),
-  capability: Object.freeze({ status: "transitional", description: "保留任务范围、表现结果、独立程度与依赖条件的能力和熟练度。" }),
-  relationship: Object.freeze({ status: "transitional", description: "人物之间有方向、有观点主体和范围的角色、信任、边界与共识。" }),
+  capability: Object.freeze({ status: "transitional", description: "主体具备的知识、技能和可完成的任务，以及已知的熟练程度和适用条件。" }),
+  relationship: Object.freeze({ status: "transitional", description: "人物之间有方向、有观点主体和范围的角色、信任、边界、支持等关系观点；本人认知与双方共同确认分别记录。" }),
   affective_association: Object.freeze({ status: "transitional", description: "保留触发对象、体验主体、情绪类型、直接关联依据与时间变化的情绪联结。" }),
   self_concept: Object.freeze({ status: "transitional", description: "主体本人表达的自我认识、角色理解与人生叙事。" }),
   condition: Object.freeze({ status: "transitional", description: "有时间和情境范围的现实条件、需求与约束。" }),

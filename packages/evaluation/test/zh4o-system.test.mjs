@@ -521,22 +521,23 @@ for (const embedding of [false, true]) test(`nonempty extraction remains scoreab
   assert.equal(databaseSnapshot(report.database.sampleDatabases[0]), before);
 });
 
-test('truncated recall cannot claim gold source text that appears only in provenance or the question', async t => {
+test('an unfit recall budget cannot claim evidence from candidates or the question', async t => {
   const f = fixture(t);
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, maximumContextCharacters: 1, control: 'none' });
   const row = report.results[0];
   assert.equal(row.status, 'completed');
-  assert.ok(row.context.sourceDialogueIds.includes('S1:1'));
-  assert.ok(row.fragmentSourceGoldEvidenceDialogueIds.includes('S1:1'));
+  assert.deepEqual(row.context.sourceDialogueIds, []);
+  assert.deepEqual(row.fragmentSourceGoldEvidenceDialogueIds, []);
+  assert.equal(row.context.context, '');
   assert.doesNotMatch(row.context.context, /苹果味汽水/);
   assert.ok(row.retrievalQuery.includes('苹果味汽水'));
   assert.equal(row.context.contextTruncated, true);
   assert.deepEqual(row.recalledGoldEvidenceDialogueIds, []);
   assert.equal(row.goldEvidenceQuestionHit, false);
-  assert.equal(row.goldEvidenceDiagnostics[0].associatedWithFragment, true);
+  assert.equal(row.goldEvidenceDiagnostics[0].associatedWithFragment, false);
   assert.equal(row.goldEvidenceDiagnostics[0].includedInAnswerContext, false);
   assert.equal(report.scores.evidenceAudit.questionHits, 0);
-  assert.equal(report.scores.evidenceAudit.fragmentSourceQuestionHits, 1);
+  assert.equal(report.scores.evidenceAudit.fragmentSourceQuestionHits, 0);
 });
 
 test('retrieval-only reports retain the configuration used to build each sample and refuse a mixed score', async t => {

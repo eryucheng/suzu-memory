@@ -1,3 +1,5 @@
+import { analysisCountLimit } from '@suzu-memory/analysis';
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -9,7 +11,6 @@ export const PREFERENCE_COUNTER_MATCH_SCHEMA = Object.freeze({
   properties: {
     analyses: {
       type: "array",
-      maxItems: 60,
       items: {
         type: "object",
         additionalProperties: false,
@@ -69,7 +70,7 @@ function enumValue(value, field, allowed) {
   return normalized;
 }
 
-export function parsePreferenceCounterMatchGeneration(value, { maximumAnalyses = 40 } = {}) {
+export function parsePreferenceCounterMatchGeneration(value, { maximumAnalyses = Infinity } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -84,7 +85,7 @@ export function parsePreferenceCounterMatchGeneration(value, { maximumAnalyses =
     || !Array.isArray(parsed.analyses)) {
     throw new Error("Preference counter matcher output requires an analyses array.");
   }
-  const limit = Math.min(60, Math.max(0, Math.trunc(Number(maximumAnalyses) || 40)));
+  const limit = analysisCountLimit(maximumAnalyses);
   if (parsed.analyses.length > limit) {
     throw new Error(`Preference counter matcher returned more than ${limit} analyses.`);
   }
@@ -130,12 +131,5 @@ export function buildPreferenceCounterMatchGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Preference counter matcher requires a bounded snapshot.");
   }
-  return [
-    "只比较当前偏好状态与每条待匹配反证是否在主体、对象、时间和适用范围上真正冲突。",
-    "不得提出最终偏好等级，不得修改当前状态，不得引用快照外信息。",
-    "只引用每个候选自己的 memoryId、observationId 和 sourceIds。证据不足时返回 unknown。",
-    "只输出符合 Schema 的 JSON。",
-    "",
-    JSON.stringify(snapshot, null, 2),
-  ].join("\n");
+  return JSON.stringify(snapshot, null, 2);
 }

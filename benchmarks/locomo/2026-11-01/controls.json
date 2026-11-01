@@ -1,0 +1,230 @@
+{
+  "schemaVersion": 1,
+  "protocol": "locomo-matched-controls-v1",
+  "date": "2026-11-01",
+  "policy": {
+    "comparison": "Same dataset, answer requirements, requested and provider-reported model, temperature, thinking mode, output limit, and judge template. Controls run one direct answer per question; memory uses model-directed retrieval.",
+    "answerTemplate": "The published answer prompt; only the memories placeholder changes. Controls receive no tool instruction and no tools.",
+    "noHistory": "Empty memories placeholder.",
+    "fullDialogue": "All sessions in chronological order, with original dates, speaker names, all text and available image captions; no truncation.",
+    "requestsPerQuestion": 1,
+    "model": "deepseek-v4-flash",
+    "temperature": 0,
+    "thinking": "disabled",
+    "maxOutputTokens": 32768,
+    "answerPromptSha256": "a8e295a2482cde1cb4b497fcaad2c0fcc964d3b126c39c71fda89e960368e250",
+    "judgePromptSha256": "44fb3d8f7a1f37b2430772cf90518a32172e4056b7a0dec085402763fd179b9f",
+    "datasetSha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "inputTokenScope": "Answer-model input per question as reported by the provider; cachedInputTokens counts provider prefix-cache hits; judge calls excluded."
+  },
+  "groups": {
+    "noHistory": {
+      "questions": 1540,
+      "correct": 6,
+      "failed": 0,
+      "accuracy": 0.003896103896103896,
+      "requests": 1540,
+      "inputTokens": 326260,
+      "outputTokens": 61811,
+      "cachedInputTokens": 0
+    },
+    "fullDialogue": {
+      "questions": 1540,
+      "correct": 1440,
+      "failed": 0,
+      "accuracy": 0.935064935064935,
+      "requests": 1540,
+      "inputTokens": 33094648,
+      "outputTokens": 101979,
+      "cachedInputTokens": 32366208
+    }
+  },
+  "byCategory": {
+    "1": {
+      "noHistory": {
+        "questions": 282,
+        "correct": 2
+      },
+      "fullDialogue": {
+        "questions": 282,
+        "correct": 265
+      }
+    },
+    "2": {
+      "noHistory": {
+        "questions": 321,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 321,
+        "correct": 287
+      }
+    },
+    "3": {
+      "noHistory": {
+        "questions": 96,
+        "correct": 4
+      },
+      "fullDialogue": {
+        "questions": 96,
+        "correct": 73
+      }
+    },
+    "4": {
+      "noHistory": {
+        "questions": 841,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 841,
+        "correct": 815
+      }
+    }
+  },
+  "bySample": [
+    {
+      "sampleId": "conv-26",
+      "fullDialogueContextCharacters": 72605,
+      "fullDialogueContextSha256": "49017851c519182f052a9a08ab14e71ce98a308ce0aba98503917f1553f281d4",
+      "noHistory": {
+        "questions": 152,
+        "correct": 1
+      },
+      "fullDialogue": {
+        "questions": 152,
+        "correct": 145
+      }
+    },
+    {
+      "sampleId": "conv-30",
+      "fullDialogueContextCharacters": 52707,
+      "fullDialogueContextSha256": "2661d1e8f0a5628e97445ecbd7d1f9517bf3c573484b94cf49f711a392fdd670",
+      "noHistory": {
+        "questions": 81,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 81,
+        "correct": 77
+      }
+    },
+    {
+      "sampleId": "conv-41",
+      "fullDialogueContextCharacters": 106835,
+      "fullDialogueContextSha256": "a431b612821b05f0ed1a2553d86c2c54eb09b03de1207e640f0bb8878fa0fae5",
+      "noHistory": {
+        "questions": 152,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 152,
+        "correct": 149
+      }
+    },
+    {
+      "sampleId": "conv-42",
+      "fullDialogueContextCharacters": 87820,
+      "fullDialogueContextSha256": "7bc1999c3a68447c186f8490ab87486e707f947aa6620aceb9320f9efe38b21c",
+      "noHistory": {
+        "questions": 199,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 199,
+        "correct": 183
+      }
+    },
+    {
+      "sampleId": "conv-43",
+      "fullDialogueContextCharacters": 105687,
+      "fullDialogueContextSha256": "2f6660bb4f72269427808eba472580ba7463873fd986a90ac468c9c769886fc5",
+      "noHistory": {
+        "questions": 178,
+        "correct": 1
+      },
+      "fullDialogue": {
+        "questions": 178,
+        "correct": 163
+      }
+    },
+    {
+      "sampleId": "conv-44",
+      "fullDialogueContextCharacters": 100464,
+      "fullDialogueContextSha256": "8667eb238a8f3efc72cedde15372e2879f65ee89da16f886e9404c88a20bf023",
+      "noHistory": {
+        "questions": 123,
+        "correct": 3
+      },
+      "fullDialogue": {
+        "questions": 123,
+        "correct": 116
+      }
+    },
+    {
+      "sampleId": "conv-47",
+      "fullDialogueContextCharacters": 96151,
+      "fullDialogueContextSha256": "0e3e3e56a9af42edb8bcf88bb4ec56628e633ed7bb00a90d4c53ba2ba748977a",
+      "noHistory": {
+        "questions": 150,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 150,
+        "correct": 137
+      }
+    },
+    {
+      "sampleId": "conv-48",
+      "fullDialogueContextCharacters": 92514,
+      "fullDialogueContextSha256": "b9fb467c4b765523e90cbee7517d3088388af928794a0b2e7559834e3db7c30d",
+      "noHistory": {
+        "questions": 191,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 191,
+        "correct": 181
+      }
+    },
+    {
+      "sampleId": "conv-49",
+      "fullDialogueContextCharacters": 74330,
+      "fullDialogueContextSha256": "bee418ce43831974e21088ca3f69d130e9ba3a551a62fe0b668215e9986b7bd1",
+      "noHistory": {
+        "questions": 156,
+        "correct": 1
+      },
+      "fullDialogue": {
+        "questions": 156,
+        "correct": 143
+      }
+    },
+    {
+      "sampleId": "conv-50",
+      "fullDialogueContextCharacters": 96938,
+      "fullDialogueContextSha256": "31e9a3c207d9c1a80d8712b377c84ec6e2e305dde6348698f11c6aff1d9b9b98",
+      "noHistory": {
+        "questions": 158,
+        "correct": 0
+      },
+      "fullDialogue": {
+        "questions": 158,
+        "correct": 146
+      }
+    }
+  ],
+  "paired": {
+    "noHistory": {
+      "bothCorrect": 6,
+      "memoryOnlyCorrect": 1378,
+      "controlOnlyCorrect": 0,
+      "bothWrong": 156
+    },
+    "fullDialogue": {
+      "bothCorrect": 1351,
+      "memoryOnlyCorrect": 33,
+      "controlOnlyCorrect": 89,
+      "bothWrong": 67
+    }
+  }
+}

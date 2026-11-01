@@ -1,12 +1,10 @@
+import { goalTransitionDecision } from './reported-goal-review.mjs';
+import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { modelCalendarFields } from '@suzu-memory/core';
-import { analysisSourceMaterial, analysisSystemPrompt } from './source-material.mjs';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
 import {
   GOAL_ANALYZERS,
@@ -105,6 +103,9 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   if (analysis.sourceIds.some((sourceId) => !availableSourceIds.has(sourceId))) {
     throw new Error("Goal analysis source must directly support its selected memory.");
   }
+  if (role === "target-intent" && analysis.peerRelations.some(peer => !snapshot.memories.some(item => item.id === peer.memoryId))) {
+    throw new Error("Goal comparison must stay within the bounded evidence snapshot.");
+  }
   assertSubjectBoundary(role, analysis, memory, snapshot.target);
   if (role === "current-relation") {
     const hasCurrent = Boolean(snapshot.currentState);
@@ -121,84 +122,16 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   return analysis;
 }
 
-async function appendAnalyzerUsage({ usageLedgerPath, generation, definition, agentId, batchId }) {
-  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage) return "";
-  try {
-    await appendUsageEvent(path.resolve(usageLedgerPath), {
-      agentId,
-      provider: generation.metadata?.provider || "",
-      model: generation.model,
-      source: "memory-evaluation",
-      feature: `memory-goal-${definition.role}`,
-      requestId: generation.requestId || "",
-      usage: generation.usage,
-      metadata: {
-        batchId,
-        durationMs: Number(generation.durationMs || 0),
-        ...generation.metadata,
-      },
-    });
-    return "";
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return `费用流水写入失败：${error.message}`;
-  }
-}
 
-async function invokeAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses }) {
-  const systemPrompt = fs.readFileSync(
-    path.join(path.resolve(promptDirectory), definition.promptFile),
-    "utf8",
-  ).replace(/^\uFEFF/u, "").trim();
-  const sourceMaterial = analysisSourceMaterial(snapshot);
-  const input = buildGoalGenerationInput(snapshot, definition);
-  let generation = null;
-  try {
-    generation = await generator({
-      input,
-      systemPrompt: analysisSystemPrompt(systemPrompt),
-      schema: definition.schema,
-      schemaName: definition.schemaName, ...(sourceMaterial ? { sourceMaterial } : {}),
-      stateFamily: "goal",
-      analyzerRole: definition.role,
-    });
-    const parsed = parseGoalGeneration(definition.role, generation?.output, { maximumAnalyses });
-    const accepted = [];
-    const rejected = [];
-    const seen = new Set();
-    for (const [index, candidate] of parsed.analyses.entries()) {
-      try {
-        if (seen.has(candidate.memoryId)) {
-          throw new Error("A goal analyzer can analyze each memory at most once.");
-        }
-        accepted.push(enforceAnalysisBoundary(definition.role, candidate, snapshot));
-        seen.add(candidate.memoryId);
-      } catch (error) {
-      assertEventSourceExecutionCurrent();
-        rejected.push({ index, memoryId: candidate.memoryId, error: error.message });
-      }
-    }
-    return {
-      definition,
-      input,
-      generation,
-      analyses: accepted,
-      rejected,
-      status: accepted.length ? "completed" : rejected.length ? "rejected" : "abstained",
-      error: "",
-    };
-  } catch (error) {
-      assertEventSourceExecutionCurrent();
-    return {
-      definition,
-      input,
-      generation,
-      analyses: [],
-      rejected: [],
-      status: "failed",
-      error: error.message,
-    };
-  }
+
+async function invokeAnalyzer(options) {
+  return invokeEvidenceAnalyzer({ ...options, buildInput: buildGoalGenerationInput, prepareInputSnapshot: (view, definition) => {
+    const ids = new Set(view.memories.map(memory => memory.id));
+    const peers = definition.role === "target-intent" ? options.snapshot.memories
+      .filter(memory => !ids.has(memory.id)).map(memory => ({ memoryId: memory.id, content: memory.content })) : [];
+    return peers.length ? { ...view, comparisonMemories: peers } : view;
+  },
+    parseGeneration: parseGoalGeneration, enforceBoundary: enforceAnalysisBoundary });
 }
 
 function byMemory(items) {
@@ -335,21 +268,8 @@ function actionPreview({ qualification, target, lifecycle, relation, currentStat
     }
     return { ...base, reason: "closed-or-historical-goal-does-not-create-current-state" };
   }
-  return {
-    no_current_state: base,
-    same_goal: { ...base, action: "reinforce", reason: "same-goal-without-state-change" },
-    progress_update: { ...base, action: "progress_update", reason: "direct-progress-on-current-goal" },
-    pauses: { ...base, action: "pause", reason: "current-goal-paused-or-blocked" },
-    resumes: { ...base, action: "resume", reason: "current-goal-resumed" },
-    completes: { ...base, action: "complete", reason: "completion-directly-proven" },
-    cancels: { ...base, action: "cancel", reason: "cancellation-directly-proven" },
-    narrower_step: { ...base, action: "progress_update", reason: "new-item-is-a-step-not-a-replacement" },
-    broader_goal: { ...base, action: "review_required", reason: "broader-goal-cannot-replace-current-automatically" },
-    replaces: { ...base, action: "supersede", reason: "new-goal-explicitly-replaces-current" },
-    conflict: { ...base, action: "review_required", reason: "conflicting-goal-state" },
-    unrelated: base,
-    unknown: base,
-  }[relation.relation] || base;
+  const transition = goalTransitionDecision({ relation, lifecycle });
+  return transition ? { ...base, ...transition } : base;
 }
 
 function mergeGoalAnalyses({ evaluation, persistEvidenceLedger }) {
@@ -360,6 +280,7 @@ function mergeGoalAnalyses({ evaluation, persistEvidenceLedger }) {
   const observations = [];
   const previews = [];
   for (const memoryId of memoryIds) {
+    if (Object.values(maps).some(map => !map.has(memoryId))) continue;
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const target = maps.targetIntent?.get(memoryId) || null;
     const holder = maps.holderResponsibility?.get(memoryId) || null;
@@ -437,7 +358,7 @@ export async function evaluateGoalEvidence({
   usageLedgerPath = "",
   promptDirectory = DEFAULT_PROMPT_DIRECTORY,
   snapshotOptions = {},
-  maximumAnalyses = 60,
+  maximumAnalyses = Infinity,
   persistEvidenceLedger = true,
 } = {}) {
   if (!repository) throw new Error("Goal evaluation requires a repository.");
@@ -504,6 +425,7 @@ export async function evaluateGoalEvidence({
   }
 
   const definitions = Object.entries(GOAL_ANALYZERS);
+  const previousRuns = priorAnalyzerRuns(repository, snapshot, batchId, definitions, snapshotOptions);
   const invocations = await Promise.all(definitions.map(async ([key, definition]) => [
     key,
     await invokeAnalyzer({
@@ -511,66 +433,17 @@ export async function evaluateGoalEvidence({
       generator: analyzers[key],
       snapshot,
       promptDirectory,
-      maximumAnalyses,
+      maximumAnalyses, previousRuns,
     }),
   ]));
-  const sourceIds = uniqueStrings(snapshot.memories.flatMap((memory) => memory.sourceIds)).sort();
-  const runs = {};
-  const analyses = {};
-  const rejected = {};
-  const warnings = [];
-  for (const [key, invocation] of invocations) {
-    const warning = await appendAnalyzerUsage({
-      usageLedgerPath,
-      generation: invocation.generation,
-      definition: invocation.definition,
-      agentId: clean(agentId),
-      batchId,
-    });
-    if (warning) warnings.push(warning);
-    runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: analysisSourceMaterial(snapshot),
-      agentId: clean(agentId),
-      batchId,
-      stateFamily: "goal",
-      analyzerRole: invocation.definition.role,
-      subjectRole: snapshot.target.subjectRole,
-      subjectKey: snapshot.target.subjectKey,
-      canonicalKey: snapshot.target.canonicalKey,
-      provider: clean(invocation.generation?.metadata?.provider) || "unreported",
-      model: clean(invocation.generation?.model) || "unreported",
-      promptVersion: invocation.definition.promptVersion,
-      schemaVersion: invocation.definition.schemaName,
-      inputHash: invocation.generation?.metadata?.analysisInputHash || createHash("sha256").update(invocation.input).digest("hex"),
-      status: invocation.status,
-      memoryIds: snapshot.memories.map((memory) => memory.id),
-      sourceIds,
-      output: invocation.generation?.output ?? {},
-      rejected: invocation.rejected,
-      usage: invocation.generation?.usage || {},
-      costAmount: Number(invocation.generation?.costAmount ?? invocation.generation?.metadata?.costAmount ?? 0) || 0,
-      costCurrency: clean(invocation.generation?.costCurrency ?? invocation.generation?.metadata?.costCurrency),
-      requestId: clean(invocation.generation?.requestId),
-      durationMs: Math.max(0, Math.trunc(Number(invocation.generation?.durationMs) || 0)),
-      errorMessage: invocation.error,
-      metadata: {
-        goalLabel: clean(goalLabel),
-        currentRepresentationLayer: snapshot.target.currentRepresentationLayer,
-        automaticStateWriteAllowed: false,
-      },
-    });
-    analyses[key] = invocation.analyses;
-    rejected[key] = invocation.rejected;
-  }
-  const failedRoles = definitions
-    .map(([key]) => key)
-    .filter((key) => ["failed", "rejected"].includes(runs[key].status));
-  let merged = { observations: [], previews: [] };
-  if (!failedRoles.length) {
-    merged = repository.transaction(() => mergeGoalAnalyses({
-      evaluation: { repository, batchId, snapshot, runs, analyses },
-      persistEvidenceLedger,
-    }));
-  }
+  const { runs, analyses, rejected, warnings, failedRoles } = await recordAnalyzerInvocations({
+    repository, agentId, batchId, stateFamily: 'goal', snapshot, invocations, usageLedgerPath,
+    metadata: { goalLabel: clean(goalLabel), currentRepresentationLayer: snapshot.target.currentRepresentationLayer, automaticStateWriteAllowed: false },
+  });
+  const merged = repository.transaction(() => mergeGoalAnalyses({
+    evaluation: { repository, batchId, snapshot, runs, analyses },
+    persistEvidenceLedger,
+  }));
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
   return {
     status: failedRoles.length ? "incomplete" : hasAnyAnalysis ? "analyzed" : "abstained",

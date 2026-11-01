@@ -1,3 +1,5 @@
+import { readReportedStateDraft } from "@suzu-memory/core";
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -32,9 +34,7 @@ const INTENSITY_FACTOR = Object.freeze({
 });
 
 function affectiveClaim(memory) {
-  return memory?.metadata?.reportedStateDraft?.affectiveClaim
-    || memory?.metadata?.affectiveClaim
-    || null;
+  return readReportedStateDraft(memory).affectiveClaim || null;
 }
 
 function emotionMatches(stored, current, matchMode) {

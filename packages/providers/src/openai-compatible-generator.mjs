@@ -3,6 +3,8 @@ import {
   openAiCompatibleEndpoint,
 } from "./openai-compatible-url.mjs";
 
+export const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 32_768;
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -222,7 +224,7 @@ export function createOpenAiCompatibleStructuredGenerator({
   connection = {},
   fetchImpl = globalThis.fetch,
   timeoutMs,
-  maxOutputTokens = 8_192,
+  maxOutputTokens = DEFAULT_GENERATION_MAX_OUTPUT_TOKENS,
 } = {}) {
   const apiKey = clean(connection.apiKey || connection.key);
   const model = clean(connection.model);
@@ -245,7 +247,7 @@ export function createOpenAiCompatibleStructuredGenerator({
     1_000,
     600_000,
   );
-  const outputLimit = boundedInteger(maxOutputTokens, 8_192, 256, 64_000);
+  const outputLimit = boundedInteger(maxOutputTokens, DEFAULT_GENERATION_MAX_OUTPUT_TOKENS, 256, 64_000);
   const maximumTransportAttempts = boundedInteger(
     connection.maximumTransportAttempts,
     3,

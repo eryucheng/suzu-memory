@@ -3,7 +3,6 @@ import path from 'node:path';
 import { Worker, isMainThread } from 'node:worker_threads';
 import { openMemoryDatabase } from '@suzu-memory/core';
 import { retrieveMemories as retrieveInline } from './retriever.mjs';
-import { isGenericQuery } from './query.mjs';
 
 const pools = new Map();
 const stopping = new Set();
@@ -98,7 +97,6 @@ export async function retrieveMemories(input = {}) {
   const { embeddingProvider, signal, ...serializable } = input;
   signal?.throwIfAborted();
   const options = input.options || {};
-  if (isGenericQuery(input.query, options.genericQueries) && !input.anchorMemoryIds?.length) return retrieveInline(input);
   if (!isMainThread || options.execution === 'inline' || !input.databasePath || input.databasePath === ':memory:') return retrieveInline(input);
   if (options.execution !== 'worker') {
     let database;

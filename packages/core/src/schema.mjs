@@ -1,7 +1,8 @@
 import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
 import { backfillSearchRows } from './search-index.mjs';
 import { memoryWorldsCompatible } from './ontology.mjs';
-export const SCHEMA_VERSION = 46;
+import { structureKnownAt } from './structure-policy.mjs';
+export const SCHEMA_VERSION = 48;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2342,6 +2343,64 @@ export const MIGRATIONS = Object.freeze([
           || member.status === 'deleted' || !memoryWorldsCompatible(origin, member))) continue;
         if (origin.reality === 'real' && origin.world_id === 'primary' && origin.world_frame === 'unknown') continue;
         update.run(origin.reality, origin.world_id, origin.world_frame, repairedAt, container.id);
+      }
+    },
+  },
+  {
+    version: 47, name: 'inherit-reported-state-world-scope',
+    sql: `
+      UPDATE memory_nodes AS node SET reality = draft.reality
+      FROM memory_reported_state_proposals AS proposal
+      JOIN memory_nodes AS draft ON draft.id = json_extract(proposal.metadata_json, '$.semanticMemoryId')
+        AND draft.agent_id = proposal.agent_id
+        AND json_extract(draft.metadata_json, '$.stateAnalysisDraft') = 1
+        AND json_extract(draft.metadata_json, '$.stateAnalysisRequestId') = json_extract(proposal.metadata_json, '$.stateAnalysisRequestId')
+        AND draft.title = json_extract(proposal.metadata_json, '$.semanticMemorySnapshot.title')
+        AND draft.content = json_extract(proposal.metadata_json, '$.semanticMemorySnapshot.content')
+      WHERE json_extract(node.metadata_json, '$.reportedStateProposalId') = proposal.id
+        AND node.agent_id = proposal.agent_id AND node.status <> 'deleted'
+        AND proposal.review_state IN ('pending', 'accepted')
+        AND node.reality = 'real' AND draft.reality <> 'real'
+        AND node.world_id = draft.world_id AND node.world_frame = draft.world_frame;
+    `,
+  },
+  {
+    version: 48, name: 'inherit-structure-information-time',
+    apply(database) {
+      const containers = database.prepare(`
+        SELECT node.*, proposal.member_ids_json
+        FROM memory_structure_proposals proposal
+        JOIN memory_nodes node ON node.id = proposal.result_memory_id
+          AND node.agent_id = proposal.agent_id AND node.kind = proposal.kind
+        WHERE proposal.operation = 'create' AND proposal.review_state IN ('pending', 'accepted')
+          AND node.status <> 'deleted' AND node.evidence_mode = 'inferred'
+          AND node.known_at = node.recorded_at
+          AND node.title = proposal.title AND node.content = proposal.content
+          AND json_extract(node.metadata_json, '$.structureProposalId') = proposal.id
+          AND json_extract(node.metadata_json, '$.manuallyEdited') IS NOT 1
+        ORDER BY CASE node.kind WHEN 'episode' THEN 0 ELSE 1 END, node.id
+      `).all();
+      const readMembers = database.prepare(`
+        WITH ids AS (
+          SELECT value AS id FROM json_each(?)
+          UNION SELECT from_memory_id FROM memory_edges WHERE agent_id = ?
+            AND to_memory_id = ? AND relation = ?
+        )
+        SELECT node.* FROM ids LEFT JOIN memory_nodes node ON node.id = ids.id
+      `);
+      const update = database.prepare('UPDATE memory_nodes SET known_at = ?, updated_at = ? WHERE id = ?');
+      const repairedAt = new Date().toISOString();
+      for (const container of containers) {
+        const ids = JSON.parse(container.member_ids_json);
+        if (!Array.isArray(ids) || new Set(ids).size < 2) continue;
+        const members = readMembers.all(container.member_ids_json, container.agent_id, container.id,
+          container.kind === 'episode' ? 'part_of_episode' : 'supports_topic');
+        if (members.some(member => !member.id || member.agent_id !== container.agent_id
+          || member.status === 'deleted' || !memoryWorldsCompatible(container, member))) continue;
+        const knownAt = structureKnownAt(members);
+        if (knownAt && Date.parse(container.known_at) !== Date.parse(knownAt)) {
+          update.run(knownAt, repairedAt, container.id);
+        }
       }
     },
   },

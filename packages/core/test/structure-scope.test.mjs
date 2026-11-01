@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { MemoryRepository, openMemoryDatabase, proposeMemoryStructure,
-  resolveMemoryStructureProposal, SCHEMA_VERSION } from '../src/index.mjs';
+  materializeMemoryStructureProposal, resolveMemoryStructureProposal, SCHEMA_VERSION } from '../src/index.mjs';
 
 const scope = { reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' };
 const differentScopes = [
@@ -32,6 +32,11 @@ test('created topics and episodes inherit member scope through review and attach
     const members = ['first', 'second', 'later'].map(suffix => event(`${kind}-${suffix}`).id);
     const proposal = propose(kind, members.slice(0, 2));
     const result = repository.getMemory(proposal.result_memory_id);
+    const embeddingTasks = () => repository.listMaintenanceTasks('test', { taskTypes: ['memory-embedding'] })
+      .filter(task => task.payload.memoryIds.includes(result.id));
+    assert.equal(embeddingTasks().length, 1, 'every structure creator must queue its embedding');
+    materializeMemoryStructureProposal(repository, { agentId: 'test', proposalId: proposal.id });
+    assert.equal(embeddingTasks().length, 1, 'already materialized structures must not queue duplicate work');
     assert.deepEqual([result.reality, result.world_id, result.world_frame],
       [scope.reality, scope.worldId, scope.worldFrame]);
     const reviewed = resolveMemoryStructureProposal(repository, { agentId: 'test',
@@ -41,6 +46,80 @@ test('created topics and episodes inherit member scope through review and attach
     assert.equal(attach.result_memory_id, result.id);
     assert.equal(repository.getMemory(result.id).world_frame, scope.worldFrame);
   }
+});
+
+test('Chinese and English containers inherit information time through creation and attachment', t => {
+  const { repository, event, propose } = fixture(t);
+  for (const kind of ['topic', 'episode']) for (const language of ['zh', 'en']) {
+    const prefix = `${kind}-${language}`;
+    const early = event(prefix + '-early', { content: language === 'zh' ? '参赛并认识朋友。' : 'Met friends at a tournament.',
+      knownAt: '2022-06-01T08:00:00Z', recordedAt: '2026-10-01T08:00:00Z' });
+    const recent = event(prefix + '-recent', { knownAt: '2022-06-03T08:00:00Z' });
+    const older = event(prefix + '-older', { knownAt: '2022-05-01T08:00:00Z' });
+    const newer = event(prefix + '-newer', { knownAt: '2022-07-01T08:00:00Z' });
+    const proposal = propose(kind, [early.id, recent.id]);
+    const memory = repository.getMemory(proposal.result_memory_id);
+    assert.equal(memory.known_at, '2022-06-03T08:00:00.000Z');
+    if (kind === 'episode') assert.equal(memory.event_date, '2026-10-20');
+    assert.notEqual(memory.recorded_at, memory.known_at);
+    resolveMemoryStructureProposal(repository, { agentId: 'test', proposalId: proposal.id, action: 'accept' });
+    repository.database.prepare("UPDATE memory_nodes SET status='superseded' WHERE id=?").run(recent.id);
+    for (const [member, expected] of [[older, memory.known_at], [newer, '2022-07-01T08:00:00.000Z']]) {
+      const attached = propose(kind, [member.id], { operation: 'attach', targetMemoryId: memory.id });
+      const after = repository.getMemory(attached.result_memory_id);
+      assert.equal(after.known_at, expected);
+      assert.equal(after.recorded_at, memory.recorded_at);
+      assert.equal(after.content, memory.content);
+      if (kind === 'episode') assert.equal(after.event_date, memory.event_date);
+    }
+  }
+});
+
+test('database upgrade repairs proven structure information times once and preserves edited records', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-structure-time-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const databasePath = path.join(directory, 'memory.db');
+  const { database, repository, event, propose } = fixture(t, databasePath);
+  event('early', { knownAt: '2022-06-01T08:00:00Z' });
+  event('recent', { knownAt: '2022-06-03T08:00:00Z' });
+  event('later', { knownAt: '2022-07-01T08:00:00Z' });
+  const episode = propose('episode', ['early', 'recent']);
+  const topic = propose('topic', [episode.result_memory_id, 'early']);
+  resolveMemoryStructureProposal(repository, { agentId: 'test', proposalId: topic.id, action: 'accept' });
+  propose('topic', ['later'], { operation: 'attach', targetMemoryId: topic.result_memory_id });
+  const edited = propose('topic', ['early', 'recent'], { content: 'Edited container.' });
+  repository.editMemoryManually({ agentId: 'test', memoryId: edited.result_memory_id, patch: { content: 'A human correction.' } });
+  const explicit = propose('topic', ['early', 'recent'], { content: 'Explicit information time.' });
+  const missing = propose('topic', ['early', 'recent'], { content: 'Missing member.' });
+  const manual = repository.upsertTopic({ agentId: 'test', content: 'Manual.', ...scope,
+    knownAt: '2024-01-01T00:00:00Z' });
+  const legacyIds = [episode, topic, edited, missing].map(p => p.result_memory_id);
+  database.prepare('UPDATE memory_nodes SET known_at=recorded_at WHERE id IN (SELECT value FROM json_each(?))')
+    .run(JSON.stringify(legacyIds));
+  database.prepare('UPDATE memory_structure_proposals SET member_ids_json=? WHERE id=?')
+    .run(JSON.stringify(['early', 'absent']), missing.id);
+  const before = database.prepare('SELECT * FROM memory_nodes ORDER BY id').all();
+  database.prepare('DELETE FROM schema_migrations WHERE name=?').run('inherit-structure-information-time');
+  database.close();
+  const upgraded = openMemoryDatabase(databasePath);
+  const after = upgraded.prepare('SELECT * FROM memory_nodes ORDER BY id').all();
+  try {
+    const expected = new Map([[episode.result_memory_id, '2022-06-03T08:00:00.000Z'],
+      [topic.result_memory_id, '2022-07-01T08:00:00.000Z']]);
+    for (const current of after) {
+      const previous = before.find(n => n.id === current.id);
+      if (expected.has(current.id)) {
+        assert.equal(current.known_at, expected.get(current.id));
+        assert.deepEqual({ ...current, known_at: previous.known_at, updated_at: previous.updated_at }, { ...previous });
+      } else assert.deepEqual(current, previous);
+    }
+    assert.ok(after.some(n => n.id === manual.id));
+    assert.ok(after.some(n => n.id === explicit.result_memory_id));
+    assert.deepEqual(upgraded.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally { upgraded.close(); }
+  const reopened = openMemoryDatabase(databasePath);
+  try { assert.deepEqual(reopened.prepare('SELECT * FROM memory_nodes ORDER BY id').all(), after); }
+  finally { reopened.close(); }
 });
 
 test('structure creation, attachment and direct membership reject mismatched scopes atomically', t => {
@@ -116,7 +195,7 @@ test('database upgrade restores proven legacy structure scopes and preserves amb
   const read = connection => connection.prepare('SELECT * FROM memory_nodes ORDER BY id').all();
   const before = read(database);
   const reviewStates = database.prepare('SELECT id,review_state FROM memory_structure_proposals ORDER BY id').all();
-  database.prepare('DELETE FROM schema_migrations WHERE version=?').run(SCHEMA_VERSION);
+  database.prepare('DELETE FROM schema_migrations WHERE name=?').run('inherit-structure-world-scope');
   database.close();
 
   const upgraded = openMemoryDatabase(databasePath);

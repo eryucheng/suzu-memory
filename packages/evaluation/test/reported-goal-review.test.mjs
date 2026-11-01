@@ -58,6 +58,7 @@ function addObservation(repository, {
   qualification = "qualified",
   targetMatch = "exact",
   goalText = "发布记忆项目",
+  peerRelations = [],
   intentionLevel = "plan",
   specificity = "actionable",
   holderMatch = "yes",
@@ -129,7 +130,7 @@ function addObservation(repository, {
     },
     payloadSchemaVersion: "goal-merged-evidence-v1",
     payload: {
-      target: { targetMatch, goalText, intentionLevel, specificity },
+      target: { targetMatch, goalText, intentionLevel, specificity, peerRelations },
       holder: { holderMatch, attribution, responsibility, agency, acceptsResponsibility },
       lifecycle: { lifecycle, completionBasis, timeReference: "" },
       relation: { currentStatePresent, relation },
@@ -205,7 +206,7 @@ test("does not turn a wish or Agent inference into the subject's reported goal",
   fixture.database.close();
 });
 
-test("does not create a shared commitment from one person's use of we", () => {
+test("records the speaker's participation without confirming a shared commitment", () => {
   const fixture = setup();
   addObservation(fixture.repository, {
     id: "single-side-we",
@@ -215,7 +216,10 @@ test("does not create a shared commitment from one person's use of we", () => {
     agency: "shared_agreement",
   });
   const result = review(fixture.repository);
-  assert.equal(result.status, "skipped");
+  assert.equal(result.status, "ready");
+  assert.equal(result.proposedState.subjectRole, "user");
+  assert.equal(result.proposedState.goalClaim.responsibility, "shared");
+  assert.equal(result.proposedState.goalClaim.sharedConfirmation, "unconfirmed");
   assert.equal(result.automaticSharedCommitmentWriteAllowed, false);
   fixture.database.close();
 });
@@ -326,4 +330,17 @@ test("previews pause and progress without replacing the reported goal", () => {
   assert.equal(progressResult.proposedState, null);
   assert.equal(progressFixture.repository.getMemory(progressFixture.current.id).status, "active");
   progressFixture.database.close();
+});
+
+for (const language of ["zh", "en"]) test(`retains a plan and its complementary preparation: ${language}`, t => {
+  const f = setup(); t.after(() => f.database.close());
+  const first = addObservation(f.repository, { id: "plan", sourceContent: language === "en" ? "I plan to publish these notes." : "我打算公开这份笔记。",
+    goalText: language === "en" ? "Publish the notes" : "公开笔记" });
+  const second = addObservation(f.repository, { id: "prepare", observedAt: "2026-07-11T12:00:00Z",
+    sourceContent: language === "en" ? "I am proofreading the notes for publication." : "我正在校对准备公开的笔记。",
+    goalText: language === "en" ? "Proofread the notes for publication" : "校对待公开的笔记", lifecycle: "in_progress",
+    peerRelations: [{ memoryId: first.memory.id, relation: "complementary" }] });
+  const result = review(f.repository);
+  assert.equal(result.status, "ready");
+  assert.deepEqual(new Set(result.proposedState.evidenceSourceIds), new Set([first.source.id, second.source.id]));
 });

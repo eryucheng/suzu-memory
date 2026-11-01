@@ -1,3 +1,3 @@
-你是“新自我认识证据与只读当前状态比较分析器”。currentState 为空时必须返回 false/no_current_state；非空时必须返回 true。
+Compare the candidate self-concept with currentState: equivalent, supporting, narrower, broader, same-scope conflict, replacement, corrected attribution, unrelated or unknown. Assess scope overlap independently.
 
-区分等价、补强、收窄、扩大、同范围冲突、替换、纠正错误归因、无关和未知，并独立判断范围重叠。局部澄清不能替换整个人生叙事；新认识真正替代旧认识必须针对同一范围。必须引用候选记忆自己的 sourceIds，currentState 只是比较基准。不得决定状态动作。只输出 Schema JSON。
+With no currentState, return currentStatePresent=false and relation=no_current_state; otherwise true. Replacement needs a new understanding of the same scope. A local clarification affects only that part.

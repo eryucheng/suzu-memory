@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as analysis from '@suzu-memory/analysis';
 import { createRelatedAnalyzerBatch } from '../../analysis/src/related-analyzer-batch.mjs';
-import { LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA } from '@suzu-memory/embedding-indexer';
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '../src/index.mjs';
@@ -16,8 +16,9 @@ test('extraction target branches expose only their family fields and reject cros
     connection: { baseUrl: 'https://api.example.test', model: 'fixture', apiKey: 'secret', structuredOutputMode: 'strict-tool' },
     fetchImpl: async (_url, options) => {
       wireSchema = JSON.parse(options.body).tools[0].function.parameters;
+      const schemaName = JSON.parse(options.body).tools[0].function.name;
       return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{
-        function: { name: request.schemaName, arguments: '{"memories":[]}' },
+        function: { name: schemaName, arguments: schemaName === 'long-term-memory-extraction-repair-v3' ? '{"results":[]}' : '{"memories":[]}' },
       }] } }] }) };
     },
   });
@@ -43,8 +44,8 @@ test('extraction target branches expose only their family fields and reject cros
   const targets = {
     identity: { identityField: 'other', fieldCardinality: 'single' },
     belief: { objectRole: 'world', objectName: '天气' },
-    relationship: { counterpartRole: 'other', counterpartName: 'Mio' },
-    affective_association: { triggerRole: 'other', triggerName: 'Mio' },
+    relationship: { counterpartRole: 'other', counterpartName: 'Mio', relationshipDimension: 'support' },
+    affective_association: { triggerRole: 'world', triggerName: 'flowers' },
   };
   const alternatives = LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.anyOf;
   for (const [family, target] of Object.entries(targets)) {
@@ -60,6 +61,9 @@ test('extraction target branches expose only their family fields and reject cros
       ...(family === 'relationship' ? { kind: 'relationship', retentionReason: 'relationship' } : {}) };
     const output = { memories: [candidate] };
     assert.deepEqual(validateMemoryTaskOutput(request, output).memories[0].stateTarget, target);
+    assert.throws(() => validateMemoryTaskOutput(request, {
+      memories: [{ ...candidate, retentionReason: 'explicit_preference' }],
+    }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
     for (const wrong of [{}, { ...target, objectName: '无关人物', direction: 'holder_to_counterpart' }]) {
       const invalid = { memories: [{ ...candidate, stateTarget: wrong }] };
       assert.throws(() => validateMemoryTaskOutput(request, invalid), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
@@ -77,11 +81,11 @@ test('extraction target branches expose only their family fields and reject cros
   assert.deepEqual(wireBranches.find(item => item.properties.stateFamily.enum.includes('preference')).properties.kind.enum,
     ['preference']);
   for (const [key, value] of Object.entries(original.properties.memories.items.properties)) {
-    if (['stateTarget', 'stateFamily', 'kind'].includes(key)) continue;
+    if (['stateTarget', 'stateFamily', 'kind', 'retentionReason'].includes(key)) continue;
     for (const branch of wireBranches) assert.deepEqual(branch.properties[key], value);
   }
   assert.equal(Object.hasOwn(validateMemoryTaskOutput(request, { memories: [event] }).memories[0], 'stateTarget'), false);
-  for (const schemaName of ['long-term-memory-extraction-v2', 'long-term-memory-extraction-repair-v2']) {
+  for (const schemaName of ['long-term-memory-extraction-v2']) {
     const output = { memories: [{ ...event, stateTarget: null }] };
     const originalOutput = structuredClone(output);
     const normalized = validateMemoryTaskOutput({ ...request, schemaName }, output);
@@ -91,6 +95,11 @@ test('extraction target branches expose only their family fields and reject cros
   assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, stateTarget: {} }] }));
   assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...base, stateTarget: null }] }));
   assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, stateTarget: null, unexpected: null }] }));
+  const repair = { schemaName: 'long-term-memory-extraction-repair-v3', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
+  const repairOutput = { results: [{ candidateIndex: 3, status: 'repaired', memories: [{ ...event, stateTarget: null }] }] };
+  assert.equal(Object.hasOwn(validateMemoryTaskOutput(repair, repairOutput).results[0].memories[0], 'stateTarget'), false);
+  await generator(repair);
+  verifyStrictObjects(wireSchema);
   const mixed = { ...base, stateTarget: { ...targets.identity, objectRole: 'other', objectName: '小林' } };
   assert.throws(() => parseGeneratedLongTermExtraction({ memories: [mixed] }), /不适用：objectRole, objectName/);
   assert.throws(() => assertMemoryTaskRequest({ ...request, schemaName: 'long-term-memory-extraction-v1' }), /Unknown Memory task/);
@@ -118,7 +127,8 @@ for (const [name, definitions] of Object.entries(analysis).filter(([key]) => key
       const batch = createRelatedAnalyzerBatch({ definitions: Object.fromEntries(entries), generator, request: { id: 'validation-request', processorVersion: 'v1' } });
       await Promise.all(entries.map(async ([key, definition]) => {
         const request = { schemaName: definition.schemaName, schema: definition.schema, analyzerRole: definition.role,
-          input: 'Snapshot:\n\n' + JSON.stringify({ memories: [], currentState: { id: 'current' } }), systemPrompt: definition.role };
+          input: 'Snapshot:\n\n' + JSON.stringify({ memories: [], currentState: { id: 'current' } }),
+          analysisSnapshot: { memories: [], currentState: { id: 'current' } }, systemPrompt: definition.role };
         assert.deepEqual(validateMemoryTaskOutput(request, { analyses: [] }), { analyses: [] });
         assert.throws(() => validateMemoryTaskOutput(request, { analyses: [{}] }));
         await batch[key](request);
@@ -130,11 +140,17 @@ for (const [name, definitions] of Object.entries(analysis).filter(([key]) => key
 }
 
 test('extraction, repair, structure, relation and attribution use their registered owner contracts', () => {
-  for (const schemaName of ['long-term-memory-extraction-v2', 'long-term-memory-extraction-repair-v2']) {
+  for (const schemaName of ['long-term-memory-extraction-v2']) {
     const request = { schemaName, schema: LONG_TERM_EXTRACTION_SCHEMA };
     validateMemoryTaskOutput(request, { memories: [] });
     assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ content: 'unsupported' }] }));
   }
+  const repair = { schemaName: 'long-term-memory-extraction-repair-v3', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
+  validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'rejected', reason: 'No supporting source.' }] });
+  validateMemoryTaskOutput(repair, { results: [] });
+  assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'repaired', memories: [] }] }));
+  assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'rejected', reason: '' }] }));
+  assert.throws(() => validateMemoryTaskOutput(repair, { memories: [] }));
   for (const [schemaName, schema] of [['memory-structure-proposals-v1', MEMORY_STRUCTURE_OUTPUT_SCHEMA], ['memory-relation-proposals-v1', MEMORY_RELATION_OUTPUT_SCHEMA]]) {
     validateMemoryTaskOutput({ schemaName, schema }, { proposals: [] });
     assert.throws(() => validateMemoryTaskOutput({ schemaName, schema }, { proposals: [{}] }));

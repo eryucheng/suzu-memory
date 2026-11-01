@@ -1,3 +1,4 @@
+import { readReportedStateDraft } from "@suzu-memory/core";
 import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.mjs";
 import {
   normalizeReportedClaim,
@@ -54,7 +55,7 @@ function candidateFromObservation(observation) {
 function currentClaim(repository, snapshot) {
   if (!snapshot.currentState) return null;
   const memory = repository.getMemory(snapshot.currentState.id);
-  const stored = memory?.metadata?.reportedHabit || memory?.metadata?.habitClaim || null;
+  const stored = readReportedStateDraft(memory).habitClaim || null;
   if (!stored || !ACTIVE_PATTERNS.has(clean(stored.patternType))) return null;
   const scope = stored.scope && typeof stored.scope === "object" ? stored.scope : stored;
   const targetMatch = clean(scope.targetMatch);

@@ -14,6 +14,7 @@ import {
 import {
   buildPreferenceEvidenceSnapshot,
   simulatePreferenceFormation,
+  analysisCountLimit,
 } from "@suzu-memory/analysis";
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -167,7 +168,7 @@ export async function evaluatePreferenceEvidenceTarget({
   usageLedgerPath = "",
   systemPromptPath = DEFAULT_PROMPT_PATH,
   snapshotOptions = {},
-  maximumEvidence = 60,
+  maximumEvidence = Infinity,
   recordEvidenceLedger = true,
 } = {}) {
   if (!repository) throw new Error("Preference evidence evaluation requires a repository.");
@@ -206,6 +207,9 @@ export async function evaluatePreferenceEvidenceTarget({
       warnings: [],
     };
   }
+  if (snapshot.memories.length > analysisCountLimit(maximumEvidence, 'maximumEvidence')) {
+    throw new Error(`Complete preference labeling requires ${snapshot.memories.length} judgments; maximumEvidence is ${maximumEvidence}.`);
+  }
   const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8")
     .replace(/^\uFEFF/u, "")
     .trim();
@@ -213,7 +217,9 @@ export async function evaluatePreferenceEvidenceTarget({
   const generation = await generator({
     input: generationInput,
     systemPrompt,
-    schema: MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA,
+    schema: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA, properties: {
+      evidence: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA.properties.evidence, maxItems: snapshot.memories.length },
+    } },
     schemaName: "memory-preference-evidence-v1",
   });
   const warnings = [];
@@ -224,7 +230,7 @@ export async function evaluatePreferenceEvidenceTarget({
     batchId,
     warnings,
   });
-  const parsed = parsePreferenceEvidenceGeneration(generation?.output, { maximumEvidence });
+  const parsed = parsePreferenceEvidenceGeneration(generation?.output);
   const labels = [];
   const rejected = [];
   const seenMemoryIds = new Set();

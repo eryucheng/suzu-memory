@@ -101,8 +101,8 @@ function analysisRun(repository, evidence, overrides = {}) {
 }
 
 for (const scenario of ['valid', 'missing-request', 'wrong-subject', 'wrong-canonical',
-  'resolved-request', 'outside-memory', 'outside-source', 'not-verbatim', 'other-family', 'cross-agent']) {
-  test(`third-person identity observations require a complete request binding: ${scenario}`, t => {
+  'resolved-request', 'outside-memory', 'outside-source', 'not-verbatim', 'preference-family', 'condition-family', 'cross-agent']) {
+  test(`third-person state observations require a complete request binding: ${scenario}`, t => {
     const { database, repository } = setup();
     t.after(() => database.close());
     const evidence = evidenceMemory(repository);
@@ -110,7 +110,7 @@ for (const scenario of ['valid', 'missing-request', 'wrong-subject', 'wrong-cano
     if (scenario !== 'not-verbatim') repository.linkSource(evidence.memory.id, evidence.source.id, 'verbatim');
     const outside = evidenceMemory(repository, { id: 'outside-memory' });
     repository.linkSource(evidence.memory.id, outside.source.id, 'verbatim');
-    const stateFamily = scenario === 'other-family' ? 'preference' : 'identity';
+    const stateFamily = scenario === 'preference-family' ? 'preference' : scenario === 'condition-family' ? 'condition' : 'identity';
     const requestAgent = scenario === 'cross-agent' ? 'agent-other' : 'agent-test';
     const requestEvidence = requestAgent === 'agent-test' ? evidence
       : evidenceMemory(repository, { agentId: requestAgent, id: 'other-agent-memory' });
@@ -136,7 +136,7 @@ for (const scenario of ['valid', 'missing-request', 'wrong-subject', 'wrong-cano
       claimedDirection: 'support', effectiveDirection: 'neutral', qualification: 'unresolved',
       payloadSchemaVersion: 'identity-merged-evidence-v1', sourceIds: [evidence.source.id], analysisRunIds: [run.id],
     });
-    if (scenario === 'valid') {
+    if (['valid', 'preference-family', 'condition-family'].includes(scenario)) {
       const observation = record();
       assert.equal(observation.subject_key, 'third-person');
       assert.equal(observation.effective_direction, 'neutral');
@@ -144,7 +144,7 @@ for (const scenario of ['valid', 'missing-request', 'wrong-subject', 'wrong-cano
       assert.throws(record, /does not identify the evaluated subject/);
       assert.equal(database.prepare('SELECT COUNT(*) AS count FROM memory_state_evidence_observations').get().count, 0);
     }
-    assert.equal(requestReads, ['missing-request', 'other-family'].includes(scenario) ? 0 : 1,
+    assert.equal(requestReads, scenario === 'missing-request' ? 0 : 1,
       'only the referenced request may be loaded once per observation');
     assert.equal(repository.getMemory(evidence.memory.id).subject_key, 'user');
   });

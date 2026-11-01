@@ -178,6 +178,44 @@ async function mergeCounter(fixture, analyzerOverrides = {}) {
   return mergePreferenceSpecialistEvidence(fixture.repository, { evaluation, policy });
 }
 
+test('counter matching accepts every supplied observation above forty and honors an explicit zero budget before generation', async t => {
+  const fixture = setup();
+  t.after(() => fixture.database.close());
+  const observationIds = Array.from({ length: 41 }, (_, index) => {
+    const memory = fixture.repository.upsertMemory({ id: `opposition-${index}`, agentId: 'agent-test', kind: 'event',
+      layer: 'episodic', content: 'I no longer like puzzle games.', subjectRole: 'user', subjectKey: 'user',
+      reality: 'real', evidenceMode: 'explicit', temporalState: 'current' });
+    fixture.repository.linkSource(memory.id, fixture.source.id, 'evidence');
+    return fixture.repository.recordStateEvidenceObservation({
+      agentId: 'agent-test', stateFamily: 'preference', subjectRole: 'user', subjectKey: 'user', canonicalKey: fixture.canonicalKey,
+      memoryId: memory.id, evidenceGroupId: `evidence-${index}`, signal: 'explicit_dislike', claimedDirection: 'opposition',
+      effectiveDirection: 'neutral', qualification: 'unresolved', origin: 'manual', confidence: 0.9,
+      payloadSchemaVersion: 'preference-merged-evidence-v1', excludedReason: 'counter-match-required', sourceIds: [fixture.source.id],
+      observedAt: fixture.source.known_at,
+    }).id;
+  });
+  let calls = 0;
+  const options = { repository: fixture.repository, agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: fixture.canonicalKey, objectLabel: fixture.objectLabel, observationIds,
+    snapshotOptions: { maxCandidates: 41, maxSnapshotChars: 250000 }, generator: async request => {
+      calls += 1;
+      const snapshot = JSON.parse(request.input);
+      assert.equal(request.schema.properties.analyses.maxItems, 41);
+      assert.equal(snapshot.candidates.length, 41);
+      return { output: { analyses: snapshot.candidates.map(candidate => ({ observationId: candidate.observationId,
+        memoryId: candidate.memoryId, sourceIds: candidate.sourceIds, relation: 'same_scope_conflict', scopeOverlap: 'exact',
+        temporalRelation: 'overlaps_current', confidence: 0.9, rationale: 'An explicit change of preference within the current scope.' })) }, model: 'fixture' };
+    } };
+  const blocked = await evaluatePreferenceCounterEvidence({ ...options, maximumAnalyses: 0 });
+  assert.equal(calls, 0);
+  assert.equal(blocked.run.status, 'failed');
+  assert.match(blocked.run.error_message, /maximumAnalyses/);
+  const result = await evaluatePreferenceCounterEvidence(options);
+  assert.equal(result.status, 'matched', result.reason);
+  assert.equal(result.observations.length, 41);
+  assert.equal(calls, 1);
+});
+
 test("defers new opposition while a current preference exists and activates only an exact current conflict", async () => {
   const fixture = setup();
   const merged = await mergeCounter(fixture);

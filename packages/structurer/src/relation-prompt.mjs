@@ -1,3 +1,5 @@
+import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit } from './prompt.mjs';
+
 function clean(value) {
   return String(value ?? "").trim();
 }
@@ -9,7 +11,7 @@ export const MEMORY_RELATION_OUTPUT_SCHEMA = Object.freeze({
   properties: {
     proposals: {
       type: "array",
-      maxItems: 20,
+      maxItems: DEFAULT_MAXIMUM_PROPOSALS,
       items: {
         type: "object",
         additionalProperties: false,
@@ -39,15 +41,10 @@ export function buildRelationGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Memory relation generation requires a snapshot object.");
   }
-  return [
-    "请根据以下受限记忆与原始证据提出因果关系候选。只输出符合 Schema 的 JSON。",
-    "候选只供人工审核，不会由你直接写入记忆图。",
-    "",
-    JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2),
-  ].join("\n");
+  return JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2);
 }
 
-export function parseRelationGeneration(value, { maximumProposals = 20 } = {}) {
+export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -64,7 +61,7 @@ export function parseRelationGeneration(value, { maximumProposals = 20 } = {}) {
   if (!Array.isArray(parsed.proposals)) {
     throw new Error("Memory relation generator output requires a proposals array.");
   }
-  const limit = Math.min(100, Math.max(0, Math.trunc(Number(maximumProposals) || 20)));
+  const limit = proposalCountLimit(maximumProposals);
   if (parsed.proposals.length > limit) {
     throw new Error(`Memory relation generator returned more than ${limit} proposals.`);
   }
