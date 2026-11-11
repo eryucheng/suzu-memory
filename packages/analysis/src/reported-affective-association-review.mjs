@@ -225,7 +225,7 @@ export function reviewReportedAffectiveAssociationState({
     ...snapshotOptions,
     currentRepresentationLayer: "reported",
   });
-  if (baseResult.status === "skipped") {
+  if (baseResult.status !== "ready") {
     return { ...baseResult, representationLayer: "reported", ...flags() };
   }
   const snapshot = baseResult.snapshot;

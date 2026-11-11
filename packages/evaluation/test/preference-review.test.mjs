@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 import {
   MemoryRepository,
@@ -114,6 +115,8 @@ function addObservation(repository, {
   payload = {},
   qualification = "qualified",
   excludedReason = "",
+  world = {},
+  semanticWorld = null,
 } = {}) {
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -133,6 +136,7 @@ function addObservation(repository, {
     subjectRole: "user",
     subjectKey: "user",
     reality: "real",
+    ...world,
     evidenceMode: "explicit",
     temporalState: "historical",
     eventStart: occurredAt,
@@ -144,6 +148,17 @@ function addObservation(repository, {
     evidenceStrength: 1,
     provenance: "test",
   });
+  let analysisRequest = null;
+  if (semanticWorld) {
+    analysisRequest = repository.recordStateAnalysisRequest({ agentId: 'agent-test', batchId: `semantic-batch-${id}`, candidateIndex: 0,
+      stateFamily: 'preference', subjectRole: 'user', subjectKey: 'user', canonicalKey: 'user:preference:puzzle-games', targetLabel: 'Puzzles',
+      representationLayer: 'inferred', evidenceMode: 'inferred', memoryIds: [memory.id], sourceIds: [source.id] });
+    const semantic = repository.upsertMemory({ id: `semantic-${id}`, agentId: 'agent-test', kind: 'derived_hypothesis', layer: 'provisional',
+      title: 'Puzzles', content: 'A fixed preference draft.', subjectRole: 'user', subjectKey: 'user', ...semanticWorld,
+      metadata: { stateAnalysisDraft: true, stateAnalysisRequestId: analysisRequest.id } });
+    repository.bindStateAnalysisTarget({ agentId: 'agent-test', requestId: analysisRequest.id, canonicalKey: analysisRequest.canonical_key,
+      metadata: { semanticMemoryId: semantic.id } });
+  }
   const observation = repository.recordStateEvidenceObservation({
     id,
     agentId: "agent-test",
@@ -162,7 +177,7 @@ function addObservation(repository, {
     origin: "deterministic",
     scope: { kind: "exact", label: "解谜游戏", context: "" },
     payloadSchemaVersion: "test-evidence-v1",
-    payload,
+    payload: { ...payload, ...(analysisRequest ? { analysisRequest: { id: analysisRequest.id } } : {}) },
     excludedReason,
     sourceIds: [source.id],
     observedAt: occurredAt,
@@ -211,8 +226,48 @@ async function approvedSelectionReview(repository, support) {
   }));
 }
 
-async function approvedStableReview(repository, supports) {
+for (const [role, failure] of [['synthesizer', 'provider'], ['synthesizer', 'persistence'],
+  ['critic', 'provider'], ['critic', 'persistence']]) test(`canonical review records ${role} usage once across ${failure} failure and recovery`, async t => {
+  const { database, repository } = setup();
+  t.after(() => database.close());
+  const support = addObservation(repository, { id: 'usage-choice', signal: 'active_choice', direction: 'support',
+    content: '用户有空时主动选择了解谜游戏。', sourceText: '今晚有空，其他娱乐先放下，我想玩解谜游戏。',
+    occurredAt: '2026-07-12T12:00:00Z', payload: { agency: 'self_initiated', constraint: 'none',
+      alternatives: 'available', instrumentalGoal: 'none', opportunityCost: 'medium', canDecline: true } });
+  const charges = [];
+  const calls = { synthesizer: 0, critic: 0 };
+  const record = repository.recordStateAnalysisRun.bind(repository);
+  if (failure === 'persistence') repository.recordStateAnalysisRun = input => {
+    if (input.analyzerRole === `preference-state-${role}`) throw new Error('review storage failure');
+    return record(input);
+  };
+  const generator = currentRole => async () => {
+    const receipt = { model: 'fixture', requestId: `${currentRole}-${++calls[currentRole]}`, usage: { prompt_tokens: 5 } };
+    if (currentRole === role && failure === 'provider' && calls[currentRole] === 1) {
+      throw Object.assign(new Error('review provider failure'), receipt);
+    }
+    return { ...receipt, output: currentRole === 'critic'
+      ? { verdict: 'approve_shadow', issues: [], summary: 'The proposal stays within the supplied evidence.' }
+      : { action: 'create', proposedLevel: 'selection_tendency', scopeChange: 'none',
+        scope: { kind: 'category', label: '解谜游戏', context: '空闲时间' }, evidenceDecisions: [{
+          observationId: support.observation.id, treatment: 'positive_preference_evidence', rationale: 'A voluntary choice with alternatives.' }],
+        confidence: 0.9, rationale: 'The choice supports a reviewable selection tendency.' } };
+  };
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => reviewPreferenceCanonicalState(
+    reviewArgs(repository, { synthesizer: generator('synthesizer'), critic: generator('critic'), usageLedgerPath: 'review-owner-unused.jsonl' })));
+  if (failure === 'persistence') await assert.rejects(run, /review storage failure/);
+  else assert.equal((await run()).status, 'incomplete');
+  assert.equal(charges.length, role === 'synthesizer' ? 1 : 2);
+  repository.recordStateAnalysisRun = record;
+  assert.equal((await run()).status, 'approved-shadow');
+  assert.equal(charges.length, calls.synthesizer + calls.critic);
+  assert.equal(new Set(charges.map(charge => charge.requestId)).size, charges.length);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), charges.length * 5);
+});
+
+async function approvedStableReview(repository, supports, world = null) {
   return reviewPreferenceCanonicalState(reviewArgs(repository, {
+    snapshotOptions: { world },
     synthesizer: async () => ({
       output: {
         action: "create",
@@ -249,9 +304,10 @@ const establishedPromotionPolicy = Object.freeze({
   maximumOppositionRatio: 0.5,
 });
 
-async function acceptedStablePreference(repository, prefix = "established") {
+async function acceptedStablePreference(repository, prefix = "established", world = null, semanticWorld = null) {
   const supports = [
     addObservation(repository, {
+      world, semanticWorld,
       id: `${prefix}-choice-one`,
       signal: "active_choice",
       direction: "support",
@@ -268,6 +324,7 @@ async function acceptedStablePreference(repository, prefix = "established") {
       },
     }),
     addObservation(repository, {
+      world, semanticWorld,
       id: `${prefix}-choice-two`,
       signal: "active_choice",
       direction: "support",
@@ -284,7 +341,7 @@ async function acceptedStablePreference(repository, prefix = "established") {
       },
     }),
   ];
-  const review = await approvedStableReview(repository, supports);
+  const review = await approvedStableReview(repository, supports, semanticWorld || world);
   assert.equal(review.status, "approved-shadow", JSON.stringify(review));
   const pending = proposePreferenceStateFromCanonicalReview(repository, {
     agentId: "agent-test",
@@ -971,4 +1028,47 @@ test("refuses to revoke an established promotion after a later established state
   }), /later changes/u);
   assert.equal(repository.getStatePromotionProposal("agent-test", proposal.id).review_state, "accepted");
   database.close();
+});
+
+
+test("fictional state promotion and revocation preserve its world alongside a real current state", async t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const real = await acceptedStablePreference(repository, 'world-real', { reality: 'real', worldId: 'room', worldFrame: 'physical' });
+  const storyWorld = { reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' };
+  const story = await acceptedStablePreference(repository, 'world-story', storyWorld);
+  assert.equal(repository.getMemory(real.accepted.memory.id).status, 'active');
+  const proposal = proposePreferenceEstablishedPromotion(repository, { agentId: 'agent-test', sourceMemoryId: story.accepted.memory.id,
+    policy: establishedPromotionPolicy, createdAt: '2026-08-02T08:00:00Z' });
+  const promoted = resolveStatePromotionProposal(repository, { agentId: 'agent-test', proposalId: proposal.id, action: 'accept' });
+  assert.deepEqual([promoted.memory.reality, promoted.memory.world_id, promoted.memory.world_frame], ['fictional', 'story-a', 'fictional']);
+  const revoked = revokeStatePromotionProposal(repository, { agentId: 'agent-test', proposalId: proposal.id, revokedBy: 'human', note: 'Review withdrawn.' });
+  assert.deepEqual([revoked.restoredSource.reality, revoked.restoredSource.world_id, revoked.restoredSource.world_frame], ['fictional', 'story-a', 'fictional']);
+  assert.equal(repository.getMemory(real.accepted.memory.id).status, 'active');
+});
+
+test("a mixed-world complete preference review blocks before invoking either model", async t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const a = addObservation(repository, { id: 'ambiguous-real', signal: 'active_choice', direction: 'support', content: 'A real choice.', sourceText: 'Real.', occurredAt: '2026-07-20T09:00:00Z' });
+  const b = addObservation(repository, { id: 'ambiguous-story', signal: 'active_choice', direction: 'support', content: 'A fictional choice.', sourceText: 'Story.', occurredAt: '2026-07-21T09:00:00Z',
+    world: { reality: 'fictional', worldId: 'story', worldFrame: 'fictional' } });
+  let calls = 0;
+  const review = await reviewPreferenceCanonicalState(reviewArgs(repository, { synthesizer: async () => { calls++; throw Error('unexpected'); }, critic: async () => { calls++; throw Error('unexpected'); } }));
+  assert.equal(review.status, 'blocked'); assert.equal(review.reason, 'world-scope-required'); assert.equal(calls, 0);
+  assert.deepEqual(review.snapshot.observations.map(item => item.memoryId).sort(), [a.memory.id, b.memory.id].sort());
+});
+
+test("canonical freshness and promotion use observation semantic worlds rather than raw real dialogue", async t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const real = await acceptedStablePreference(repository, 'raw-real');
+  const world = { reality: 'fictional', worldId: 'story-semantic', worldFrame: 'fictional' };
+  const fictional = await acceptedStablePreference(repository, 'raw-story', null, world);
+  assert.equal(repository.getMemory(fictional.supports[0].memory.id).reality, 'real');
+  assert.deepEqual([fictional.accepted.memory.reality, fictional.accepted.memory.world_id, fictional.accepted.memory.world_frame], ['fictional', 'story-semantic', 'fictional']);
+  const promotion = proposePreferenceEstablishedPromotion(repository, { agentId: 'agent-test', sourceMemoryId: fictional.accepted.memory.id,
+    policy: establishedPromotionPolicy, createdAt: '2026-08-02T08:00:00Z' });
+  const accepted = resolveStatePromotionProposal(repository, { agentId: 'agent-test', proposalId: promotion.id, action: 'accept' });
+  assert.equal(accepted.memory.reality, 'fictional');
+  assert.equal(repository.getMemory(real.accepted.memory.id).status, 'active');
+  const revoked = revokeStatePromotionProposal(repository, { agentId: 'agent-test', proposalId: promotion.id, revokedBy: 'human', note: 'Review withdrawn.' });
+  assert.equal(revoked.restoredSource.reality, 'fictional');
 });

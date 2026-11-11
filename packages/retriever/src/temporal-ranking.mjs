@@ -62,7 +62,7 @@ function historicalCoverage(candidates, limit) {
   return [...selected, ...candidates.filter(candidate => !ids.has(candidate.node.id))];
 }
 
-export function rankTemporalCandidates(candidates, temporal, { timeZone, temporalWeight = 0.35, topicless = false, today,
+export function rankTemporalCandidates(candidates, temporal, { timeZone, temporalWeight = 0.35, topicless = false,
   maximumReturnedCandidates = 5, maximumChainMemories = 3 } = {}) {
   if (!temporal?.matched) return candidates;
   const weight = Number.isFinite(Number(temporalWeight)) ? Math.max(0, Number(temporalWeight)) : 0.35;
@@ -99,7 +99,6 @@ export function rankTemporalCandidates(candidates, temporal, { timeZone, tempora
 }
 
 export function temporalOverviewCandidates(nodes, temporal, options) {
-  const today = options.today;
   let eligible = nodes.filter(node => !['topic', 'reflection'].includes(node.kind)
     && memoryCalendarDate(node, options.timeZone));
   if (temporal.toleranceWindow) eligible = eligible.filter(node => {

@@ -123,6 +123,10 @@ function proposalSummary(type, proposal) {
 
 export function resolveIngestionReviewInput(repository, agentId, decision, identityBindings = {}) {
   let candidate = decision?.candidate && typeof decision.candidate === "object" ? decision.candidate : {};
+  const sources = [...new Set(decision?.sourceIds || [])].map(id => sourceById(repository, agentId, id)).filter(Boolean);
+  const sourceWorlds = [...new Map(sources.map(source => [JSON.stringify([source.world_id, source.world_frame]),
+    { worldId: source.world_id, worldFrame: source.world_frame }])).values()];
+  if (sourceWorlds.length === 1) candidate = { ...candidate, ...sourceWorlds[0] };
   const provisional = clean(decision?.provisional_memory_id)
     ? repository.getMemory(decision.provisional_memory_id) : null;
   const request = repository.listStateAnalysisRequests(agentId, {
@@ -130,55 +134,56 @@ export function resolveIngestionReviewInput(repository, agentId, decision, ident
   }).find(item => Number(item.candidate_index) === Number(decision?.candidate_index)) || null;
   const identity = candidate.metadata?.actorIdentity || request?.metadata?.actorIdentity || provisional?.metadata?.actorIdentity || {};
   const identityChoices = new Map();
-  function selectedPerson(name, role) {
+  function selectedPerson(name, role, key, status) {
+    if (key || status === 'entity' || !['user', 'agent', 'other'].includes(role)) return { name, role, key, status };
     const resolved = resolveExtractionParticipant(name, identity.participants);
-    if (resolved.status !== 'ambiguous') return { name, role };
-    const key = JSON.stringify([role, name]);
+    if (resolved.status !== 'ambiguous') return { name, role, key, status };
+    const choiceKey = JSON.stringify([role, name]);
     const options = resolved.matches.map(person => ({ value: JSON.stringify([person.actorRole, person.actorKey]),
       name: person.name, actorRole: person.actorRole, actorKey: person.actorKey }));
-    identityChoices.set(key, { key, name, role, options });
-    const selection = clean(identityBindings?.[key]);
-    if (!selection) return { name, role };
+    identityChoices.set(choiceKey, { key: choiceKey, name, role, options });
+    const selection = clean(identityBindings?.[choiceKey]);
+    if (!selection) return { name, role, key, status };
     const person = options.find(option => option.value === selection);
     if (!person) throw new Error('Selected person is not an identity candidate for this review.');
-    return { name: person.name, role: person.actorRole };
+    return { name: person.name, role: person.actorRole, key: person.actorKey, status: 'bound' };
   }
-  const subject = selectedPerson(candidate.subjectName, candidate.subjectRole);
+  const subject = selectedPerson(candidate.subjectName, candidate.subjectRole,
+    candidate.subjectKey || request?.subject_key || provisional?.subject_key, candidate.subjectIdentityStatus);
   const stateTarget = { ...candidate.stateTarget };
   for (const prefix of ['object', 'counterpart', 'trigger']) {
     if (!stateTarget[`${prefix}Role`]) continue;
-    const person = selectedPerson(stateTarget[`${prefix}Name`], stateTarget[`${prefix}Role`]);
+    const person = selectedPerson(stateTarget[`${prefix}Name`], stateTarget[`${prefix}Role`],
+      stateTarget[`${prefix}Key`], stateTarget[`${prefix}IdentityStatus`]);
     stateTarget[`${prefix}Name`] = person.name;
     stateTarget[`${prefix}Role`] = person.role;
+    stateTarget[`${prefix}Key`] = person.key;
+    stateTarget[`${prefix}IdentityStatus`] = person.status;
   }
+  const storedRoles = provisional ? repository.listMemoryRoles(provisional.id) : [];
   candidate = { ...candidate, subjectName: subject.name, subjectRole: subject.role,
+    subjectKey: subject.key, subjectIdentityStatus: subject.status,
     ...(candidate.stateTarget ? { stateTarget } : {}),
     actorRoles: (candidate.actorRoles || []).map(actor => {
-      const person = selectedPerson(actor.actorName, actor.actorRole);
-      return { ...actor, actorName: person.name, actorRole: person.role };
+      const stored = storedRoles.find(value => value.role === actor.role && value.actor_role === actor.actorRole
+        && clean(value.metadata?.actorName) === clean(actor.actorName));
+      const person = selectedPerson(actor.actorName, actor.actorRole, actor.actorKey || stored?.actor_key, actor.identityStatus);
+      return { ...actor, actorName: person.name, actorRole: person.role, actorKey: person.key, identityStatus: person.status };
     }) };
   for (const key of Object.keys(identityBindings || {})) {
     if (!identityChoices.has(key)) throw new Error('Unknown identity binding for this review.');
   }
   const resolved = resolveExtractedCandidateIdentity(candidate, agentId, identity);
   const subjectRole = clean(candidate.subjectRole || request?.subject_role || provisional?.subject_role);
-  const subjectKey = clean(candidate.subjectKey || request?.subject_key || provisional?.subject_key || resolved.subjectKey);
-  const storedRoles = provisional ? repository.listMemoryRoles(provisional.id) : [];
-  const actorRoles = resolved.actorRoles.map((actor, index) => {
-    const original = candidate.actorRoles[index];
-    const stored = storedRoles.find(value => value.role === actor.role && value.actor_role === actor.actorRole
-      && clean(value.metadata?.actorName) && clean(value.metadata.actorName) === clean(actor.metadata?.actorName));
-    const isSubject = actor.actorRole === subjectRole && clean(actor.metadata?.actorName)
-      && clean(actor.metadata.actorName) === clean(candidate.subjectName);
-    return { ...actor, actorKey: clean(original?.actorKey || stored?.actor_key || (isSubject ? subjectKey : '') || actor.actorKey) };
-  });
+  const subjectKey = clean(resolved.subjectKey);
+  const actorRoles = resolved.actorRoles;
   for (const observer of storedRoles.filter(role => role.role === 'observer')) {
     if (!actorRoles.some(role => role.role === 'observer' && role.actorRole === observer.actor_role && role.actorKey === observer.actor_key)) {
       actorRoles.push({ role: 'observer', actorRole: observer.actor_role, actorKey: observer.actor_key,
         confidence: observer.confidence, metadata: observer.metadata, provenance: observer.provenance });
     }
   }
-  return { request, identityChoices: [...identityChoices.values()], candidate: {
+  return { request, sources, sourceWorlds, identityChoices: [...identityChoices.values()], candidate: {
     ...candidate, subjectRole, subjectKey, actorRoles,
     metadata: { ...candidate.metadata, ...(Object.keys(identityBindings || {}).length ? { humanIdentityBindings: identityBindings } : {}) },
     canonicalKey: clean(request?.canonical_key || candidate.canonicalKey || provisional?.canonical_key),
@@ -188,11 +193,9 @@ export function resolveIngestionReviewInput(repository, agentId, decision, ident
 }
 
 function ingestionReviewDetail(repository, agentId, decision) {
-  const { candidate, request, identityChoices } = resolveIngestionReviewInput(repository, agentId, decision);
+  const { candidate, request, identityChoices, sources } = resolveIngestionReviewInput(repository, agentId, decision);
   const provisional = memoryDetail(repository, agentId, decision.provisional_memory_id);
-  const evidence = uniqueEvidence((decision.sourceIds || []).map((sourceId) => (
-    evidenceSource(sourceById(repository, agentId, sourceId), { kind: "source" })
-  )).filter(Boolean));
+  const evidence = uniqueEvidence(sources.map(source => evidenceSource(source, { kind: "source" })));
   return {
     identityChoices,
     writePreview: {

@@ -10,10 +10,6 @@ function datePart(value, timeZone) {
   return dateKeyInTimeZone(text, timeZone);
 }
 
-function temporalEvidence(memory, timeZone) {
-  return datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone) || datePart(memory.knownAt, timeZone);
-}
-
 function deriveEpisodeBoundary(members, timeZone) {
   const dates = members.flatMap((memory) => [
     datePart(memory.eventDate, timeZone),
@@ -36,23 +32,14 @@ function deriveEpisodeBoundary(members, timeZone) {
   };
 }
 
-export function canProposeStructure(snapshot, {
-  timeZone = DEFAULT_MEMORY_TIME_ZONE,
-  minimumTopicEvidenceDates = 2,
-  minimumEpisodeTimedMembers = 2,
-} = {}) {
+export function canProposeStructure(snapshot) {
   const memories = snapshot.currentMemories;
-  if (snapshot.candidateContainers.some(container => memories.some(memory => !container.memberIds.includes(memory.id)))) return true;
-  const timed = memories.filter(memory => datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone));
-  if (timed.length >= Math.max(2, Math.trunc(Number(minimumEpisodeTimedMembers) || 2))) return true;
-  return new Set(memories.map(memory => temporalEvidence(memory, timeZone)).filter(Boolean)).size
-    >= Math.max(2, Math.trunc(Number(minimumTopicEvidenceDates) || 2));
+  return memories.length >= 2 || snapshot.candidateContainers.some(container =>
+    memories.some(memory => !container.memberIds.includes(memory.id)));
 }
 
 export function enforceStructureCandidatePolicy(candidate, snapshot, {
   timeZone = DEFAULT_MEMORY_TIME_ZONE,
-  minimumTopicEvidenceDates = 2,
-  minimumEpisodeTimedMembers = 2,
   requiredTriggerMemoryIds = [],
   requiredHistoricalMemoryIds = [],
   requireRetrospectiveParticipation = false,
@@ -73,7 +60,7 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   const kind = clean(candidate.kind);
   const enforceRetrospectiveParticipation = (value) => {
     if (!requireRetrospectiveParticipation) return value;
-    const members = new Set(value.memberIds);
+    const members = new Set([...value.memberIds, ...(value.expectedTarget?.memberIds || [])]);
     const triggerIds = new Set(
       (Array.isArray(requiredTriggerMemoryIds) ? requiredTriggerMemoryIds : []).map(clean).filter(Boolean),
     );
@@ -93,11 +80,16 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   };
   if (operation === "attach") {
     const target = containerById.get(clean(candidate.targetMemoryId));
-    if (!target || target.kind !== kind) {
+    if (!target || (kind && target.kind !== kind)) {
       throw new Error("Attach target must be a matching candidateContainer in this bounded snapshot.");
     }
     if (!memoryWorldsCompatible(target, scopedMembers[0])) throw new Error("Structure target is outside its members' world scope.");
-    return enforceRetrospectiveParticipation({ ...candidate, memberIds });
+    const additions = memberIds.filter(id => !target.memberIds.includes(id));
+    if (!additions.length) throw Object.assign(new Error('Attach proposal must add at least one new member.'),
+      { code: 'MEMORY_STRUCTURE_NO_NEW_MEMBERS' });
+    if (!clean(candidate.content)) throw new Error('Structure attachment requires an updated overall summary.');
+    return enforceRetrospectiveParticipation({ ...candidate, kind: target.kind, memberIds: additions,
+      expectedTarget: { title: target.title, content: target.content, memberIds: target.memberIds } });
   }
   if (operation !== "create") {
     throw new Error("Structure operation must be create or attach.");
@@ -110,25 +102,13 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   }
   const members = memberIds.map((id) => currentById.get(id));
   if (kind === "episode") {
-    const timedMembers = members.filter((memory) => (
-      datePart(memory.eventDate, timeZone) || datePart(memory.eventStart, timeZone)
-    ));
-    const minimum = Math.max(2, Math.trunc(Number(minimumEpisodeTimedMembers) || 2));
-    if (timedMembers.length < minimum) {
-      throw new Error(`Episode creation requires at least ${minimum} time-bearing current memories.`);
-    }
     return enforceRetrospectiveParticipation({
       ...candidate,
       memberIds,
-      ...deriveEpisodeBoundary(timedMembers, timeZone),
+      ...deriveEpisodeBoundary(members, timeZone),
     });
   }
   if (kind === "topic") {
-    const evidenceDates = new Set(members.map(memory => temporalEvidence(memory, timeZone)).filter(Boolean));
-    const minimum = Math.max(2, Math.trunc(Number(minimumTopicEvidenceDates) || 2));
-    if (evidenceDates.size < minimum) {
-      throw new Error(`Topic creation requires evidence from at least ${minimum} distinct dates.`);
-    }
     return enforceRetrospectiveParticipation({
       ...candidate,
       memberIds,

@@ -1,3 +1,4 @@
+import { entityNameKey, entityNameKeys } from './entity-identity.mjs';
 import { eventSourceError } from './event-source-contract.mjs';
 import { removeSearchRows } from './search-index.mjs';
 import { getEventSourceCleanup, advanceEventSourceCleanup, advanceEventSourceEpoch } from './event-source-state.mjs';
@@ -189,15 +190,26 @@ export function cleanEventSourceDatabase(repository, { agentId, id }) {
     // Orphan entity aliases/metadata can contain source-derived names. Shared
     // entities retain their content while any untouched memory still uses them.
     for (const entityId of entities) {
-      if (database.prepare('SELECT 1 FROM actor_entity_bindings WHERE entity_id=? LIMIT 1').get(entityId)) continue;
+      const bindings = database.prepare('SELECT actor_key FROM actor_entity_bindings WHERE entity_id=?').all(entityId);
+      if (bindings.some(binding => !/^(?:entity:|unresolved-person-)/u.test(binding.actor_key))) continue;
       const entity = database.prepare('SELECT * FROM entities WHERE id=? AND agent_id=?').get(entityId, agentId);
       const remaining = database.prepare(`SELECT source.content FROM memory_entities link JOIN memory_sources evidence
         ON evidence.memory_id=link.memory_id JOIN source_records source ON source.id=evidence.source_id
-        WHERE link.entity_id=? AND source.lifecycle='active'`).all(entityId).map(row => row.content);
-      const supported = name => remaining.some(content => content.includes(name));
-      database.prepare("UPDATE entities SET canonical_name=?,aliases_json=?,metadata_json='{}' WHERE id=? AND agent_id=?")
-        .run(supported(entity.canonical_name) ? entity.canonical_name : entity.id,
-          JSON.stringify(parse(entity.aliases_json, []).filter(supported)), entityId, agentId);
+        WHERE link.entity_id=? AND source.lifecycle='active'`).all(entityId).map(row => entityNameKey(row.content));
+      const supported = name => remaining.some(content => content.includes(entityNameKey(name)));
+      const supportedAliases = parse(entity.aliases_json, []).filter(supported);
+      const canonicalName = supported(entity.canonical_name) ? entity.canonical_name : supportedAliases[0] || entity.id;
+      const aliases = supportedAliases.filter(alias => entityNameKey(alias) !== entityNameKey(canonicalName));
+      const world = parse(entity.metadata_json).world;
+      database.prepare('UPDATE entities SET canonical_name=?,aliases_json=?,metadata_json=? WHERE id=? AND agent_id=?')
+        .run(canonicalName, JSON.stringify(aliases),
+          JSON.stringify(remaining.length && world ? { world } : {}), entityId, agentId);
+      if (bindings.length) database.prepare("UPDATE actor_entity_bindings SET display_name=?,metadata_json='{}' WHERE entity_id=?")
+        .run(canonicalName, entityId);
+      database.prepare('DELETE FROM entity_names WHERE entity_id=?').run(entityId);
+      const names = entityNameKeys({ canonicalName, aliases });
+      const indexName = database.prepare('INSERT INTO entity_names(entity_id,agent_id,kind,name_key) VALUES (?,?,?,?)');
+      for (const name of names) indexName.run(entityId, agentId, entity.kind, name);
     }
     if (database.prepare('PRAGMA foreign_key_check').all().length) throw eventSourceError('EVENT_SOURCE_CLEANUP_REFERENCES', 'Cleanup would leave dangling source dependencies.');
     return advanceEventSourceCleanup(repository, agentId, id, 'database-cleaned', counts);

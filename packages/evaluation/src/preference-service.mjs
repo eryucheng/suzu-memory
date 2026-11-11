@@ -214,22 +214,25 @@ export async function evaluatePreferenceEvidenceTarget({
     .replace(/^\uFEFF/u, "")
     .trim();
   const generationInput = buildPreferenceEvidenceGenerationInput(snapshot);
-  const generation = await generator({
-    input: generationInput,
-    systemPrompt,
-    schema: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA, properties: {
-      evidence: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA.properties.evidence, maxItems: snapshot.memories.length },
-    } },
-    schemaName: "memory-preference-evidence-v1",
-  });
+  let generation = null;
   const warnings = [];
-  const usageRecorded = await recordUsage({
-    generation,
-    usageLedgerPath,
-    agentId: clean(agentId),
-    batchId,
-    warnings,
-  });
+  let usageRecorded = false;
+  try {
+    generation = await generator({
+      input: generationInput,
+      systemPrompt,
+      schema: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA, properties: {
+        evidence: { ...MEMORY_PREFERENCE_EVIDENCE_OUTPUT_SCHEMA.properties.evidence, maxItems: snapshot.memories.length },
+      } },
+      schemaName: "memory-preference-evidence-v1",
+    });
+  } catch (error) {
+    generation = error;
+    throw error;
+  } finally {
+    usageRecorded = await recordUsage({ generation, usageLedgerPath,
+      agentId: clean(agentId), batchId, warnings });
+  }
   const parsed = parsePreferenceEvidenceGeneration(generation?.output);
   const labels = [];
   const rejected = [];

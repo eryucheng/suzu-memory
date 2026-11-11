@@ -5,7 +5,8 @@ import { proposeRelationsForBatch, prepareRelationGeneration } from "./relation-
 import { proposeStructuresForBatch, prepareStructureGeneration } from "./service.mjs";
 import { createConsolidationGenerationBatch, buildConsolidationRequest } from "./consolidation-generation-batch.mjs";
 
-import { runBudgetedMemoryParts, memoryBudgetError } from "./budgeted-parts.mjs";
+import { runBudgetedMemoryParts, blockedMemoryPartsError } from "./budgeted-parts.mjs";
+import { assertGenerationRequestBudget, STRUCTURE_REQUEST_CHARACTERS, RELATION_REQUEST_CHARACTERS } from './generation-input.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -110,16 +111,27 @@ export async function runMemoryConsolidation({
     await runBudgetedMemoryParts({ parts: progress.parts, checkpoint,
       prepare: part => {
         const prepared = {};
-        if (!part.structure && typeof structureGenerator === "function") {
-          prepared.structure = prepareStructureGeneration({ ...optionsFor(part, "structure"), generator: structureGenerator });
+        const combined = structureGenerator === relationGenerator && structureGenerator?.supportsCombinedConsolidation;
+        if (!part.coveredOutputs?.includes('structure') && (!part.structure || part.structure.status === 'partial-failure') && typeof structureGenerator === "function") {
+          prepared.structure = prepareStructureGeneration({ ...optionsFor(part, "structure"),
+            ...(combined ? { maximumRequestCharacters: Infinity } : {}), generator: combined ? null : structureGenerator });
         }
-        if (!part.relations && typeof relationGenerator === "function") {
-          prepared.relations = prepareRelationGeneration({ ...optionsFor(part, "relations"), generator: relationGenerator });
+        if (!part.coveredOutputs?.includes('relations') && !part.relations && typeof relationGenerator === "function") {
+          prepared.relations = prepareRelationGeneration({ ...optionsFor(part, "relations"),
+            ...(combined ? { maximumRequestCharacters: Infinity } : {}), generator: combined ? null : relationGenerator });
         }
         const calls = Object.entries(prepared).filter(([, value]) => value.request)
           .map(([key, value]) => ({ key, request: value.request }));
-        if (calls.length && structureGenerator === relationGenerator && structureGenerator?.supportsCombinedConsolidation) {
-          structureGenerator.assertRequestBudget?.(buildConsolidationRequest(calls));
+        if (calls.length && combined) {
+          const budget = calls.reduce((sum, call) => sum + (call.key === 'structure'
+            ? structureOptions.maximumRequestCharacters ?? STRUCTURE_REQUEST_CHARACTERS
+            : relationOptions.maximumRequestCharacters ?? RELATION_REQUEST_CHARACTERS), 0);
+          const fullCalls = calls.map(call => ({ ...call,
+            request: prepared[call.key].fullRequest || call.request }));
+          assertGenerationRequestBudget(buildConsolidationRequest(fullCalls), budget, structureGenerator);
+          if (prepared.relations?.fullRequest) {
+            assertGenerationRequestBudget(buildConsolidationRequest(calls), budget, structureGenerator);
+          }
         }
         return prepared;
       },
@@ -129,7 +141,8 @@ export async function runMemoryConsolidation({
         const jobs = Object.entries(prepared).map(([key, preparedGeneration]) => {
           const operation = key === "structure" ? proposeStructuresForBatch : proposeRelationsForBatch;
           const generator = combined ? combined[key] : key === "structure" ? structureGenerator : relationGenerator;
-          return [key, operation({ ...optionsFor(part, key), generator, preparedGeneration })];
+          return [key, operation({ ...optionsFor(part, key), generator, preparedGeneration,
+            ...(key === 'relations' ? { fullEvidenceGenerator: relationGenerator } : {}) })];
         });
         const results = await Promise.allSettled(jobs.map(([, promise]) => promise));
         for (const [index, result] of results.entries()) {
@@ -141,14 +154,22 @@ export async function runMemoryConsolidation({
         checkpoint();
         const failure = results.find(result => result.status === "rejected");
         if (failure) throw failure.reason;
-        return { status: "completed" };
+        return { status: part.structure?.status === 'partial-failure' ? 'partial-failure'
+          : [part.structure, part.relations].some(report => report?.status === 'capacity-reached') ? 'capacity-reached' : 'completed' };
+      },
+      onSplit: (part, children) => {
+        for (const child of children) {
+          child.coveredOutputs = [...new Set([...(part.coveredOutputs || []),
+            ...['structure', 'relations'].filter(key => part[key]
+              && !['capacity-reached', 'partial-failure'].includes(part[key].status))])];
+          delete child.structure; delete child.relations;
+        }
       },
     });
     structure = aggregate("structure");
     relations = aggregate("relations");
-    if (progress.parts.some(part => part.status === "blocked")) {
-      throw memoryBudgetError("A complete new/old memory pair exceeds the organization budget; original material is retained for review.");
-    }
+    const blocked = blockedMemoryPartsError(progress.parts, 'A complete new/old memory pair exceeds the organization budget; original material is retained for review.');
+    if (blocked) throw blocked;
     const hasProposals = structureIds.length > 0 || relationIds.length > 0;
     const finished = repository.finishConsolidationRun({
       agentId: normalizedAgentId,
@@ -174,7 +195,7 @@ export async function runMemoryConsolidation({
       structureProposalIds: structureIds,
       relationProposalIds: relationIds,
       errorMessage: error.message,
-      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MAX_TOKENS"].includes(error.code),
+      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MEMORY_STRUCTURE_OUTPUT_FULL", "MEMORY_OUTPUT_LIMIT", "MAX_TOKENS"].includes(error.code),
       errorDetails: {
         stage: "retrospective-consolidation",
         errorCode: clean(error.code),

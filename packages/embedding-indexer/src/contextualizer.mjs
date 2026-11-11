@@ -122,12 +122,13 @@ function hasExactKeys(value, expected) {
   return keys.length === required.length && keys.every((key, index) => key === required[index]);
 }
 
-function listActiveMemories(repository, agentId) {
+function listActiveMemories(repository, agentId, memoryIds) {
   const result = [];
   let offset = 0;
   while (true) {
     const page = repository.listMemories(agentId, {
       statuses: ["active"],
+      memoryIds,
       limit: 200,
       offset,
     });
@@ -244,7 +245,7 @@ export async function generateMemoryRetrievalContexts({
   const criticPrompt = readPrompt(promptDirectory, "retrieval-context-critic-system-prompt.md");
   const excluded = new Set((Array.isArray(excludedKinds) ? excludedKinds : []).map(clean));
   const selectedIds = new Set((Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean));
-  const all = listActiveMemories(repository, normalizedAgentId);
+  const all = listActiveMemories(repository, normalizedAgentId, selectedIds.size ? [...selectedIds] : null);
   const sourceView = executionEventSourceView(repository, normalizedAgentId);
   const eligible = all
     .filter((memory) => !sourceView || sourceView.allows(memory))
@@ -328,6 +329,7 @@ export async function generateMemoryRetrievalContexts({
           proposal,
           riskReasons: criticNeed.reasons,
         });
+        report.criticCalls += 1;
         criticGeneration = await critic({
           input: criticInput,
           systemPrompt: criticPrompt,
@@ -336,7 +338,6 @@ export async function generateMemoryRetrievalContexts({
           ...(sourceMaterial ? { sourceMaterial } : {}),
           analyzerRole: "memory-retrieval-context-critic",
         });
-        report.criticCalls += 1;
         critique = normalizeCritique(criticGeneration?.output);
       } else {
         report.locallyApproved += 1;
@@ -377,6 +378,8 @@ export async function generateMemoryRetrievalContexts({
         report.results.push({ memoryId: memory.id, status: "added", contextId: stored.id });
       }
     } catch (error) {
+      if (failureStage === 'proposal') proposalGeneration ||= error;
+      else if (failureStage === 'critic') criticGeneration ||= error;
       assertEventSourceExecutionCurrent();
       report.failed += 1;
       report.results.push({
@@ -396,20 +399,21 @@ export async function generateMemoryRetrievalContexts({
         } : null,
       });
       if (!continueOnError) throw error;
-    }
-    for (const [generation, feature] of [
-      [proposalGeneration, "memory-retrieval-context-proposal"],
-      [criticGeneration, "memory-retrieval-context-critic"],
-    ]) {
-      const warning = await recordGenerationUsage({
-        ledgerPath,
-        generation,
-        agentId: normalizedAgentId,
-        memoryId: memory.id,
-        feature,
-        policyVersion: normalizedPolicyVersion,
-      });
-      if (warning) report.usageLoggingErrors.push(warning);
+    } finally {
+      for (const [generation, feature] of [
+        [proposalGeneration, "memory-retrieval-context-proposal"],
+        [criticGeneration, "memory-retrieval-context-critic"],
+      ]) {
+        const warning = await recordGenerationUsage({
+          ledgerPath,
+          generation,
+          agentId: normalizedAgentId,
+          memoryId: memory.id,
+          feature,
+          policyVersion: normalizedPolicyVersion,
+        });
+        if (warning) report.usageLoggingErrors.push(warning);
+      }
     }
     if (typeof onProgress === "function") {
       onProgress({

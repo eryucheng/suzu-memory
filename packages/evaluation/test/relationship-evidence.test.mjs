@@ -455,24 +455,6 @@ test("keeps a provider failure as audit only and writes no merged relationship e
   fixture.database.close();
 });
 
-test("rejects a current-state comparison that invents an absent relationship", async () => {
-  const fixture = setup();
-  const record = fixture.add({
-    id: "invented-current-relationship",
-    content: "用户明确说自己信任 Agent。",
-    sourceContent: "我信任你。",
-  });
-  const result = await evaluate(fixture, record, analyzersFor(record, {
-    currentStatePresent: true,
-    relation: "supports",
-    scopeOverlap: "exact",
-  }));
-  assert.equal(result.status, "incomplete");
-  assert.deepEqual(result.failedRoles, ["currentRelation"]);
-  assert.deepEqual(result.observations, []);
-  fixture.database.close();
-});
-
 test("explicitly rejects a shared holder until bilateral review exists", async () => {
   const fixture = setup();
   const record = fixture.add({

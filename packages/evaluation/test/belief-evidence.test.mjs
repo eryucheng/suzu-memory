@@ -305,26 +305,6 @@ test("does not turn a historical belief into a new current state", async () => {
   fixture.database.close();
 });
 
-test("rejects a relation analyzer that invents a missing current state", async () => {
-  const fixture = setup();
-  const record = fixture.add({
-    id: "invented-current-state",
-    content: "Agent 表示有些鱼很好吃。",
-    sourceContent: "我觉得有些鱼很好吃。",
-  });
-  const analyzers = analyzersFor(record, {
-    currentStatePresent: true,
-    relation: "equivalent",
-    scopeOverlap: "exact",
-  });
-  const result = await evaluate(fixture, record, analyzers);
-  assert.equal(result.status, "incomplete");
-  assert.deepEqual(result.failedRoles, ["currentRelation"]);
-  assert.equal(result.runs.currentRelation.status, "rejected");
-  assert.deepEqual(result.observations, []);
-  fixture.database.close();
-});
-
 test("audits partial provider failure without writing a merged belief observation", async () => {
   const fixture = setup();
   const record = fixture.add({

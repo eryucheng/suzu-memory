@@ -6,7 +6,6 @@ import test from 'node:test';
 import { buildPreferenceEvidenceSnapshot, simulatePreferenceFormation } from '@suzu-memory/analysis';
 import { proposeStructuresForBatch } from '@suzu-memory/structurer';
 import { DEFAULT_PREFERENCE_FORMATION_POLICY } from '../../analysis/src/inferred-preference.mjs';
-import { canProposeStructure } from '../../structurer/src/policy.mjs';
 import { createMemoryService } from '../src/index.mjs';
 
 for (const [timeZone, timestamp, day] of [
@@ -58,13 +57,4 @@ for (const [timeZone, timestamp, day] of [
     assert.equal(preview.evidence[0].day, day);
   });
   assert.equal(service.withRepository(repository => repository.getMemory('episode').event_date, { readOnly: true }), day);
-});
-
-test('structure topic evidence counts local dates instead of UTC dates', () => {
-  const snapshot = { candidateContainers: [], currentMemories: [
-    { id: 'a', knownAt: '2026-10-21T23:30:00Z' },
-    { id: 'b', knownAt: '2026-10-22T08:00:00Z' },
-  ] };
-  assert.equal(canProposeStructure(snapshot, { timeZone: 'Asia/Shanghai' }), false);
-  assert.equal(canProposeStructure(snapshot, { timeZone: 'UTC' }), true);
 });

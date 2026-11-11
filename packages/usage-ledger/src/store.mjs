@@ -77,7 +77,8 @@ export async function appendUsageEvent(ledgerPath, input, catalog = DEFAULT_PRIC
     // echoes or diagnostic bodies whose source dependencies cannot be verified.
     event.metadata = {};
     event.usage = Object.fromEntries(Object.entries(event.usage).filter(([, value]) => typeof value === 'number' && Number.isFinite(value)));
-    execution.assertCurrent();
+    // A completed provider call remains billable after cancellation or erasure.
+    // Only the sanitized accounting record may be written past that boundary.
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.appendFileSync(destination, `${JSON.stringify(event)}\n`, 'utf8');
     return event;

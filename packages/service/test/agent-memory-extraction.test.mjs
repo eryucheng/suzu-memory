@@ -1,3 +1,6 @@
+import { buildLongTermExtractionInput, normalizeGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { MemoryRepository } from '@suzu-memory/core';
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,8 +15,7 @@ function candidate(overrides = {}) {
   return { kind: 'event', title: '参观博物馆', content: 'Mio 今天参观了博物馆。', subjectRole: 'other', subjectName: 'Mio',
     actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: 'Mio', confidence: 1 }],
     canonicalKey: '', stateFamily: 'not_applicable', stateLabel: '',
-    reality: 'real', evidenceMode: 'explicit', temporalState: 'historical', revisionAction: 'add', retentionReason: 'episodic_event',
-    eventDate: '2026-09-21', eventStart: '', eventEnd: '', confidence: 0.95, importance: 0.5,
+    reality: 'real', evidenceMode: 'explicit', temporalState: 'historical', revisionAction: 'add', eventDate: '2026-09-21', eventStart: '', eventEnd: '', confidence: 0.95, importance: 0.5,
     sourceRefs: ['M0001'], ...overrides };
 }
 function event(id, senderId, name, text, extra = {}) {
@@ -28,11 +30,11 @@ function fixture(t, defaults = {}) {
   return createMemoryService({ dataRoot, agentId, defaults: { memoryOwner: 'Suzu', primaryUserId: 'absent-human',
     userName: 'Absent Human', createPrimaryRelationship: false, ...defaults } });
 }
-async function process(memory, memories) {
+async function process(memory, memories, entities) {
   let request;
   const result = await memory.processPendingEvents({ sourceScope: scope, generator: async value => {
     request = value;
-    return { output: { memories }, usage: {} };
+    return { output: extractionModelFixture({ memories, ...(entities ? { entities } : {}) }), usage: {} };
   } });
   return { result, request };
 }
@@ -166,7 +168,7 @@ test('human approval preserves known people separately from the memory owner', a
   const { result } = await process(memory, [candidate({ kind: 'relationship', stateFamily: 'relationship',
     title: 'Mio 对 Ren 的信任', content: '我觉得 Mio 对 Ren 渐渐有了信任。',
     canonicalKey: 'trust-ren', stateLabel: '对 Ren 的信任', stateTarget: { counterpartRole: 'other', counterpartName: 'Ren', relationshipDimension: 'trust' },
-    evidenceMode: 'inferred', temporalState: 'current', retentionReason: 'relationship', sourceRefs: ['M0002'],
+    evidenceMode: 'inferred', temporalState: 'current', sourceRefs: ['M0002'],
     actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: 'Mio', confidence: .9 },
       { role: 'participant', actorRole: 'other', actorName: 'Ren', confidence: .9 }] })]);
   const review = result.candidateResults[0];
@@ -181,6 +183,8 @@ test('human approval preserves known people separately from the memory owner', a
   assert.ok(after.some(role => role.role === 'participant' && role.actor_key === 'ren'));
   assert.ok(after.some(role => role.role === 'experiencer' && role.actor_key === 'mio'));
   assert.equal(accepted.resolution.memory.agent_id, agentId);
+  assert.equal(accepted.resolution.memory.world_id, 'group-only');
+  assert.equal(accepted.resolution.memory.metadata.stateTarget?.counterpartKey, 'ren');
   assert.equal(after.some(role => role.role === 'experiencer' && role.actor_key === agentId), false);
 });
 
@@ -230,7 +234,7 @@ test('group-only Agent extracts another Agent experience with stable identity an
   assert.equal(node.subject_role, 'other');
   assert.equal(node.subject_key, 'agent-b');
   assert.doesNotMatch(request.input, /Absent Human|absent-human|对方名字|INTERNAL_HASH_NOT_MODEL_CONTEXT|INTERNAL_RUN_NOT_MODEL_CONTEXT/u);
-  assert.match(request.input, /"role":"other","name":"Mio"/u);
+  assert.match(request.input, /"ref":"P2","name":"Mio"/u);
   assert.doesNotMatch(request.input, /agent-a|agent-b/u);
   assert.deepEqual(request.sourceMaterial.eventSources, [source.source], 'Full audit provenance remains in code.');
   memory.withRepository(repository => {
@@ -269,13 +273,17 @@ test('Direct extraction does not create a privileged human relationship from the
 test('same-name Agents use distinct supplied names and unresolved names are reviewed', async t => {
   const memory = fixture(t);
   memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', '我去了博物馆。'), event(2, 'agent-c', 'Mio', '我去了公园。')] });
-  const { result, request } = await process(memory, [candidate(), candidate({ subjectName: 'Mio [other:agent-b]',
-    actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: 'Mio [other:agent-b]', confidence: 1 }] })]);
-  assert.match(request.input, /Mio \[other:agent-b\]/u);
-  assert.match(request.input, /Mio \[other:agent-c\]/u);
+  const { result, request } = await process(memory, [candidate(), { ...extractionModelFixture({ memories: [candidate()] }).memories[0], subject: { ref: 'P2' },
+    actors: [{ role: 'experiencer', person: { ref: 'P2' }, confidence: 1 }] }]);
+  assert.match(request.input, /"ref":"P2","name":"Mio"/u);
+  assert.match(request.input, /"ref":"P3","name":"Mio"/u);
+  assert.doesNotMatch(request.input, /agent-b|agent-c|absent-human/u);
   assert.ok(result.candidateResults[0].reasons.includes('ambiguous-participant-identity'));
   assert.equal(result.candidateResults[1].status, 'created');
   assert.equal(memory.listMemories({ kinds: ['event'] }).items[0].subject_key, 'agent-b');
+  const detail = memory.getReviewConsoleProposal('ingestion', result.candidateResults[1].ingestionDecisionId);
+  assert.deepEqual(detail.identityChoices, []);
+  assert.equal(detail.writePreview.subjectKey, 'agent-b');
 });
 
 test('shared group events use actual participants instead of a default user pair', async t => {
@@ -312,8 +320,7 @@ test('known relationship target and holder resolve to actual Agent IDs', async t
   const memory = fixture(t);
   memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', '我信任 Suzu，会和它继续合作。')] });
   const { result } = await process(memory, [candidate({ kind: 'relationship', stateFamily: 'relationship',
-    stateLabel: '对 Suzu 的信任', canonicalKey: 'mio-trust-suzu', temporalState: 'current', retentionReason: 'relationship',
-    stateTarget: { counterpartRole: 'other', counterpartName: 'Suzu', relationshipDimension: 'trust' } })]);
+    stateLabel: '对 Suzu 的信任', canonicalKey: 'mio-trust-suzu', temporalState: 'current', stateTarget: { counterpartRole: 'other', counterpartName: 'Suzu', relationshipDimension: 'trust' } })]);
   const requestId = result.candidateResults[0].stateAnalysisRequestId;
   assert.ok(requestId, JSON.stringify(result.candidateResults));
   memory.withRepository(repository => {
@@ -361,7 +368,7 @@ test('state holders use resolved identities across English apostrophes and Chine
     kind: 'preference', stateFamily: 'preference', stateLabel: 'painting', canonicalKey: 'painting',
     title: sourceRef === 'M0001' ? 'Sunrise painting' : '灯塔画',
     content: sourceRef === 'M0001' ? `${subjectName} likes sunrise painting.` : `${subjectName}喜欢灯塔画。`,
-    temporalState: 'current', retentionReason: 'explicit_preference', subjectName,
+    temporalState: 'current', subjectName,
     actorRoles: [{ role: 'preference_holder', actorRole: 'other', actorName: holderName, confidence: 1 }],
     sourceRefs: [sourceRef],
   });
@@ -386,11 +393,11 @@ test('one Agent keeps separate states for same-name Agents and humans across gro
   memory.appendEventSources({ scope, events: people.map((person, index) => event(index + 1, person.id, person.name,
     '我打算整理书单。', { sender: person, spaceId: `group-${index % 2}` })) });
   await process(memory, people.map((person, index) => {
-    const name = `${person.name} [other:${person.id}]`;
-    return candidate({ kind: 'plan', stateFamily: 'goal', stateLabel: '整理书单', canonicalKey: 'goal:reading-list',
-      title: '整理书单', content: `${name} 打算整理书单。`, subjectName: name,
-      actorRoles: [{ role: 'experiencer', actorRole: 'other', actorName: name, confidence: 1 }],
-      temporalState: 'current', retentionReason: 'open_loop', sourceRefs: [`M000${index + 1}`] });
+    const wire = extractionModelFixture({ memories: [candidate({ kind: 'plan', stateFamily: 'goal', stateLabel: '整理书单',
+      canonicalKey: 'goal:reading-list', title: '整理书单', content: `${person.name} 打算整理书单。`,
+      subjectName: person.name, temporalState: 'current', sourceRefs: [`M000${index + 1}`] })] }).memories[0];
+    return { ...wire, subject: { ref: `P${index + 2}` },
+      actors: [{ role: 'experiencer', person: { ref: `P${index + 2}` }, confidence: 1 }] };
   }));
   const result = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
     generator: directStateAnalysis, structureGenerator: null });
@@ -426,7 +433,7 @@ test('group relationship analysis accepts owner and multiple counterpart identit
   await process(memory, pairs.map(([holder, name, counterpart, counterpartName], index) => candidate({
     kind: 'relationship', stateFamily: 'relationship', stateLabel: `对 ${counterpartName} 的信任`,
     canonicalKey: `trust:${counterpart}`, subjectName: name, content: `${name} 信任 ${counterpartName}。`,
-    temporalState: 'current', retentionReason: 'relationship', sourceRefs: [`M000${index + 3}`],
+    temporalState: 'current', sourceRefs: [`M000${index + 3}`],
     stateTarget: { counterpartRole: 'other', counterpartName, relationshipDimension: 'trust' },
   })));
   const result = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
@@ -440,4 +447,199 @@ test('group relationship analysis accepts owner and multiple counterpart identit
   assert.equal(memory.getMemory(aboutOwner.id).memory.content, 'Mio 信任 Suzu。');
   const requests = result.stateAnalysis.results.map(item => item.request);
   assert.deepEqual(new Set(requests.map(request => request.targetSpec.counterpartKey)), new Set(pairs.map(pair => pair[2])));
+});
+
+for (const language of ['en', 'zh']) test(`world targets keep their meaning when their label matches participants: ${language}`, async t => {
+  const label = language === 'en' ? 'Paris' : '巴黎';
+  const text = language === 'en' ? 'I think the city Paris is beautiful, and thinking of it calms me.' : '我觉得巴黎这座城市很美，想到它就安心。';
+  for (const duplicate of [false, true]) {
+    const memory = fixture(t);
+    t.after(() => memory.close());
+    memory.appendEventSources({ scope, events: [event(1, 'city-name-person', label, text),
+      ...(duplicate ? [event(2, 'same-name-peer', label, language === 'en' ? 'Hello.' : '你好。')] : [])] });
+    const candidates = ['belief', 'affective_association'].map(category => ({
+      title: label, content: text, classification: { category, key: `city-${category}`, label,
+        target: { [category === 'belief' ? 'object' : 'trigger']: { world: label } } },
+      subject: { ref: 'P2' }, actors: [], reality: 'real', evidenceMode: 'explicit', temporalState: 'current',
+      revisionAction: 'add', time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'],
+    }));
+    const { result } = await process(memory, candidates);
+    assert.equal(result.stateAnalysisRequestsQueued, 2, JSON.stringify(result.candidateResults));
+    assert.equal(result.memoriesForReview, 0);
+    const requests = memory.withRepository(repository => repository.listStateAnalysisRequests(agentId, { statuses: ['pending'] }));
+    for (const request of requests) {
+      const prefix = request.state_family === 'belief' ? 'object' : 'trigger';
+      assert.equal(request.subject_key, 'city-name-person');
+      assert.equal(request.targetSpec[`${prefix}Role`], 'world');
+      assert.equal(request.targetSpec[`${prefix}Key`], '');
+      assert.equal(request.targetSpec[`${prefix}Label`], label);
+    }
+  }
+});
+
+
+for (const language of ['en', 'zh']) test(`named objects reach entity recall without changing the same-name person's identity: ${language}`, async t => {
+  const memory = fixture(t); t.after(() => memory.close());
+  const city = language === 'en' ? 'Paris' : '巴黎', guild = language === 'en' ? 'Orion Guild' : '猎户公会';
+  const raw = language === 'en' ? 'I visited Paris in France, joined the Orion Guild, and bought the Amber Compass. My friend Mira visited Paris in Texas.'
+    : '我去了法国的巴黎，加入了猎户公会，还买了琥珀罗盘。我的朋友米拉去了德克萨斯州的巴黎。';
+  memory.appendEventSources({ scope, events: [event(1, 'same-name-person', city, raw)] });
+  const entities = [{ ref: 'E1', kind: 'place', name: city, aliases: ['City of Light'] },
+    { ref: 'E2', kind: 'organization', name: guild, aliases: ['Orion'] },
+    { ref: 'E3', kind: 'object', name: 'Amber Compass', aliases: ['琥珀罗盘'] },
+    { ref: 'E4', kind: 'person', name: language === 'en' ? 'Mira' : '米拉', aliases: [] },
+    { ref: 'E5', kind: 'place', name: city, aliases: ['Paris Texas'] }];
+  const base = { title: city, content: raw, classification: { category: 'event' }, actors: [], reality: 'real', evidenceMode: 'explicit',
+    temporalState: 'historical', revisionAction: 'add', time: null, confidence: 1, importance: 0.6, sourceRefs: ['M0001'] };
+  let reads = 0;
+  const find = MemoryRepository.prototype.findEntitiesByNames;
+  t.mock.method(MemoryRepository.prototype, 'findEntitiesByNames', function (args) { reads++; return find.call(this, args); });
+  const { result } = await process(memory, [{ ...base, subject: { ref: 'P2' }, entityRefs: ['E1', 'E2', 'E3'] },
+    { ...base, subject: { ref: 'E4' }, entityRefs: ['E5'] }], entities);
+  assert.equal(result.memoriesStored, 2, JSON.stringify(result.candidateResults));
+  assert.equal(reads, 1);
+  const saved = result.candidateResults.map(item => memory.getMemory(item.memoryId));
+  assert.equal(saved[0].memory.subject_key, 'same-name-person');
+  assert.ok(saved[1].memory.subject_key.startsWith('entity:'));
+  const cities = saved.map(item => item.entities.find(entity => entity.kind === 'place'));
+  assert.notEqual(cities[0].id, cities[1].id);
+  assert.equal(saved[0].entities.find(entity => entity.kind === 'organization').canonical_name, guild);
+  assert.ok(saved[0].entities.some(entity => entity.kind === 'object'));
+  assert.equal(saved[0].sources[0].content, raw);
+  const recall = await memory.search(guild, { sourceScope: scope, persistTrace: false, now: '2026-09-22T00:00:00Z' });
+  assert.ok(recall.candidates.some(item => item.memoryId === saved[0].memory.id && item.routeMatches.some(route => route.route === 'entity')), JSON.stringify(recall.candidates.map(item => ({ id: item.memoryId, routes: item.routeMatches }))));
+});
+
+
+test('entity references survive semantic state materialization and source erasure removes derived names', async t => {
+  const memory = fixture(t); t.after(() => memory.close());
+  const marker = 'PRIVATE_ENTITY_ASTER';
+  const knownAt = '2026-09-22T12:00:00.000Z';
+  memory.appendEventSources({ scope, events: [
+    { ...event(1, 'mio', 'Mio', `I plan to visit ${marker} with friend Liora from 2026-09-25 through 2026-09-27.`),
+      knownAt: '2026-09-23T08:00:00.000Z' },
+    { ...event(2, 'mio', 'Mio', 'The visit is confirmed.'), occurredAt: '2026-09-22T08:00:00.000Z', knownAt },
+  ] });
+  const entities = [{ ref: 'E1', kind: 'place', name: marker, aliases: ['PRIVATE_ALIAS_ASTER'] },
+    { ref: 'E2', kind: 'person', name: 'Liora', aliases: [] }];
+  const base = { title: marker, content: `Mio plans to visit ${marker} with Liora from 2026-09-25 through 2026-09-27.`,
+    subject: { ref: 'P2' }, actors: [], entityRefs: ['E1', 'E2'], reality: 'real', evidenceMode: 'explicit',
+    temporalState: 'current', revisionAction: 'add', time: { start: '2026-09-25T08:00:00Z', end: '2026-09-27T08:00:00Z' },
+    confidence: 1, importance: 0.5, sourceRefs: ['M0001', 'M0002'] };
+  const { result } = await process(memory, [{ ...base, classification: { category: 'plan', key: 'visit-aster', label: 'Visit Aster' } },
+    { ...base, subject: { ref: 'E2' }, classification: { category: 'event' } }], entities);
+  const requestId = result.candidateResults[0].stateAnalysisRequestId;
+  assert.ok(requestId);
+  memory.withRepository(repository => {
+    const request = repository.getStateAnalysisRequest(agentId, requestId);
+    const draft = repository.materializeStateAnalysisMemory(agentId, requestId);
+    assert.deepEqual(new Set(repository.listMemoryEntities(draft.id).map(entity => entity.id)), new Set(request.metadata.entityIds));
+    assert.equal(draft.known_at, knownAt);
+    assert.equal(draft.event_start, '2026-09-25T08:00:00.000Z');
+    assert.equal(draft.event_end, '2026-09-27T08:00:00.000Z');
+  }, { sourceScope: scope });
+  const maintained = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
+    generator: directStateAnalysis, structureGenerator: null });
+  assert.equal(maintained.automaticStateAcceptance.accepted.length, 1);
+  const plan = memory.listMemories({ kinds: ['plan'] }).items[0];
+  assert.equal(plan.known_at, knownAt);
+  assert.equal(plan.event_start, '2026-09-25T08:00:00.000Z');
+  assert.equal(plan.event_end, '2026-09-27T08:00:00.000Z');
+  assert.ok(memory.getMemory(plan.id).entities.some(entity => entity.canonical_name === marker));
+  const cleared = { ...scope, clears: [{ spaceId: 'group-only', throughSequence: 2 }] };
+  assert.equal(memory.eraseEventSources({ id: 'erase-entity-source', scope: cleared }).complete, true);
+  memory.withRepository(repository => {
+    assert.deepEqual(repository.findEntitiesByName({ agentId, name: marker }), []);
+    assert.deepEqual(repository.findEntitiesByName({ agentId, name: 'PRIVATE_ALIAS_ASTER' }), []);
+    assert.deepEqual(repository.findEntitiesByName({ agentId, name: 'Liora' }), []);
+    assert.ok(repository.listActorEntityBindings(agentId).every(binding => binding.display_name !== 'Liora'));
+  });
+});
+
+
+for (const temporalState of ['historical', 'unknown']) test('explicit review commits entity bindings only after acceptance: ' + temporalState, async t => {
+  const memory = fixture(t); t.after(() => memory.close());
+  const identity = { companionId: agentId, companionName: 'Suzu', primaryUserId: 'u', primaryUserName: 'Lin' };
+  const built = buildLongTermExtractionInput({ identity, messages: [{ id: 'review-source', role: 'user', speaker: 'Lin', text: 'I visited the park with Mira.' }] });
+  const row = normalizeGeneratedLongTermExtraction({ entities: [{ ref: 'E1', kind: 'person', name: 'Mira', aliases: [] }], memories: [{
+    title: 'Park visit', content: 'Lin visited the park with Mira.', classification: { category: 'event' }, subject: { ref: 'P2' },
+    actors: [{ role: 'participant', person: { ref: 'E1' }, confidence: 1 }], reality: 'fictional', evidenceMode: 'explicit',
+    temporalState, revisionAction: 'add', time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'] }] }, built).memories[0];
+  const decision = memory.withRepository(repository => {
+    const source = repository.upsertSource({ agentId, sourceKind: 'test', externalId: 'review-source', content: built.messages[0].text,
+      worldId: 'story-park', worldFrame: 'fictional' });
+    return repository.recordIngestionDecision({ agentId, batchId: 'review-with-entity', candidateIndex: 0, decision: 'review', resultStatus: 'review',
+      candidate: { ...row, metadata: { actorIdentity: { ...identity, participants: built.participants } } }, sourceIds: [source.id] });
+  });
+  memory.getReviewConsoleProposal('ingestion', decision.id);
+  memory.withRepository(repository => assert.deepEqual(repository.findEntitiesByName({ agentId, name: 'Mira' }), [], 'Reading a review does not create entities.'));
+  const entityState = () => memory.withRepository(repository => ({ entities: repository.listEntities(agentId),
+    bindings: repository.listActorEntityBindings(agentId), names: repository.database.prepare('SELECT * FROM entity_names ORDER BY entity_id,name_key').all() }));
+  const before = entityState();
+  const accepted = memory.resolveHighLevelProposal('ingestion', decision.id, { action: 'accept' });
+  if (temporalState === 'unknown') {
+    assert.equal(accepted.resolution.status, 'needs-correction');
+    assert.ok(accepted.resolution.reasons.includes('unknown-temporal-state'));
+    assert.deepEqual(entityState(), before, 'An unsuccessful review leaves no new entities, aliases or actor bindings.');
+    memory.withRepository(repository => assert.equal(repository.getIngestionDecision(agentId, decision.id).review_state, 'pending'));
+    return;
+  }
+  assert.equal(accepted.resolution.status, 'accepted');
+  const detail = memory.getMemory(accepted.resolution.memory.id);
+  assert.equal(detail.memory.world_id, 'story-park');
+  assert.equal(detail.memory.world_frame, 'fictional');
+  const guest = detail.entities.find(entity => entity.canonical_name === 'Mira');
+  assert.ok(guest);
+  assert.equal(guest.metadata.world.world_id, 'story-park');
+  assert.ok(detail.roles.some(role => role.role === 'participant' && role.actor_key === `entity:${guest.id}`));
+  assert.equal(accepted.resolution.decision.resolvedCandidate.entityBindings.E1, guest.id);
+  memory.withRepository(repository => {
+    const captured = repository.listIngestionEntityBindings({ agentId, batchId: 'review-with-entity', entityScopes: [row.entityScope] });
+    assert.equal(captured[0].entity.id, guest.id);
+  });
+});
+
+
+test('review keeps mixed-world evidence pending until its scope is resolved', async t => {
+  const memory = fixture(t); t.after(() => memory.close());
+  memory.appendEventSources({ scope, events: [
+    { ...event(1, 'mio', 'Mio', 'I saw a gate.'), world: { id: 'story-a', frame: 'fictional' } },
+    { ...event(2, 'mio', 'Mio', 'I saw a gate again.'), world: { id: 'story-b', frame: 'fictional' } },
+  ] });
+  const { result } = await process(memory, [candidate({ title: 'The gate', content: 'Mio saw a gate twice.',
+    reality: 'fictional', eventDate: '', sourceRefs: ['M0001', 'M0002'] })]);
+  const review = result.candidateResults[0];
+  assert.ok(review.reasons.includes('mixed-world-evidence-needs-resolution'));
+  const outcome = memory.resolveHighLevelProposal('ingestion', review.ingestionDecisionId, { action: 'accept' });
+  assert.equal(outcome.resolution.status, 'needs-correction');
+  assert.equal(outcome.resolution.memory, null);
+  assert.equal(outcome.resolution.decision.review_state, 'pending');
+  assert.equal(memory.listMemories({ kinds: ['event'] }).items.length, 0);
+});
+
+for (const variant of ['alias', 'normalized-name']) test('source erasure retains the remaining supported entity name: ' + variant, async t => {
+  const memory = fixture(t); t.after(() => memory.close());
+  const secondText = variant === 'alias' ? '我再次参观了巴黎。' : 'I visited ＰＡＲＩＳ again.';
+  memory.appendEventSources({ scope, events: [
+    event(1, 'visitor', 'Lin', 'I visited Paris.', { spaceId: 'first-room' }),
+    event(2, 'visitor', 'Lin', secondText, { spaceId: 'second-room' }),
+  ] });
+  const base = { title: 'Paris', content: 'Lin visited Paris.', classification: { category: 'event' }, subject: { ref: 'P2' },
+    actors: [], entityRefs: ['E1'], reality: 'real', evidenceMode: 'explicit', temporalState: 'historical', revisionAction: 'add',
+    time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'] };
+  const secondContent = variant === 'alias' ? 'Lin 再次参观了巴黎。' : 'Lin visited Paris again.';
+  const { result } = await process(memory, [base, { ...base, content: secondContent, sourceRefs: ['M0002'] }],
+    [{ ref: 'E1', kind: 'place', name: 'Paris', aliases: ['巴黎'] }]);
+  assert.equal(result.memoriesStored, 2);
+  const id = memory.getMemory(result.candidateResults[0].memoryId).entities.find(entity => entity.kind === 'place').id;
+  const cleared = { ...scope, clears: [{ spaceId: 'first-room', throughSequence: 1 }] };
+  assert.equal(memory.eraseEventSources({ id: 'clear-first-room', scope: cleared }).complete, true);
+  const retained = memory.getMemory(result.candidateResults[1].memoryId);
+  assert.equal(retained.memory.content, secondContent);
+  const expectedName = variant === 'alias' ? '巴黎' : 'Paris';
+  memory.withRepository(repository => {
+    assert.equal(repository.getEntity(agentId, id).canonical_name, expectedName);
+    assert.equal(repository.findEntitiesByName({ agentId, name: expectedName })[0].id, id);
+  });
+  assert.ok(retained.entities.some(entity => entity.id === id && entity.canonical_name === expectedName));
 });

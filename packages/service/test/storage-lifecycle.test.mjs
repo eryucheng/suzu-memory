@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { MemoryRepository, openMemoryDatabase, ensureCompanionRelationshipStructure } from '@suzu-memory/core';
 import { MemoryService } from '../src/index.mjs';
 import { runImmediateMemoryMaintenance, runEventContinuityMaintenance } from '@suzu-memory/maintenance';
+import { prepareEventContinuity } from '@suzu-memory/analysis';
 
 function fixture(t, resolution = 'matched') {
   const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
@@ -35,6 +36,37 @@ function fixture(t, resolution = 'matched') {
   }
   return {repository, database, service, seed, run, setResolution: value => { resolution = value; }, calls: () => calls};
 }
+
+test('event continuity ranks compatible history without expanding unrelated worlds or every historical detail', async t => {
+  const f = fixture(t);
+  const seed = (id, fields = {}) => {
+    f.repository.upsertMemory({ id, agentId: 'owner', kind: 'event', layer: 'episodic', content: `Book list progress ${id}`,
+      reality: 'real', worldId: 'room', worldFrame: 'physical', ...fields });
+    const source = f.repository.upsertSource({ agentId: 'owner', sourceKind: 'conversation', externalId: id, content: id });
+    f.repository.linkSource(id, source.id);
+  };
+  f.repository.transaction(() => {
+    for (let i = 0; i < 128; i++) seed(`unrelated-${i}`, { reality: 'fictional', worldId: `story-${i}`, worldFrame: 'fictional' });
+    for (let i = 0; i < 30; i++) seed(`historical-${i}`, { worldId: 'another-real-space', worldFrame: 'relational', subjectRole: 'other', subjectKey: 'friend' });
+    seed('new-event');
+    seed('future-event');
+  });
+  const details = [], bodies = [], vectorIds = [];
+  const detail = f.repository.getMemoryDetail.bind(f.repository), list = f.repository.listMemories.bind(f.repository), vectors = f.repository.readEmbeddingRows.bind(f.repository);
+  f.repository.getMemoryDetail = (...args) => { details.push(args[1]); return detail(...args); };
+  f.repository.listMemories = (...args) => { const page = list(...args); bodies.push(...page.items.map(row => row.id)); return page; };
+  f.repository.readEmbeddingRows = (...args) => { const rows = vectors(...args); vectorIds.push(...rows.map(row => row.memory_id)); return rows; };
+  const embeddingProvider = Object.assign(async () => ({ model: 'test', vector: [1, 0] }), { model: 'test', dimensions: 2 });
+  const prepared = await prepareEventContinuity({ repository: f.repository, agentId: 'owner', memoryIds: ['new-event'], embeddingProvider });
+  assert.ok(prepared.request);
+  assert.ok(prepared.items[0].candidates.length > 0);
+  assert.ok(prepared.items[0].candidates.every(row => row.id.startsWith('historical-')));
+  assert.equal(details.length, new Set(details).size);
+  assert.deepEqual(new Set(details), new Set(JSON.parse(prepared.request.input).memories.map(row => row.id)));
+  assert.ok(details.length <= 11);
+  assert.ok(bodies.every(id => id === 'new-event' || id.startsWith('historical-')));
+  assert.deepEqual(new Set(vectorIds), new Set(['new-event']));
+});
 
 test('editing an event invalidates its affected chain, preserves unrelated links and requeues every affected decision', async t => {
   const f = fixture(t);
@@ -167,7 +199,7 @@ test('human-approved events enter both association and accumulated organization,
       kind: 'event', title: '整理书单', content: source.content, subjectRole: 'agent', subjectKey: 'owner',
       reality: 'real', evidenceMode: 'explicit', temporalState: 'historical', revisionAction: 'add',
       eventDate: '2026-09-23', eventStart: '2026-09-23T08:00:00Z', stateFamily: 'not_applicable',
-      confidence: 0.9, importance: 0.7, retentionReason: 'significant_event',
+      confidence: 0.9, importance: 0.7,
     } });
   const enqueue = f.repository.enqueueMaintenanceTask.bind(f.repository);
   f.repository.enqueueMaintenanceTask = () => { throw new Error('queue unavailable'); };

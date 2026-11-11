@@ -8,6 +8,10 @@ export const DEFAULT_LENGTH_ARCHIVE_POLICY = Object.freeze({
 });
 
 const sourceOf = row => row.metadata?.eventSource || {};
+const companionReply = row => row.actor_role === 'companion' ? {
+  id: row.metadata?.host?.turnId || logicalArchiveEventId(row), complete: true,
+  lastEventId: sourceOf(row).eventId || logicalArchiveEventId(row),
+} : null;
 
 // Fragment rows remain one indivisible source message. No source text is lost
 // to meet a request budget, and no partial fragment group reaches extraction.
@@ -43,7 +47,7 @@ async function roundEnds(groups, resolveReply, maximum, reverse = false) {
 
 const characters = rows => rows.reduce((sum, row) => sum + String(row.content?.text || '').length, 0);
 
-export async function planReplyChunk({ pending, previous = [], resolveReply, measure,
+export async function planReplyChunk({ pending, previous = [], resolveReply = companionReply, measure,
   maximumCoreCharacters = DEFAULT_LENGTH_ARCHIVE_POLICY.maximumCoreCharacters, maximumCoreMessages = 100,
   maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false }) {
   for (const value of [maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters]) {

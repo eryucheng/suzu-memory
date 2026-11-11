@@ -10,13 +10,19 @@ test("offline memory tools require their host to supply a structured generator",
   );
 });
 
-test("injected generator receives the selected model and preserves its callable surface", () => {
-  const generator = async () => ({ output: {} });
+test("injected generator preserves host model selection, execution and request budget hooks", async () => {
+  const requests = [], budgetChecks = [];
+  const generator = Object.assign(async request => { requests.push(request); return { output: { memories: [] } }; },
+    { assertRequestBudget: request => budgetChecks.push(request) });
   let received = null;
   const selected = createInjectedStructuredGenerator((options) => {
     received = options;
     return generator;
   }, { label: "memory-analyze", model: "deepseek-chat" });
-  assert.equal(selected, generator);
   assert.deepEqual(received, { model: "deepseek-chat" });
+  const request = { input: 'Lin visited the museum.', schemaName: 'memory-extraction' };
+  selected.assertRequestBudget(request);
+  assert.deepEqual(await selected(request), { output: { memories: [] } });
+  assert.deepEqual(requests, [request]);
+  assert.deepEqual(budgetChecks, [request]);
 });

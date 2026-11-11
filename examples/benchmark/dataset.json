@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "Cat name example",
+  "answerInstruction": "Answer A or B only.",
+  "samples": [{
+    "id": "cat-name",
+    "identity": {
+      "primaryUserId": "avery", "primaryUserName": "Avery",
+      "companionId": "robin", "companionName": "Robin"
+    },
+    "turns": [{
+      "sessionId": "chat-1", "turnId": "1",
+      "recordedAt": "2026-01-01T10:00:00Z",
+      "userMessage": { "text": "My cat is called Cedar." },
+      "assistantMessage": { "text": "Cedar is your cat's name." }
+    }],
+    "questions": [{
+      "id": "cat-name-1", "cutoff": 1, "now": "2026-01-02T10:00:00Z",
+      "question": "What is Avery's cat's name? A: Cedar; B: Maple.",
+      "reference": "A", "category": "single-hop"
+    }]
+  }]
+}

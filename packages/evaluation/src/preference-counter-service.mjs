@@ -1,3 +1,4 @@
+import { memoryWorldScope, commonMemoryWorld, memoryWorldsCompatible } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -78,6 +79,7 @@ export function buildPreferenceCounterMatchSnapshot({
   objectLabel,
   observationIds = [],
   currentStateId = "",
+  world = null,
   maxCandidates = 30,
   maxMemoryContentChars = 900,
   maxSourceContentChars = 1200,
@@ -93,7 +95,18 @@ export function buildPreferenceCounterMatchSnapshot({
     || !normalizedSubjectKey || !normalizedCanonicalKey || !normalizedObjectLabel) {
     throw new Error("Preference counter snapshot target is incomplete.");
   }
+  const requestedIds = uniqueStrings(observationIds);
+  const fixedCurrent = clean(currentStateId) ? repository.getMemory(clean(currentStateId)) : null;
+  if (clean(currentStateId) && (!fixedCurrent || fixedCurrent.agent_id !== normalizedAgentId)) throw new Error('Preference counter current state is unavailable.');
+  if (world && fixedCurrent && !memoryWorldsCompatible(world, fixedCurrent, { allowRealSpaces: true })) {
+    return { status: 'blocked', reason: 'world-scope-does-not-match-current', snapshot: { observationIds: requestedIds, currentStateId } };
+  }
+  const observations = requestedIds.map(id => repository.getStateEvidenceObservation(normalizedAgentId, id));
+  const fixedWorld = fixedCurrent ? memoryWorldScope(fixedCurrent) : world ? memoryWorldScope(world)
+    : commonMemoryWorld(observations.map(item => item?.world));
+  if (!fixedWorld) return { status: 'blocked', reason: 'world-scope-required', snapshot: { observationIds: requestedIds } };
   const current = repository.getCurrentCanonicalMemory({
+    ...fixedWorld,
     agentId: normalizedAgentId,
     subjectRole: normalizedSubjectRole,
     subjectKey: normalizedSubjectKey,
@@ -110,7 +123,6 @@ export function buildPreferenceCounterMatchSnapshot({
   if (clean(currentStateId) && clean(currentStateId) !== current.id) {
     throw new Error("Preference counter snapshot does not target the current canonical state.");
   }
-  const requestedIds = uniqueStrings(observationIds);
   if (!requestedIds.length) {
     throw new Error("Preference counter snapshot requires explicit observationIds.");
   }
@@ -121,7 +133,7 @@ export function buildPreferenceCounterMatchSnapshot({
   const memoryCharLimit = Math.min(4000, Math.max(100, Math.trunc(Number(maxMemoryContentChars) || 900)));
   const sourceCharLimit = Math.min(6000, Math.max(100, Math.trunc(Number(maxSourceContentChars) || 1200)));
   const candidates = requestedIds.map((observationId) => {
-    const observation = repository.getStateEvidenceObservation(normalizedAgentId, observationId);
+    const observation = observations[requestedIds.indexOf(observationId)];
     if (!observation || observation.lifecycle !== "current") {
       throw new Error("Preference counter observation must be current and belong to the same Agent.");
     }
@@ -141,6 +153,9 @@ export function buildPreferenceCounterMatchSnapshot({
     const detail = repository.getMemoryDetail(normalizedAgentId, observation.memory_id);
     if (!memory || !detail || memory.status === "deleted") {
       throw new Error("Preference counter evidence memory is unavailable.");
+    }
+    if (!memoryWorldsCompatible(fixedWorld, observation.world, { allowRealSpaces: true })) {
+      throw new Error('Preference counter observation crosses the fixed current-state world.');
     }
     const sources = new Map(detail.sources.map((source) => [source.id, source]));
     if (observation.sourceIds.some((sourceId) => !sources.has(sourceId))) {
@@ -295,11 +310,11 @@ export async function evaluatePreferenceCounterEvidence({
     currentStateId,
     ...snapshotOptions,
   });
-  if (built.status === "skipped") {
+  if (built.status !== "ready") {
     return {
-      status: "skipped",
+      status: built.status,
       reason: built.reason,
-      snapshot: null,
+      snapshot: built.snapshot,
       run: null,
       analyses: [],
       observations: [],
@@ -348,6 +363,7 @@ export async function evaluatePreferenceCounterEvidence({
       }
     }
   } catch (error) {
+    generation ||= error;
     errorMessage = error.message;
   }
   const sourceIds = uniqueStrings(snapshot.candidates.flatMap((item) => item.sourceIds)).sort();
@@ -359,6 +375,12 @@ export async function evaluatePreferenceCounterEvidence({
     ? "failed"
     : analyses.length ? "completed"
       : rejected.length ? "rejected" : "abstained";
+  const warning = await appendCounterUsage({
+    usageLedgerPath,
+    generation,
+    agentId: snapshot.agentId,
+    batchId,
+  });
   const run = repository.recordStateAnalysisRun({
     agentId: snapshot.agentId,
     batchId,
@@ -388,12 +410,6 @@ export async function evaluatePreferenceCounterEvidence({
       candidateObservationIds: snapshot.candidates.map((item) => item.observationId),
       automaticMemoryWriteAllowed: false,
     },
-  });
-  const warning = await appendCounterUsage({
-    usageLedgerPath,
-    generation,
-    agentId: snapshot.agentId,
-    batchId,
   });
   const observations = status === "completed" ? repository.transaction(() => analyses.map((item) => {
     const resolution = resolutionFor(item.analysis);

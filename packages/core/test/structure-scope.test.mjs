@@ -26,6 +26,75 @@ function fixture(t, databasePath = ':memory:') {
   return { database, repository, event, propose };
 }
 
+test('summary updates persist with memberships, refresh search, invalidate vectors and restore on dismissal', t => {
+  const {database, repository, event} = fixture(t);
+  for (const kind of ['topic', 'episode']) for (const language of ['zh', 'en']) {
+    const base = language === 'zh' ? '林正在准备徒步。' : 'Lin is preparing to hike.';
+    const updated = language === 'zh' ? '林已完成徒步并回家。' : 'Lin completed the hike and returned home.';
+    const prefix = `${kind}-${language}`;
+    const members = ['first', 'second', 'later'].map(id => event(`${prefix}-${id}`));
+    const proposal = proposeMemoryStructure(repository, {agentId: 'test', kind, title: 'Hiking', content: base,
+      eventDate: kind === 'episode' ? '2026-10-20' : null, memberIds: members.slice(0,2).map(m => m.id)});
+    const memory = repository.getMemory(proposal.result_memory_id);
+    repository.upsertEmbedding({memoryId: memory.id, model: 'fixture', vector: [1,0], contentHash: 'old'});
+    const attached = proposeMemoryStructure(repository, {agentId: 'test', operation: 'attach', kind,
+      targetMemoryId: memory.id, content: updated, memberIds: [members[2].id]});
+    const current = repository.getMemory(memory.id);
+    assert.equal(current.content, updated);
+    assert.equal(current.recorded_at, memory.recorded_at);
+    assert.equal(current.evidence_mode, memory.evidence_mode);
+    assert.equal(database.prepare('SELECT count(*) n FROM memory_embeddings WHERE memory_id=?').get(memory.id).n, 0);
+    assert.equal(database.prepare('SELECT content FROM memory_fts WHERE memory_id=?').get(memory.id).content, updated);
+    assert.ok(repository.listMaintenanceTasks('test', {taskTypes:['memory-embedding']}).some(task => task.payload.memoryIds.includes(memory.id)));
+    assert.equal(repository.listContainerMembers({agentId:'test',containerId:memory.id,containerKind:kind,
+      relation:kind === 'episode' ? 'part_of_episode' : 'supports_topic'}).length, 3);
+    materializeMemoryStructureProposal(repository, {agentId:'test',proposalId:attached.id});
+    assert.equal(repository.getMemory(memory.id).content, updated);
+    const reverted = resolveMemoryStructureProposal(repository, {agentId:'test',proposalId:attached.id,action:'dismiss'});
+    assert.equal(reverted.memory.content, base);
+    assert.equal(database.prepare('SELECT content FROM memory_fts WHERE memory_id=?').get(memory.id).content, base);
+  }
+});
+
+test('dismissal follows summary dependencies without resurrecting rejected content or overwriting manual edits', t => {
+  const {repository, event} = fixture(t);
+  const members = ['a','b','c','d','e'].map(id => event(id));
+  const topic = repository.upsertTopic({agentId:'test',title:'Hiking',content:'Base summary.',...scope});
+  repository.linkMemoryToTopic({agentId:'test',topicId:topic.id,memoryId:members[0].id});
+  const add = (index, content) => proposeMemoryStructure(repository, {agentId:'test',operation:'attach',kind:'topic',
+    targetMemoryId:topic.id,content,memberIds:[members[index].id]});
+  const first = add(1, 'First added fact.');
+  const second = add(2, 'First and second added facts.');
+  resolveMemoryStructureProposal(repository,{agentId:'test',proposalId:first.id,action:'dismiss'});
+  assert.equal(repository.getMemory(topic.id).content,'Base summary.');
+  resolveMemoryStructureProposal(repository,{agentId:'test',proposalId:second.id,action:'dismiss'});
+  assert.equal(repository.getMemory(topic.id).content,'Base summary.');
+  const manual = add(3,'Generated summary.');
+  repository.editMemoryManually({agentId:'test',memoryId:topic.id,patch:{content:'Manually edited summary.'}});
+  resolveMemoryStructureProposal(repository,{agentId:'test',proposalId:manual.id,action:'dismiss'});
+  assert.equal(repository.getMemory(topic.id).content,'Manually edited summary.');
+  const later = add(4,'New generated summary based on the manual revision.');
+  resolveMemoryStructureProposal(repository,{agentId:'test',proposalId:later.id,action:'dismiss'});
+  assert.equal(repository.getMemory(topic.id).content,'Manually edited summary.');
+});
+
+test('a failed summary index update rolls back the proposal, membership and vector changes', t => {
+  const {database, repository, event} = fixture(t);
+  const member = event('member');
+  const topic = repository.upsertTopic({agentId:'test',title:'Hiking',content:'Base summary.',...scope});
+  repository.upsertEmbedding({memoryId:topic.id,model:'fixture',vector:[1,0]});
+  const sync = repository.syncSearch;
+  repository.syncSearch = () => {throw new Error('simulated index failure');};
+  try {
+    assert.throws(() => proposeMemoryStructure(repository,{agentId:'test',operation:'attach',kind:'topic',targetMemoryId:topic.id,
+      memberIds:[member.id],content:'Updated summary.'}),/simulated index failure/);
+  } finally {repository.syncSearch = sync;}
+  assert.equal(repository.getMemory(topic.id).content,'Base summary.');
+  assert.equal(repository.listTopicMembers({agentId:'test',topicId:topic.id}).length,0);
+  assert.equal(repository.listStructureProposals('test').length,0);
+  assert.equal(database.prepare('SELECT count(*) n FROM memory_embeddings WHERE memory_id=?').get(topic.id).n,1);
+});
+
 test('created topics and episodes inherit member scope through review and attachment', t => {
   const { repository, event, propose } = fixture(t);
   for (const kind of ['topic', 'episode']) {

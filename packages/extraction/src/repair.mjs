@@ -1,32 +1,27 @@
-import { LONG_TERM_EXTRACTION_SCHEMA, normalizeGeneratedLongTermExtraction, parseGeneratedLongTermExtraction } from './prompt.mjs';
+import { LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction, parseExtractionEntities } from './prompt.mjs';
 
 const objectSchema = properties => ({ type: 'object', additionalProperties: false,
   properties, required: Object.keys(properties) });
 const candidateIndex = { type: 'integer', minimum: 0 };
 const reason = { type: 'string', minLength: 1 };
 
-export const LONG_TERM_EXTRACTION_REPAIR_SCHEMA = objectSchema({
+export const LONG_TERM_EXTRACTION_REPAIR_SCHEMA = { ...objectSchema({
+  entities: LONG_TERM_EXTRACTION_SCHEMA.properties.entities,
   results: { type: 'array', items: { type: 'object', anyOf: [
     objectSchema({ candidateIndex, status: { type: 'string', enum: ['repaired'] },
       memories: { type: 'array', minItems: 1, items: LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items } }),
     ...['rejected', 'pending'].map(status => objectSchema({ candidateIndex,
       status: { type: 'string', enum: [status] }, reason })),
   ] } },
-});
-
-export function normalizeGeneratedExtractionRepair(output) {
-  const parsed = typeof output === 'string' ? JSON.parse(output) : output;
-  if (!parsed || !Array.isArray(parsed.results)) return parsed;
-  return { ...parsed, results: parsed.results.map(result => result?.status === 'repaired'
-    ? { ...result, memories: normalizeGeneratedLongTermExtraction({ memories: result.memories }).memories } : result) };
-}
+}), required: ['results'] };
 
 export function parseGeneratedExtractionRepair(output, context) {
-  const parsed = normalizeGeneratedExtractionRepair(output);
-  if (!parsed || Array.isArray(parsed) || Object.keys(parsed).join() !== 'results' || !Array.isArray(parsed.results)) {
-    throw new Error('Extraction repair must contain only a results array.');
+  const parsed = typeof output === 'string' ? JSON.parse(output) : output;
+  if (!parsed || Array.isArray(parsed) || Object.keys(parsed).some(key => !['results', 'entities'].includes(key)) || !Array.isArray(parsed.results)) {
+    throw new Error('Extraction repair requires a results array and optional entities.');
   }
-  return { results: parsed.results.map(result => {
+  const entities = parseExtractionEntities(parsed.entities);
+  return { ...(Object.hasOwn(parsed, 'entities') ? { entities } : {}), results: parsed.results.map(result => {
     if (!result || Array.isArray(result) || !Number.isInteger(result.candidateIndex) || result.candidateIndex < 0) {
       throw new Error('Extraction repair requires a non-negative candidateIndex.');
     }
@@ -37,7 +32,7 @@ export function parseGeneratedExtractionRepair(output, context) {
       throw new Error('Extraction repair result fields do not match its status.');
     }
     if (repaired) {
-      const { memories } = parseGeneratedLongTermExtraction({ memories: result.memories }, context);
+      const { memories } = parseGeneratedLongTermExtraction({ entities, memories: result.memories }, context);
       if (!memories.length) throw new Error('A repaired candidate must contain a memory.');
       return { candidateIndex: result.candidateIndex, status: result.status, memories };
     }

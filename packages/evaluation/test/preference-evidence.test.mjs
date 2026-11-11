@@ -1,10 +1,10 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { readUsageEvents } from "@suzu-memory/usage-ledger";
+import { readUsageEvents, withUsageRecorder } from "@suzu-memory/usage-ledger";
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
 import {
@@ -43,7 +43,7 @@ const policy = Object.freeze({
 });
 
 function fixture() {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const definitions = [
     {
@@ -183,7 +183,7 @@ function generatedLabel(repository, memoryId, signal, overrides = {}) {
 }
 
 test('preference labeling uses the complete input size above eighty and checks explicit budgets before generation', async t => {
-  const database = openMemoryDatabase(':memory:');
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
   const memoryIds = Array.from({ length: 81 }, (_, index) => {
@@ -239,7 +239,7 @@ test("builds a bounded target-specific snapshot with code-derived groups", () =>
 
 test("evaluates three audited free-time choices without writing memory", async () => {
   const { database, repository } = fixture();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-preference-evidence-"));
+  const directory = createTestDirectory(path.join(os.tmpdir(), "suzu-preference-evidence-"));
   const ledgerPath = path.join(directory, "usage.jsonl");
   const beforeNodes = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count);
   let received = null;
@@ -474,6 +474,29 @@ test("allows the generator to abstain without fabricating a preference", async (
   assert.equal(result.preview.proposedKind, "");
   assert.equal(result.evidenceLedger.analysisRun.status, "abstained");
   assert.equal(result.evidenceLedger.observations.length, 0);
+  database.close();
+});
+
+for (const failure of ['provider', 'persistence']) test(`preference labeling records each receipt before ${failure} failure and recovery`, async () => {
+  const { database, repository } = fixture();
+  const charges = [];
+  let calls = 0;
+  const record = repository.recordStateAnalysisRun.bind(repository);
+  if (failure === 'persistence') repository.recordStateAnalysisRun = () => { throw new Error('label storage failure'); };
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => evaluatePreferenceEvidenceTarget({
+    repository, agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user', canonicalKey: 'puzzle-games',
+    memoryIds: ['puzzle-1'], policy, usageLedgerPath: path.join(os.tmpdir(), 'label-owner-unused.jsonl'),
+    generator: async () => {
+      const receipt = { model: 'fixture', requestId: `label-${++calls}`, usage: { prompt_tokens: 7 } };
+      if (failure === 'provider' && calls === 1) throw Object.assign(new Error('label provider failure'), receipt);
+      return { ...receipt, output: { evidence: [] } };
+    } }));
+  await assert.rejects(run, new RegExp(`label ${failure === 'provider' ? 'provider' : 'storage'} failure`));
+  assert.deepEqual(charges.map(charge => charge.requestId), ['label-1']);
+  repository.recordStateAnalysisRun = record;
+  assert.equal((await run()).status, 'abstained');
+  assert.deepEqual(charges.map(charge => charge.requestId), ['label-1', 'label-2']);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), 14);
   database.close();
 });
 

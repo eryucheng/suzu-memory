@@ -237,7 +237,7 @@ function normalizeQuestion(entry, index, persona) {
   };
 }
 
-function loadPersonaQuestions(datasetRoot, persona, qaPath) {
+function loadPersonaQuestions(persona, qaPath) {
   const seen = new Set();
   return readJsonl(qaPath, `RHELM ${persona} QA`).map((entry, index) => {
     const question = normalizeQuestion(entry, index, persona);
@@ -365,7 +365,7 @@ export function loadRhelmDataset(datasetRoot, { chunkSize = 500, chunkOverlap = 
   const personas = [];
   for (const qaPath of sortedFiles(qaDirectory)) {
     const persona = rhelmPersonaFromQaFilename(qaPath);
-    const questions = loadPersonaQuestions(normalizedRoot, persona, qaPath);
+    const questions = loadPersonaQuestions(persona, qaPath);
     const conversationSources = loadConversationSources(normalizedRoot, persona);
     const emails = emailDateMaps(normalizedRoot, persona);
     const attachmentSources = loadAttachmentSources(normalizedRoot, persona, emails.byPrefix);

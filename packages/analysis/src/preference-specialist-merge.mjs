@@ -1,3 +1,4 @@
+import { commonMemoryWorld, memoryWorldScope } from '@suzu-memory/core';
 import { simulatePreferenceFormation } from "./preference-simulator.mjs";
 
 function clean(value) {
@@ -192,8 +193,33 @@ function buildMergedCandidates(evaluation) {
 
 // Each signal uses its own evidence path; unrelated specialist failures cannot
 // invalidate a complete explicit statement.
-export function preferenceEvidenceMemoryIds(evaluation) {
-  return buildMergedCandidates(evaluation).filter(item => !item.preGate).map(item => item.memory.id);
+export function preferenceEvidenceRetryMemoryIds(evaluation) {
+  const maps = Object.fromEntries(Object.entries(evaluation.analyses)
+    .map(([key, items]) => [key, byMemory(items)]));
+  const retryIds = new Map(Object.entries(evaluation.runs)
+    .map(([key, run]) => [key, new Set(run.metadata.retryMemoryIds)]));
+  const pending = (key, memoryId) => retryIds.get(key)?.has(memoryId) === true;
+  return evaluation.snapshot.memories.filter(memory => {
+    const object = maps.objectGrounding?.get(memory.id);
+    if (object?.targetMatch === "none") return false;
+    const explicit = maps.explicitExpression?.get(memory.id);
+    const behavior = maps.behaviorConditions?.get(memory.id);
+    const sharing = maps.sharingAffect?.get(memory.id);
+    const timeScope = maps.timeScope?.get(memory.id);
+    const required = ["objectGrounding", "timeScope"];
+    // Preserve signal priority even when its analysis has not returned yet.
+    // A complete self statement does not depend on behavior or sharing.
+    if (expressionSignal(explicit) || pending("explicitExpression", memory.id)) {
+      required.push("explicitExpression");
+    } else if (behaviorSignal(behavior, timeScope) || pending("behaviorConditions", memory.id)) {
+      required.push("behaviorConditions");
+    } else if (sharingSignal(sharing) || pending("sharingAffect", memory.id)) {
+      required.push("sharingAffect", "behaviorConditions");
+    } else {
+      return false;
+    }
+    return required.some(key => pending(key, memory.id));
+  }).map(memory => memory.id);
 }
 
 export function mergePreferenceSpecialistEvidence(repository, {
@@ -207,7 +233,11 @@ export function mergePreferenceSpecialistEvidence(repository, {
     throw new Error("Preference specialist merge requires a specialist evaluation result.");
   }
   const persistedRequest = validatedAnalysisRequest(repository, evaluation, analysisRequest);
+  const semantic = persistedRequest ? repository.getStateAnalysisRequestSemanticMemory(persistedRequest.agent_id, persistedRequest.id) : null;
+  const world = semantic ? memoryWorldScope(semantic) : commonMemoryWorld(evaluation.snapshot.memories);
+  if (!world) return { status: 'blocked', reason: 'world-scope-required', observations: [], labels: [] };
   const currentState = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId: evaluation.snapshot.agentId,
     subjectRole: evaluation.snapshot.target.subjectRole,
     subjectKey: evaluation.snapshot.target.subjectKey,

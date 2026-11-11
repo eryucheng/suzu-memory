@@ -34,6 +34,31 @@ async function fixture({ archive = true } = {}) {
 }
 const tasks = memory => memory.withRepository(repository => repository.listMaintenanceTasks(agentId, { limit: 500 }), { readOnly: true });
 
+test('structure continuation material respects the selected source cutoff at both endpoints and evidence', async t => {
+  const { memory, dataRoot, nodes } = await fixture();
+  t.after(async () => { await memory.close(); fs.rmSync(dataRoot, { recursive: true, force: true }); });
+  memory.withRepository(repository => {
+    repository.bindEventContinuity({ agentId, memoryId: nodes[2].node.id, candidateId: nodes[1].node.id,
+      resolution: 'matched', relation: 'completes', contentHash: 'completion', rationale: '同一事件完成。',
+      evidenceSourceIds: [nodes[1].source.id, nodes[2].source.id] });
+    repository.bindEventContinuity({ agentId, memoryId: nodes[3].node.id, candidateId: nodes[2].node.id,
+      resolution: 'matched', relation: 'same_thread', contentHash: 'future', rationale: '后续记录。',
+      evidenceSourceIds: [nodes[2].source.id, nodes[3].source.id] });
+  });
+  const selected = Object.values(nodes).map(item => item.node.id);
+  const snapshot = memory.withRepository(repository => buildStructureSnapshot({ repository, agentId, memoryIds: selected }), { sourceScope: scope(2) });
+  assert.deepEqual(snapshot.eventContinuity.groups, [[nodes[1].node.id, nodes[2].node.id].sort()]);
+  assert.ok(!JSON.stringify(snapshot).includes(nodes[3].node.id));
+
+  memory.withRepository(repository => repository.bindEventContinuity({ agentId, memoryId: nodes[2].node.id, candidateId: nodes[1].node.id,
+    resolution: 'matched', relation: 'completes', contentHash: 'later-evidence', rationale: '判定依赖后续证据。',
+    evidenceSourceIds: [nodes[1].source.id, nodes[2].source.id, nodes[3].source.id] }));
+  const historical = memory.withRepository(repository => buildStructureSnapshot({ repository, agentId, memoryIds: selected }), { sourceScope: scope(2) });
+  assert.deepEqual(historical.eventContinuity?.groups || [], []);
+  const complete = memory.withRepository(repository => buildStructureSnapshot({ repository, agentId, memoryIds: selected }), { sourceScope: scope(3) });
+  assert.deepEqual(complete.eventContinuity.groups, [selected.sort()]);
+});
+
 test('completed scopes do not leak through long-lived Host callbacks into later Memory work', async () => {
   const { memory } = await fixture();
   let resource;
@@ -63,7 +88,7 @@ test('scoped claims filter before LIMIT and preserve mixed or unknown-source tas
   const options = { processInputEvents: false, maximumTasks: 1, minimumStructureMemories: 2,
     generator: null, retrievalContextGenerator: null,
     structureGenerator: async request => {
-      if (request.schemaName === 'memory-structure-proposals-v1') calls.push(request);
+      if (request.schemaName === 'memory-structure-proposals-v2') calls.push(request);
       return { output: { proposals: [] } };
     } };
   await memory.runSemanticMaintenance({ ...options, sourceScope: scope() });
@@ -125,7 +150,7 @@ test('extraction filters claims and uses canonical eligible context plus exact i
 });
 
 test('cancellation fences late embedding writes and leaves the original lease for expiry recovery', async () => {
-  const { memory, nodes } = await fixture();
+  const { memory } = await fixture();
   const begun = Promise.withResolvers(), release = Promise.withResolvers();
   const provider = Object.assign(async () => { begun.resolve(); await release.promise; return { model: 'cancel-vector', vector: [1,2,3] }; },
     { model: 'cancel-vector', dimensions: 3 });

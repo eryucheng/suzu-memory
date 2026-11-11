@@ -131,6 +131,7 @@ export function buildPreferenceCanonicalReviewSnapshot({
   subjectLabel,
   objectLabel,
   policy,
+  world = null,
   maxObservations = 400,
   maxMemoryContentChars = 700,
   maxSourceContentChars = 900,
@@ -140,6 +141,7 @@ export function buildPreferenceCanonicalReviewSnapshot({
     repository,
     agentId,
     stateFamily: "preference",
+    world,
     subjectRole,
     subjectKey,
     canonicalKey,
@@ -152,7 +154,7 @@ export function buildPreferenceCanonicalReviewSnapshot({
     maxCurrentStateContentChars: 1000,
     maxSnapshotChars,
   });
-  if (baseResult.status === "skipped") return baseResult;
+  if (baseResult.status !== "ready") return baseResult;
   const base = baseResult.snapshot;
   const normalizedAgentId = base.agentId;
   const normalizedSubjectRole = base.target.subjectRole;
@@ -194,9 +196,11 @@ export function buildPreferenceCanonicalReviewSnapshot({
       objectLabel: base.target.stateLabel,
       representationLayer: "inferred",
       stateScopeKey: "root",
+      world: base.target.world,
     },
     currentState: current ? {
       id: current.id,
+      reality: current.reality, worldId: current.world_id, worldFrame: current.world_frame,
       level: currentLevel(current) || "unknown",
       content: base.currentState.content,
       scope: current.metadata?.preferenceScope || {},
@@ -443,11 +447,11 @@ export async function reviewPreferenceCanonicalState({
     policy,
     ...snapshotOptions,
   });
-  if (built.status === "skipped") {
+  if (built.status !== "ready") {
     return {
-      status: "skipped",
+      status: built.status,
       reason: built.reason,
-      snapshot: null,
+      snapshot: built.snapshot,
       synthesis: null,
       critique: null,
       runs: {},
@@ -475,6 +479,7 @@ export async function reviewPreferenceCanonicalState({
   let synthesis = null;
   let synthesisError = "";
   let synthesisRejected = [];
+  let synthesisReturned = false;
   try {
     synthesisGeneration = await synthesizer({
       input: synthesisInput,
@@ -483,24 +488,16 @@ export async function reviewPreferenceCanonicalState({
       schemaName: synthesisContract.schemaName,
       analyzerRole: synthesisContract.role,
     });
+    synthesisReturned = true;
     synthesis = validateSynthesis(
       parsePreferenceStateSynthesis(synthesisGeneration?.output),
       snapshot,
     );
   } catch (error) {
+    synthesisGeneration ||= error;
     synthesisError = error.message;
     synthesisRejected = [{ error: error.message }];
   }
-  const synthesisRun = recordReviewRun(repository, {
-    contract: synthesisContract,
-    snapshot,
-    batchId,
-    input: synthesisInput,
-    generation: synthesisGeneration,
-    status: synthesis ? "completed" : synthesisGeneration ? "rejected" : "failed",
-    rejected: synthesisRejected,
-    errorMessage: synthesisError,
-  });
   const warnings = [];
   const synthesisWarning = await appendReviewUsage({
     usageLedgerPath,
@@ -510,6 +507,16 @@ export async function reviewPreferenceCanonicalState({
     role: "preference-state-synthesizer",
   });
   if (synthesisWarning) warnings.push(synthesisWarning);
+  const synthesisRun = recordReviewRun(repository, {
+    contract: synthesisContract,
+    snapshot,
+    batchId,
+    input: synthesisInput,
+    generation: synthesisGeneration,
+    status: synthesis ? "completed" : synthesisReturned ? "rejected" : "failed",
+    rejected: synthesisRejected,
+    errorMessage: synthesisError,
+  });
   if (!synthesis) {
     return {
       status: "incomplete",
@@ -533,6 +540,7 @@ export async function reviewPreferenceCanonicalState({
   let critique = null;
   let criticError = "";
   let criticRejected = [];
+  let criticReturned = false;
   try {
     criticGeneration = await critic({
       input: criticInput,
@@ -541,22 +549,13 @@ export async function reviewPreferenceCanonicalState({
       schemaName: criticContract.schemaName,
       analyzerRole: criticContract.role,
     });
+    criticReturned = true;
     critique = validateCritic(parsePreferenceStateCritic(criticGeneration?.output), snapshot, synthesis);
   } catch (error) {
+    criticGeneration ||= error;
     criticError = error.message;
     criticRejected = [{ error: error.message }];
   }
-  const criticRun = recordReviewRun(repository, {
-    contract: criticContract,
-    snapshot,
-    batchId,
-    input: criticInput,
-    generation: criticGeneration,
-    status: critique ? "completed" : criticGeneration ? "rejected" : "failed",
-    rejected: criticRejected,
-    errorMessage: criticError,
-    metadata: { synthesisRunId: synthesisRun.id },
-  });
   const criticWarning = await appendReviewUsage({
     usageLedgerPath,
     generation: criticGeneration,
@@ -565,6 +564,17 @@ export async function reviewPreferenceCanonicalState({
     role: "preference-state-critic",
   });
   if (criticWarning) warnings.push(criticWarning);
+  const criticRun = recordReviewRun(repository, {
+    contract: criticContract,
+    snapshot,
+    batchId,
+    input: criticInput,
+    generation: criticGeneration,
+    status: critique ? "completed" : criticReturned ? "rejected" : "failed",
+    rejected: criticRejected,
+    errorMessage: criticError,
+    metadata: { synthesisRunId: synthesisRun.id },
+  });
   if (!critique) {
     return {
       status: "incomplete",

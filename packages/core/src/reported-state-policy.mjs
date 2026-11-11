@@ -1,3 +1,4 @@
+import { memoryWorldScope, memoryWorldsCompatible } from './ontology.mjs';
 import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 import { createHash } from "node:crypto";
 import { assertEventSourceExecutionCurrent } from "./event-source-execution.mjs";
@@ -93,8 +94,17 @@ function memoryLayer(stateFamily) {
   return "semantic";
 }
 
+function reportedProposalWorld(repository, proposal) {
+  const semantic = readStateAnalysisSemanticMemory(repository, proposal);
+  const selected = repository.getStateEvidenceObservation(proposal.agent_id, proposal.selectedObservationId);
+  if (semantic) return memoryWorldScope(semantic);
+  if (!selected) throw new Error('Reported state lost its selected world evidence.');
+  return selected.world;
+}
+
 function currentState(repository, proposal) {
   const current = repository.getCurrentCanonicalMemory({
+    ...reportedProposalWorld(repository, proposal),
     agentId: proposal.agent_id,
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
@@ -199,6 +209,10 @@ function reviewedEvidence(repository, proposal) {
     }
   }
   if (!selected) throw new Error("Reported state proposal lost its selected evidence.");
+  const world = reportedProposalWorld(repository, proposal);
+  if (!readStateAnalysisSemanticMemory(repository, proposal) && ![selected, ...contributions].every(item => memoryWorldsCompatible(world, item.observation.world, { allowRealSpaces: true }))) {
+    throw new Error('Reported state contributing evidence crosses incompatible worlds.');
+  }
   const draft = proposal.draft || {};
   if (NEW_STATE_ACTIONS.has(proposal.action) || proposal.action === "reinforce") {
     const selectedMemoryId = clean(selected.observation.memory_id || selected.observation.memoryId);
@@ -276,6 +290,12 @@ function reportedStateContent(proposal, evidence, semantic) {
   return statements.length > 1 ? statements.join("\n") : evidence.contentSnapshot;
 }
 
+function stateCalendarMetadata(semantic, evidence) {
+  const hasEventTime = semantic && (semantic.event_date || semantic.event_start || semantic.event_end);
+  return hasEventTime ? modelCalendarFields(semantic, [])
+    : modelCalendarFields(evidence.detail.memory, [], evidence.detail.sources);
+}
+
 function materializeState(repository, proposal, evidence) {
   const validityStart = iso(proposal.draft.validFrom, "validity start");
   const pending = repository.getMemory(provisionalStateId(proposal));
@@ -287,7 +307,7 @@ function materializeState(repository, proposal, evidence) {
     .digest("hex")
     .slice(0, 24)}`;
   const stateLabel = clean(proposal.metadata?.target?.stateLabel);
-  const semantic = semanticDraft(repository, proposal);
+  const semantic = readStateAnalysisSemanticMemory(repository, proposal);
   return repository.upsertMemory({
     id: memoryId,
     agentId: proposal.agent_id,
@@ -298,9 +318,7 @@ function materializeState(repository, proposal, evidence) {
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
     canonicalKey: proposal.canonical_key,
-    reality: semantic?.reality || pending?.reality || evidence.detail.memory.reality,
-    worldId: semantic?.world_id || pending?.world_id || evidence.detail.memory.world_id,
-    worldFrame: semantic?.world_frame || pending?.world_frame || evidence.detail.memory.world_frame,
+    ...reportedProposalWorld(repository, proposal),
     evidenceMode: "explicit",
     representationLayer: "reported",
     stateFamily: proposal.state_family,
@@ -310,7 +328,10 @@ function materializeState(repository, proposal, evidence) {
     revisionAction: ["create", "add_scoped_exception"].includes(proposal.action)
       ? "add"
       : "update",
-    knownAt: evidence.detail.memory.known_at || evidence.observation.observed_at,
+    eventDate: semantic?.event_date || null,
+    eventStart: semantic?.event_start || null,
+    eventEnd: semantic?.event_end || null,
+    knownAt: semantic?.known_at || evidence.detail.memory.known_at || evidence.observation.observed_at,
     validFrom: validityStart,
     validTo: referenced ? pending.valid_to : null,
     status: referenced && pending.status === "superseded" ? pending.status : "active",
@@ -319,11 +340,12 @@ function materializeState(repository, proposal, evidence) {
     actorRoles: actorRoles(proposal),
     metadata: {
       reportedStateProposalId: proposal.id,
-      ...modelCalendarFields(evidence.detail.memory, [], evidence.detail.sources),
+      ...stateCalendarMetadata(semantic, evidence),
       reportedStateAction: proposal.action,
       reportedStateReviewVersion: proposal.review_version,
       reportedStateInputHash: proposal.input_hash,
       reportedStateDraft: proposal.draft,
+      ...(semantic?.metadata?.stateTarget ? { stateTarget: semantic.metadata.stateTarget } : {}),
       truthBoundary: proposal.metadata?.truthBoundary || {},
       ...(referenced && pending.metadata?.reportedStateTransitionId
         ? { reportedStateTransitionId: pending.metadata.reportedStateTransitionId } : {}),
@@ -336,6 +358,10 @@ function attachSelectedEvidence(repository, proposal, targetMemory, evidence, {
   provisional = false,
   reuseExisting = false,
 } = {}) {
+  const related = [readStateAnalysisSemanticMemory(repository, proposal)?.id,
+    ...(evidence.contributions || [evidence]).map(item => item.detail.memory.id)].filter(Boolean);
+  const entityIds = [...new Set(related.flatMap(id => repository.listMemoryEntities(id).map(entity => entity.id)))];
+  repository.linkMemoryEntities({ memoryId: targetMemory.id, entityIds });
   const existingDraft = reuseExisting ? readReportedStateDraft(targetMemory) : {};
   const existingObservations = new Set(existingDraft.evidenceObservationIds || []);
   const existingSources = new Set(existingDraft.evidenceSourceIds || []);
@@ -383,16 +409,19 @@ function provisionalStateId(proposal) {
   return `pending-reported-state-${canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24)}`;
 }
 
-function semanticDraft(repository, proposal) {
+export function stateAnalysisSemanticMemoryMatches(memory, { agentId, requestId, snapshot = null }) {
+  return Boolean(memory && memory.agent_id === agentId && memory.status !== 'deleted'
+    && memory.metadata?.stateAnalysisDraft === true && memory.metadata.stateAnalysisRequestId === requestId
+    && (!snapshot || (memory.title === snapshot.title && memory.content === snapshot.content)));
+}
+
+export function readStateAnalysisSemanticMemory(repository, proposal) {
   const id = proposal.metadata?.semanticMemoryId;
   if (!id) return null;
   const memory = repository.getMemory(id);
-  if (!memory || memory.agent_id !== proposal.agent_id || memory.status === 'deleted'
-    || memory.metadata?.stateAnalysisDraft !== true
-    || memory.metadata.stateAnalysisRequestId !== proposal.metadata.stateAnalysisRequestId
-    || memory.title !== proposal.metadata.semanticMemorySnapshot?.title
-    || memory.content !== proposal.metadata.semanticMemorySnapshot?.content) {
-    throw new Error('Reported state semantic memory is no longer available.');
+  if (!stateAnalysisSemanticMemoryMatches(memory, { agentId: proposal.agent_id,
+    requestId: proposal.metadata.stateAnalysisRequestId, snapshot: proposal.metadata.semanticMemorySnapshot || {} })) {
+    throw new Error('State analysis semantic memory is no longer available.');
   }
   return memory;
 }
@@ -432,7 +461,7 @@ export function materializeReportedStateProposal(repository, { agentId, proposal
         transition = { memoryId: current.id, before: fields(current), applied: fields(closed) };
       }
     }
-    const semantic = semanticDraft(repository, proposal);
+    const semantic = readStateAnalysisSemanticMemory(repository, proposal);
     const memory = repository.upsertMemory({
       id: provisionalStateId(proposal), agentId: proposal.agent_id,
       kind: proposal.proposed_kind || previous?.kind,
@@ -441,23 +470,25 @@ export function materializeReportedStateProposal(repository, { agentId, proposal
       content: reportedStateContent(proposal, evidence, semantic),
       subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
       canonicalKey: proposal.canonical_key, evidenceMode: "explicit",
-      reality: semantic?.reality || evidence.detail.memory.reality,
-      worldId: semantic?.world_id || evidence.detail.memory.world_id,
-      worldFrame: semantic?.world_frame || evidence.detail.memory.world_frame,
+      ...reportedProposalWorld(repository, proposal),
       representationLayer: "reported", stateFamily: proposal.state_family,
       stateScopeKey: proposal.proposed_scope_key,
       statePhase: terminal?.statePhase || proposal.state_phase || previous?.state_phase,
       temporalState: terminal?.temporalState || proposal.temporal_state || previous?.temporal_state,
-      knownAt: evidence.detail.memory.known_at || evidence.observation.observed_at,
+      eventDate: semantic?.event_date || null,
+      eventStart: semantic?.event_start || null,
+      eventEnd: semantic?.event_end || null,
+      knownAt: semantic?.known_at || evidence.detail.memory.known_at || evidence.observation.observed_at,
       validFrom: proposal.draft?.validFrom || evidence.observation.observed_at,
       confidence: bounded(evidence.observation.confidence, 0.75), importance: 0.6,
       actorRoles: actorRoles({ ...proposal, proposed_kind: proposal.proposed_kind || previous?.kind }, { provisional: true }),
       metadata: {
         provisional: true, reviewState: "pending", epistemicStatus: "reported_state",
-        ...modelCalendarFields(evidence.detail.memory, [], evidence.detail.sources),
+        ...stateCalendarMetadata(semantic, evidence),
         reportedStateProposalId: proposal.id, reportedStateAction: proposal.action,
         reportedStatePreviousMemoryId: proposal.previousMemoryId,
         reportedStateDraft: proposal.draft,
+        ...(semantic?.metadata?.stateTarget ? { stateTarget: semantic.metadata.stateTarget } : {}),
           ...(transition ? { reportedStateTransition: transition } : {}),
           ...(confirmation ? { reportedStateConfirmation: confirmation } : {}),
       },
@@ -619,6 +650,7 @@ export function resolveReportedStateProposal(repository, {
 
     if (proposal.action === "add_scoped_exception") {
       const existingException = repository.getCurrentCanonicalMemory({
+        ...reportedProposalWorld(repository, proposal),
         agentId: normalizedAgentId,
         subjectRole: proposal.subject_role,
         subjectKey: proposal.subject_key,

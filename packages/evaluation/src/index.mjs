@@ -1,4 +1,10 @@
 export * from "@suzu-memory/analysis";
+export {
+  runMemoryBenchmark, answerWithMemoryTools, createBenchmarkCompletion,
+  loadMemoryBenchmarkDataset, normalizeMemoryBenchmarkDataset,
+  gradeExactBenchmarkAnswer, buildMemoryBenchmarkMessages,
+  MEMORY_BENCHMARK_VERSION, BENCHMARK_SEARCH_INSTRUCTION,
+} from './benchmark.mjs';
 
 export {
   evaluateRetrievalResult,

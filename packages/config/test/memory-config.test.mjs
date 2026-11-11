@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
+import { createChatHostMemoryAdapter } from '@suzu-memory/host-adapter';
 
 import {
   createMemoryServiceFromConfig,
@@ -177,11 +178,56 @@ test("config reuses existing OpenAI-compatible generation and embedding provider
   assert.ok(requests.every((item) => item.request.headers.Authorization === "Bearer secret"));
   const controller = new AbortController();
   controller.abort();
-  for (const embed of [text => providers.embedding(text, { signal: controller.signal }),
+  for (const embed of [text => providers.generator({ input: text, signal: controller.signal }),
+    text => providers.interventionGenerator({ input: text, signal: controller.signal }),
+    text => providers.embedding(text, { signal: controller.signal }),
     text => providers.embedding.embedMany([text], { signal: controller.signal })]) {
     await assert.rejects(embed('cancelled'), { name: 'AbortError' });
   }
   assert.equal(requests.length, 2, 'Cancelled requests must not contact the provider.');
+});
+
+test('configured extraction cancels its HTTP request without consuming the failure budget or losing its source', async t => {
+  const root = temporaryDirectory();
+  let started, requestSignal;
+  const requests = [];
+  const entered = new Promise(resolve => { started = resolve; });
+  let calls = 0;
+  const service = createMemoryServiceFromConfig({ agentId: 'cancelled-extraction', dataRoot: root,
+    defaults: { primaryUserId: 'u', userName: 'User', companionId: 'a', memoryOwner: 'Assistant' },
+    providers: { generation: { baseUrl: 'https://provider.invalid', model: 'fixture', apiKey: 'fixture' } },
+  }, { fetchImpl: (_url, { signal }) => new Promise((resolve, reject) => {
+    calls++;
+    const respond = () => resolve(new Response(JSON.stringify({ choices: [{ message: { content: '{"memories":[]}' } }] })));
+    requests.push({ signal, respond });
+    if (calls === 1) requestSignal = signal;
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    started();
+  }) });
+  t.after(async () => { await service.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const host = createChatHostMemoryAdapter({ memory: service, hostId: 'config-test', identity: {
+    spaceId: service.agentId, primaryUserId: 'u', primaryUserName: 'User', companionId: 'a', companionName: 'Assistant' } });
+  await host.afterReply({ sessionId: 's', turnId: '1', userMessage: { text: 'I visited the museum.' } });
+  const controller = new AbortController();
+  const reason = new DOMException('Cancelled by user.', 'AbortError');
+  const pending = service.processPendingEvents({ signal: controller.signal });
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await entered;
+  const independent = service.providers.generator({ input: 'An independent operation.' });
+  controller.abort(reason);
+  try {
+    assert.equal(requestSignal.aborted, true);
+    assert.equal(requests[1].signal.aborted, false, 'One operation must not cancel another operation using the same provider.');
+  } finally { requests.forEach(request => request.respond()); }
+  await rejected;
+  assert.deepEqual((await independent).output, { memories: [] });
+  assert.equal(calls, 2);
+  const events = service.listInputEvents({ statuses: ['pending', 'processing'] }).items;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].content.text, 'I visited the museum.');
+  assert.equal(events[0].metadata.suzuMemoryProcessing?.failureHistory?.length || 0, 0);
+  service.recoverProcessingEvents({ now: new Date(Date.now() + 3_600_000) });
+  assert.equal(service.listInputEvents({ statuses: ['pending'] }).total, 1);
 });
 
 test("config validates and preserves strict structured output mode", () => {

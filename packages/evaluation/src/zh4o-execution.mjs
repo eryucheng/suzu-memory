@@ -61,9 +61,11 @@ export function summarizeMemoryPreparation(samples) {
 }
 
 /** Count provider transport attempts in the same budget as evaluator retries. */
-export async function runQuestionOperation(operation, { delayMs = 500, onAttempts = () => {} } = {}) {
+export async function runQuestionOperation(operation, { delayMs = 500, onAttempts = () => {}, maximumAttempts = 3, signal } = {}) {
+  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) throw new RangeError('maximumAttempts must be a positive integer.');
   let attempts = 0;
   while (true) {
+    signal?.throwIfAborted();
     try {
       const result = await operation();
       attempts += Math.max(1, Number(result?.metadata?.transportAttempts) || 1);
@@ -73,8 +75,12 @@ export async function runQuestionOperation(operation, { delayMs = 500, onAttempt
       attempts += Math.max(1, Number(error?.transportAttempts) || 1);
       onAttempts(attempts);
       const nextInvocationAttempts = Math.max(1, Number(error?.maximumTransportAttempts || error?.transportAttempts) || 1);
-      if (!questionFailure(error).retryable || attempts + nextInvocationAttempts > 3) throw error;
-      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs * attempts));
+      signal?.throwIfAborted();
+      if (!questionFailure(error).retryable || attempts + nextInvocationAttempts > maximumAttempts) throw error;
+      if (delayMs > 0) {
+        const { setTimeout: wait } = await import('node:timers/promises');
+        await wait(delayMs * attempts, undefined, { signal });
+      }
     }
   }
 }

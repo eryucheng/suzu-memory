@@ -102,7 +102,7 @@ async function invokeAnalyzer({
     return {
       definition,
       input,
-      generation,
+      generation: generation || error,
       parsed: null,
       status: generation ? "rejected" : "failed",
       error: clean(error?.message) || `reward-${role}-analysis-failed`,

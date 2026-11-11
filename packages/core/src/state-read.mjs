@@ -1,3 +1,4 @@
+import { memoryWorldScope } from './ontology.mjs';
 import { REPORTED_STATE_TERMINAL_PHASES } from './reported-state-policy.mjs';
 
 const clean = value => String(value ?? '').trim();
@@ -47,6 +48,7 @@ function resolveCurrentState(repository, primary, { includeClosed = false, closu
     ].includes(primary.kind)
   ) return null;
   const current = repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(primary),
     agentId: primary.agent_id,
     subjectRole: primary.subject_role,
     subjectKey: primary.subject_key,
@@ -66,6 +68,7 @@ function resolveCurrentState(repository, primary, { includeClosed = false, closu
     && (current.id !== primary.id || closed)) return current;
   if (primary.representation_layer !== "inferred") return null;
   const established = repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(primary),
     agentId: primary.agent_id,
     subjectRole: primary.subject_role,
     subjectKey: primary.subject_key,
@@ -99,6 +102,7 @@ function currentRepresentationCompletion(repository, primary) {
   ) return null;
   const nodes = STATE_REPRESENTATION_LAYERS
     .map((representationLayer) => repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(primary),
       agentId: primary.agent_id,
       subjectRole: primary.subject_role,
       subjectKey: primary.subject_key,
@@ -136,8 +140,7 @@ function stateScopeCompletion(database, primary, eligibleMemoryIds) {
         AND exception.canonical_key = ?
         AND exception.representation_layer = ?
         AND exception.state_family = ?
-        AND exception.world_id = ?
-        AND exception.world_frame = ?
+        AND memory_worlds_compatible(exception.reality, exception.world_id, exception.world_frame, ?, ?, ?)
       ORDER BY COALESCE(exception.valid_from, exception.known_at, exception.recorded_at) DESC,
         exception.updated_at DESC, exception.id ASC
     `).all(
@@ -148,6 +151,7 @@ function stateScopeCompletion(database, primary, eligibleMemoryIds) {
       primary.canonical_key,
       primary.representation_layer,
       primary.state_family,
+      primary.reality,
       primary.world_id,
       primary.world_frame,
     ).filter((node) => eligibleMemoryIds.has(node.id));
@@ -174,8 +178,7 @@ function stateScopeCompletion(database, primary, eligibleMemoryIds) {
       AND broad.canonical_key = ?
       AND broad.representation_layer = ?
       AND broad.state_family = ?
-      AND broad.world_id = ?
-      AND broad.world_frame = ?
+      AND memory_worlds_compatible(broad.reality, broad.world_id, broad.world_frame, ?, ?, ?)
     ORDER BY broad.updated_at DESC, broad.id ASC
   `).all(
     primary.agent_id,
@@ -185,6 +188,7 @@ function stateScopeCompletion(database, primary, eligibleMemoryIds) {
     primary.canonical_key,
     primary.representation_layer,
     primary.state_family,
+    primary.reality,
     primary.world_id,
     primary.world_frame,
   ).find((node) => eligibleMemoryIds.has(node.id));

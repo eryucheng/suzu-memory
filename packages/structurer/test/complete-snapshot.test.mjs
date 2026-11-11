@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { MemoryRepository, openMemoryDatabase, invalidateEventContinuity } from "@suzu-memory/core";
 import {
   buildStructureSnapshot, buildRelationSnapshot, proposeStructuresForBatch,
   proposeRelationsForBatch, planMemoryConsolidation, runMemoryConsolidation,
@@ -38,11 +38,51 @@ test("structure generation receives full memories, titles and existing container
     received = JSON.parse(input.slice(input.indexOf("{")));
     return { output: { proposals: [] } };
   } });
-  assert.equal(received.currentMemories[0].content, content);
-  assert.equal(received.currentMemories[0].title, "完整经历的标题。".repeat(25));
+  assert.equal(received.memories[0].content, content);
+  assert.equal(received.memories[0].title, "完整经历的标题。".repeat(25));
   assert.equal(received.candidateContainers[0].content, previous);
   assert.throws(() => buildStructureSnapshot({ ...args, maxContentChars: 700 }), /complete 700-character budget/);
   assert.throws(() => buildStructureSnapshot({ ...args, maxSnapshotChars: 4000 }), /4000-character privacy budget/);
+});
+
+test("structure generation receives selected confirmed event continuations and drops invalidated ones", async (t) => {
+  const { repository, agentId, memoryIds } = fixture(t, { count: 5 });
+  repository.bindEventContinuity({ agentId, memoryId: memoryIds[0], resolution: "new", contentHash: "initial", rationale: "新经历。" });
+  repository.bindEventContinuity({ agentId, memoryId: memoryIds[1], resolution: "matched", candidateId: memoryIds[0],
+    relation: "completes", contentHash: "completion", rationale: "同一经历的完成。" });
+  repository.bindEventContinuity({ agentId, memoryId: memoryIds[3], resolution: "matched", candidateId: memoryIds[4],
+    relation: "same_thread", contentHash: "outside", rationale: "目标不在本批材料内。" });
+  repository.upsertEdge({ agentId, fromMemoryId: memoryIds[0], toMemoryId: memoryIds[2],
+    relation: "same_thread", provenance: "other-analysis", weight: 1, confidence: 1 });
+  const selected = memoryIds.slice(0, 4);
+  let input;
+  await proposeStructuresForBatch({ repository, agentId, memoryIds: selected,
+    generator: async request => { input = JSON.parse(request.input); return { output: { proposals: [] } }; } });
+  assert.deepEqual(input.eventContinuity.groups, [[memoryIds[0], memoryIds[1]]]);
+  assert.deepEqual(input.eventContinuity.transitions, [{ fromMemoryId: memoryIds[1], toMemoryId: memoryIds[0], relation: "completes" }]);
+  assert.ok(!JSON.stringify(input).includes(memoryIds[4]));
+  assert.deepEqual(input.memories.map(memory => memory.id), selected);
+
+  invalidateEventContinuity(repository, { agentId, memoryId: memoryIds[1] });
+  const refreshed = buildStructureSnapshot({ repository, agentId, memoryIds: selected });
+  assert.deepEqual(refreshed.eventContinuity?.groups || [], []);
+});
+
+test("structure continuation evidence includes visible existing container members without expanding hidden intermediates", (t) => {
+  const { repository, agentId, memoryIds } = fixture(t, { count: 4 });
+  repository.bindEventContinuity({ agentId, memoryId: memoryIds[1], resolution: "matched", candidateId: memoryIds[0],
+    relation: "same_thread", contentHash: "same-event", rationale: "同一具体经历。" });
+  repository.bindEventContinuity({ agentId, memoryId: memoryIds[2], resolution: "matched", candidateId: memoryIds[1],
+    relation: "same_thread", contentHash: "later-part", rationale: "同一经历的后续。" });
+  const topic = repository.upsertTopic({ agentId, title: "相关经历", content: "这组经历的共同主题。" });
+  repository.linkMemoryToTopic({ agentId, memoryId: memoryIds[0], topicId: topic.id });
+  const visible = buildStructureSnapshot({ repository, agentId, memoryIds: [memoryIds[1], memoryIds[3]], nearbyContainerIds: [topic.id] });
+  assert.deepEqual(visible.eventContinuity.groups, [[memoryIds[0], memoryIds[1]]]);
+  assert.deepEqual(visible.candidateContainers[0].memberIds, [memoryIds[0]]);
+  assert.ok(!JSON.stringify(visible).includes(memoryIds[2]));
+
+  const disconnected = buildStructureSnapshot({ repository, agentId, memoryIds: [memoryIds[0], memoryIds[2]], maxContainers: 0 });
+  assert.deepEqual(disconnected.eventContinuity?.groups || [], []);
 });
 
 test("relation generation receives complete evidence including its final causal correction", async (t) => {
@@ -112,8 +152,8 @@ test("all selected sources are retained and aggregate excess stops before genera
   let calls = 0;
   const large = fixture(t, { content: "长材料".repeat(20_000) });
   const generator = async () => { calls += 1; return { output: { proposals: [] } }; };
-  await assert.rejects(proposeStructuresForBatch({ ...large, generator }), /32000-character privacy budget/);
-  await assert.rejects(proposeRelationsForBatch({ ...large, generator }), /48000-character privacy budget/);
+  await assert.rejects(proposeStructuresForBatch({ ...large, generator }), /32000-character budget/);
+  await assert.rejects(proposeRelationsForBatch({ ...large, generator }), /48000-character budget/);
   assert.equal(calls, 0);
 });
 

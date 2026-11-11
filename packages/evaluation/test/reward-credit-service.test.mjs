@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
@@ -211,26 +212,35 @@ test("keeps ordinary positive affect out of reward credit", async () => {
   value.database.close();
 });
 
-test("keeps malformed analyzer output retryable and auditable", async () => {
+for (const failure of ['malformed-output', 'provider-error']) test(`keeps ${failure} retryable and records its reward receipt once`, async () => {
   const value = fixture();
   completeUsage(value);
-  const result = await processRewardObservation({
+  const charges = [];
+  const receipt = { model: 'test-model', requestId: 'failed-outcome', usage: { prompt_tokens: 7 } };
+  const result = await withUsageRecorder(charge => charges.push(charge), () => processRewardObservation({
     repository: value.repository,
     agentId: "agent-test",
     observationId: value.observation.id,
+    usageLedgerPath: 'reward-owner-unused.jsonl',
     analyzers: {
-      outcome: async () => ({ output: "not-json", model: "test-model" }),
+      outcome: async () => {
+        if (failure === 'provider-error') throw Object.assign(new Error('completed outcome is invalid'), receipt);
+        return { ...receipt, output: 'not-json' };
+      },
       target: async () => ({ output: {} }),
       credit: async () => ({ output: {} }),
     },
-  });
+  }));
   assert.equal(result.status, "retryable-failure");
   assert.equal(result.failedRole, "outcome");
   assert.equal(value.repository.getRewardObservation("agent-test", value.observation.id).status, "pending");
   const runs = value.repository.listRewardAnalysisRuns("agent-test", value.observation.id);
   assert.equal(runs.length, 1);
-  assert.equal(runs[0].status, "rejected");
-  assert.equal(runs[0].output.rawText, "not-json");
+  assert.equal(runs[0].status, failure === 'provider-error' ? 'failed' : 'rejected');
+  if (failure === 'malformed-output') assert.equal(runs[0].output.rawText, "not-json");
+  assert.equal(charges.length, 1);
+  assert.equal(charges[0].requestId, receipt.requestId);
+  assert.equal(charges[0].usage.prompt_tokens, 7);
   value.database.close();
 });
 

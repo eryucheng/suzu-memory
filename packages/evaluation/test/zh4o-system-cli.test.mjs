@@ -20,9 +20,7 @@ function outputSink() {
 }
 
 function fixture(t) {
-  const base = path.join(os.tmpdir(), "Codex", "zh4o-cli-tests");
-  fs.mkdirSync(base, { recursive: true });
-  const directory = fs.mkdtempSync(path.join(base, "case-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-zh4o-cli-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const dataset = path.join(directory, "dataset.json"), config = path.join(directory, "config.json");
   fs.writeFileSync(dataset, JSON.stringify([{ sample_id: "cli", conversation: { speaker_a: "甲", speaker_b: "乙",

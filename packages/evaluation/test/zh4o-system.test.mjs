@@ -1,3 +1,4 @@
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,9 +12,7 @@ import { ZH4O_ANSWER_SCHEMA, ZH4O_ANSWER_SCHEMA_NAME, buildZh4oAnswerRequest,
   runZh4oMemorySystemBenchmark, aggregateZh4oReports } from "../src/index.mjs";
 
 function fixture(t, sessions) {
-  const base = process.env.SUZU_EVALUATION_TEST_ROOT || path.join(os.tmpdir(), "Codex", "suzu-memory-evaluation-tests");
-  fs.mkdirSync(base, { recursive: true });
-  const directory = fs.mkdtempSync(path.join(base, "case-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-evaluation-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const datasetPath = path.join(directory, "data.json");
   fs.writeFileSync(datasetPath, JSON.stringify([{ sample_id: "fixture", conversation: {
@@ -74,14 +73,14 @@ function eventExtractionFetch(f) {
         usage: { prompt_tokens: texts.length } });
     }
     const tool = body.tools[0].function;
-    if (tool.name !== 'long-term-memory-extraction-v2') return f.fetchImpl(url, options);
+    if (tool.name !== 'long-term-memory-extraction-v4') return f.fetchImpl(url, options);
     const output = { memories: [{ kind: 'event', title: '赵齐找到金色书签', content: '赵齐在图书馆找到了金色的书签。',
       subjectRole: 'user', subjectName: '赵齐', actorRoles: [], canonicalKey: '', stateFamily: 'not_applicable',
       stateLabel: '', reality: 'real', evidenceMode: 'explicit', temporalState: 'current', revisionAction: 'add',
-      retentionReason: 'episodic_event', eventDate: '', eventStart: '', eventEnd: '', confidence: 0.98,
+      eventDate: '', eventStart: '', eventEnd: '', confidence: 0.98,
       importance: 0.8, sourceRefs: ['M0001'] }] };
     return Response.json({ model: body.model, choices: [{ message: { tool_calls: [{ type: 'function',
-      function: { name: tool.name, arguments: JSON.stringify(output) } }] } }], usage: { prompt_tokens: 10, completion_tokens: 10 } });
+      function: { name: tool.name, arguments: JSON.stringify(extractionModelFixture(output)) } }] } }], usage: { prompt_tokens: 10, completion_tokens: 10 } });
   };
 }
 
@@ -585,7 +584,7 @@ test('nonempty event continuity receives no synthetic calendar dates at the mode
   const base = eventExtractionFetch(f), continuityInputs = [];
   const fetchImpl = async (url, options) => {
     const body = JSON.parse(options.body), tool = body.tools?.[0]?.function;
-    if (tool?.name === 'long-term-memory-extraction-v2') {
+    if (tool?.name === 'long-term-memory-extraction-v4') {
       const response = await base(url, options), data = await response.json();
       const memories = JSON.parse(data.choices[0].message.tool_calls[0].function.arguments).memories;
       memories.push({ ...memories[0], title: '赵齐找到银色书签', content: '赵齐在阅览室找到了银色书签。', sourceRefs: ['M0003'] });

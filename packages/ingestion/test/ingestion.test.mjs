@@ -1,3 +1,4 @@
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from 'node:fs';
@@ -8,6 +9,8 @@ import {
   ensureCompanionRelationshipStructure,
   MemoryRepository,
   openMemoryDatabase,
+  withEventSourceExecution,
+  readCausalExcerpt,
 } from "@suzu-memory/core";
 
 import {
@@ -17,7 +20,9 @@ import {
   reviseCompanionEvent,
 } from "../src/index.mjs";
 import { generateCompanionEventBatch, retryCompanionExtractionRepair } from "../src/processing-stages.mjs";
+import * as processingStages from '../src/processing-stages.mjs';
 import { archiveLongTermEvidence, fallbackStateAnalysisToProvisionalReview, loadLongTermExtractionSystemPrompt } from "@suzu-memory/extraction";
+import { calculateCost, withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 const AGENT_ID = "companion-test";
 const IDENTITY = Object.freeze({
@@ -67,7 +72,6 @@ function generatedEventCandidate(overrides = {}) {
     evidenceMode: "explicit",
     temporalState: "historical",
     revisionAction: "add",
-    retentionReason: "significant_event",
     eventDate: "2026-08-04",
     eventStart: "2026-08-04T02:00:00.000Z",
     eventEnd: "",
@@ -83,6 +87,44 @@ function repositoryFixture() {
   return { database, repository: new MemoryRepository(database) };
 }
 
+test('ingestion preserves original sources and only archives uniquely located causal excerpts', async t => {
+  for (const language of ['en', 'zh']) {
+    const { database, repository } = repositoryFixture(); t.after(() => database.close());
+    const start = language === 'en' ? 'Because the museum was closed,' : '因为博物馆闭馆，';
+    const end = language === 'en' ? 'User cancelled the visit.' : 'User 取消了参观。';
+    const causal = `${start} ${end}`;
+    const content = `  ${'Background information. '.repeat(40)}${causal}${' Other matters.'.repeat(40)}  `;
+    const repeated = `${content}\n${causal}`;
+    appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, events: [
+      event({ content: { text: content } }),
+      event({ eventId: 'second', content: { text: repeated } }),
+    ] });
+    let calls = 0;
+    const result = await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
+      generator: async () => {
+        calls++;
+        return { output: extractionModelFixture({
+          causalExcerpts: ['M0001', 'M0002', 'M9999'].map(sourceRef => ({ sourceRef, start, end })),
+          memories: [generatedEventCandidate({ content: causal, sourceRefs: ['M0001', 'M0002'] })],
+        }) };
+      } });
+    assert.equal(calls, 1);
+    assert.equal(result.messagesArchived, 2);
+    const sources = repository.listMemorySources(result.candidateResults[0].memoryId);
+    const first = sources.find(source => source.metadata.memoryRef === 'M0001');
+    const second = sources.find(source => source.metadata.memoryRef === 'M0002');
+    assert.equal(first.content, content.trim());
+    assert.equal(second.content, repeated.trim());
+    const range = readCausalExcerpt(first);
+    assert.ok(range, 'A uniquely anchored passage must survive extraction, archiving and database reads.');
+    assert.equal(first.content.slice(range.start, range.end), causal);
+    assert.equal(readCausalExcerpt(second), null, 'Ambiguous anchors require the complete original.');
+    const edited = repository.upsertSource({ agentId: AGENT_ID, sourceKind: first.source_kind,
+      externalId: first.external_id, content: `${first.content}\nThe visit went ahead after all.`, metadata: first.metadata });
+    assert.equal(readCausalExcerpt(edited), null, 'Editing the original invalidates its previous passage.');
+  }
+});
+
 for (const language of ['en', 'zh']) test('repairs only the time-conflicting candidate and revalidates the correction: ' + language, async () => {
   const source = language === 'en' ? 'This week I applied to adoption agencies.' : '这周我向收养机构提交了申请。';
   const valid = generatedEventCandidate({ sourceRefs: ['M0002'], content: 'User visited a museum.', eventDate: '', eventStart: '' });
@@ -97,13 +139,13 @@ for (const language of ['en', 'zh']) test('repairs only the time-conflicting can
     event({ eventId: 'second', occurredAt: '2023-08-23T07:32:00Z', content: { text: 'I visited a museum.' } }),
   ], generator: async request => {
     requests.push(request);
-    if (requests.length === 1) return { output: { memories: [wrong, valid] } };
+    if (requests.length === 1) return { output: extractionModelFixture({ memories: [wrong, valid] }) };
     const input = JSON.parse(request.input);
     assert.equal(input.timeZone, 'Asia/Shanghai');
     assert.deepEqual(input.candidates.map(item => item.candidateIndex), [0]);
-    assert.deepEqual(input.sourceMessages.map(item => item.ref), ['M0001']);
+    assert.deepEqual(input.sourceMessages.map(item => item.ref), ['M0001', 'M0002']);
     assert.match(input.candidates[0].validationError, /Temporal conflict/u);
-    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [requests.length === 2 ? wrong : corrected] }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [requests.length === 2 ? wrong : corrected] }] }) };
   } });
   assert.equal(requests.length, 3);
   assert.equal(result.generation.metadata.repairAttempts, 2);
@@ -115,7 +157,7 @@ test('healthy temporal extraction makes no repair API request', async () => {
   let calls = 0;
   const memory = generatedEventCandidate({ sourceRefs: ['M0001'], content: 'User completed the design on 2026-08-04.' });
   const result = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
-    generator: async () => { calls++; return { output: { memories: [memory] } }; } });
+    generator: async () => { calls++; return { output: extractionModelFixture({ memories: [memory] }) }; } });
   assert.equal(calls, 1);
   assert.equal(result.generation.metadata.initialInvalidCandidateCount, 0);
 });
@@ -130,8 +172,8 @@ test('unresolved time conflicts keep raw evidence and the configured timezone th
     events: event({ occurredAt: '2023-08-21T02:00:00Z', content: { text: 'This week I applied.' } }) });
   const result = await processPendingCompanionEvents({ repository: f.repository, agentId: AGENT_ID,
     identity: IDENTITY, timeZone: 'America/Los_Angeles',
-    generator: async () => ({ output: ++calls === 1 ? { memories: [wrong] }
-      : { results: [{ candidateIndex: 0, status: 'repaired', memories: [wrong] }] } }) });
+    generator: async () => ({ output: extractionModelFixture(++calls === 1 ? { memories: [wrong] }
+      : { results: [{ candidateIndex: 0, status: 'repaired', memories: [wrong] }] }) }) });
   assert.equal(calls, 4);
   assert.equal(result.memoriesStored, 0);
   assert.equal(result.messagesArchived, 1);
@@ -144,7 +186,7 @@ test('unresolved time conflicts keep raw evidence and the configured timezone th
   const retried = await retryCompanionExtractionRepair({ repository: f.repository, agentId: AGENT_ID, task,
     identity: IDENTITY, completedAt: '2026-10-30T02:00:00Z', generator: async request => {
       assert.equal(JSON.parse(request.input).timeZone, 'America/Los_Angeles');
-      return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] }) };
     } });
   assert.equal(retried.memoriesStored, 1);
   assert.equal(retried.failureReviewTask, null);
@@ -160,15 +202,169 @@ test('normal archive processing uses the extraction timezone at a week boundary'
   const memory = generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: '', eventStart: '', content: 'In the week of 2023-08-20, User applied.' });
   let calls = 0;
   const result = await processPendingCompanionEvents({ repository: f.repository, agentId: AGENT_ID,
-    identity: IDENTITY, timeZone: 'America/Los_Angeles', generator: async () => { calls++; return { output: { memories: [memory] } }; } });
+    identity: IDENTITY, timeZone: 'America/Los_Angeles', generator: async () => { calls++; return { output: extractionModelFixture({ memories: [memory] }) }; } });
   assert.equal(calls, 1);
   assert.equal(result.memoriesStored, 1);
   assert.equal(result.memoriesForReview, 0);
 });
 
+for (const mode of ['success', 'archive-failure', 'output-limit', 'transport-failure']) test(`review repair retains its generation usage exactly once: ${mode}`, async t => {
+  const f = repositoryFixture();
+  t.after(() => f.database.close());
+  appendCompanionEvents({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
+  const initial = await processPendingCompanionEvents({ repository: f.repository, agentId: AGENT_ID,
+    identity: IDENTITY, generator: async ({ schemaName }) => ({ output: extractionModelFixture(
+      schemaName === 'long-term-memory-extraction-v4'
+        ? { memories: [generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: 'invalid' })] }
+        : { results: [{ candidateIndex: 0, status: 'pending', reason: 'Needs source review.' }] }) }) });
+  const task = f.repository.getMaintenanceTask(AGENT_ID, initial.generationDiagnostics.failureReviewTaskId);
+  const charges = [];
+  let calls = 0;
+  const generator = async () => {
+    const receipt = { model: 'repair-fixture', requestId: `repair-${++calls}`,
+      usage: { prompt_tokens: calls === 1 ? 11 : 13 }, metadata: { provider: 'fixture' } };
+    if (['output-limit', 'transport-failure'].includes(mode)) {
+      if (calls === 1) return { ...receipt,
+        output: { results: [{ candidateIndex: 0, status: 'pending', reason: 'Unresolved date.' }] } };
+      throw Object.assign(new Error('Completed repair response failed.'), receipt,
+        { code: mode === 'output-limit' ? 'MAX_TOKENS' : 'MEMORY_PROVIDER_TRANSPORT_EXHAUSTED' });
+    }
+    return { ...receipt, output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired',
+      memories: [generatedEventCandidate({ sourceRefs: ['M0001'] })] }] }) };
+  };
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => retryCompanionExtractionRepair({
+    repository: f.repository, agentId: AGENT_ID, task, identity: IDENTITY, generator,
+    usageLedgerPath: path.join(os.tmpdir(), 'repair-owner-unused.jsonl'), executionTime: new Date('2026-11-10T00:00:00Z'),
+    completedAt: '2026-11-10T00:00:00Z' }));
+  if (mode === 'archive-failure') {
+    const review = f.repository.reviewMaintenanceTaskFailure.bind(f.repository);
+    f.repository.reviewMaintenanceTaskFailure = () => { throw new Error('temporary repair archive failure'); };
+    await assert.rejects(run, /temporary repair archive failure/);
+    assert.equal(charges.length, 1);
+    assert.equal(f.repository.getMaintenanceTask(AGENT_ID, task.id).review_state, 'pending');
+    f.repository.reviewMaintenanceTaskFailure = review;
+    await run();
+    assert.deepEqual(charges.map(charge => charge.requestId), ['repair-1', 'repair-2']);
+    assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), 24);
+  } else if (mode === 'output-limit') {
+    await assert.rejects(run, { code: 'MAX_TOKENS' });
+    assert.deepEqual(charges.map(charge => [charge.requestId, charge.usage.prompt_tokens]),
+      [['repair-1', 11], ['repair-2', 13]]);
+    assert.equal(charges[1].metadata.failed, true);
+  } else {
+    const result = await run();
+    assert.deepEqual(charges.map(charge => [charge.requestId, charge.usage.prompt_tokens]),
+      mode === 'success' ? [['repair-1', 11]] : [['repair-1', 11], ['repair-2', 13]]);
+    assert.equal(result.generationDiagnostics.degraded, mode !== 'success');
+  }
+});
+
+test('extraction billing preserves each physical receipt and its cache token units', async t => {
+  const f = repositoryFixture();
+  t.after(() => f.database.close());
+  appendCompanionEvents({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
+  const usages = [
+    { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 80 }, completion_tokens: 1 },
+    { prompt_tokens: 200, prompt_tokens_details: { cached_tokens: 50 }, completion_tokens: 2 },
+    { prompt_cache_miss_tokens: 30, prompt_cache_hit_tokens: 70, completion_tokens: 3 },
+  ];
+  const charges = [];
+  let calls = 0;
+  const result = await withUsageRecorder(charge => charges.push(charge), () => processPendingCompanionEvents({
+    repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
+    usageLedgerPath: path.join(os.tmpdir(), 'physical-receipt-unused.jsonl'), generator: async () => {
+      const call = calls++;
+      return { model: 'deepseek-v4-pro', requestId: `cache-${call + 1}`, usage: usages[call],
+        output: extractionModelFixture(call === 0
+          ? { memories: [generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: 'invalid' })] }
+          : { results: [{ candidateIndex: 0, ...(call === 1
+            ? { status: 'pending', reason: 'Still checking source date.' }
+            : { status: 'repaired', memories: [generatedEventCandidate({ sourceRefs: ['M0001'] })] }) }] }) };
+    } }));
+  assert.equal(result.generationDiagnostics.repaired, true);
+  assert.equal(calls, 3);
+  assert.deepEqual(charges.map(charge => charge.requestId), ['cache-1', 'cache-2', 'cache-3']);
+  assert.deepEqual(charges.map(charge => charge.usage), usages);
+  assert.deepEqual(charges.map(charge => charge.units), [
+    { inputUncachedTokens: 20, inputCachedTokens: 80, outputTextTokens: 1 },
+    { inputUncachedTokens: 150, inputCachedTokens: 50, outputTextTokens: 2 },
+    { inputUncachedTokens: 30, inputCachedTokens: 70, outputTextTokens: 3 },
+  ]);
+  const total = charges.reduce((sum, charge) => sum + calculateCost(charge).amountCny, 0);
+  const expected = calculateCost({ model: 'deepseek-v4-pro', timestamp: charges[0].timestamp,
+    units: { inputUncachedTokens: 200, inputCachedTokens: 200, outputTextTokens: 6 } }).amountCny;
+  assert.ok(Math.abs(total - expected) < 1e-12);
+});
+
+for (const stage of ['initial', 'repair']) test(`extraction bills a completed physical receipt before an abort guard: ${stage}`, async t => {
+  const f = repositoryFixture();
+  t.after(() => f.database.close());
+  appendCompanionEvents({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
+  const controller = new AbortController();
+  const charges = [];
+  let calls = 0;
+  await assert.rejects(withUsageRecorder(charge => charges.push(charge), () => withEventSourceExecution(f.repository,
+    () => processPendingCompanionEvents({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
+      usageLedgerPath: path.join(os.tmpdir(), 'abort-receipt-unused.jsonl'), generator: async () => {
+        const receipt = { model: 'fixture', requestId: `physical-${++calls}`, usage: { prompt_tokens: 7 } };
+        if (stage === 'repair' && calls === 1) return { ...receipt,
+          output: extractionModelFixture({ memories: [generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: 'invalid' })] }) };
+        controller.abort();
+        return { ...receipt, output: stage === 'initial' ? { memories: [] }
+          : { results: [{ candidateIndex: 0, status: 'pending', reason: 'Late response.' }] } };
+      } }), { signal: controller.signal })), { name: 'AbortError' });
+  assert.equal(calls, stage === 'initial' ? 1 : 2);
+  assert.deepEqual(charges.map(charge => charge.requestId), Array.from({ length: calls }, (_, i) => `physical-${i + 1}`));
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), calls * 7);
+  assert.equal(f.repository.listMemories(AGENT_ID).total, 0);
+});
+
+test('the ingestion billing boundary preserves generator capabilities and call arguments', async () => {
+  const receiver = { owner: 'provider' };
+  const request = { input: 'Complete model material.' };
+  const budgetError = Object.assign(new Error('Provider budget rejects the complete request.'), { code: 'FIXTURE_BUDGET' });
+  const generator = async function (received, extra) {
+    assert.equal(this, receiver);
+    assert.equal(received, request);
+    assert.equal(extra, 'same extra argument');
+    return { output: {}, usage: {} };
+  };
+  const capability = Symbol('provider-capability');
+  Object.defineProperty(generator, 'assertRequestBudget', { value: () => { throw budgetError; } });
+  generator[capability] = { complete: true };
+  const wrapped = processingStages.recordingCompanionEventGenerator({ generator, warnings: [] });
+  assert.equal(wrapped.assertRequestBudget, generator.assertRequestBudget);
+  assert.equal(wrapped[capability], generator[capability]);
+  assert.throws(() => wrapped.assertRequestBudget(request), error => error === budgetError);
+  assert.deepEqual(await wrapped.call(receiver, request, 'same extra argument'), { output: {}, usage: {} });
+});
+
+test('ordinary extraction charges both responses once when archive storage fails before retry', async t => {
+  const f = repositoryFixture();
+  t.after(() => f.database.close());
+  appendCompanionEvents({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY, events: event() });
+  const complete = f.repository.completeInputBatch.bind(f.repository);
+  let rejectArchive = true;
+  f.repository.completeInputBatch = (agentId, batchId, options) => {
+    if (options.success && rejectArchive) { rejectArchive = false; throw new Error('temporary archive failure'); }
+    return complete(agentId, batchId, options);
+  };
+  const charges = [];
+  let calls = 0;
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => processPendingCompanionEvents({
+    repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
+    usageLedgerPath: path.join(os.tmpdir(), 'ingestion-owner-unused.jsonl'), generator: async () => ({
+      model: 'fixture', requestId: `ordinary-${++calls}`, usage: { prompt_tokens: 7 }, output: { memories: [] } }) }));
+  await assert.rejects(run, /temporary archive failure/);
+  assert.equal(charges.length, 1);
+  assert.equal((await run()).status, 'processed');
+  assert.deepEqual(charges.map(charge => charge.requestId), ['ordinary-1', 'ordinary-2']);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), 14);
+});
+
 test('memory overrides use the same source-time validation', async () => {
   const wrong = generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: '', eventStart: '', content: 'User finished the design yesterday.' });
-  await assert.rejects(generateCompanionEventBatch({ identity: IDENTITY, events: [event()], memoriesOverride: [wrong] }),
+  await assert.rejects(generateCompanionEventBatch({ identity: IDENTITY, events: [event()], memoriesOverride: extractionModelFixture([wrong]) }),
     { code: 'MEMORY_EXTRACTION_TIME_CONFLICT' });
 });
 
@@ -199,24 +395,31 @@ test("normalizes one primary user and one companion while allowing third-party e
   );
 });
 
-test('keeps candidates with inapplicable null targets without sending a repair request', async () => {
-  const output = { memories: [
-    generatedEventCandidate({ sourceRefs: ['M0001'], stateTarget: null }),
+test('omitted targets and empty optional time fields need no paid repair call', async () => {
+  const output = extractionModelFixture({ memories: [
+    generatedEventCandidate({ sourceRefs: ['M0001'], eventDate: '', eventStart: '' }),
     generatedEventCandidate({ kind: 'preference', title: '喜欢薰衣草香味', content: 'User 明确说喜欢薰衣草香味。',
       subjectRole: 'user', subjectName: 'User', canonicalKey: 'lavender', stateFamily: 'preference',
-      stateLabel: '薰衣草香味', retentionReason: 'explicit_preference', sourceRefs: ['M0001'], stateTarget: null }),
-  ] };
+      stateLabel: '薰衣草香味', sourceRefs: ['M0001'], eventDate: '', eventStart: '' }),
+  ] });
+  output.memories[0].time = { date: null, start: null, end: null };
+  output.memories[1].time = {};
   const original = structuredClone(output);
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async ({ schemaName }) => {
       calls++;
-      assert.equal(schemaName, 'long-term-memory-extraction-v2');
+      assert.equal(schemaName, 'long-term-memory-extraction-v4');
       return { output, usage: {} };
     } });
   assert.equal(calls, 1);
   assert.deepEqual(generated.generation.output.memories.map(m => m.title), ['共同完成事件入口设计', '喜欢薰衣草香味']);
-  for (const memory of generated.generation.output.memories) assert.equal(Object.hasOwn(memory, 'stateTarget'), false);
+  for (const memory of generated.generation.output.memories) {
+    assert.equal(Object.hasOwn(memory, 'stateTarget'), false);
+    assert.equal(memory.eventDate, '');
+    assert.equal(memory.eventStart, '');
+    assert.equal(memory.eventEnd, '');
+  }
   assert.deepEqual(output, original);
 });
 
@@ -227,18 +430,18 @@ test("repairs one schema-valid JSON object that fails strict extraction validati
   const schemas = [];
   const generator = async ({ input, schemaName }) => {
     schemas.push(schemaName);
-    if (schemaName === "long-term-memory-extraction-v2") {
+    if (schemaName === "long-term-memory-extraction-v4") {
       return {
-        output: { memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] },
+        output: extractionModelFixture({ memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] }),
         usage: { prompt_tokens: 10, completion_tokens: 5 },
         durationMs: 10,
         requestId: "initial-request",
         metadata: { schemaName },
       };
     }
-    assert.match(input, /eventDate.*YYYY-MM-DD/u);
+    assert.match(input, /time.date.*YYYY-MM-DD/u);
     return {
-      output: { results: [{ candidateIndex: 0, status: "repaired", memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }] },
+      output: extractionModelFixture({ results: [{ candidateIndex: 0, status: "repaired", memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }] }),
       usage: { prompt_tokens: 4, completion_tokens: 2 },
       durationMs: 5,
       requestId: "repair-request",
@@ -251,8 +454,8 @@ test("repairs one schema-valid JSON object that fails strict extraction validati
     generator,
   });
   assert.deepEqual(schemas, [
-    "long-term-memory-extraction-v2",
-    "long-term-memory-extraction-repair-v3",
+    "long-term-memory-extraction-v4",
+    "long-term-memory-extraction-repair-v5",
   ]);
   assert.equal(generated.generation.output.memories[0].eventDate, "2026-08-04");
   assert.deepEqual(generated.generation.usage, { prompt_tokens: 14, completion_tokens: 7 });
@@ -274,15 +477,15 @@ test("keeps the repair pass in the source language of the invalid candidate", as
     events: pending,
     identity: IDENTITY,
     generator: async ({ schemaName, systemPrompt }) => {
-      if (schemaName === "long-term-memory-extraction-v2") {
+      if (schemaName === "long-term-memory-extraction-v4") {
         return {
-          output: { memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] },
+          output: extractionModelFixture({ memories: [generatedEventCandidate({ sourceRefs: ["M0001"], eventDate: "August 4, 2026" })] }),
           usage: {},
         };
       }
       repairPrompt = systemPrompt;
       return {
-        output: { results: [{ candidateIndex: 0, status: "repaired", memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }] },
+        output: extractionModelFixture({ results: [{ candidateIndex: 0, status: "repaired", memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }] }),
         usage: {},
       };
     },
@@ -300,7 +503,7 @@ test("retains individually valid candidates when one repair cannot satisfy domai
   const generator = async () => {
     calls += 1;
     return {
-      output: calls === 1 ? { memories: [valid, invalid] } : { results: [{ candidateIndex: 1, status: "repaired", memories: [invalid] }] },
+      output: extractionModelFixture(calls === 1 ? { memories: [valid, invalid] } : { results: [{ candidateIndex: 1, status: "repaired", memories: [invalid] }] }),
       usage: { prompt_tokens: 3, completion_tokens: 2 },
       durationMs: 4,
       requestId: `request-${calls}`,
@@ -324,14 +527,14 @@ test("retains individually valid candidates when one repair cannot satisfy domai
     generated.generation.metadata.rejectedCandidates.map((item) => item.stage),
     ["initial", "repair", "repair", "repair"],
   );
-  assert.match(generated.generation.metadata.repairValidationError, /eventDate/u);
+  assert.match(generated.generation.metadata.repairValidationError, /time.date/u);
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 1);
   assert.equal(generated.generation.metadata.candidateValidationIncomplete, true);
 });
 
 test("never lets a repair response delete candidates that were already valid", async () => {
   const invalid = generatedEventCandidate({ eventDate: "August 4, 2026" });
-  const valid = generatedEventCandidate({ title: "必须保留的有效候选", sourceRefs: ["M0001"], stateTarget: null });
+  const valid = generatedEventCandidate({ title: "必须保留的有效候选", sourceRefs: ["M0001"] });
   let calls = 0;
   const generated = await generateCompanionEventBatch({
     events: [event()],
@@ -339,7 +542,7 @@ test("never lets a repair response delete candidates that were already valid", a
     generator: async () => {
       calls += 1;
       return {
-        output: calls === 1 ? { memories: [valid, invalid] } : { results: [] },
+        output: extractionModelFixture(calls === 1 ? { memories: [valid, invalid] } : { results: [] }),
         usage: {},
       };
     },
@@ -361,22 +564,22 @@ for (const language of ['zh', 'en']) test('retries only omitted candidate indice
   const valid = generatedEventCandidate({ title: 'Already valid', sourceRefs: ['M0001'] });
   const first = generatedEventCandidate({ title: 'First', sourceRefs: ['M0001'] });
   const second = generatedEventCandidate({ title: 'Second', sourceRefs: ['M0001'] });
-  const invalid = memory => { const { retentionReason, revisionAction, ...rest } = memory; return rest; };
+  const invalid = memory => { const { revisionAction, ...rest } = memory; return rest; };
   const requests = [];
   const generated = await generateCompanionEventBatch({ events: [event({ content: {
     text: language === 'en' ? 'I went to a parade and it inspired me to help others.' : '我参加了游行，这激励我去帮助别人。',
   } })], identity: IDENTITY, generator: async request => {
     requests.push(request);
-    if (requests.length === 1) return { output: { memories: [valid, invalid(first), invalid(second)] }, usage: { prompt_tokens: 3 } };
+    if (requests.length === 1) return { output: extractionModelFixture({ memories: [valid, invalid(first), invalid(second)] }), usage: { prompt_tokens: 3 } };
     const input = JSON.parse(request.input);
     assert.equal(input.sourceMessages.length, 1);
     assert.match(request.systemPrompt, new RegExp('M0001=' + language));
     if (requests.length === 2) {
       assert.deepEqual(input.candidates.map(item => item.candidateIndex), [1, 2]);
-      return { output: { results: [{ candidateIndex: 2, status: 'repaired', memories: [second] }] }, usage: { prompt_tokens: 2 } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 2, status: 'repaired', memories: [second] }] }), usage: { prompt_tokens: 2 } };
     }
     assert.deepEqual(input.candidates.map(item => item.candidateIndex), [1]);
-    return { output: { results: [{ candidateIndex: 1, status: 'repaired', memories: [first] }] }, usage: { prompt_tokens: 1 } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 1, status: 'repaired', memories: [first] }] }), usage: { prompt_tokens: 1 } };
   } });
   assert.equal(requests.length, 3);
   assert.deepEqual(generated.generation.output.memories.map(item => item.title), ['Already valid', 'Second', 'First']);
@@ -398,18 +601,18 @@ for (const language of ['zh', 'en']) test('repairs one candidate into independen
     actorRoles: [{ role: 'experiencer', actorRole: 'user', actorName: 'User', confidence: 1 }],
     content: language === 'en' ? 'User visited the museum.' : 'User 参观了博物馆。' });
   const preference = { ...visit, kind: 'preference', title: 'Reading preference', stateFamily: 'preference',
-    stateLabel: 'Reading', canonicalKey: 'reading', retentionReason: 'explicit_preference', temporalState: 'current',
+    stateLabel: 'Reading', canonicalKey: 'reading', temporalState: 'current',
     content: language === 'en' ? 'User likes reading.' : 'User 喜欢阅读。' };
   let calls = 0;
   const generated = await generateCompanionEventBatch({ identity: IDENTITY, events: [event({ content: {
     text: language === 'en' ? 'I visited the museum. I also like reading.' : '我参观了博物馆。我也喜欢阅读。',
   } })], generator: async request => {
-    if (++calls === 1) return { output: { memories: [{ ...visit, kind: 'invalid-kind' }] } };
+    if (++calls === 1) return { output: extractionModelFixture({ memories: [{ ...visit, kind: 'invalid-kind' }] }) };
     assert.deepEqual(JSON.parse(request.input).candidates.map(item => item.candidateIndex), [0]);
-    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [visit, preference] }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [visit, preference] }] }) };
   } });
   assert.equal(calls, 2);
-  assert.deepEqual(generated.generation.output.memories, [visit, preference]);
+  assert.deepEqual(generated.generation.output.memories.map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })), [visit, preference].map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })));
   assert.equal(generated.generation.metadata.repairValidCandidateCount, 1);
   assert.equal(generated.generation.metadata.finalCandidateCount, 2);
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
@@ -422,24 +625,25 @@ for (const language of ['zh', 'en']) test('repairs one candidate into independen
   assert.equal(new Set(archived.candidateResults.map(item => item.ingestionDecisionId)).size, 2);
 });
 
-test('duplicate or unrequested indices cannot stand in for another candidate', async () => {
-  const memory = generatedEventCandidate({ sourceRefs: ['M0001'] });
-  const invalid = { ...memory, eventDate: 'last week' };
+test('duplicate or unrequested indices cannot change pending candidates or their entity declarations', async () => {
+  const entities = [{ ref: 'E1', kind: 'place', name: 'Paris', aliases: [] }];
+  const memory = { ...extractionModelFixture({ memories: [generatedEventCandidate({ sourceRefs: ['M0001'], content: 'User visited Paris.' })] }).memories[0], entityRefs: ['E1'] };
+  const invalid = { ...memory, time: { date: 'last week' } };
   let calls = 0;
-  const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
+  const laterInputs = [];
+  const generated = await generateCompanionEventBatch({ events: [event({ content: { text: memory.content } })], identity: IDENTITY,
     generator: async request => {
-      if (++calls === 1) return { output: { memories: [invalid, invalid] } };
+      if (++calls === 1) return { output: { entities, memories: [invalid, invalid] } };
       const result = index => ({ candidateIndex: index, status: 'repaired', memories: [memory] });
-      if (calls === 2) return { output: { results: [result(0), result(0), result(99)] } };
+      if (calls === 2) return { output: { entities: [{ ref: 'E1', kind: 'person', name: 'Mallory', aliases: [] }], results: [result(0), result(0), result(99)] } };
       const input = JSON.parse(request.input);
-      if (calls === 3) {
-        assert.deepEqual(input.candidates.map(item => item.candidateIndex), [0, 1]);
-        return { output: { results: [result(0), { candidateIndex: 1, status: 'pending', reason: 'Still unresolved.' }] } };
-      }
-      assert.deepEqual(input.candidates.map(item => item.candidateIndex), [1]);
-      return { output: { results: [result(1)] } };
+      laterInputs.push(input);
+      if (calls === 3) return { output: { entities, results: [result(0), { candidateIndex: 1, status: 'pending', reason: 'Still unresolved.' }] } };
+      return { output: { entities, results: [result(1)] } };
     } });
   assert.equal(calls, 4);
+  assert.deepEqual(laterInputs.map(input => input.candidates.map(item => item.candidateIndex)), [[0, 1], [1]]);
+  assert.ok(laterInputs.every(input => input.entities[0].name === 'Paris' && input.entities[0].kind === 'place'));
   assert.equal(generated.generation.metadata.repairValidCandidateCount, 2);
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
 });
@@ -448,8 +652,8 @@ test('explicit rejections are recorded and do not require another repair attempt
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async () => ++calls === 1
-      ? { output: { memories: [generatedEventCandidate({ eventDate: 'not a date' })] } }
-      : { output: { results: [{ candidateIndex: 0, status: 'rejected', reason: 'The source does not support this experience.' }] } } });
+      ? { output: extractionModelFixture({ memories: [generatedEventCandidate({ eventDate: 'not a date' })] }) }
+      : { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'rejected', reason: 'The source does not support this experience.' }] }) } });
   assert.equal(calls, 2);
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
   assert.deepEqual(generated.generation.metadata.repairRejectedCandidates,
@@ -461,11 +665,11 @@ test('repair transport failure preserves valid candidates without retrying the e
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async () => {
-      if (++calls === 1) return { output: { memories: [valid, { ...valid, eventDate: 'invalid' }] }, usage: { prompt_tokens: 5 } };
+      if (++calls === 1) return { output: extractionModelFixture({ memories: [valid, { ...valid, eventDate: 'invalid' }] }), usage: { prompt_tokens: 5 } };
       throw Object.assign(new Error('Provider transport exhausted.'), { code: 'MEMORY_PROVIDER_TRANSPORT_EXHAUSTED', usage: { prompt_tokens: 2 } });
     } });
   assert.equal(calls, 2);
-  assert.deepEqual(generated.generation.output.memories, [valid]);
+  assert.deepEqual(generated.generation.output.memories.map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })), [valid].map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })));
   assert.deepEqual(generated.generation.metadata.extractionRepair.candidates.map(item => item.index), [1]);
   assert.equal(generated.generation.usage.prompt_tokens, 7);
 });
@@ -475,9 +679,9 @@ test('repairs missing source references using the supplied batch sources', async
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async request => {
-      if (++calls === 1) return { output: { memories: [{ ...corrected, sourceRefs: [] }] } };
+      if (++calls === 1) return { output: extractionModelFixture({ memories: [{ ...corrected, sourceRefs: [] }] }) };
       assert.equal(JSON.parse(request.input).sourceMessages[0].ref, 'M0001');
-      return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] }) };
     } });
   assert.equal(calls, 2);
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
@@ -492,12 +696,12 @@ for (const language of ['zh', 'en']) test('repairs incorrect citations from the 
     event({ eventId: 'citation-context', content: { text: language === 'en' ? 'Good morning.' : '早上好。' } }),
     event({ eventId: 'citation-evidence', content: { text: language === 'en' ? 'I visited the museum.' : '我参观了博物馆。' } }),
   ], generator: async request => {
-    if (++calls === 1) return { output: { memories: [{ ...corrected, sourceRefs: ['M0999'], kind: 'invalid-kind' }] } };
+    if (++calls === 1) return { output: extractionModelFixture({ memories: [{ ...corrected, sourceRefs: ['M0999'], kind: 'invalid-kind' }] }) };
     assert.deepEqual(JSON.parse(request.input).sourceMessages.map(message => message.ref), ['M0001', 'M0002']);
-    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] }) };
   } });
   assert.equal(calls, 2);
-  assert.deepEqual(generated.generation.output.memories, [corrected]);
+  assert.deepEqual(generated.generation.output.memories.map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })), [corrected].map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })));
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
 });
 
@@ -509,23 +713,23 @@ test('corrects a citation to supplied evidence while rejecting an unseen source'
     event({ eventId: 'unrelated-citation', content: { text: 'Good morning.' } }),
     event({ eventId: 'supplied-citation', content: { text: 'We visited the museum and attended a concert.' } }),
   ], generator: async request => {
-    if (++calls === 1) return { output: { memories: [
+    if (++calls === 1) return { output: extractionModelFixture({ memories: [
       { ...first, sourceRefs: ['M0001'], kind: 'invalid-kind' }, { ...second, kind: 'invalid-kind' },
-    ] } };
+    ] }) };
     const input = JSON.parse(request.input);
     if (calls === 2) {
       assert.deepEqual(input.sourceMessages.map(message => message.ref), ['M0001', 'M0002']);
-      return { output: { results: [
+      return { output: extractionModelFixture({ results: [
         { candidateIndex: 0, status: 'repaired', memories: [first] },
         { candidateIndex: 1, status: 'repaired', memories: [{ ...second, sourceRefs: ['M0003'] }] },
-      ] } };
+      ] }) };
     }
     assert.deepEqual(input.candidates.map(item => item.candidateIndex), [1]);
-    assert.deepEqual(input.sourceMessages.map(message => message.ref), ['M0002']);
-    return { output: { results: [{ candidateIndex: 1, status: 'repaired', memories: [second] }] } };
+    assert.deepEqual(input.sourceMessages.map(message => message.ref), ['M0001', 'M0002']);
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 1, status: 'repaired', memories: [second] }] }) };
   } });
   assert.equal(calls, 3);
-  assert.deepEqual(generated.generation.output.memories, [first, second]);
+  assert.deepEqual(generated.generation.output.memories.map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })), [first, second].map(({ kind, content, sourceRefs }) => ({ kind, content, sourceRefs })));
   assert.equal(generated.generation.metadata.unresolvedCandidateCount, 0);
 });
 
@@ -533,11 +737,11 @@ test('recovers an unparseable initial response through the same indexed repair c
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async request => {
-      if (++calls === 1) return { output: 'truncated JSON' };
+      if (++calls === 1) return { output: extractionModelFixture('truncated JSON') };
       const input = JSON.parse(request.input);
       assert.equal(input.candidates[0].candidate, null);
       assert.equal(input.candidates[0].rawOutput, 'truncated JSON');
-      return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate({ sourceRefs: ['M0001'] })] }] } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate({ sourceRefs: ['M0001'] })] }] }) };
     } });
   assert.equal(calls, 2);
   assert.equal(generated.generation.output.memories.length, 1);
@@ -547,21 +751,21 @@ test('recovers an unparseable initial response through the same indexed repair c
 test('repairs each invalid candidate against its own family contract and reports complete recovery', async () => {
   const valid = generatedEventCandidate({ sourceRefs: ['M0001'] });
   const preference = generatedEventCandidate({ kind: 'preference', stateFamily: 'preference', stateLabel: '阅读偏好',
-    canonicalKey: 'reading', retentionReason: 'explicit_preference', sourceRefs: ['M0001'] });
+    canonicalKey: 'reading', sourceRefs: ['M0001'] });
   const goal = generatedEventCandidate({ kind: 'plan', stateFamily: 'goal', stateLabel: '阅读计划',
-    canonicalKey: 'reading-plan', retentionReason: 'open_loop', sourceRefs: ['M0001'] });
+    canonicalKey: 'reading-plan', sourceRefs: ['M0001'] });
   let calls = 0;
   const generated = await generateCompanionEventBatch({ events: [event()], identity: IDENTITY,
     generator: async request => {
-      if (++calls === 1) return { output: { memories: [valid,
+      if (++calls === 1) return { output: extractionModelFixture({ memories: [valid,
         { ...preference, stateTarget: { objectRole: 'world', objectName: '阅读' } },
-        { ...goal, kind: 'belief_state' }] }, usage: {} };
+        { ...goal, kind: 'belief_state' }] }), usage: {} };
       const input = JSON.parse(request.input);
       assert.equal(input.candidates.length, 2);
       assert.deepEqual(input.candidates.map(item => item.candidateIndex), [1, 2]);
-      assert.match(input.candidates[0].validationError, /不适用：stateTarget/u);
-      assert.match(input.candidates[1].validationError, /goal 允许的 kind：plan, commitment, open_loop/u);
-      return { output: { results: [preference, goal].map((memory, index) => ({ candidateIndex: index + 1, status: "repaired", memories: [memory] })) }, usage: {} };
+      assert.match(input.candidates[0].validationError, /不适用：target/u);
+      assert.match(input.candidates[1].validationError, /classification.category 无效/u);
+      return { output: extractionModelFixture({ results: [preference, goal].map((memory, index) => ({ candidateIndex: index + 1, status: "repaired", memories: [memory] })) }), usage: {} };
     } });
   assert.equal(calls, 2);
   assert.equal(generated.generation.output.memories.length, 3);
@@ -586,7 +790,7 @@ for (const language of ['en', 'zh']) for (const role of ['user', 'companion']) {
         { role: 'participant', actorRole: otherRole, actorName: otherName, confidence: 1 }], sourceRefs: ['M0001'] });
     let calls = 0;
     const generated = await generateCompanionEventBatch({ events: appended.events, identity: IDENTITY,
-      generator: async () => { calls++; return { output: { memories: [candidate] } }; } });
+      generator: async () => { calls++; return { output: extractionModelFixture({ memories: [candidate] }) }; } });
     assert.equal(calls, 1);
     const archived = archiveLongTermEvidence({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
       messages: generated.messages, generatedMemories: generated.generation.output.memories,
@@ -608,11 +812,11 @@ test('a non-state fact classification error is repaired before asking for a stat
   const generated = await generateCompanionEventBatch({ events: [event({
     content: { text: 'A friend adopted a child last year.' },
   })], identity: IDENTITY, generator: async request => {
-    if (++calls === 1) return { output: { memories: [invalid] } };
+    if (++calls === 1) return { output: extractionModelFixture({ memories: [invalid] }) };
     const input = JSON.parse(request.input);
-    assert.match(input.candidates[0].validationError, /not_applicable 允许的 kind：event, reflection/u);
+    assert.match(input.candidates[0].validationError, /classification.category 无效/u);
     assert.doesNotMatch(input.candidates[0].validationError, /canonicalKey/u);
-    return { output: { results: [{ candidateIndex: 0, status: "repaired", memories: [corrected] }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: "repaired", memories: [corrected] }] }) };
   } });
   assert.equal(calls, 2);
   assert.equal(generated.generation.output.memories[0].kind, 'event');
@@ -627,7 +831,7 @@ test("corrects known participant roles from host identity before evidence gates"
     })],
     identity: IDENTITY,
     generator: async () => ({
-      output: {
+      output: extractionModelFixture({
         memories: [generatedEventCandidate({
           subjectRole: "user",
           subjectName: "Companion",
@@ -636,13 +840,14 @@ test("corrects known participant roles from host identity before evidence gates"
           ],
           sourceRefs: ["M0001"],
         })],
-      },
+      }),
       usage: {},
     }),
   });
   assert.equal(generated.generation.output.memories[0].subjectRole, "agent");
   assert.equal(generated.generation.output.memories[0].actorRoles[0].actorRole, "agent");
-  assert.equal(generated.generation.metadata.knownParticipantRoleCorrectionCount, 2);
+  assert.equal(generated.generation.output.memories.length, 1);
+  assert.deepEqual(generated.generation.output.memories[0].actorRoles.map(actor => actor.actorName), ['Companion']);
 });
 
 test("appends events idempotently and rejects conflicting replays without producing memory", () => {
@@ -720,7 +925,7 @@ test("retracts archived evidence and removes memories that have no active source
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   assert.equal(processed.status, "processed");
   const activeBefore = repository.listMemories(AGENT_ID, {
@@ -761,7 +966,7 @@ test("rejects a revision while the target event is owned by a processing batch",
 
 test("fragments oversized events without losing text and keeps replay idempotency", () => {
   const { database, repository } = repositoryFixture();
-  const text = "甲".repeat(145);
+  const text = '甲'.repeat(11) + '🌊' + '乙'.repeat(133);
   const first = appendCompanionEvents({
     repository,
     agentId: AGENT_ID,
@@ -948,7 +1153,7 @@ test("keeps extraction as a separately testable stage without host context", asy
   const generated = await generateCompanionEventBatch({
     events: pending,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({ sourceRefs: ["M0001"] })],
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({ sourceRefs: ["M0001"] })]),
   });
   assert.equal(generated.messages.length, 1);
   assert.equal(generated.generation.output.memories.length, 1);
@@ -985,7 +1190,7 @@ test("uses boundary messages for interpretation without archiving or citing them
     })],
     generator: async ({ input }) => {
       receivedInput = input;
-      return { output: { memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }, usage: {} };
+      return { output: extractionModelFixture({ memories: [generatedEventCandidate({ sourceRefs: ["M0001"] })] }), usage: {} };
     },
   });
   assert.equal(result.messagesArchived, 1);
@@ -1029,9 +1234,9 @@ test("shares one provider request across archive windows but rejects cross-windo
     generator: async () => {
       requests += 1;
       return {
-        output: {
+        output: extractionModelFixture({
           memories: [generatedEventCandidate({ sourceRefs: ["M0001", "M0002"] })],
-        },
+        }),
         usage: {},
       };
     },
@@ -1074,7 +1279,7 @@ test("preserves utterance order across budget splits only with explicit continui
       { id: "split-a", continuityId: "conversation-1", coreEventIds: [first.eventId] },
       { id: "split-b", continuityId: "conversation-1", coreEventIds: [second.eventId] },
     ],
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   const followedBy = database.prepare(`
     SELECT COUNT(*) AS count
@@ -1102,7 +1307,7 @@ test("reassembles every fragment before extraction and archives one complete utt
   const generated = await generateCompanionEventBatch({
     events: pending,
     identity: IDENTITY,
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   assert.equal(generated.messages.length, 1);
   assert.equal(generated.messages[0].text, longText);
@@ -1115,7 +1320,7 @@ test("reassembles every fragment before extraction and archives one complete utt
     agentId: AGENT_ID,
     identity: IDENTITY,
     maximumContentCharacters: 100,
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   assert.equal(processed.eventsProcessed, pending.length);
   assert.equal(processed.messagesArchived, 1);
@@ -1161,7 +1366,7 @@ test("processes a bilateral relationship-world batch without a host transcript",
     agentId: AGENT_ID,
     identity: IDENTITY,
     now: new Date("2026-08-04T02:05:00.000Z"),
-    memoriesOverride: [generatedEventCandidate()],
+    memoriesOverride: extractionModelFixture([generatedEventCandidate()]),
   });
   assert.equal(result.status, "processed");
   assert.equal(result.eventsProcessed, 2);
@@ -1230,7 +1435,7 @@ test("archives supplied primary identities with the same actor keys used by enti
     repository,
     agentId: AGENT_ID,
     identity,
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
 
   assert.equal(result.status, "processed");
@@ -1275,7 +1480,7 @@ test("stores one-off daily evidence as an episodic event without promoting a sta
     agentId: AGENT_ID,
     identity: IDENTITY,
     now: new Date("2026-08-04T02:05:00.000Z"),
-    memoriesOverride: [generatedEventCandidate({
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({
       title: "中午吃了牛肉面",
       content: "User 中午吃了牛肉面。",
       subjectRole: "user",
@@ -1283,10 +1488,9 @@ test("stores one-off daily evidence as an episodic event without promoting a sta
       actorRoles: [
         { role: "experiencer", actorRole: "user", actorName: "User", confidence: 1 },
       ],
-      retentionReason: "episodic_event",
       importance: 0.25,
       sourceRefs: ["M0001"],
-    })],
+    })]),
   });
   assert.equal(result.status, "processed");
   assert.equal(result.memoriesStored, 1);
@@ -1350,10 +1554,10 @@ test('output truncation splits once, persists the smaller limit, and archives ev
       sizes.push(refs.length);
       if (refs.length > 2) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' });
       const sources = [...input.matchAll(/^\[(M\d{4})\].*?(独立原话\d)/gmu)];
-      return { output: { memories: sources.map(([, ref, text]) => generatedEventCandidate({ title: text,
+      return { output: extractionModelFixture({ memories: sources.map(([, ref, text]) => generatedEventCandidate({ title: text,
         content: text, subjectRole: 'user', subjectName: 'User',
         actorRoles: [{ role: 'experiencer', actorRole: 'user', actorName: 'User', confidence: 1 }],
-        sourceRefs: [ref] })) }, usage: {} };
+        sourceRefs: [ref] })) }), usage: {} };
     };
     for (let i = 0; i < 3; i++) {
       const result = await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
@@ -1430,22 +1634,29 @@ test('a truncated repair also splits instead of silently retaining only the init
     appendCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY,
       events: [event({ eventId: 'repair-first' }), event({ eventId: 'repair-second' })] });
     const calls = [];
+    const charges = [];
     const generator = async ({ input, schemaName }) => {
       calls.push(schemaName);
-      if (schemaName === 'long-term-memory-extraction-repair-v3') {
-        throw Object.assign(new Error('repair output truncated'), { code: 'MAX_TOKENS', usage: { completion_tokens: 10 } });
+      const receipt = { model: 'fixture', requestId: `split-${calls.length}` };
+      if (schemaName === 'long-term-memory-extraction-repair-v5') {
+        throw Object.assign(new Error('repair output truncated'), receipt, { code: 'MAX_TOKENS', usage: { completion_tokens: 10 } });
       }
       const refs = [...input.matchAll(/^\[(M\d{4})\]/gmu)].map(match => match[1]);
-      return { output: { memories: refs.length === 2
+      return { ...receipt, output: extractionModelFixture({ memories: refs.length === 2
         ? [generatedEventCandidate({ sourceRefs: ['M0001'] }), generatedEventCandidate({ sourceRefs: ['M0002'], eventDate: 'bad-date' })]
-        : [] }, usage: { completion_tokens: 5 } };
+        : [] }), usage: { completion_tokens: 5 } };
     };
-    const first = await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
+    const run = () => withUsageRecorder(charge => charges.push(charge), () => processPendingCompanionEvents({
+      repository, agentId: AGENT_ID, identity: IDENTITY, generator,
+      usageLedgerPath: path.join(os.tmpdir(), 'split-receipt-unused.jsonl') }));
+    const first = await run();
     assert.equal(first.eventsProcessed, 1);
     assert.equal(first.generationDiagnostics.degraded, false);
-    await processPendingCompanionEvents({ repository, agentId: AGENT_ID, identity: IDENTITY, generator });
-    assert.deepEqual(calls, ['long-term-memory-extraction-v2', 'long-term-memory-extraction-repair-v3',
-      'long-term-memory-extraction-v2', 'long-term-memory-extraction-v2']);
+    await run();
+    assert.deepEqual(calls, ['long-term-memory-extraction-v4', 'long-term-memory-extraction-repair-v5',
+      'long-term-memory-extraction-v4', 'long-term-memory-extraction-v4']);
+    assert.deepEqual(charges.map(charge => [charge.requestId, charge.usage.completion_tokens]),
+      [['split-1', 5], ['split-2', 10], ['split-3', 5], ['split-4', 5]]);
     assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ['archived'] }).total, 2);
     assert.equal(repository.listMaintenanceTasks(AGENT_ID, { taskTypes: ['long-term-extraction'] }).length, 0);
   } finally { database.close(); }
@@ -1520,7 +1731,7 @@ test("claims only the caller-scoped pending events for an archive window", async
     agentId: AGENT_ID,
     identity: IDENTITY,
     candidateEventIds: second.events.map((item) => item.id),
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   assert.equal(result.status, "processed");
   assert.equal(repository.getInputEvent(AGENT_ID, first.events[0].id).status, "pending");
@@ -1651,14 +1862,14 @@ test("queues expensive post-processing without calling providers in the archive 
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({
       sourceRefs: ["M0001"],
       subjectRole: "user",
       subjectName: "User",
       actorRoles: [
         { role: "experiencer", actorRole: "user", actorName: "User", confidence: 1 },
       ],
-    })],
+    })]),
     embeddingProvider: async () => {
       embeddingCalls += 1;
       throw new Error("embedding unavailable");
@@ -1705,7 +1916,7 @@ test("rolls back archival when required follow-up tasks cannot be persisted", as
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({ sourceRefs: ["M0001"] })],
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({ sourceRefs: ["M0001"] })]),
   }), /queue storage unavailable/u);
   assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ["pending"] }).total, 1);
   assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ["archived"] }).total, 0);
@@ -1715,7 +1926,7 @@ test("rolls back archival when required follow-up tasks cannot be persisted", as
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({ sourceRefs: ["M0001"] })],
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({ sourceRefs: ["M0001"] })]),
   });
   assert.equal(retried.status, "processed");
   assert.equal(repository.listInputEvents(AGENT_ID, { statuses: ["archived"] }).total, 1);
@@ -1738,7 +1949,7 @@ test("preserves inferred beliefs as isolated provisional evidence after analysis
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({
       kind: "belief_state",
       title: "对科技馆的兴趣",
       content: "User 似乎喜欢逛科技馆。",
@@ -1751,11 +1962,10 @@ test("preserves inferred beliefs as isolated provisional evidence after analysis
       stateLabel: "喜欢逛科技馆",
       evidenceMode: "inferred",
       temporalState: "current",
-      retentionReason: "explicit_belief",
       eventDate: "",
       eventStart: "",
       sourceRefs: ["M0001"],
-    })],
+    })]),
   });
   assert.equal(result.memoriesForReview, 0);
   assert.equal(result.candidateResults[0].status, "analysis_pending");
@@ -1793,7 +2003,7 @@ test("queues inferred preference candidates for the behavioral specialist", asyn
     repository,
     agentId: AGENT_ID,
     identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({
+    memoriesOverride: extractionModelFixture([generatedEventCandidate({
       kind: "preference",
       title: "对科技馆的兴趣",
       content: "User 可能越来越喜欢逛科技馆。",
@@ -1807,60 +2017,16 @@ test("queues inferred preference candidates for the behavioral specialist", asyn
       stateLabel: "喜欢逛科技馆",
       evidenceMode: "inferred",
       temporalState: "current",
-      retentionReason: "explicit_preference",
       eventDate: "",
       eventStart: "",
       sourceRefs: ["M0001"],
-    })],
+    })]),
   });
   assert.equal(result.stateAnalysisRequestsQueued, 1);
   assert.equal(result.candidateResults[0].status, "analysis_pending");
   const requests = repository.listStateAnalysisRequests(AGENT_ID, { statuses: ["pending"] });
   assert.equal(requests.length, 1);
   assert.equal(requests[0].representation_layer, "inferred");
-  assert.equal(repository.listPendingProvisionalMemories(AGENT_ID).length, 0);
-  database.close();
-});
-
-test("does not expose structurally unresolved reviews as personal impressions", async () => {
-  const { database, repository } = repositoryFixture();
-  appendCompanionEvents({
-    repository,
-    agentId: AGENT_ID,
-    identity: IDENTITY,
-    events: event({
-      actor: { role: "companion", id: AGENT_ID, name: "Companion" },
-      content: { text: "我感觉 User 最近可能很喜欢逛科技馆。" },
-    }),
-  });
-  const result = await processPendingCompanionEvents({
-    repository,
-    agentId: AGENT_ID,
-    identity: IDENTITY,
-    memoriesOverride: [generatedEventCandidate({
-      kind: "preference",
-      title: "对科技馆的兴趣",
-      content: "User 似乎喜欢逛科技馆。",
-      subjectRole: "user",
-      subjectName: "User",
-      actorRoles: [],
-      canonicalKey: "preference:museum-visits",
-      stateFamily: "preference",
-      stateLabel: "喜欢逛科技馆",
-      evidenceMode: "inferred",
-      temporalState: "current",
-      retentionReason: "significant_event",
-      eventDate: "",
-      eventStart: "",
-      sourceRefs: ["M0001"],
-    })],
-  });
-  assert.equal(result.candidateResults[0].status, "review");
-  assert.deepEqual(
-    result.candidateResults[0].reasons,
-    ["retention-reason-kind-mismatch"],
-  );
-  assert.equal(result.candidateResults[0].provisionalMemoryId, "");
   assert.equal(repository.listPendingProvisionalMemories(AGENT_ID).length, 0);
   database.close();
 });
@@ -1890,9 +2056,9 @@ test("uses the long-term extraction prompt and refuses to guess across mixed wor
     generator: async ({ systemPrompt }) => {
       receivedSystemPrompt = systemPrompt;
       return {
-        output: {
+        output: extractionModelFixture({
           memories: [generatedEventCandidate()],
-        },
+        }),
         usage: {},
       };
     },
@@ -1902,4 +2068,151 @@ test("uses the long-term extraction prompt and refuses to guess across mixed wor
   assert.deepEqual(result.candidateResults[0].reasons, ["mixed-world-evidence-needs-resolution"]);
   assert.equal(repository.listMemories(AGENT_ID, { statuses: [], kinds: ["event"] }).total, 0);
   database.close();
+});
+
+for (const language of ['en', 'zh']) test(`repair receives its archive window, owner and read-only context: ${language}`, async () => {
+  const firstText = language === 'en' ? 'The dog is named Mochi.' : '那只狗叫麻糬。';
+  const secondText = language === 'en' ? 'We swam together.' : '我们一起游泳了。';
+  const beforeText = language === 'en' ? 'We are telling a story about a dog.' : '我们正在讲一只狗的故事。';
+  const afterText = language === 'en' ? 'Then we fed the dog.' : '随后我们喂了那只狗。';
+  const content = language === 'en' ? 'User swam with the dog Mochi.' : 'User 和那只叫麻糬的狗一起游泳了。';
+  const source = (id, text) => event({ eventId: id, world: { frame: 'fictional', id: 'story' }, content: { text } });
+  const corrected = generatedEventCandidate({ title: content, content, subjectRole: 'user', subjectName: 'User',
+    actorRoles: [{ role: 'experiencer', actorRole: 'user', actorName: 'User', confidence: 1 }],
+    reality: 'fictional', eventDate: '', eventStart: '', sourceRefs: ['M0001', 'M0002'] });
+  let calls = 0;
+  let repairInput;
+  let repairText;
+  const result = await generateCompanionEventBatch({ identity: IDENTITY,
+    events: [{ ...source('name', firstText), knownAt: '2026-08-05T02:00:00Z' }, source('swim', secondText), source('other', 'UNRELATED_WINDOW')],
+    archiveWindows: [
+      { id: 'story-window', coreEventIds: ['name', 'swim'], previousContextEvents: [{ ...source('before', beforeText), knownAt: '2000-01-01T00:00:00Z', metadata: { sourceTimeKnown: false } }],
+        continuationGuidanceEvents: [source('after', afterText)] },
+      { id: 'unrelated-window', coreEventIds: ['other'] },
+    ], generator: async request => {
+      if (++calls === 1) {
+        const { revisionAction, ...invalid } = corrected;
+        return { output: extractionModelFixture({ memories: [{ ...invalid, sourceRefs: ['M0002'] }] }) };
+      }
+      repairInput = JSON.parse(request.input);
+      repairText = request.input;
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [corrected] }] }) };
+    } });
+  const input = repairInput;
+  assert.equal(input.memoryOwner, 'P1');
+  assert.deepEqual(input.sourceMessages.map(message => message.ref), ['M0001', 'M0002']);
+  assert.deepEqual(input.sourceMessages[0].world, { frame: 'fictional', id: 'story' });
+  assert.equal(input.sourceMessages[0].knownAt, '2026-08-05T02:00:00Z');
+  assert.equal(input.contextWindows[0].previousContextMessages[0].timestamp, 'unknown');
+  assert.doesNotMatch(repairText, /2000-01-01/);
+  assert.equal(input.contextWindows[0].previousContextMessages[0].text, beforeText);
+  assert.equal(input.contextWindows[0].continuationGuidanceMessages[0].text, afterText);
+  assert.ok(input.contextWindows.every(window => window.window === 'W0001'));
+  assert.ok(input.contextWindows.flatMap(window => [...window.previousContextMessages, ...window.continuationGuidanceMessages]).every(message => !Object.hasOwn(message, 'ref')));
+  assert.doesNotMatch(repairText, /UNRELATED_WINDOW/);
+  assert.equal(calls, 2);
+  assert.deepEqual(result.generation.output.memories[0].sourceRefs, ['M0001', 'M0002']);
+  assert.equal(result.generation.output.memories[0].reality, 'fictional');
+  assert.equal(result.generation.metadata.unresolvedCandidateCount, 0);
+});
+
+
+for (const mode of ['complete-table', 'used-entities-only', 'later-retry']) test('candidate repair preserves same-name entity identities: ' + mode, async t => {
+  const entities = [{ ref: 'E1', kind: 'place', name: 'Paris', aliases: ['Paris France'] },
+    { ref: 'E2', kind: 'place', name: 'Paris', aliases: ['Paris Texas'] }];
+  const base = extractionModelFixture({ memories: [generatedEventCandidate({ subjectRole: 'user', subjectName: 'User',
+    actorRoles: [], sourceRefs: ['M0001'], eventDate: '', eventStart: '', content: 'User visited Paris in France.' })] }).memories[0];
+  const second = { ...base, content: 'User visited Paris in Texas.', sourceRefs: ['M0002'], entityRefs: ['E2'] };
+  let calls = 0;
+  const generated = await generateCompanionEventBatch({ identity: IDENTITY,
+    events: [event({ content: { text: base.content } }), event({ eventId: 'event-2', content: { text: second.content } })],
+    archiveWindows: [{ id: 'france', coreEventIds: ['event-1'] }, { id: 'texas', coreEventIds: ['event-2'] }],
+    generator: async request => {
+      if (++calls === 1) return { output: { entities, memories: [{ ...base, entityRefs: ['E1'] },
+        { ...second, classification: { category: 'invalid' } }] } };
+      const input = JSON.parse(request.input);
+      assert.deepEqual(input.entities, entities);
+      assert.equal(input.sourceMessages.length, 1, 'Repair reads the affected window.');
+      return { output: { entities: mode === 'complete-table' ? entities : [entities[1]], results: [{ candidateIndex: 1, status: 'repaired', memories: [second] }] } };
+    } });
+  assert.equal(calls, 2);
+  assert.equal(generated.generation.output.memories.length, 2);
+  assert.equal(generated.generation.output.memories[0].entityScope, generated.generation.output.memories[1].entityScope);
+  const f = repositoryFixture(); t.after(() => f.database.close());
+  f.repository.upsertEntity({ id: 'existing-france', agentId: AGENT_ID, kind: 'place', canonicalName: 'Paris', aliases: ['Paris France'] });
+  const archive = (memories, offset = 0) => archiveLongTermEvidence({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
+    messages: generated.messages, batchId: 'entity-repair', candidateIndexOffset: offset, generatedMemories: memories });
+  const rows = generated.generation.output.memories;
+  const results = mode === 'later-retry' ? [...archive([rows[0]]).candidateResults, ...archive([rows[1]], 1).candidateResults]
+    : archive(rows).candidateResults;
+  assert.ok(results.every(item => item.status === 'created'));
+  const linked = results.map(item => f.repository.listMemoryEntities(item.memoryId).find(entity => entity.kind === 'place'));
+  assert.equal(linked[0].id, 'existing-france', 'A unique existing object may be reused.');
+  assert.notEqual(linked[0].id, linked[1].id, 'Another E reference cannot take the entity already bound in this batch.');
+  assert.ok(linked[0].aliases.includes('Paris France'));
+  assert.ok(linked[1].aliases.includes('Paris Texas'));
+  const repeated = archive([rows[1]], 2).candidateResults[0];
+  assert.equal(f.repository.listMemoryEntities(repeated.memoryId).find(entity => entity.kind === 'place').id, linked[1].id);
+  const stored = f.repository.listIngestionEntityBindings({ agentId: AGENT_ID, batchId: 'entity-repair', entityScopes: [rows[0].entityScope] });
+  assert.deepEqual(new Set(stored.map(item => `${item.ref}:${item.entity.id}`)), new Set([`E1:${linked[0].id}`, `E2:${linked[1].id}`]));
+});
+
+
+test('partial repair retains newly declared entity references for remaining candidates', async t => {
+  const first = extractionModelFixture({ memories: [generatedEventCandidate({ subjectRole: 'user', subjectName: 'User', actorRoles: [],
+    sourceRefs: ['M0001'], content: 'User visited Paris in France.', eventDate: '', eventStart: '' })] }).memories[0];
+  const second = { ...first, content: 'User visited Paris in Texas.' };
+  let calls = 0, continuationRefs;
+  const generated = await generateCompanionEventBatch({ identity: IDENTITY, events: [event({ content: { text: first.content + ' ' + second.content } })],
+    generator: async request => {
+      if (++calls === 1) return { output: { memories: [first, second].map(row => ({ ...row, classification: { category: 'invalid' } })) } };
+      if (calls === 2) return { output: { entities: [{ ref: 'E1', kind: 'place', name: 'Paris', aliases: ['Paris France'] }],
+        results: [{ candidateIndex: 0, status: 'repaired', memories: [{ ...first, entityRefs: ['E1'] }] },
+          { candidateIndex: 1, status: 'pending', reason: 'The second location remains to be checked.' }] } };
+      continuationRefs = (JSON.parse(request.input).entities || []).map(entity => entity.ref);
+      return { output: { entities: [{ ref: 'E2', kind: 'place', name: 'Paris', aliases: ['Paris Texas'] }],
+        results: [{ candidateIndex: 1, status: 'repaired', memories: [{ ...second, entityRefs: ['E2'] }] }] } };
+    } });
+  assert.equal(calls, 3);
+  assert.deepEqual(continuationRefs, ['E1'], 'The next repair sees the reference already assigned.');
+  const rows = generated.generation.output.memories;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].entityScope, rows[1].entityScope);
+  const f = repositoryFixture(); t.after(() => f.database.close());
+  const archived = archiveLongTermEvidence({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY,
+    messages: generated.messages, batchId: 'partial-new-entities', generatedMemories: rows });
+  const ids = archived.candidateResults.map(item => f.repository.listMemoryEntities(item.memoryId).find(entity => entity.kind === 'place').id);
+  assert.equal(ids.length, 2); assert.notEqual(ids[0], ids[1]);
+});
+
+
+test('repair preserves accepted entity types and keeps earlier successful memories when a later reference conflicts', async t => {
+  const first = extractionModelFixture({ memories: [generatedEventCandidate({ subjectRole: 'user', subjectName: 'User', actorRoles: [],
+    sourceRefs: ['M0001'], eventDate: '', eventStart: '', content: 'User visited Paris.' })] }).memories[0];
+  const second = { ...first, content: 'User met Mira.' };
+  const paris = { ref: 'E1', kind: 'place', name: 'Paris', aliases: [] };
+  let calls = 0, finalInput;
+  const generated = await generateCompanionEventBatch({ identity: IDENTITY, events: [event({ content: { text: first.content + ' ' + second.content } })],
+    generator: async request => {
+      if (++calls === 1) return { output: { memories: [first, second].map(memory => ({ ...memory, classification: { category: 'invalid' } })) } };
+      if (calls === 2) return { output: { entities: [paris], results: [
+        { candidateIndex: 0, status: 'repaired', memories: [{ ...first, entityRefs: ['E1'] }] },
+        { candidateIndex: 1, status: 'pending', reason: 'Check the person.' }] } };
+      if (calls === 3) return { output: { entities: [{ ref: 'E1', kind: 'person', name: 'Mira', aliases: [] }],
+        results: [{ candidateIndex: 1, status: 'repaired', memories: [{ ...second, entityRefs: ['E1'] }] }] } };
+      finalInput = JSON.parse(request.input);
+      return { output: { entities: [{ ref: 'E2', kind: 'person', name: 'Mira', aliases: [] }],
+        results: [{ candidateIndex: 1, status: 'repaired', memories: [{ ...second, entityRefs: ['E2'] }] }] } };
+    } });
+  assert.equal(calls, 4);
+  assert.equal(finalInput.entities[0].kind, 'place');
+  assert.match(finalInput.candidates[0].validationError, /E1.*place/);
+  assert.deepEqual(generated.generation.output.memories.map(memory => memory.content), [first.content, second.content]);
+  const f = repositoryFixture(); t.after(() => f.database.close());
+  const archived = archiveLongTermEvidence({ repository: f.repository, agentId: AGENT_ID, identity: IDENTITY, messages: generated.messages,
+    batchId: 'repair-conflicting-types', generatedMemories: generated.generation.output.memories });
+  assert.equal(archived.memoriesStored, 2);
+  const named = archived.candidateResults.map(item => f.repository.listMemoryEntities(item.memoryId).find(entity => ['Paris', 'Mira'].includes(entity.canonical_name)));
+  assert.deepEqual(named.map(entity => entity.kind), ['place', 'person']);
+  assert.notEqual(named[0].id, named[1].id);
 });

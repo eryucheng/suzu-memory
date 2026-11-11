@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 import {
   MemoryRepository,
@@ -177,6 +178,33 @@ async function mergeCounter(fixture, analyzerOverrides = {}) {
   });
   return mergePreferenceSpecialistEvidence(fixture.repository, { evaluation, policy });
 }
+
+for (const failure of ['provider', 'persistence']) test(`counter matching records each receipt before ${failure} failure and recovery`, async t => {
+  const f = setup();
+  t.after(() => f.database.close());
+  const merged = await mergeCounter(f);
+  const charges = [];
+  let calls = 0;
+  const record = f.repository.recordStateAnalysisRun.bind(f.repository);
+  if (failure === 'persistence') f.repository.recordStateAnalysisRun = () => { throw new Error('counter storage failure'); };
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => evaluatePreferenceCounterEvidence({
+    repository: f.repository, agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: f.canonicalKey, objectLabel: f.objectLabel, observationIds: [merged.observations[0].id],
+    usageLedgerPath: 'counter-owner-unused.jsonl', generator: async () => {
+      const receipt = { model: 'fixture', requestId: `counter-${++calls}`, usage: { prompt_tokens: 7 } };
+      if (failure === 'provider' && calls === 1) throw Object.assign(new Error('counter provider failure'), receipt);
+      return { ...receipt, output: { analyses: [{ observationId: merged.observations[0].id,
+        memoryId: f.evidence.id, sourceIds: [f.source.id], relation: 'same_scope_conflict', scopeOverlap: 'exact',
+        temporalRelation: 'overlaps_current', confidence: 0.9, rationale: 'The source explicitly changes this preference.' }] } };
+    } }));
+  if (failure === 'persistence') await assert.rejects(run, /counter storage failure/);
+  else assert.equal((await run()).status, 'incomplete');
+  assert.deepEqual(charges.map(charge => charge.requestId), ['counter-1']);
+  f.repository.recordStateAnalysisRun = record;
+  assert.equal((await run()).status, 'matched');
+  assert.deepEqual(charges.map(charge => charge.requestId), ['counter-1', 'counter-2']);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), 14);
+});
 
 test('counter matching accepts every supplied observation above forty and honors an explicit zero budget before generation', async t => {
   const fixture = setup();

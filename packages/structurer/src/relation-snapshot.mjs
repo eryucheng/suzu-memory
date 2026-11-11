@@ -1,5 +1,5 @@
 import { memoryBudgetError } from "./budgeted-parts.mjs";
-import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, eventSourceMaterial, modelCalendarFields } from "@suzu-memory/core";
+import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, eventSourceMaterial, modelCalendarFields, readCausalExcerpt } from "@suzu-memory/core";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -41,8 +41,10 @@ export function buildRelationSnapshot({
   const sourceLimit = completeLimit(maxSourcesPerMemory);
   const memoryCharLimit = completeLimit(maxMemoryContentChars);
   const sourceCharLimit = completeLimit(maxSourceContentChars);
-  const snapshotCharLimit = Math.min(250_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 48_000)));
+  const snapshotCharLimit = maxSnapshotChars === Infinity ? Infinity
+    : Math.min(250_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 48_000)));
   const sourceRecords = new Map();
+  const sourceExcerpts = new Map();
   const excluded = [];
   const memories = [];
   if (requestedIds.length > memoryLimit) {
@@ -57,13 +59,14 @@ export function buildRelationSnapshot({
       excluded.push({ id, reason: memory.status !== "active" ? "not-active" : "not-direct-memory" });
       continue;
     }
-    const detail = repository.getMemoryDetail(normalizedAgentId, id);
-    const sources = detail.sources.filter(source => !sourceView || sourceView.sourceIds.has(source.id));
+    const sources = repository.listMemorySources(id).filter(source => !sourceView || sourceView.sourceIds.has(source.id));
     if (sources.length > sourceLimit) {
       throw memoryBudgetError(`Relation snapshot memory ${id} exceeds the complete ${sourceLimit}-source budget.`);
     }
     for (const source of sources) {
       if (!sourceRecords.has(source.id)) {
+        const excerpt = readCausalExcerpt(source);
+        if (excerpt) sourceExcerpts.set(source.id, excerpt);
         sourceRecords.set(source.id, {
           id: source.id,
           sourceKind: source.source_kind,
@@ -126,5 +129,6 @@ export function buildRelationSnapshot({
     throw memoryBudgetError(`Relation snapshot exceeds the ${snapshotCharLimit}-character privacy budget.`);
   }
   if (material) snapshot.sourceMaterial = material;
+  if (sourceExcerpts.size) snapshot.sourceExcerpts = sourceExcerpts;
   return snapshot;
 }

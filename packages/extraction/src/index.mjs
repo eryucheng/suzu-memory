@@ -3,15 +3,17 @@ export {
   fallbackStateAnalysisToProvisionalReview,
   loadLongTermExtractionSystemPrompt,
   resolveExtractedCandidateIdentity,
+  resolveExtractedCandidateStateTarget,
 } from "./archive.mjs";
 
 export {
   LONG_TERM_EXTRACTION_SCHEMA,
-  RETENTION_REASONS,
+  EXTRACTION_ENTITY_SCHEMA,
+  extractionEntityScope,
+  parseExtractionEntities,
   assignMemoryRefs,
   buildLongTermExtractionInput,
   detectExtractionLanguage,
-  isRetentionReasonCompatible,
   normalizeGeneratedLongTermExtraction,
   parseGeneratedLongTermExtraction,
 } from "./prompt.mjs";
@@ -21,7 +23,9 @@ export {
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
 
-export { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles } from './participant-identity.mjs';
+export { buildExtractionParticipants, resolveExtractionParticipant, resolveExtractionSpeaker, resolveExtractionActor } from './participant-identity.mjs';
 
-export { LONG_TERM_EXTRACTION_REPAIR_SCHEMA, normalizeGeneratedExtractionRepair, parseGeneratedExtractionRepair } from './repair.mjs';
+export { LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair } from './repair.mjs';
 export { createExtractionTimeValidator } from './temporal-evidence.mjs';
+
+export { createExtractionEntityBinder } from './entity-bindings.mjs';

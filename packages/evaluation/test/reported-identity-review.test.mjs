@@ -385,7 +385,7 @@ test("identity peer comparisons reject references outside the bounded snapshot",
   } finally { fixture.database.close(); }
 });
 
-test("identity retries analyze only the failed item while keeping accepted peers read-only", async t => {
+test("identity retries analyze only the failed item while keeping accepted peers read-only", async () => {
   const fixture = setup();
   try {
     const first = add(fixture, { id: "types", text: "I have a dog and a cat." });
@@ -419,7 +419,6 @@ test("identity retries analyze only the failed item while keeping accepted peers
     assert.deepEqual(calls, { fieldValue: 2, subjectAttribution: 1, familyBoundary: 1, timeRevision: 1, currentRelation: 1 });
     assert.deepEqual(snapshots.map(item => ({ ...item, memories: [...item.memories].sort() })), [{ memories: ["names","types"], peers: [], sources: 2 },
       { memories: ["names"], peers: ["types"], sources: 1 }]);
-    t.diagnostic(JSON.stringify({ analyzerCalls: calls, snapshots }));
   } finally { fixture.database.close(); }
 });
 
@@ -432,7 +431,7 @@ test("complementary wording does not combine facts from distinct fictional world
       { valueText: "a dog", valueRelations: [{ memoryId: second.memory.id, relation: "complementary" }] },
       { valueText: "Milo" },
     ]);
-    assert.equal(review(fixture).status, "review_required");
+    assert.equal(review(fixture).status, "blocked");
   } finally { fixture.database.close(); }
 });
 

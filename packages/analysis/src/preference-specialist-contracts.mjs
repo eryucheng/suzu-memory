@@ -280,7 +280,7 @@ export function parsePreferenceSpecialistGeneration(role, value, { maximumAnalys
   return { analyses };
 }
 
-export function buildPreferenceSpecialistGenerationInput(snapshot, analyzerRole) {
+export function buildPreferenceSpecialistGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Preference specialist generation requires a snapshot object.");
   }

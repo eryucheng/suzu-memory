@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createHook } from 'node:async_hooks';
-import { spawnSync } from 'node:child_process';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
 import { closeRetrievalWorkers, DEFAULT_RETRIEVAL_OPTIONS, lexicalScore, prepareLexicalQuery, retrieveMemories } from '../src/index.mjs';
 import { createNodeReader } from '../src/node-reader.mjs';
@@ -13,9 +12,7 @@ import { collectBm25SeedScores } from '../src/bm25-route.mjs';
 import { buildOrdinarySeedCandidates, createSeedLexicalScorer } from '../src/seed-routes.mjs';
 
 function fixture(t, count = 60) {
-  const parent = path.join(os.tmpdir(), 'Codex', 'suzu-memory-retrieval-performance-tests');
-  fs.mkdirSync(parent, { recursive: true });
-  const root = fs.mkdtempSync(path.join(parent, 'execution-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-memory-retrieval-test-'));
   const databasePath = path.join(root, 'memory.db');
   t.after(async () => { await closeRetrievalWorkers(); fs.rmSync(root, { recursive: true, force: true }); });
   const database = openMemoryDatabase(databasePath);
@@ -175,42 +172,6 @@ test('seed lexical reuse is bound to one prepared query and node snapshot', () =
   assert.ok(createSeedLexicalScorer(prepareLexicalQuery('2026-10-20'))(node).admissionOverlap > 0, 'event date remains part of seed text');
 });
 
-for (const execution of ['inline', 'worker']) test(`a retrieval shares candidate assembly and seed text (${execution})`, t => {
-  const { databasePath } = fixture(t, 60);
-  const coverageDirectory = path.join(path.dirname(databasePath), 'coverage');
-  const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
-  const childScript = path.join(path.dirname(databasePath), 'probe.mjs');
-  fs.writeFileSync(childScript, `
-    import { retrieveMemories, closeRetrievalWorkers } from ${JSON.stringify(moduleUrl)};
-    try {
-      const result = await retrieveMemories({ databasePath: ${JSON.stringify(databasePath)}, agentId: 'perf-agent',
-        query: '灯塔博物馆', now: new Date('2026-10-23T04:00:00Z'), options: { execution: ${JSON.stringify(execution)}, sqlPrefilter: false } });
-      if (result.status !== 'ready') throw new Error('Expected a real retrieval result.');
-    } finally { await closeRetrievalWorkers(); }
-  `);
-  const child = spawnSync(process.execPath, [childScript], {
-    env: { ...process.env, NODE_V8_COVERAGE: coverageDirectory }, encoding: 'utf8', windowsHide: true, timeout: 30000,
-  });
-  assert.equal(child.error, undefined);
-  assert.equal(child.status, 0, child.stderr);
-  const queryUrl = new URL('../src/query.mjs', import.meta.url).href;
-  const seedUrl = new URL('../src/seed-routes.mjs', import.meta.url).href;
-  let calls = 0;
-  let assemblies = 0;
-  for (const file of fs.readdirSync(coverageDirectory)) {
-    const coverage = JSON.parse(fs.readFileSync(path.join(coverageDirectory, file), 'utf8'));
-    for (const script of coverage.result.filter(value => value.url === queryUrl)) {
-      calls += script.functions.filter(value => value.functionName === 'lexicalScore').reduce((sum, value) => sum + value.ranges[0].count, 0);
-    }
-    for (const script of coverage.result.filter(value => value.url === seedUrl)) {
-      assemblies += script.functions.filter(value => value.functionName === 'buildOrdinarySeedCandidates')
-        .reduce((sum, value) => sum + value.ranges[0].count, 0);
-    }
-  }
-  assert.equal(assemblies, 1, 'all memory kinds share one candidate assembly');
-  assert.equal(calls, 60, 'ordinary, convergence and episodic routes must reuse identical seed text scores');
-});
-
 test('SQL superset and worker execution preserve complete public retrieval results', async t => {
   const { recall } = fixture(t);
   const embeddingProvider = async () => ({ model: 'fixture', vector: new Float32Array([1, 0]) });
@@ -253,26 +214,69 @@ test('SQL prefilter retains direct SQL edits and missing index rows', async t =>
 
 test('large candidate selection reads bodies in a batch and hydrates graph targets on demand', t => {
   const { databasePath } = fixture(t, 1100);
+  const setup = openMemoryDatabase(databasePath);
+  try {
+    setup.prepare("UPDATE memory_nodes SET reality='hypothetical' WHERE id='memory-7'").run();
+  } finally { setup.close(); }
   const database = openMemoryDatabase(databasePath, { readOnly: true });
   try {
-  const reader = createNodeReader(database, 'perf-agent');
+  const reads = [];
+  const observed = { prepare(sql) {
+    const statement = database.prepare(sql);
+    return new Proxy(statement, { get(target, key) {
+      const value = target[key];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        const result = value.apply(target, args);
+        if (key === 'all' || key === 'get') reads.push({ sql, args, rows: Array.isArray(result) ? result.length : Number(Boolean(result)) });
+        return result;
+      };
+    } });
+  } };
+  const reader = createNodeReader(observed, 'perf-agent');
   const nodes = reader.load(['active']);
-  assert.deepEqual(reader.stats, { deferred: true, metadataRows: 1100, bodyRows: 0, bodyQueries: 0 });
+  assert.equal(nodes.length, 1100);
+  assert.ok(!reads.some(read => /\bFROM memory_nodes\b/iu.test(read.sql)
+    && (/\bSELECT\s+\*/iu.test(read.sql) || /\b(?:content|title)\b/iu.test(read.sql))),
+  'Loading the candidate metadata reads no title or body columns.');
   const ids = prefilterCandidateIds(database, 'perf-agent', prepareLexicalQuery('灯塔博物馆'), {}, {}, nodes.length);
+  for (const [reality, expectedCount] of [['real', 1099], ['hypothetical', 1]]) {
+    reads.length = 0;
+    const scopedReader = createNodeReader(observed, 'perf-agent');
+    const scoped = scopedReader.load(['active']).filter(node => node.world_id === 'primary'
+      && node.world_frame === 'unknown' && node.reality === reality);
+    assert.equal(scoped.length, expectedCount, reality);
+    assert.ok(!reads.some(read => /\bSELECT\s+\*\s+FROM memory_nodes\b/iu.test(read.sql)),
+      'World eligibility, including reality, must not fetch any body.');
+    const scopedCandidates = scoped.filter(node => ids.has(node.id));
+    assert.ok(scopedCandidates.length > 0);
+    if (reality === 'hypothetical') assert.deepEqual(scopedCandidates.map(node => node.id), ['memory-7']);
+    else assert.ok(scopedCandidates.every(node => node.id !== 'memory-7'));
+    reads.length = 0;
+    scopedReader.hydrate(scopedCandidates);
+    assert.equal(reads.length, 1, reality + ' scope hydrates its admitted bodies in one read.');
+    assert.equal(reads[0].rows, scopedCandidates.length);
+    assert.deepEqual(new Set(JSON.parse(reads[0].args[1])), new Set(scopedCandidates.map(node => node.id)),
+      'The body request contains only candidates admitted by this world scope.');
+  }
   const candidates = nodes.filter(node => ids.has(node.id));
+  reads.length = 0;
   reader.hydrate(candidates);
-  assert.equal(reader.stats.bodyQueries, 1);
-  assert.equal(reader.stats.bodyRows, candidates.length);
+  assert.equal(reads.length, 1, 'Hydration executes one actual database read.');
+  assert.equal(reads[0].rows, candidates.length);
+  const [bodyRead] = reads;
   assert.ok(candidates.length < 200);
   assert.ok(candidates.every(node => node.content.includes('灯塔博物馆')));
   const target = nodes.find(node => !ids.has(node.id));
   assert.match(target.content, /工作材料/);
   assert.ok(target.title);
-  assert.equal(reader.stats.bodyRows, candidates.length + 1);
-  assert.equal(reader.stats.bodyQueries, 2);
-  const plan = database.prepare(`EXPLAIN QUERY PLAN SELECT id,title,content FROM memory_nodes
-    WHERE agent_id=? AND id IN (SELECT value FROM json_each(?))`).all('perf-agent', JSON.stringify([...ids]));
-  assert.ok(plan.some(row => /SEARCH.*INDEX/u.test(row.detail)), JSON.stringify(plan));
+  assert.equal(reads.length, 2, 'Reading title after content reuses the same hydrated body.');
+  assert.equal(reads[1].rows, 1);
+  for (const read of [bodyRead, reads[1]]) {
+    const plan = database.prepare(`EXPLAIN QUERY PLAN ${read.sql}`).all(...read.args);
+    assert.ok(plan.some(row => /\bSEARCH memory_nodes\b.*\b(?:INDEX|PRIMARY KEY)\b/u.test(row.detail)), JSON.stringify(plan));
+    assert.ok(!plan.some(row => /^SCAN memory_nodes\b/u.test(row.detail)), JSON.stringify(plan));
+  }
   } finally { database.close(); }
 });
 

@@ -1,3 +1,4 @@
+import { memoryWorldScope } from './ontology.mjs';
 import { createHash } from "node:crypto";
 
 import { ROOT_STATE_SCOPE_KEY } from "./state-scope.mjs";
@@ -82,6 +83,7 @@ function assertCanonicalReviewStillCurrent(repository, source, canonicalReview) 
     throw new Error("Established promotion requires a complete canonical review snapshot.");
   }
   const observations = repository.listStateEvidenceObservations(source.agent_id, {
+    world: source,
     stateFamily: "preference",
     subjectRole: source.subject_role,
     subjectKey: source.subject_key,
@@ -111,6 +113,7 @@ function preferencePromotionSource(repository, { agentId, sourceMemoryId }) {
     throw new Error("Established preference promotion requires the active inferred stable preference root.");
   }
   const current = repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(source),
     agentId: source.agent_id,
     subjectRole: source.subject_role,
     subjectKey: source.subject_key,
@@ -335,6 +338,7 @@ export function resolveStatePromotionProposal(repository, {
       throw new Error("State promotion source changed after review; review it again.");
     }
     const established = repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(source),
       agentId: normalizedAgentId,
       subjectRole: proposal.subject_role,
       subjectKey: proposal.subject_key,
@@ -357,7 +361,7 @@ export function resolveStatePromotionProposal(repository, {
       subjectRole: proposal.subject_role,
       subjectKey: proposal.subject_key,
       canonicalKey: proposal.canonical_key,
-      reality: source.reality,
+      ...memoryWorldScope(source),
       evidenceMode: "inferred",
       representationLayer: "established",
       stateFamily: proposal.state_family,
@@ -438,6 +442,7 @@ export function revokeStatePromotionProposal(repository, {
     const result = repository.getMemory(proposal.resultMemoryId);
     const source = repository.getMemory(proposal.sourceMemoryId);
     const currentEstablished = result && repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(result),
       agentId: normalizedAgentId,
       subjectRole: proposal.subject_role,
       subjectKey: proposal.subject_key,
@@ -447,6 +452,7 @@ export function revokeStatePromotionProposal(repository, {
       stateScopeKey: proposal.state_scope_key,
     });
     const currentInferred = repository.getCurrentCanonicalMemory({
+    ...memoryWorldScope(source),
       agentId: normalizedAgentId,
       subjectRole: proposal.subject_role,
       subjectKey: proposal.subject_key,
@@ -487,7 +493,7 @@ export function revokeStatePromotionProposal(repository, {
       subjectRole: source.subject_role,
       subjectKey: source.subject_key,
       canonicalKey: source.canonical_key,
-      reality: source.reality,
+      ...memoryWorldScope(source),
       evidenceMode: source.evidence_mode,
       representationLayer: source.representation_layer,
       stateFamily: source.state_family,

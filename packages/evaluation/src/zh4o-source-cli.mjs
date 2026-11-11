@@ -58,7 +58,7 @@ export function runMemoryZh4oSourceCli({
   return response;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     runMemoryZh4oSourceCli();
   } catch (error) {

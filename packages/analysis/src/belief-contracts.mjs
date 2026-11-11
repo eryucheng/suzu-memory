@@ -105,15 +105,14 @@ export const BELIEF_ANALYZERS = Object.freeze({
   currentRelation: Object.freeze({
     stateFamily: "belief",
     role: "current-relation",
-    schemaName: "memory-belief-current-relation-v1",
-    promptVersion: "belief-current-relation-v1",
+    schemaName: "memory-belief-current-relation-v2",
+    promptVersion: "belief-current-relation-v2",
     promptFile: "belief-current-relation-system-prompt.md",
-    schema: resultSchema(["currentStatePresent", "relation", "scopeOverlap"], {
-      currentStatePresent: { type: "boolean" },
+    schema: resultSchema(["relation", "scopeOverlap"], {
       relation: {
         type: "string",
         enum: [
-          "no_current_state", "equivalent", "supports", "narrows", "broadens",
+          "equivalent", "supports", "narrows", "broadens",
           "partial_exception", "same_scope_conflict", "retracts", "unrelated", "unknown",
         ],
       },
@@ -191,12 +190,8 @@ function parseRoleItem(role, value, index) {
     };
   }
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") {
-      throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    }
     return {
       ...common,
-      currentStatePresent: value.currentStatePresent,
       relation: requireEnum(value.relation, `analyses[${index}].relation`, [
         "no_current_state", "equivalent", "supports", "narrows", "broadens",
         "partial_exception", "same_scope_conflict", "retracts", "unrelated", "unknown",

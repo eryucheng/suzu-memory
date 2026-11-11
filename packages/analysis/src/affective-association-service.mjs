@@ -15,8 +15,10 @@ function batchId(args) { const raw = [args.agentId, args.subjectRole, args.subje
   args.triggerKey, args.triggerLabel, clean(args.canonicalKey).toLocaleLowerCase("en-US"), args.currentRepresentationLayer,
   unique(args.memoryIds).sort().join("\u001f")]
   .map(clean).join("\u001e"); return `affective-analysis-${createHash("sha256").update(raw).digest("hex").slice(0, 24)}`; }
-function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer) {
+function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer, world) {
+  if (!world) return null;
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId,
     subjectRole,
     subjectKey,
@@ -45,7 +47,6 @@ function enforce(role, item, snapshot) {
   }
   if (role === "current-relation") {
     const exists = Boolean(snapshot.currentState);
-    if (item.currentStatePresent !== exists) throw new Error("Affective current-state presence does not match the read-only snapshot.");
     if (exists && item.relation === "no_current_state") throw new Error("Affective relation omitted current state.");
     if (!exists && item.relation !== "no_current_state") throw new Error("Affective relation invented current state.");
   }
@@ -165,11 +166,12 @@ export async function evaluateAffectiveAssociationEvidence({ repository, agentId
     triggerKey, triggerLabel, canonicalKey, currentRepresentationLayer, memoryIds: normalizedIds });
   const base = buildPreferenceEvidenceSnapshot({ repository, agentId, subjectRole, subjectKey, canonicalKey,
     memoryIds: normalizedIds, ...snapshotOptions });
+  const world = base.world;
   const snapshot = { ...base, agentId: clean(agentId), target: { ...base.target, stateFamily: "affective_association",
     associationLabel: clean(associationLabel), currentRepresentationLayer: clean(currentRepresentationLayer) },
     trigger: { subjectRole: trigger.triggerRole, subjectKey: trigger.triggerKey,
     label: trigger.triggerLabel }, currentState: currentView(repository, clean(agentId), base.target.subjectRole,
-    base.target.subjectKey, base.target.canonicalKey, clean(currentRepresentationLayer)),
+    base.target.subjectKey, base.target.canonicalKey, clean(currentRepresentationLayer), world),
     inputPolicy: { ...base.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
       modelCanChooseStateAction: false, currentMoodCannotRewriteMemory: true, activationBiasAllowed: false } };

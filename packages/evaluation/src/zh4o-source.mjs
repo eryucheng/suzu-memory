@@ -266,7 +266,9 @@ export function writeZh4oDatasetFromMoomSource({
   const built = buildZh4oDatasetFromMoomSource({ sourceRoot });
   const resolvedManifestPath = clean(manifestPath)
     ? path.resolve(manifestPath)
-    : resolvedOutputPath.replace(/\.json$/iu, ".source-manifest.json");
+    : resolvedOutputPath.replace(/(?:\.json)?$/iu, ".source-manifest.json");
+  if ((process.platform === 'win32' ? resolvedOutputPath.toLowerCase() === resolvedManifestPath.toLowerCase()
+    : resolvedOutputPath === resolvedManifestPath)) throw new Error('Dataset and source manifest need different output paths.');
   fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
   fs.mkdirSync(path.dirname(resolvedManifestPath), { recursive: true });
   fs.writeFileSync(resolvedOutputPath, JSON.stringify(built.dataset, null, 2) + "\n", "utf8");

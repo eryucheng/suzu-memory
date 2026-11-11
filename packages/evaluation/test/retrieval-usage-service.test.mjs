@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 import {
   MemoryRepository,
@@ -112,37 +113,40 @@ test("keeps uncertain or not-used classifications out of negative feedback", asy
   value.database.close();
 });
 
-test("keeps malformed usage analysis pending and continues a bounded batch", async () => {
+for (const failure of ['malformed-output', 'provider-error']) test(`keeps ${failure} usage analysis pending and charges each bounded-batch response once`, async () => {
   const first = fixture({ suffix: "1" });
   const second = fixture({ suffix: "2", database: first.database, repository: first.repository });
-  const result = await processPendingRetrievalUsageRequests({
+  const charges = [];
+  let calls = 0;
+  const result = await withUsageRecorder(charge => charges.push(charge), () => processPendingRetrievalUsageRequests({
     repository: first.repository,
     agentId: "agent-test",
     maxRequests: 2,
+    usageLedgerPath: 'retrieval-usage-owner-unused.jsonl',
     generator: async ({ input }) => {
       const snapshot = JSON.parse(input);
+      const receipt = { model: 'test-model', requestId: `usage-${++calls}`, usage: { prompt_tokens: 7 }, metadata: { provider: 'test' } };
       if (snapshot.trace.id === first.trace.id) {
+        if (failure === 'provider-error') throw Object.assign(new Error('completed usage analysis is invalid'), receipt);
         return {
+          ...receipt,
           output: { analyses: [{
             memoryId: first.ids[0],
             usage: "used",
             rationale: "故意漏掉另一条。",
           }] },
-          model: "test-model",
-          metadata: { provider: "test" },
         };
       }
       return {
+        ...receipt,
         output: { analyses: snapshot.trace.selectedMemoryIds.map((memoryId) => ({
           memoryId,
           usage: "uncertain",
           rationale: "无法可靠确认。",
         })) },
-        model: "test-model",
-        metadata: { provider: "test" },
       };
     },
-  });
+  }));
   assert.equal(result.status, "partial-failure");
   assert.equal(result.counts["retryable-failure"], 1);
   assert.equal(result.counts.completed, 1);
@@ -151,5 +155,7 @@ test("keeps malformed usage analysis pending and continues a bounded batch", asy
   assert.equal(Number(first.database.prepare(`
     SELECT COUNT(*) AS count FROM memory_retrieval_usage_analysis_runs
   `).get().count), 2);
+  assert.deepEqual(charges.map(charge => charge.requestId), ['usage-1', 'usage-2']);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), 14);
   first.database.close();
 });

@@ -9,7 +9,7 @@ import {
   companionMessagesFromEvents,
   generateCompanionEventBatch,
   extractionRepairFailure,
-  recordCompanionEventGenerationUsage,
+  recordingCompanionEventGenerator,
 } from "./processing-stages.mjs";
 
 function clean(value) {
@@ -181,8 +181,7 @@ export async function processPendingCompanionEvents({
     const selection = await planReplyChunk({
       ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...chunkPolicy, maximumCoreMessages, flush: true,
       pending: claimed.events, previous: previousContextEvents,
-      resolveReply: chunkPolicy?.resolveReply || (row => row.actor_role === 'companion'
-        ? { id: row.id, complete: true, lastEventId: logicalArchiveEventId(row) } : null),
+      resolveReply: chunkPolicy?.resolveReply,
       measure: selection => {
         const { request } = buildCompanionExtractionRequest({ ...selection, identity: normalizedIdentity, systemPrompt, timeZone });
         return request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100;
@@ -231,7 +230,7 @@ export async function processPendingCompanionEvents({
     }));
   }
   let terminalGenerationFailure = null;
-  let failureUsageWarning = '';
+  const usageWarnings = [];
   try {
     generated = await generateCompanionEventBatch({
       events: claimed.events,
@@ -239,7 +238,8 @@ export async function processPendingCompanionEvents({
       continuationGuidanceEvents,
       archiveWindows,
       identity: normalizedIdentity,
-      generator,
+      generator: recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
+        agentId, batchId: claimed.batch.id, warnings: usageWarnings }),
       memoriesOverride,
       systemPrompt,
       timeZone,
@@ -248,16 +248,11 @@ export async function processPendingCompanionEvents({
   } catch (error) {
     assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
-    if (error?.usage) {
-      failureUsageWarning = await recordCompanionEventGenerationUsage({ usageLedgerPath, executionTime,
-        agentId, batchId: claimed.batch.id, generation: { ...error,
-          metadata: { ...error.metadata, failed: true, errorCode: error.code || '' } } });
-    }
     if (error?.code === 'MAX_TOKENS') {
       const count = companionMessagesFromEvents(claimed.events, normalizedIdentity).length;
       if (count > 1) {
         const smaller = await processSmallerBatch(Math.max(1, Math.floor(count / 2)), error.message);
-        if (smaller) return { ...smaller, warnings: [...(smaller.warnings || []), ...(failureUsageWarning ? [failureUsageWarning] : [])] };
+        if (smaller) return { ...smaller, warnings: [...(smaller.warnings || []), ...usageWarnings] };
       }
     }
     const transportAttempts = error?.code === "MEMORY_PROVIDER_TRANSPORT_EXHAUSTED"
@@ -372,17 +367,7 @@ export async function processPendingCompanionEvents({
     maintenanceTasks: [],
     warnings: [],
   };
-  const usageWarning = await recordCompanionEventGenerationUsage({
-    usageLedgerPath,
-    executionTime,
-    agentId,
-    batchId: claimed.batch.id,
-    generation: generated.generation,
-  });
-  const warnings = usageWarning
-    ? [...postProcessing.warnings, usageWarning]
-    : postProcessing.warnings;
-  if (failureUsageWarning) warnings.push(failureUsageWarning);
+  const warnings = [...postProcessing.warnings, ...usageWarnings];
   if (terminalGenerationFailure) {
     warnings.push(
       `Long-term extraction was deferred to human review after ${terminalGenerationFailure.attempts} failed attempts: ${terminalGenerationFailure.errorMessage}`,
@@ -434,9 +419,6 @@ export async function processPendingCompanionEvents({
       ),
       unresolvedCandidateCount: generated.generation.metadata?.unresolvedCandidateCount ?? null,
       candidateValidationIncomplete: Boolean(generated.generation.metadata?.candidateValidationIncomplete),
-      knownParticipantRoleCorrectionCount: Number(
-        generated.generation.metadata?.knownParticipantRoleCorrectionCount || 0,
-      ),
     },
     memoriesStored: archive.memoriesStored,
     memoriesForReview: archive.memoriesForReview,

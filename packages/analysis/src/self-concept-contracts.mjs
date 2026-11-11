@@ -54,11 +54,10 @@ export const SELF_CONCEPT_ANALYZERS = Object.freeze({
   }),
   currentRelation: Object.freeze({
     stateFamily: "self_concept", role: "current-relation",
-    schemaName: "memory-self-concept-current-relation-v1", promptVersion: "self-concept-current-relation-v1",
+    schemaName: "memory-self-concept-current-relation-v2", promptVersion: "self-concept-current-relation-v2",
     promptFile: "self-concept-current-relation-system-prompt.md",
-    schema: resultSchema(["currentStatePresent", "relation", "scopeOverlap"], {
-      currentStatePresent: { type: "boolean" },
-      relation: { type: "string", enum: ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "replaces", "corrects_attribution", "unrelated", "unknown"] },
+    schema: resultSchema(["relation", "scopeOverlap"], {
+      relation: { type: "string", enum: ["equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "replaces", "corrects_attribution", "unrelated", "unknown"] },
       scopeOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
     }),
   }),
@@ -94,9 +93,7 @@ function parseRoleItem(role, value, index) {
     stateTime: requireEnum(value.stateTime, `analyses[${index}].stateTime`, ["current", "historical", "temporary", "future", "unknown"]),
     revisionCue: requireEnum(value.revisionCue, `analyses[${index}].revisionCue`, ["changed", "clarified", "never_held", "none", "unknown"]) };
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    return { ...common, currentStatePresent: value.currentStatePresent,
-      relation: requireEnum(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "replaces", "corrects_attribution", "unrelated", "unknown"]),
+    return { ...common, relation: requireEnum(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "replaces", "corrects_attribution", "unrelated", "unknown"]),
       scopeOverlap: requireEnum(value.scopeOverlap, `analyses[${index}].scopeOverlap`, ["exact", "partial", "none", "unknown"]) };
   }
   throw new Error(`Unknown self-concept analyzer role: ${role || "(empty)"}.`);

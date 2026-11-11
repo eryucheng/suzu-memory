@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import {
+  ENTITY_KINDS,
   DIRECT_INGESTION_MEMORY_KINDS,
   STATE_IDENTITY_FIELDS,
-  STATE_TARGET_OBJECT_ROLES,
   RELATIONSHIP_DIMENSIONS,
   DEFAULT_MEMORY_TIME_ZONE,
   EVIDENCE_MODES,
@@ -10,144 +11,64 @@ import {
   MEMORY_STATE_FAMILY_DEFINITIONS,
   REALITY_STATES,
   REVISION_ACTIONS,
-  SUBJECT_ROLES,
   TEMPORAL_STATES,
   isMemoryKindAllowedForStateFamily,
   isStatefulMemoryKind,
   timestampInTimeZone,
 } from "@suzu-memory/core";
-import { buildExtractionParticipants } from './participant-identity.mjs';
+import { buildExtractionParticipants, resolveExtractionActor, resolveExtractionSpeaker } from './participant-identity.mjs';
 import { createExtractionTimeValidator } from './temporal-evidence.mjs';
 
-export const RETENTION_REASONS = Object.freeze([
-  "identity",
-  "episodic_event",
-  "significant_event",
-  "state_change",
-  "relationship",
-  "commitment",
-  "open_loop",
-  "explicit_belief",
-  "explicit_preference",
-  "agent_reflection",
-]);
-
-const RETENTION_KINDS = Object.freeze({
-  identity: Object.freeze(["fact"]),
-  episodic_event: Object.freeze(["event"]),
-  significant_event: Object.freeze(["event"]),
-  state_change: Object.freeze(["fact", "belief_state", "preference", "relationship"]),
-  relationship: Object.freeze(["relationship"]),
-  commitment: Object.freeze(["commitment"]),
-  open_loop: Object.freeze(["plan", "open_loop"]),
-  explicit_belief: Object.freeze(["belief_state"]),
-  explicit_preference: Object.freeze(["preference"]),
-  agent_reflection: Object.freeze(["reflection"]),
-});
-
-export function isRetentionReasonCompatible(kind, retentionReason) {
-  return Boolean(RETENTION_KINDS[retentionReason]?.includes(kind));
-}
-
-const GENERATED_ACTOR_ROLES = MEMORY_ACTOR_ROLES.filter((role) => ![
-  "subject",
-  "speaker",
-].includes(role));
-
-const GENERATED_ACTOR_IDENTITIES = SUBJECT_ROLES.filter((role) => [
-  "user",
-  "agent",
-  "other",
-].includes(role));
-
-const GENERATED_EVIDENCE_MODES = EVIDENCE_MODES.filter((mode) => [
-  "explicit",
-  "observed",
-  "inferred",
-].includes(mode));
-
-const personRole = { type: "string", enum: ["user", "agent", "other"] };
-const objectRole = { type: "string", enum: STATE_TARGET_OBJECT_ROLES };
-const personName = { type: "string", minLength: 1 };
-const GENERATED_TARGET_PROPERTIES = Object.freeze({
+const GENERATED_ACTOR_ROLES = MEMORY_ACTOR_ROLES.filter(role => !['subject', 'speaker'].includes(role));
+const GENERATED_EVIDENCE_MODES = EVIDENCE_MODES.filter(mode => ['explicit', 'observed', 'inferred'].includes(mode));
+const objectSchema = properties => ({ type: 'object', additionalProperties: false,
+  properties, required: Object.keys(properties) });
+const text = { type: 'string', minLength: 1 };
+const stateKey = { ...text, description: '按状态的维度、对象和适用范围命名的简短稳定键。' };
+const stateLabel = { ...text, description: '可独立更新的状态命题或对象标签。' };
+const score = { type: 'number', minimum: 0, maximum: 1 };
+const person = { type: 'object', anyOf: [
+  objectSchema({ ref: { type: 'string', pattern: '^[PE][1-9][0-9]*$' } }),
+  objectSchema({ name: text }),
+] };
+const objectTarget = { type: 'object', anyOf: [...person.anyOf, objectSchema({ world: text })] };
+const subject = { type: 'object', anyOf: [...person.anyOf, objectSchema({
+  scope: { type: 'string', enum: ['shared', 'world', 'unknown'] }, name: { type: 'string' },
+})], description: '已知人物使用 P 引用，新声明人物使用 E 引用；共同经历、世界与无法确定的主体使用 scope。' };
+const TARGET_PROPERTIES = {
   identity: {
-    identityField: { type: "string", enum: STATE_IDENTITY_FIELDS,
-      description: "主体本人的身份维度；relationship_status 表示主体的婚恋状态。" },
-    fieldCardinality: { type: "string", enum: ["single", "multi_item", "sequence"],
-      description: "single=同一时间和范围内的单值，婚恋状态使用此值；multi_item=可同时成立的多项；sequence=按时间排列的经历。" },
+    identityField: { type: 'string', enum: STATE_IDENTITY_FIELDS,
+      description: '主体本人的身份维度；relationship_status 表示婚恋状态。' },
+    fieldCardinality: { type: 'string', enum: ['single', 'multi_item', 'sequence'],
+      description: 'single=同一时间和范围内单值，婚恋状态使用此值；multi_item=可同时成立多项；sequence=按时间排列的经历。' },
   },
-  belief: {
-    objectRole,
-    objectName: personName,
-  },
-  relationship: { counterpartRole: personRole, counterpartName: personName,
-    relationshipDimension: { type: "string", enum: RELATIONSHIP_DIMENSIONS } },
-  affective_association: { triggerRole: objectRole, triggerName: personName },
-});
-const TARGET_SPEC_FAMILIES = new Set(Object.keys(GENERATED_TARGET_PROPERTIES));
-const kindsForFamily = family => DIRECT_INGESTION_MEMORY_KINDS.filter(kind => family === 'not_applicable'
-  ? !isStatefulMemoryKind(kind) : isMemoryKindAllowedForStateFamily(kind, family));
-
-function branchProperties(kinds, families) {
-  const reasons = Object.entries(RETENTION_KINDS)
-    .filter(([, compatibleKinds]) => kinds.some(kind => compatibleKinds.includes(kind)));
-  return {
-    kind: { type: 'string', enum: kinds },
-    stateFamily: { type: 'string', enum: families,
-      description: families.map(family => `${family}=${family === 'not_applicable'
-        ? '具体经历和已表达的反思' : MEMORY_STATE_FAMILY_DEFINITIONS[family].description}`).join('；') },
-    retentionReason: { type: 'string', enum: reasons.map(([reason]) => reason),
-      description: reasons.map(([reason, compatibleKinds]) =>
-        `${reason}: ${compatibleKinds.filter(kind => kinds.includes(kind)).join(', ')}`).join('; ') },
-  };
-}
-
-const targetlessFamilies = new Map();
-for (const family of ['not_applicable', ...MEMORY_STATE_FAMILIES.filter(family => !TARGET_SPEC_FAMILIES.has(family))]) {
-  const key = kindsForFamily(family).join(',');
-  targetlessFamilies.set(key, [...(targetlessFamilies.get(key) || []), family]);
-}
-const targetAlternatives = [
-  ...Object.entries(GENERATED_TARGET_PROPERTIES).map(([family, properties]) => ({
-    type: "object",
-    properties: {
-      ...branchProperties(kindsForFamily(family), [family]),
-      stateTarget: { type: "object", additionalProperties: false, properties, required: Object.keys(properties) },
-    },
-    required: ["stateTarget"],
+  belief: { object: objectTarget },
+  relationship: { counterpart: person, dimension: { type: 'string', enum: RELATIONSHIP_DIMENSIONS } },
+  affective_association: { trigger: objectTarget },
+};
+// The core ontology owns legal kind/family combinations. The wire category
+// selects one combination; storage identity remains with state matching.
+const CATEGORIES = Object.fromEntries([
+  ...DIRECT_INGESTION_MEMORY_KINDS.filter(kind => !isStatefulMemoryKind(kind))
+    .map(kind => [kind, { kind, stateFamily: 'not_applicable' }]),
+  ...MEMORY_STATE_FAMILIES.flatMap(stateFamily => DIRECT_INGESTION_MEMORY_KINDS
+    .filter(kind => isMemoryKindAllowedForStateFamily(kind, stateFamily))
+    .map(kind => [stateFamily === 'goal' ? kind : stateFamily, { kind, stateFamily }])),
+]);
+const categoryField = categories => ({ type: 'string', enum: categories,
+  description: categories.map(category => `${category}=${category === 'event' ? '具体经历'
+    : category === 'reflection' ? '已经表达的反思' : category === 'plan' ? '未来打算'
+      : category === 'commitment' ? '已答应的责任' : category === 'open_loop' ? '尚待跟进的事项'
+        : MEMORY_STATE_FAMILY_DEFINITIONS[CATEGORIES[category].stateFamily].description}`).join('；') });
+const classificationBranches = [
+  objectSchema({ category: categoryField(['event']) }),
+  objectSchema({ category: categoryField(['reflection']), key: { type: 'string', description: '同一反思的稳定键；新反思可留空。' } }),
+  ...Object.entries(TARGET_PROPERTIES).map(([category, properties]) => objectSchema({
+    category: categoryField([category]), key: stateKey, label: stateLabel, target: objectSchema(properties),
   })),
-  ...[...targetlessFamilies].map(([kinds, families]) => ({ type: "object", properties: {
-    ...branchProperties(kinds.split(','), families),
-    stateTarget: false,
-  } })),
+  objectSchema({ category: categoryField(Object.keys(CATEGORIES).filter(category =>
+    isStatefulMemoryKind(CATEGORIES[category].kind) && !TARGET_PROPERTIES[category])), key: stateKey, label: stateLabel }),
 ];
-
-function normalizedGeneratedStateTarget(candidate, index) {
-  const properties = GENERATED_TARGET_PROPERTIES[candidate.stateFamily];
-  if (!properties) {
-    if (Object.hasOwn(candidate, "stateTarget")) throw new Error(`memories[${index}].stateTarget 不适用于 ${candidate.stateFamily}，应省略。`);
-    return undefined;
-  }
-  const value = candidate.stateTarget;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`memories[${index}].stateTarget 必须是 ${candidate.stateFamily} 的目标对象。`);
-  }
-  const expected = Object.keys(properties).filter(key => key !== "relationshipDimension"
-    || candidate.stateFamily !== "relationship" || Object.hasOwn(value, key));
-  const missing = expected.filter(key => !Object.hasOwn(value, key));
-  const unexpected = Object.keys(value).filter(key => !Object.hasOwn(properties, key));
-  if (missing.length || unexpected.length) throw new Error(
-    `memories[${index}].stateTarget (${candidate.stateFamily}) 字段不符合约定；缺少：${missing.join(", ") || "无"}；不适用：${unexpected.join(", ") || "无"}。`,
-  );
-  return Object.fromEntries(expected.map(key => {
-    const field = properties[key];
-    const text = clean(value[key]);
-    if (typeof value[key] !== "string" || (field.enum ? !field.enum.includes(text) : !text)) {
-      throw new Error(`memories[${index}].stateTarget.${key} 无效。`);
-    }
-    return [key, text];
-  }));
-}
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -161,12 +82,7 @@ function normalizeExtractionLanguage(value) {
   return "";
 }
 
-/**
- * Detects only the language policy relevant to this product's current
- * Chinese/English contract. It deliberately ignores punctuation, digits, and
- * names, so a Chinese sentence mentioning "AI" remains Chinese rather than
- * being unnecessarily treated as mixed.
- */
+/** Infer the Chinese/English output policy from Han and Latin letter counts. */
 export function detectExtractionLanguage(value) {
   const text = String(value || "");
   const han = (text.match(/\p{Script=Han}/gu) || []).length;
@@ -175,9 +91,7 @@ export function detectExtractionLanguage(value) {
   if (!han) return "en";
   if (!latin) return "zh";
   const smallerShare = Math.min(han, latin) / (han + latin);
-  // Keep short embedded terms such as "AI" inside a Chinese window, while
-  // recognising genuinely bilingual sentences as mixed rather than forcing
-  // them into either output language.
+  // Treat substantial text in both scripts as mixed.
   return smallerShare >= 0.25 ? "mixed" : han > latin ? "zh" : "en";
 }
 
@@ -219,141 +133,64 @@ export function assignMemoryRefs(messages = [], start = 1) {
 
 function formatMessages(messages, {
   includeRefs = false,
-  limit = Number.POSITIVE_INFINITY,
   language = "unknown",
   participants = [],
   timeZone = DEFAULT_MEMORY_TIME_ZONE,
 } = {}) {
-  return messages.slice(0, limit).map((message) => {
+  return messages.map((message) => {
     const source = message.eventSource;
-    const matches = source ? participants.filter(participant => participant.actorKey === source.sender.id) : [];
-    const participant = matches.length === 1 ? matches[0]
-      : matches.find(candidate => candidate.actorRole === message.speakerIdentity?.actorRole);
+    const participant = resolveExtractionSpeaker(message, participants);
     const context = source ? { spaceId: source.spaceId, spaceKind: source.topology?.spaceKind || source.topology?.kind } : null;
     return `${includeRefs ? `[${message.memoryRef}] ` : ""}[${timestampInTimeZone(message.timestamp, timeZone) || message.timestamp || ""}] ${
       message.worldFrame ? `[world=${message.worldFrame}:${message.worldId || "primary"}] ` : ""
     }${language === "mixed" && message.sourceLanguage && message.sourceLanguage !== "unknown"
       ? `[source-language=${message.sourceLanguage}] ` : ""
-    }${context ? `[来源 ${JSON.stringify(context)}] ${participant?.name || source.sender.name || source.sender.kind}` : roleLabel(message.role, language)}${
+    }${context ? `[来源 ${JSON.stringify(context)}] ` : ""}${participant ? `${participant.ref} ${participant.displayName}` : source?.sender.name || roleLabel(message.role, language)}${
       source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${timestampInTimeZone(message.knownAt, timeZone) || message.knownAt}]` : ''
     }：${message.text}`;
   }).join("\n\n");
 }
 
-export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    memories: {
-      type: "array",
-      description: "本批对话中提取的记忆候选；没有时返回空数组。",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          kind: {
-            type: "string",
-            enum: DIRECT_INGESTION_MEMORY_KINDS,
-            description: "event=具体经历；reflection=已表达的反思；plan=未来打算；commitment=已答应的责任；open_loop=尚待跟进的事项。人物事实、认识、喜好和关系按对应分析家族选择兼容类型。",
-          },
-          title: { type: "string", description: "简短具体的标题。" },
-          content: { type: "string", description: "可独立理解的记忆正文；文字字段遵循窗口指定的输出语言。" },
-          subjectRole: {
-            type: "string",
-            enum: SUBJECT_ROLES,
-            description: "使用输入人物表中的角色：agent 为记忆拥有者，user 为实际出现的已知人类用户，other 为其他 Agent 或人物；shared 为多个实际主体的共同事件，unknown 为无法确定。",
-          },
-          subjectName: { type: "string", description: "记忆主体的名称。" },
-          actorRoles: {
-            type: "array",
-            description: "标记所述事情中有直接证据的人物角色；无法确定的条目省略。",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                role: { type: "string", enum: GENERATED_ACTOR_ROLES,
-                  description: "experiencer=经历者；observer=直接观察事件者；participant=参与事情的行动或决策者；belief_holder=观念持有者；preference_holder=偏好持有者。" },
-                actorRole: { type: "string", enum: GENERATED_ACTOR_IDENTITIES },
-                actorName: { type: "string" },
-                confidence: { type: "number", minimum: 0, maximum: 1 },
-              },
-              required: ["role", "actorRole", "actorName", "confidence"],
-            },
-          },
-          canonicalKey: {
-            type: "string",
-            description: "同一可变事实使用同一个简短稳定键；事件和反思可为空字符串。",
-          },
-          stateFamily: {
-            type: "string",
-            enum: ["not_applicable", ...MEMORY_STATE_FAMILIES],
-          },
-          stateLabel: {
-            type: "string",
-            description: "人物状态的可读目标标签；事件和反思使用空字符串。",
-          },
-          stateTarget: {
-            type: "object",
-            description: `状态对应的对象或身份维度，仅 ${[...TARGET_SPEC_FAMILIES].join('、')} 使用；其他分类省略整个字段。`,
-          },
-          reality: { type: "string", enum: REALITY_STATES },
-          evidenceMode: {
-            type: "string",
-            enum: GENERATED_EVIDENCE_MODES,
-            description: "explicit=原文明示支持的事实、感受、看法或计划；observed=直接观察的结果；inferred=基于行为或其他证据形成的可撤销推断。转述保留实际陈述者与被描述主体的区别。",
-          },
-          temporalState: { type: "string", enum: TEMPORAL_STATES },
-          revisionAction: { type: "string", enum: REVISION_ACTIONS },
-          retentionReason: { type: "string", enum: RETENTION_REASONS },
-          eventDate: {
-            type: "string",
-            description: "有效 YYYY-MM-DD；无法可靠确定时为空字符串。",
-          },
-          eventStart: {
-            type: "string",
-            description: "有直接证据的 ISO 8601 发生时间；只能确定日期或无法确定时为空字符串。",
-          },
-          eventEnd: {
-            type: "string",
-            description: "有直接证据的 ISO 8601 结束时间；未结束或无法确定时为空字符串。",
-          },
-          confidence: { type: "number", minimum: 0, maximum: 1, description: "证据可靠程度。" },
-          importance: { type: "number", minimum: 0, maximum: 1, description: "对记忆拥有者的重要程度。" },
-          sourceRefs: {
-            type: "array",
-            description: "支持本条内容的正文消息编号；多条消息共同提供证据时全部引用。",
-            minItems: 1,
-            items: { type: "string", pattern: "^M[0-9]{4}$" },
-          },
-        },
-        anyOf: targetAlternatives,
-        required: [
-          "kind",
-          "title",
-          "content",
-          "subjectRole",
-          "subjectName",
-          "actorRoles",
-          "canonicalKey",
-          "stateFamily",
-          "stateLabel",
-          "reality",
-          "evidenceMode",
-          "temporalState",
-          "revisionAction",
-          "retentionReason",
-          "eventDate",
-          "eventStart",
-          "eventEnd",
-          "confidence",
-          "importance",
-          "sourceRefs",
-        ],
-      },
-    },
-  },
-  required: ["memories"],
+export const EXTRACTION_ENTITY_SCHEMA = objectSchema({
+  ref: { type: 'string', pattern: '^E[1-9][0-9]*$' }, kind: { type: 'string', enum: ENTITY_KINDS }, name: text,
+  aliases: { type: 'array', items: text, description: '原文明确提供的其他名称。' },
 });
+const entityArray = { type: ['array', 'null'], items: EXTRACTION_ENTITY_SCHEMA,
+  description: '本批可持续指代的人物、地点、组织、物品等；同一对象声明一次，记忆用 E 编号引用。' };
+
+export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({ ...objectSchema({
+  entities: entityArray,
+  causalExcerpts: { type: ['array', 'null'], items: objectSchema({
+    sourceRef: { type: 'string', pattern: '^M[0-9]{4}$' },
+    start: { type: 'string', minLength: 1 }, end: { type: 'string', minLength: 1 },
+  }) },
+  memories: { type: 'array', description: '本批记忆候选；没有时返回空数组。', items: { ...objectSchema({
+    title: { type: 'string', description: '简短具体的标题。' },
+    content: { ...text, description: '可独立理解的正文；文字字段遵循窗口指定的输出语言。' },
+    classification: { type: 'object', anyOf: classificationBranches },
+    entityRefs: { type: ['array', 'null'], items: { type: 'string', pattern: '^E[1-9][0-9]*$' }, description: '本条明确涉及的实体编号。' },
+    subject,
+    actors: { type: 'array', description: '有直接证据的人物角色；无法确定的条目省略。', items: objectSchema({
+      role: { type: 'string', enum: GENERATED_ACTOR_ROLES,
+        description: 'experiencer=经历者；observer=直接观察者；participant=行动或决策参与者；belief_holder=观念持有者；preference_holder=偏好持有者。' },
+      person, confidence: score,
+    }) },
+    reality: { type: 'string', enum: REALITY_STATES },
+    evidenceMode: { type: 'string', enum: GENERATED_EVIDENCE_MODES,
+      description: 'explicit=原文明示的事实、感受、看法或计划；observed=直接观察结果；inferred=基于证据的可撤销推断。' },
+    temporalState: { type: 'string', enum: TEMPORAL_STATES },
+    revisionAction: { type: 'string', enum: REVISION_ACTIONS },
+    time: { type: ['object', 'null'], anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: [], properties: {
+      date: { type: ['string', 'null'], description: '已知事发日 YYYY-MM-DD。' },
+      start: { type: ['string', 'null'], description: '已知发生时刻，带 UTC 偏移的 ISO 8601。' },
+      end: { type: ['string', 'null'], description: '已知结束时刻，带 UTC 偏移的 ISO 8601。' },
+    } }], description: '未知为 null；已知时填写日期或时刻，省略未知部分。' },
+    confidence: { ...score, description: '证据可靠程度。' },
+    importance: { ...score, description: '对记忆拥有者的重要程度。' },
+    sourceRefs: { type: 'array', minItems: 1, description: '支持内容的全部正文消息编号。',
+      items: { type: 'string', pattern: '^M[0-9]{4}$' } },
+  }), required: ['title', 'content', 'classification', 'subject', 'actors', 'reality', 'evidenceMode', 'temporalState', 'revisionAction', 'time', 'confidence', 'importance', 'sourceRefs'] } },
+}), required: ['memories'] });
 
 export function buildLongTermExtractionInput({
   messages = [],
@@ -407,10 +244,10 @@ export function buildLongTermExtractionInput({
   const participants = buildExtractionParticipants(allMessages, { companionName: memoryOwner, primaryUserName: userName, ...identity });
   const owner = participants.find(participant => participant.actorRole === 'agent');
   const parts = [
-    `记忆拥有者：${owner?.name || memoryOwner}`,
+    `记忆拥有者：${owner ? `${owner.ref} ${owner.displayName}` : memoryOwner}`,
     `时间基准时区：${timeZone}。消息时间按该时区显示并带 UTC 偏移；相对日期以对应消息的当地日期为准。`,
     '【人物表】',
-    JSON.stringify(participants.map(({ actorRole, name }) => ({ role: actorRole, name }))),
+    JSON.stringify(participants.map(({ ref, displayName }) => ({ ref, name: displayName }))),
   ];
   for (const window of standardizedWindows) {
     const previousContext = formatMessages(window.previousContextMessages, {
@@ -483,203 +320,172 @@ function validCalendarDate(value) {
     && parsed.getUTCDate() === day;
 }
 
-// A null target carries no information for targetless families. Keep real
-// target objects and all other fields intact for the normal strict checks.
-export function normalizeGeneratedLongTermExtraction(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.memories)) return value;
-  return { ...value, memories: value.memories.map(candidate => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
-      || candidate.stateTarget !== null || TARGET_SPEC_FAMILIES.has(candidate.stateFamily)) return candidate;
-    const normalized = { ...candidate };
-    delete normalized.stateTarget;
+function exactFields(value, required, optional, path) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} 必须是对象。`);
+  const missing = required.filter(key => !Object.hasOwn(value, key));
+  const unexpected = Object.keys(value).filter(key => !required.includes(key) && !optional.includes(key));
+  if (missing.length || unexpected.length) throw new Error(`${path} 字段不符合约定；缺少：${missing.join(', ') || '无'}；不适用：${unexpected.join(', ') || '无'}。`);
+}
+
+function validatePerson(value, path, { scope = false, world = false } = {}) {
+  exactFields(value, [], ['ref', 'name', ...(scope ? ['scope'] : []), ...(world ? ['world'] : [])], path);
+  if (Object.hasOwn(value, 'ref') && Object.keys(value).length === 1 && typeof value.ref === 'string' && /^[PE][1-9][0-9]*$/u.test(value.ref)) return;
+  if (Object.hasOwn(value, 'name') && Object.keys(value).length === 1 && typeof value.name === 'string' && clean(value.name)) return;
+  if (world && Object.keys(value).length === 1 && typeof value.world === 'string' && clean(value.world)) return;
+  if (scope && Object.keys(value).sort().join() === 'name,scope'
+    && ['shared', 'world', 'unknown'].includes(value.scope) && typeof value.name === 'string') return;
+  throw new Error(`${path} 必须是人物引用、原文名称${scope ? '或明确的主体范围' : ''}${world ? '或世界对象' : ''}。`);
+}
+
+/** Parse the model contract. Identity references are resolved only at the
+ * ingestion boundary, where the batch's authoritative participant table lives. */
+export function parseGeneratedLongTermExtraction(value, { messages, timeZone } = {}) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(stripCodeFence(value)); }
+    catch (error) { throw new Error(`长期记忆提取模型输出不是有效 JSON：${error.message}`); }
+  }
+  exactFields(parsed, ['memories'], ['entities', 'causalExcerpts'], '长期记忆提取模型输出');
+  const entities = parseExtractionEntities(parsed.entities ?? []);
+  const entityByRef = new Map(entities.map(entity => [entity.ref, entity]));
+  if (!Array.isArray(parsed.memories)) throw new Error('memories 必须是数组。');
+  const validateTime = createExtractionTimeValidator(messages || [], timeZone);
+  const properties = LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties;
+  return { ...(parsed.entities != null ? { entities } : {}),
+    ...(Array.isArray(parsed.causalExcerpts) ? { causalExcerpts: parsed.causalExcerpts } : {}),
+    memories: parsed.memories.map((candidate, index) => {
+    const path = `memories[${index}]`;
+    exactFields(candidate, Object.keys(properties).filter(key => key !== 'entityRefs'), ['entityRefs'], path);
+    for (const field of ['title', 'content']) {
+      if (typeof candidate[field] !== 'string' || (field === 'content' && !clean(candidate[field]))) throw new Error(`${path}.${field} 无效。`);
+    }
+    for (const field of ['reality', 'evidenceMode', 'temporalState', 'revisionAction']) {
+      if (!properties[field].enum.includes(candidate[field])) throw new Error(`${path}.${field} 无效。`);
+    }
+    const classification = candidate.classification;
+    if (!classification || typeof classification.category !== 'string' || !Object.hasOwn(CATEGORIES, classification.category)) throw new Error(`${path}.classification.category 无效。`);
+    const { kind, stateFamily } = CATEGORIES[classification.category];
+    const required = ['category', ...(kind === 'reflection' ? ['key'] : isStatefulMemoryKind(kind) ? ['key', 'label'] : []),
+      ...(TARGET_PROPERTIES[stateFamily] ? ['target'] : [])];
+    exactFields(classification, required, [], `${path}.classification`);
+    for (const field of ['key', 'label'].filter(key => required.includes(key))) {
+      if (typeof classification[field] !== 'string' || (kind !== 'reflection' && !clean(classification[field]))) throw new Error(`${path}.classification.${field} 不能为空。`);
+    }
+    if (TARGET_PROPERTIES[stateFamily]) {
+      const targetPath = `${path}.classification.target`;
+      exactFields(classification.target, Object.keys(TARGET_PROPERTIES[stateFamily]), [], targetPath);
+      for (const [field, schema] of Object.entries(TARGET_PROPERTIES[stateFamily])) {
+        const entry = classification.target[field];
+        if (schema.anyOf) validatePerson(entry, `${targetPath}.${field}`, { world: field !== 'counterpart' });
+        else if (!schema.enum.includes(entry)) throw new Error(`${targetPath}.${field} 无效。`);
+      }
+    }
+    validatePerson(candidate.subject, `${path}.subject`, { scope: true });
+    if (!Array.isArray(candidate.actors)) throw new Error(`${path}.actors 必须是数组。`);
+    for (const [actorIndex, actor] of candidate.actors.entries()) {
+      const actorPath = `${path}.actors[${actorIndex}]`;
+      exactFields(actor, ['role', 'person', 'confidence'], [], actorPath);
+      if (!GENERATED_ACTOR_ROLES.includes(actor.role)) throw new Error(`${actorPath}.role 无效。`);
+      validatePerson(actor.person, `${actorPath}.person`);
+      if (typeof actor.confidence !== 'number' || !Number.isFinite(actor.confidence) || actor.confidence < 0 || actor.confidence > 1) throw new Error(`${actorPath}.confidence 无效。`);
+    }
+    let time = candidate.time;
+    if (time !== null) {
+      exactFields(time, [], ['date', 'start', 'end'], `${path}.time`);
+      if (Object.values(time).some(entry => entry !== null && typeof entry !== 'string')) throw new Error(`${path}.time 字段必须是已知日期、时刻或 null。`);
+      time = Object.fromEntries(Object.entries(time).map(([field, value]) => [field, clean(value) || null]));
+      if (time.date && !validCalendarDate(time.date)) throw new Error(`${path}.time.date 必须是有效 YYYY-MM-DD。`);
+      for (const field of ['start', 'end']) if (time[field] && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/u.test(time[field])
+        || !validCalendarDate(time[field].slice(0, 10)) || !Number.isFinite(new Date(time[field]).getTime()))) {
+        throw new Error(`${path}.time.${field} 必须是带 UTC 偏移的有效 ISO 8601 时间。`);
+      }
+      if (time.start && time.end && new Date(time.end) < new Date(time.start)) throw new Error(`${path}.time.end 不能早于 start。`);
+      if (!Object.values(time).some(Boolean)) time = null;
+    }
+    if (!Array.isArray(candidate.sourceRefs) || !candidate.sourceRefs.length
+      || candidate.sourceRefs.some(ref => typeof ref !== 'string' || !/^M[0-9]{4}$/u.test(ref))) throw new Error(`${path}.sourceRefs 无效。`);
+    for (const field of ['confidence', 'importance']) {
+      if (typeof candidate[field] !== 'number' || !Number.isFinite(candidate[field]) || candidate[field] < 0 || candidate[field] > 1) throw new Error(`${path}.${field} 必须在 0 到 1 之间。`);
+    }
+    const entityRefs = candidate.entityRefs ?? [];
+    if (!Array.isArray(entityRefs) || entityRefs.some(ref => typeof ref !== 'string' || !entityByRef.has(ref))) throw new Error(`${path}.entityRefs 无效。`);
+    const inspectRef = (entry, personal) => {
+      if (!entry?.ref?.startsWith('E')) return;
+      const entity = entityByRef.get(entry.ref);
+      if (!entity || personal && !['person', 'agent'].includes(entity.kind)) throw new Error(`${path} 的实体引用类型不适用。`);
+    };
+    inspectRef(candidate.subject, true);
+    candidate.actors.forEach(actor => inspectRef(actor.person, true));
+    if (classification.target) for (const [key, entry] of Object.entries(classification.target)) inspectRef(entry, key === 'counterpart');
+    const normalized = { ...candidate, ...(candidate.entityRefs != null ? { entityRefs: [...new Set(entityRefs)] } : {}), title: clean(candidate.title), content: clean(candidate.content), time,
+      sourceRefs: [...new Set(candidate.sourceRefs)] };
+    validateTime({ ...normalized, kind, eventDate: time?.date || '', eventStart: time?.start || '', eventEnd: time?.end || '' });
     return normalized;
   }) };
 }
 
-export function parseGeneratedLongTermExtraction(value, { messages, timeZone } = {}) {
-  let parsed = value;
-  if (typeof value === "string") {
-    try {
-      parsed = JSON.parse(stripCodeFence(value));
-    } catch (error) {
-      throw new Error(`长期记忆提取模型输出不是有效 JSON：${error.message}`);
-    }
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("长期记忆提取模型输出必须是 JSON 对象。");
-  }
-  const keys = Object.keys(parsed).sort();
-  if (keys.length !== 1 || keys[0] !== "memories") {
-    throw new Error("长期记忆提取模型输出只能包含 memories。");
-  }
-  if (!Array.isArray(parsed.memories)) throw new Error("memories 必须是数组。");
-  parsed = normalizeGeneratedLongTermExtraction(parsed);
-  const validateTime = messages ? createExtractionTimeValidator(messages, timeZone) : null;
-  const allowedKinds = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.kind.enum);
-  const allowedRoles = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.subjectRole.enum);
-  const allowedReality = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.reality.enum);
-  const allowedEvidence = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.evidenceMode.enum);
-  const allowedTemporal = new Set(LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties.temporalState.enum);
-  const allowedRevision = new Set(REVISION_ACTIONS);
-  const allowedRetentionReasons = new Set(RETENTION_REASONS);
-  const allowedStateFamilies = new Set(["not_applicable", ...MEMORY_STATE_FAMILIES]);
-  const allowedActorRoles = new Set(GENERATED_ACTOR_ROLES);
-  const allowedActorIdentities = new Set(GENERATED_ACTOR_IDENTITIES);
-  const expectedKeys = [
-    "actorRoles",
-    "canonicalKey",
-    "confidence",
-    "content",
-    "eventDate",
-    "eventEnd",
-    "eventStart",
-    "evidenceMode",
-    "importance",
-    "kind",
-    "reality",
-    "retentionReason",
-    "revisionAction",
-    "sourceRefs",
-    "stateFamily",
-    "stateLabel",
-    "subjectName",
-    "subjectRole",
-    "temporalState",
-    "title",
-  ];
-  const memories = parsed.memories.map((candidate, index) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-      throw new Error(`memories[${index}] 必须是对象。`);
-    }
-    const expectedCandidateKeys = [...expectedKeys,
-      ...(TARGET_SPEC_FAMILIES.has(candidate.stateFamily) ? ["stateTarget"] : []),
-    ].sort();
-    const candidateKeys = Object.keys(candidate).sort();
-    if (
-      candidateKeys.length !== expectedCandidateKeys.length
-      || candidateKeys.some((key, keyIndex) => key !== expectedCandidateKeys[keyIndex])
-    ) throw new Error(`memories[${index}] 字段不符合约定（stateFamily=${clean(candidate.stateFamily)}）；缺少：${expectedCandidateKeys.filter(key => !Object.hasOwn(candidate, key)).join(', ') || '无'}；不适用：${candidateKeys.filter(key => !expectedCandidateKeys.includes(key)).join(', ') || '无'}。`);
-    for (const field of ["kind", "content", "subjectRole", "reality", "evidenceMode", "temporalState", "revisionAction"]) {
-      if (!clean(candidate[field])) throw new Error(`memories[${index}].${field} 不能为空。`);
-    }
-    if (!allowedKinds.has(candidate.kind)) {
-      let targetProblem = "";
-      try { normalizedGeneratedStateTarget(candidate, index); }
-      catch (error) { targetProblem = ` ${error.message}`; }
-      throw new Error(`memories[${index}].kind 无效。${targetProblem}`);
-    }
-    if (!allowedRoles.has(candidate.subjectRole)) throw new Error(`memories[${index}].subjectRole 无效。`);
-    if (!allowedReality.has(candidate.reality)) throw new Error(`memories[${index}].reality 无效。`);
-    if (!allowedEvidence.has(candidate.evidenceMode)) throw new Error(`memories[${index}].evidenceMode 无效。`);
-    if (!allowedTemporal.has(candidate.temporalState)) throw new Error(`memories[${index}].temporalState 无效。`);
-    if (!allowedRevision.has(candidate.revisionAction)) throw new Error(`memories[${index}].revisionAction 无效。`);
-    if (!allowedRetentionReasons.has(candidate.retentionReason)) {
-      throw new Error(`memories[${index}].retentionReason 无效。`);
-    }
-    if (!allowedStateFamilies.has(candidate.stateFamily)) {
-      throw new Error(`memories[${index}].stateFamily 无效。`);
-    }
-    const stateful = isStatefulMemoryKind(candidate.kind);
-    const stateLabel = clean(candidate.stateLabel);
-    const stateTarget = normalizedGeneratedStateTarget(candidate, index);
-    if (stateful) {
-      if (!MEMORY_STATE_FAMILIES.includes(candidate.stateFamily)
-        || !isMemoryKindAllowedForStateFamily(candidate.kind, candidate.stateFamily)) {
-        throw new Error(`memories[${index}] 的 kind 与 stateFamily 不兼容；${candidate.stateFamily} 允许的 kind：${kindsForFamily(candidate.stateFamily).join(', ')}。`);
-      }
-      if (!clean(candidate.canonicalKey)) {
-        throw new Error(`memories[${index}].canonicalKey 不能为空。`);
-      }
-      if (!stateLabel) throw new Error(`memories[${index}].stateLabel 不能为空。`);
-    } else if (candidate.stateFamily !== "not_applicable" || stateLabel) {
-      throw new Error(`memories[${index}] 的非状态候选不能携带状态分析目标。`);
-    }
-    const eventDate = clean(candidate.eventDate);
-    if (eventDate && !validCalendarDate(eventDate)) {
-      throw new Error(
-        `memories[${index}].eventDate 必须为空或有效的 YYYY-MM-DD，实际为 ${JSON.stringify(eventDate.slice(0, 80))}。`,
-      );
-    }
-    const normalizeEventTimestamp = (field) => {
-      const text = clean(candidate[field]);
-      if (!text) return "";
-      const date = new Date(text);
-      if (!Number.isFinite(date.getTime())) {
-        throw new Error(`memories[${index}].${field} 必须为空或有效 ISO 8601 时间。`);
-      }
-      return date.toISOString();
-    };
-    const eventStart = normalizeEventTimestamp("eventStart");
-    const eventEnd = normalizeEventTimestamp("eventEnd");
-    if (eventStart && eventEnd && eventEnd < eventStart) {
-      throw new Error(`memories[${index}].eventEnd 不能早于 eventStart。`);
-    }
-    if (!Array.isArray(candidate.actorRoles)) {
-      throw new Error(`memories[${index}].actorRoles 必须是数组。`);
-    }
-    const actorRoles = candidate.actorRoles.map((actor, actorIndex) => {
-      if (!actor || typeof actor !== "object" || Array.isArray(actor)) {
-        throw new Error(`memories[${index}].actorRoles[${actorIndex}] 必须是对象。`);
-      }
-      const actorKeys = Object.keys(actor).sort();
-      const expectedActorKeys = ["actorName", "actorRole", "confidence", "role"];
-      if (
-        actorKeys.length !== expectedActorKeys.length
-        || actorKeys.some((key, keyIndex) => key !== expectedActorKeys[keyIndex])
-      ) throw new Error(`memories[${index}].actorRoles[${actorIndex}] 字段不符合约定。`);
-      if (!allowedActorRoles.has(actor.role)) {
-        throw new Error(`memories[${index}].actorRoles[${actorIndex}].role 无效。`);
-      }
-      if (!allowedActorIdentities.has(actor.actorRole)) {
-        throw new Error(`memories[${index}].actorRoles[${actorIndex}].actorRole 无效。`);
-      }
-      const actorName = clean(actor.actorName);
-      if (actor.actorRole === "other" && !actorName) {
-        throw new Error(`memories[${index}].actorRoles[${actorIndex}].actorName 不能为空。`);
-      }
-      const confidence = Number(actor.confidence);
-      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-        throw new Error(`memories[${index}].actorRoles[${actorIndex}].confidence 必须在 0 到 1 之间。`);
-      }
-      return {
-        role: actor.role,
-        actorRole: actor.actorRole,
-        actorName,
-        confidence,
-      };
-    });
-    if (
-      !Array.isArray(candidate.sourceRefs)
-      || !candidate.sourceRefs.length
-      || candidate.sourceRefs.some((ref) => !/^M\d{4}$/u.test(String(ref)))
-    ) throw new Error(`memories[${index}].sourceRefs 无效。`);
-    for (const field of ["confidence", "importance"]) {
-      const number = Number(candidate[field]);
-      if (!Number.isFinite(number) || number < 0 || number > 1) {
-        throw new Error(`memories[${index}].${field} 必须在 0 到 1 之间。`);
-      }
-    }
-    const memory = {
-      ...candidate,
-      title: clean(candidate.title),
-      content: clean(candidate.content),
-      subjectName: clean(candidate.subjectName),
-      canonicalKey: clean(candidate.canonicalKey),
-      stateFamily: candidate.stateFamily,
-      stateLabel,
-      ...(stateTarget ? { stateTarget } : {}),
-      actorRoles,
-      eventDate,
-      eventStart,
-      eventEnd,
-      sourceRefs: [...new Set(candidate.sourceRefs.map(String))],
-      confidence: Number(candidate.confidence),
-      importance: Number(candidate.importance),
-    };
-    validateTime?.(memory);
-    return memory;
+export function parseExtractionEntities(value = []) {
+  if (value === null) return [];
+  if (!Array.isArray(value)) throw new Error('entities 必须是数组。');
+  const refs = new Set();
+  return value.map((entity, index) => {
+    exactFields(entity, ['ref', 'kind', 'name', 'aliases'], [], `entities[${index}]`);
+    if (typeof entity.ref !== 'string' || !/^E[1-9][0-9]*$/u.test(entity.ref) || refs.has(entity.ref)
+      || !ENTITY_KINDS.includes(entity.kind) || typeof entity.name !== 'string' || !clean(entity.name)
+      || !Array.isArray(entity.aliases) || entity.aliases.some(alias => typeof alias !== 'string' || !clean(alias))) throw new Error(`entities[${index}] 无效。`);
+    refs.add(entity.ref);
+    return { ...entity, name: clean(entity.name), aliases: [...new Set(entity.aliases.map(clean))] };
   });
-  return {
-    memories,
-  };
+}
+
+export function extractionEntityScope(messages = []) {
+  return createHash('sha256').update(JSON.stringify(messages.map(message => message.id || message.memoryRef))).digest('hex').slice(0, 24);
+}
+
+/** Resolve host references once; keep declared entity references for the local
+ * repository transaction that binds persistent entities. */
+export function normalizeGeneratedLongTermExtraction(value, context = {}) {
+  const parsed = parseGeneratedLongTermExtraction(value, context);
+  const declarations = new Map((parsed.entities || []).map(entity => [entity.ref, entity]));
+  const identityScope = context.entityScope || extractionEntityScope(context.messages);
+  function identity(person) {
+    if (person.scope) return { role: person.scope, key: '', name: clean(person.name), status: 'scope' };
+    if (person.world) return { role: 'world', key: '', name: clean(person.world), status: 'scope' };
+    if (person.ref?.startsWith('E')) {
+      const entity = declarations.get(person.ref);
+      return { role: ['person', 'agent'].includes(entity.kind) ? 'other' : 'world', key: '', name: entity.name, status: 'entity', entity };
+    }
+    return resolveExtractionActor({ ref: person.ref, name: person.name }, context);
+  }
+  return { memories: parsed.memories.map(candidate => {
+    const { kind, stateFamily } = CATEGORIES[candidate.classification.category];
+    const holder = identity(candidate.subject);
+    const target = candidate.classification.target;
+    let stateTarget;
+    if (stateFamily === 'identity') stateTarget = { ...target };
+    else if (target) {
+      const prefix = stateFamily === 'belief' ? 'object' : stateFamily === 'relationship' ? 'counterpart' : 'trigger';
+      const other = identity(target[prefix]);
+      stateTarget = { [`${prefix}Role`]: other.role, [`${prefix}Name`]: other.name, [`${prefix}Key`]: other.key, [`${prefix}IdentityStatus`]: other.status,
+        ...(other.entity ? { [`${prefix}EntityRef`]: other.entity.ref } : {}),
+        ...(stateFamily === 'relationship' ? { relationshipDimension: target.dimension } : {}) };
+    }
+    return { kind, title: candidate.title, content: candidate.content,
+      subjectRole: holder.role, subjectName: holder.name, subjectKey: holder.key, subjectIdentityStatus: holder.status,
+      ...(holder.entity ? { subjectEntityRef: holder.entity.ref } : {}),
+      actorRoles: candidate.actors.map(actor => { const person = identity(actor.person);
+        return { role: actor.role, actorRole: person.role, actorKey: person.key, actorName: person.name, identityStatus: person.status,
+          ...(person.entity ? { entityRef: person.entity.ref } : {}), confidence: actor.confidence }; }),
+      ...(declarations.size ? { entityScope: identityScope, entityMentions: [...new Set([...(candidate.entityRefs || []), candidate.subject.ref, ...candidate.actors.map(actor => actor.person.ref),
+        ...Object.values(candidate.classification.target || {}).map(value => value?.ref)].filter(ref => declarations.has(ref)))].map(ref => declarations.get(ref)) } : {}),
+      canonicalKey: clean(candidate.classification.key), stateFamily, stateLabel: clean(candidate.classification.label),
+      ...(stateTarget ? { stateTarget } : {}),
+      reality: candidate.reality, evidenceMode: candidate.evidenceMode, temporalState: candidate.temporalState,
+      revisionAction: candidate.revisionAction,
+      eventDate: candidate.time?.date || '',
+      eventStart: candidate.time?.start ? new Date(candidate.time.start).toISOString() : '',
+      eventEnd: candidate.time?.end ? new Date(candidate.time.end).toISOString() : '',
+      confidence: candidate.confidence, importance: candidate.importance, sourceRefs: candidate.sourceRefs,
+    };
+  }) };
 }

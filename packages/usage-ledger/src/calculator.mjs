@@ -14,17 +14,16 @@ export function normalizeUsage(modelName, usage = {}) {
   if (model.startsWith("deepseek-")) {
     const nativeMiss = number(usage.prompt_cache_miss_tokens);
     const nativeHit = number(usage.prompt_cache_hit_tokens);
-    const hasNativeCacheBreakdown =
-      Object.hasOwn(usage, "prompt_cache_miss_tokens")
-      || Object.hasOwn(usage, "prompt_cache_hit_tokens");
+    const hasMiss = Object.hasOwn(usage, 'prompt_cache_miss_tokens');
+    const hasHit = Object.hasOwn(usage, 'prompt_cache_hit_tokens');
+    const hasPrompt = Object.hasOwn(usage, 'prompt_tokens');
+    const prompt = number(usage.prompt_tokens);
+    const cached = hasHit ? nativeHit : hasPrompt && hasMiss ? Math.max(0, prompt - nativeMiss)
+      : number(usage.prompt_tokens_details?.cached_tokens) || number(usage.cache_read_input_tokens);
     return {
-      inputUncachedTokens: hasNativeCacheBreakdown ? nativeMiss : (
-        number(usage.input_tokens)
-        + number(usage.cache_creation_input_tokens)
-      ),
-      inputCachedTokens: hasNativeCacheBreakdown
-        ? nativeHit
-        : number(usage.cache_read_input_tokens),
+      inputUncachedTokens: hasMiss ? nativeMiss : hasPrompt ? Math.max(0, prompt - cached)
+        : number(usage.input_tokens) + number(usage.cache_creation_input_tokens),
+      inputCachedTokens: cached,
       outputTextTokens: number(usage.completion_tokens) || number(usage.output_tokens),
     };
   }

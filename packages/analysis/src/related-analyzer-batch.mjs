@@ -3,7 +3,7 @@ import path from "node:path";
 import { analysisSystemPrompt, analysisSourceMaterial } from "./source-material.mjs";
 import { isStateAnalysisBudgetError, stateAnalysisBudgetError } from "./request-budget.mjs";
 import { analysisCountLimit, analysisSchemaForCount } from './analysis-output.mjs';
-import { mergeEventSourceMaterials, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { mergeEventSourceMaterials, assertEventSourceExecutionCurrent, withModelReferences } from '@suzu-memory/core';
 import { stateMatchAnalysisSchema } from './state-memory-candidates.mjs';
 import { createHash } from 'node:crypto';
 import { appendUsageEvent } from '@suzu-memory/usage-ledger';
@@ -12,9 +12,16 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+const analysisReferenceFields = new Set(['id', 'memoryId', 'sourceIds', 'episodeIds', 'candidateId', 'canonicalKey']);
+
+function withAnalysisReferences(request, material, renderInput) {
+  return withModelReferences(request, { material, fields: analysisReferenceFields, renderInput });
+}
+
 function providerRequest(request, snapshot = request.analysisSnapshot) {
   const { analysisSnapshot, renderAnalysisInput, ...provided } = request;
-  return { ...provided, input: renderAnalysisInput ? renderAnalysisInput(snapshot) : provided.input };
+  if (!renderAnalysisInput) return provided;
+  return withAnalysisReferences({ ...provided, input: renderAnalysisInput(snapshot) }, snapshot, renderAnalysisInput);
 }
 
 function sameSnapshot(calls) {
@@ -67,6 +74,22 @@ function combinedInput(calls, snapshot) {
   ].join("\n");
 }
 
+function analyzerGeneration(generation, calls, index) {
+  return {
+    ...generation,
+    usage: index === 0 ? generation.usage || {} : null,
+    costAmount: index === 0 ? generation.costAmount : 0,
+    metadata: {
+      ...generation.metadata,
+      ...(calls.length > 1 ? {
+        combinedStateAnalysis: true,
+        combinedAnalyzerKeys: calls.map(item => item.key),
+      } : {}),
+      usageRecordedByAnalyzerKey: calls[0].key,
+    },
+  };
+}
+
 function splitGeneration(generation, calls) {
   const results = generation?.output?.results;
   if (!results || typeof results !== "object" || Array.isArray(results)) {
@@ -77,16 +100,8 @@ function splitGeneration(generation, calls) {
       throw new Error(`Combined state analysis omitted results.${call.key}.`);
     }
     return {
-      ...generation,
+      ...analyzerGeneration(generation, calls, index),
       output: results[call.key],
-      usage: index === 0 ? generation.usage || {} : null,
-      costAmount: index === 0 ? generation.costAmount : 0,
-      metadata: {
-        ...generation.metadata,
-        combinedStateAnalysis: true,
-        combinedAnalyzerKeys: calls.map((item) => item.key),
-        usageRecordedByAnalyzerKey: calls[0].key,
-      },
     };
   });
 }
@@ -95,7 +110,7 @@ function noCurrentStateGeneration(request, snapshot = request.analysisSnapshot) 
   if (!snapshot || snapshot.currentState || snapshot.relationshipComparison) return null;
   const itemSchema = request.schema?.properties?.analyses?.items;
   const required = Array.isArray(itemSchema?.required) ? itemSchema.required : [];
-  if (!required.includes("currentStatePresent") || !required.includes("relation")) return null;
+  if (!required.includes("relation")) return null;
   const analyses = (Array.isArray(snapshot.memories) ? snapshot.memories : [])
     .map((memory) => {
       const sourceIds = Array.isArray(memory?.sourceIds)
@@ -107,12 +122,10 @@ function noCurrentStateGeneration(request, snapshot = request.analysisSnapshot) 
         sourceIds,
         confidence: 1,
         rationale: "调用方提供的只读快照中不存在当前状态。",
-        currentStatePresent: false,
-        relation: "no_current_state",
+        relation: "unknown",
       };
-      if (required.includes("comparisonMemoryId")) {
-        result.comparisonMemoryId = "";
-        result.comparisonRelation = "no_comparison";
+      if (required.includes("comparisonRelation")) {
+        result.comparisonRelation = "unknown";
         result.comparisonScopeOverlap = "unknown";
       }
       for (const field of ["scopeOverlap", "valueOverlap"]) {
@@ -198,10 +211,17 @@ export function createRelatedAnalyzerBatch({
   });
   const pending = [];
   let scheduled = false;
-  function rejectCalls(calls, error) {
+  function rejectCalls(calls, error, generation = null) {
     onGenerationError(error);
     if (isStateAnalysisBudgetError(error)) onBudgetExceeded(error);
-    calls.forEach(call => call.reject(error));
+    calls.forEach((call, index) => {
+      const failure = Object.assign(new Error(error.message, { cause: error }), error, {
+        name: error.name || 'Error',
+        ...(error.code === undefined ? {} : { code: error.code }),
+        ...(generation ? analyzerGeneration(generation, calls, index) : { usage: null, costAmount: 0 }),
+      });
+      call.reject(failure);
+    });
   }
   function enqueue(key, definition, input) {
     const decorated = decorate(input);
@@ -235,6 +255,7 @@ export function createRelatedAnalyzerBatch({
               rejectCalls(plan.calls, stateResolutionError);
               continue;
             }
+            let generation = null;
             try {
               const snapshot = stateContext?.resolved
                 ? stateContext.refresh(plan.request.analysisSnapshot) : plan.request.analysisSnapshot;
@@ -260,7 +281,7 @@ export function createRelatedAnalyzerBatch({
               const deterministic = !resolveIdentity && plan.calls.length === 1
                 && plan.calls[0].definition.role === 'current-relation' && generator.supportsCombinedStateAnalysis === true
                 ? noCurrentStateGeneration(actualRequest, snapshot) : null;
-              let generation = deterministic || await generator(actualRequest);
+              generation = deterministic || await generator(actualRequest);
               if (resolveIdentity) {
                 stateContext.resolve(generation?.output?.stateMatch);
                 generation = { ...generation, output: generation.output.analysis };
@@ -273,7 +294,7 @@ export function createRelatedAnalyzerBatch({
             } catch (error) {
               assertEventSourceExecutionCurrent();
               if (stateContext && !stateContext.resolved) stateResolutionError = error;
-              rejectCalls(plan.calls, error);
+              rejectCalls(plan.calls, error, generation || error);
             }
           }
         } catch (error) {
@@ -309,6 +330,26 @@ export function prepareAnalyzerReplay(previousRuns, definition, contractHash, sn
     sourceRecords: snapshot.sourceRecords.filter(source => sourceIds.has(source.id)) }, analyses, runId: run.id, analysisRequestId: clean(run.metadata.stateAnalysisRequestId) };
 }
 
+function bindAnalysisContext(item, definition, snapshot) {
+  if (!['current-relation', 'time-current-relation'].includes(definition.role)) return item;
+  const bound = { ...item, currentStatePresent: Boolean(snapshot.currentState) };
+  if (!bound.currentStatePresent) {
+    bound.relation = 'no_current_state';
+    for (const field of ['scopeOverlap', 'valueOverlap']) {
+      if (Object.hasOwn(bound, field)) bound[field] = 'unknown';
+    }
+  }
+  if (definition.stateFamily === 'relationship') {
+    const reference = snapshot.relationshipComparison?.memoryId;
+    bound.comparisonMemoryId = reference && reference !== item.memoryId ? reference : '';
+    if (!bound.comparisonMemoryId) {
+      bound.comparisonRelation = 'no_comparison';
+      bound.comparisonScopeOverlap = 'unknown';
+    }
+  }
+  return bound;
+}
+
 export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses,
   previousRuns = [], buildInput, prepareInputSnapshot = value => value, parseGeneration, enforceBoundary, analysisKey = definition.role }) {
   const systemPrompt = analysisSystemPrompt(fs.readFileSync(
@@ -339,13 +380,13 @@ export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, 
     }
     const sourceMaterial = analysisSourceMaterial(sourceSnapshot);
     const requestSnapshot = inputSnapshot(sourceSnapshot);
-    generation = replay.snapshot ? await generator({
+    generation = replay.snapshot ? await generator(withAnalysisReferences({
       input: renderInput(requestSnapshot), systemPrompt,
       analysisSnapshot: requestSnapshot, renderAnalysisInput: renderInput,
       schema: schemaForSnapshot(requestSnapshot), schemaName: definition.schemaName,
       stateFamily: definition.stateFamily, analyzerRole: definition.role,
       ...(sourceMaterial ? { sourceMaterial } : {}),
-    }) : { output: { analyses: [] }, model: 'local-analysis-replay', usage: null };
+    }, requestSnapshot, renderInput)) : { output: { analyses: [] }, model: 'local-analysis-replay', usage: null };
     const rejected = [];
     // Retain valid siblings even when a provider duplicates an entry. Accepted
     // results are bounded by the distinct supplied memory IDs below.
@@ -361,7 +402,7 @@ export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, 
           && !replay.snapshot.memories.some(memory => memory.id === item.memoryId)) {
           throw new Error('Analyzer retry exceeded its remaining memory boundary.');
         }
-        const bounded = enforceBoundary(analysisKey, item, snapshot);
+        const bounded = enforceBoundary(analysisKey, bindAnalysisContext(item, definition, snapshot), snapshot);
         if (!bounded) continue;
         accepted.push(bounded);
         seen.add(item.memoryId);
@@ -382,6 +423,7 @@ export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, 
       status: analyses.length ? 'completed' : rejected.length ? 'rejected' : 'abstained', error: '' };
   } catch (error) {
     assertEventSourceExecutionCurrent();
+    generation ||= error;
     return { definition, input, generation, contractHash, reusedRunId: replay.runId, analysisRequestId: replay.analysisRequestId || "",
       retryMemoryIds: sourceSnapshot.memories.map(memory => memory.id),
       analyses: replay.analyses, rejected: [], status: 'failed', error: error.message };

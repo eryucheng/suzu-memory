@@ -1,5 +1,5 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -27,11 +27,11 @@ import { MIGRATIONS } from "../src/schema.mjs";
 import { createHash } from "node:crypto";
 
 function temporaryDirectory(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return createTestDirectory(path.join(os.tmpdir(), prefix));
 }
 
 test("creates a versioned SQLite memory database with Chinese search", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const info = databaseInfo(database);
   assert.equal(info.schemaVersion, SCHEMA_VERSION);
@@ -66,7 +66,7 @@ test("creates a versioned SQLite memory database with Chinese search", () => {
 test("upgrades schema v32 by adding an empty maintenance queue without rewriting data", () => {
   const directory = temporaryDirectory("suzu-memory-v32-");
   const databasePath = path.join(directory, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec(`
     CREATE TABLE schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -85,7 +85,7 @@ test("upgrades schema v32 by adding an empty maintenance queue without rewriting
   `).run();
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   assert.equal(
     migrated.prepare("SELECT value FROM memory_meta WHERE key = 'migration-sentinel'").get().value,
@@ -101,7 +101,7 @@ test("upgrades schema v32 by adding an empty maintenance queue without rewriting
 test("upgrades schema v33 and makes an interrupted legacy input batch recoverable", () => {
   const directory = temporaryDirectory("suzu-memory-v33-");
   const databasePath = path.join(directory, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec(`
     CREATE TABLE schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -149,7 +149,7 @@ test("upgrades schema v33 and makes an interrupted legacy input batch recoverabl
   `).run(inserted.event.id);
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   const repository = new MemoryRepository(migrated);
   const claimed = repository.claimPendingInputEvents("agent-test", {
     workerId: "new-worker",
@@ -165,7 +165,7 @@ test("upgrades schema v33 and makes an interrupted legacy input batch recoverabl
 test("upgrades schema v35 with recoverable consolidation leases and active event lifecycles", () => {
   const directory = temporaryDirectory("suzu-memory-v35-");
   const databasePath = path.join(directory, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec(`
     CREATE TABLE schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -206,7 +206,7 @@ test("upgrades schema v35 with recoverable consolidation leases and active event
   });
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   const repository = new MemoryRepository(migrated);
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   const recovered = repository.listClaimableConsolidationRuns("agent-test", {
@@ -222,7 +222,7 @@ test("upgrades schema v35 with recoverable consolidation leases and active event
 });
 
 test("keeps generated retrieval context versioned, searchable, and separate from memory truth", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const memory = repository.upsertMemory({
     id: "education-memory",
@@ -296,7 +296,7 @@ test("keeps generated retrieval context versioned, searchable, and separate from
 });
 
 test("keeps event, known, and recorded time separate from actor and evidence roles", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -365,7 +365,7 @@ test("keeps event, known, and recorded time separate from actor and evidence rol
 });
 
 test("keeps state discovery as an idempotent analysis request instead of a personality node", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -488,7 +488,7 @@ test("validates structured analysis targets and keeps them immutable", () => {
     /targetSpec is invalid/u,
   );
 
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -546,7 +546,7 @@ test("validates structured analysis targets and keeps them immutable", () => {
 });
 
 test("keeps reported and established current states in separate representation layers", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const common = {
     agentId: "agent-test",
@@ -612,7 +612,7 @@ test("keeps reported and established current states in separate representation l
 });
 
 test("stores state family and domain phase without guessing legacy or non-state meanings", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const event = repository.upsertMemory({
     id: "ordinary-event",
@@ -739,7 +739,7 @@ test("stores state family and domain phase without guessing legacy or non-state 
 });
 
 test("keeps causal relations as evidence-backed review proposals until explicit acceptance", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const causeSource = repository.upsertSource({
     agentId: "agent-test",
@@ -858,7 +858,7 @@ test("keeps causal relations as evidence-backed review proposals until explicit 
 });
 
 test("rejects cross-Agent causal evidence and rolls back a failed acceptance atomically", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -933,7 +933,7 @@ test("rejects cross-Agent causal evidence and rolls back a failed acceptance ato
 });
 
 test("refuses to accept a causal relation after its reviewed source becomes inactive", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -976,7 +976,7 @@ test("refuses to accept a causal relation after its reviewed source becomes inac
 });
 
 test("stores retrieval traces and append-only feedback outside personality memories", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "trace-memory",
@@ -1118,7 +1118,7 @@ test("stores retrieval traces and append-only feedback outside personality memor
 });
 
 test("binds one final response to one retrieval trace without pretending it was used", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "usage-memory",
@@ -1201,7 +1201,7 @@ test("binds one final response to one retrieval trace without pretending it was 
 });
 
 test("queues the next real user message as reward evidence without changing memory state", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "reward-memory",
@@ -1252,7 +1252,7 @@ test("queues the next real user message as reward evidence without changing memo
 });
 
 test("aggregates edge retrieval use without rewriting edges or crossing Agents", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content] of [
     ["edge-source", "用户去了科技馆。"],
@@ -1401,7 +1401,7 @@ test("aggregates edge retrieval use without rewriting edges or crossing Agents",
 });
 
 test("records idempotent plasticity shadow runs without changing learned state", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "shadow-source",
@@ -1510,7 +1510,7 @@ test("records idempotent plasticity shadow runs without changing learned state",
 });
 
 test("applies and rolls back an explicitly approved plasticity run atomically", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content] of [
     ["apply-source", "用户去了科技馆。"],
@@ -1693,7 +1693,7 @@ test("applies and rolls back an explicitly approved plasticity run atomically", 
 });
 
 test("rejects stale shadow state before applying any plasticity target", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "stale-memory",
@@ -1760,7 +1760,7 @@ test("rejects stale shadow state before applying any plasticity target", () => {
 });
 
 test("rolls back plasticity only from the latest applied target state", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "ordered-memory",
@@ -1892,7 +1892,7 @@ test("rolls back plasticity only from the latest applied target state", () => {
 });
 
 test("keeps affective activation as a separate append-only human decision", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const memory = repository.upsertMemory({
     id: "reported-museum-happiness",
@@ -1968,7 +1968,7 @@ test("keeps affective activation as a separate append-only human decision", () =
 });
 
 test("resolves entity aliases without merging ambiguous names", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const memory = repository.upsertMemory({
     id: "museum-visit",
@@ -1984,20 +1984,15 @@ test("resolves entity aliases without merging ambiguous names", () => {
     aliases: ["科技馆", " Shanghai Science Museum "],
     metadata: { city: "上海" },
   });
-  const resolved = repository.upsertEntity({
-    agentId: "agent-test",
-    kind: "place",
-    canonicalName: "科技馆",
-  });
+  assert.equal(repository.findEntitiesByName({ agentId: 'agent-test', kind: 'place', name: '科技馆' })[0].id, museum.id);
+  const resolved = repository.upsertEntity({ id: museum.id, agentId: 'agent-test', kind: 'place', canonicalName: '上海科技馆新馆' });
   assert.equal(resolved.id, museum.id);
-  assert.equal(resolved.canonical_name, "上海科技馆");
-  assert.deepEqual(resolved.aliases.sort(), ["Shanghai Science Museum", "科技馆"].sort());
-  assert.throws(() => repository.upsertEntity({
-    agentId: "agent-test",
-    kind: "place",
-    canonicalName: "浦东科技馆",
-    aliases: ["科技馆"],
-  }), /alias already belongs/u);
+  assert.ok(resolved.aliases.includes('上海科技馆'));
+  const homonym = repository.upsertEntity({ agentId: 'agent-test', kind: 'place', canonicalName: '科技馆' });
+  assert.notEqual(homonym.id, museum.id);
+  assert.deepEqual(new Set(repository.findEntitiesByName({ agentId: 'agent-test', kind: 'place', name: '科技馆' }).map(entity => entity.id)), new Set([museum.id, homonym.id]));
+  assert.throws(() => repository.findEntityByName({ agentId: 'agent-test', kind: 'place', name: '科技馆' }), /ambiguous/);
+  assert.throws(() => repository.upsertEntity({ id: museum.id, agentId: 'agent-test', kind: 'person', canonicalName: '科技馆' }), /kind/);
 
   repository.linkMemoryEntity({
     memoryId: memory.id,
@@ -2027,7 +2022,7 @@ test("resolves entity aliases without merging ambiguous names", () => {
 test("migrates a schema v3 database without guessing missing identity", () => {
   const root = temporaryDirectory("suzu-memory-schema-v3-");
   const databasePath = path.join(root, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec(`
     CREATE TABLE schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -2123,7 +2118,7 @@ test("migrates a schema v3 database without guessing missing identity", () => {
   );
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   assert.equal(
     migrated.prepare("SELECT known_at FROM memory_nodes WHERE id = 'legacy-user-fact'").get().known_at,
@@ -2175,7 +2170,7 @@ test("migrates a schema v3 database without guessing missing identity", () => {
 test("upgrades an existing schema v5 review queue without losing pending decisions", () => {
   const root = temporaryDirectory("suzu-memory-schema-v5-");
   const databasePath = path.join(root, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec(`
     CREATE TABLE schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -2209,7 +2204,7 @@ test("upgrades an existing schema v5 review queue without losing pending decisio
   );
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   const decision = new MemoryRepository(migrated)
     .getIngestionDecision("agent-test", "legacy-review");
@@ -2224,7 +2219,7 @@ test("upgrades an existing schema v5 review queue without losing pending decisio
 test("upgrades schema v10 shadow audits without treating incomplete legacy rows as applicable", () => {
   const root = temporaryDirectory("suzu-memory-schema-v10-");
   const databasePath = path.join(root, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec("PRAGMA foreign_keys = ON");
   legacy.exec(`
     CREATE TABLE schema_migrations (
@@ -2295,7 +2290,7 @@ test("upgrades schema v10 shadow audits without treating incomplete legacy rows 
   );
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   const repository = new MemoryRepository(migrated);
   const run = repository.getPlasticityShadowRun("agent-test", "legacy-shadow-run");
@@ -2315,7 +2310,7 @@ test("upgrades schema v10 shadow audits without treating incomplete legacy rows 
 test("upgrades schema v16 without guessing state families from legacy content", () => {
   const root = temporaryDirectory("suzu-memory-schema-v16-");
   const databasePath = path.join(root, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec("PRAGMA foreign_keys = ON");
   legacy.exec(`
     CREATE TABLE schema_migrations (
@@ -2358,7 +2353,7 @@ test("upgrades schema v16 without guessing state families from legacy content", 
   );
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   const repository = new MemoryRepository(migrated);
   const event = repository.getMemory("legacy-event-with-preference-word");
@@ -2373,7 +2368,7 @@ test("upgrades schema v16 without guessing state families from legacy content", 
 test("upgrades schema v18 with deterministic root scopes and preserves pending proposals", () => {
   const root = temporaryDirectory("suzu-memory-schema-v18-");
   const databasePath = path.join(root, "memory.db");
-  const legacy = new DatabaseSync(databasePath);
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
   legacy.exec("PRAGMA foreign_keys = ON");
   legacy.exec(`
     CREATE TABLE schema_migrations (
@@ -2439,7 +2434,7 @@ test("upgrades schema v18 with deterministic root scopes and preserves pending p
   `).run();
   legacy.close();
 
-  const migrated = openMemoryDatabase(databasePath);
+  const migrated = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(databaseInfo(migrated).schemaVersion, SCHEMA_VERSION);
   const repository = new MemoryRepository(migrated);
   assert.equal(repository.getMemory("v18-event").state_scope_key, "not_applicable");
@@ -2452,7 +2447,7 @@ test("upgrades schema v18 with deterministic root scopes and preserves pending p
 });
 
 test("expands a typed memory graph without crossing Agent boundaries", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const id of ["plan", "visit", "robots", "other-agent"]) {
     repository.upsertMemory({
@@ -2492,7 +2487,7 @@ test("expands a typed memory graph without crossing Agent boundaries", () => {
 });
 
 test("builds semantic and directional timeline links between event memories", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const value of [
     {
@@ -2556,7 +2551,7 @@ test("builds semantic and directional timeline links between event memories", ()
 });
 
 test("connects memories through a shared entity without building a full clique", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const entity = repository.upsertEntity({
     agentId: "agent-test",
@@ -2596,7 +2591,7 @@ test("connects memories through a shared entity without building a full clique",
 });
 
 test("keeps automatic association edges within one world and prunes legacy crossings", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const sharedEntity = repository.upsertEntity({
     agentId: "agent-test",
@@ -2676,7 +2671,7 @@ test("keeps automatic association edges within one world and prunes legacy cross
 });
 
 test("updates associations incrementally for a newly written event", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "museum-before",
@@ -2723,7 +2718,7 @@ test("updates associations incrementally for a newly written event", () => {
 });
 
 test("keeps automatic threads event-only and makes incremental insertion match a rebuild", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const value of [
     { id: "thread-old", eventStart: "2026-07-01T08:00:00.000Z" },
@@ -2812,7 +2807,7 @@ test("keeps automatic threads event-only and makes incremental insertion match a
 });
 
 test("orders shared-entity adjacency by state validity instead of import time", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const entity = repository.upsertEntity({
     agentId: "agent-test",
@@ -2857,7 +2852,7 @@ test("orders shared-entity adjacency by state validity instead of import time", 
 });
 
 test("rebuilds shared-entity adjacency when an incremental memory enters the middle", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const entity = repository.upsertEntity({
     agentId: "agent-test",
@@ -2912,7 +2907,7 @@ test("rebuilds shared-entity adjacency when an incremental memory enters the mid
 });
 
 test("enforces a real degree cap on automatic semantic associations", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (let index = 0; index < 6; index += 1) {
     const id = `dense-event-${index}`;
@@ -2958,7 +2953,7 @@ test("enforces a real degree cap on automatic semantic associations", () => {
 });
 
 test("keeps structured states out of automatic semantic and timeline edges", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const id of ["event-about-fish", "state-about-fish"]) {
     const stateful = id.startsWith("state");
@@ -2997,7 +2992,7 @@ test("keeps structured states out of automatic semantic and timeline edges", () 
 });
 
 test("prunes legacy automatic association overflow during an incremental update", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const oldIds = ["legacy-a", "legacy-b", "legacy-c", "legacy-d"];
   for (const id of [...oldIds, "a-new-seed"]) {
@@ -3058,7 +3053,7 @@ test("prunes legacy automatic association overflow during an incremental update"
 });
 
 test("supports audited manual edits, soft deletion, and restoration", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "manual-memory",
@@ -3164,7 +3159,7 @@ test("supports audited manual edits, soft deletion, and restoration", () => {
 });
 
 test("models episodes and topics as overlapping big neurons with Agent isolation", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const museum = repository.upsertMemory({
     id: "member-museum",
@@ -3322,13 +3317,15 @@ test("models episodes and topics as overlapping big neurons with Agent isolation
   database.close();
 });
 
-test("rejects ambiguous episode time and event time on semantic topics", () => {
-  const database = openMemoryDatabase(":memory:");
+test("allows unknown episode time while rejecting invalid known boundaries and event time on topics", () => {
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
-  assert.throws(() => repository.upsertEpisode({
+  const undated = repository.upsertEpisode({
     agentId: "agent-test",
     content: "没有时间边界的事件簇。",
-  }), /requires eventDate or eventStart/u);
+  });
+  assert.equal(undated.event_date, null);
+  assert.equal(undated.event_start, null);
   assert.throws(() => repository.upsertEpisode({
     agentId: "agent-test",
     content: "倒置时间的事件簇。",
@@ -3349,7 +3346,7 @@ test("rejects ambiguous episode time and event time on semantic topics", () => {
 });
 
 test("materializes structural proposals as pending nodes until an explicit acceptance", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content, eventStart] of [
     ["proposal-museum", "用户参观了科技馆。", "2026-07-11T03:00:00.000Z"],
@@ -3452,7 +3449,7 @@ test("materializes structural proposals as pending nodes until an explicit accep
 });
 
 test("audits dismissed structural proposals and rolls back their provisional nodes", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, agentId] of [
     ["rollback-a", "agent-test"],
@@ -3520,8 +3517,8 @@ test("audits dismissed structural proposals and rolls back their provisional nod
   database.close();
 });
 
-test("attaches new members to existing big neurons without rewriting them", () => {
-  const database = openMemoryDatabase(":memory:");
+test("attaches members and updates the supplied summary while preserving the container identity", () => {
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content, eventStart] of [
     ["attach-early", "上午出发去科技馆。", "2026-07-11T02:00:00.000Z"],
@@ -3566,13 +3563,13 @@ test("attaches new members to existing big neurons without rewriting them", () =
     operation: "attach",
     targetMemoryId: episode.id,
     kind: "episode",
-    content: "模型试图改写的内容不会被采用。",
+    content: "参观科技馆航天展，并在晚上继续讨论的完整出行。",
     memberIds: ["attach-middle", "attach-early", "attach-late"],
     confidence: 0.82,
   });
   assert.equal(episodeProposal.operation, "attach");
   assert.equal(episodeProposal.targetMemoryId, episode.id);
-  assert.equal(episodeProposal.content, episode.content);
+  assert.equal(episodeProposal.content, "参观科技馆航天展，并在晚上继续讨论的完整出行。");
   assert.deepEqual(episodeProposal.memberIds.sort(), ["attach-early", "attach-late"]);
   const episodeResult = resolveMemoryStructureProposal(repository, {
     agentId: "agent-test",
@@ -3580,7 +3577,7 @@ test("attaches new members to existing big neurons without rewriting them", () =
     action: "accept",
   });
   assert.equal(episodeResult.memory.id, episode.id);
-  assert.equal(episodeResult.memory.content, episode.content);
+  assert.equal(episodeResult.memory.content, episodeProposal.content);
   assert.equal(episodeResult.memory.event_start, "2026-07-11T02:00:00.000Z");
   assert.equal(episodeResult.memory.event_end, "2026-07-11T12:00:00.000Z");
   assert.deepEqual(episodeResult.addedMemberIds.sort(), ["attach-early", "attach-late"]);
@@ -3633,8 +3630,36 @@ test("attaches new members to existing big neurons without rewriting them", () =
   database.close();
 });
 
+test('entity reference lookup batches direct and actor IDs within the allowed Agent, status and memory scope', () => {
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
+  const repository = new MemoryRepository(database);
+  const person = repository.ensureActorEntity({ agentId: 'agent-test', actorRole: 'user', actorKey: 'primary', displayName: 'Avery' }).entity;
+  for (const [id, status] of [['allowed', 'active'], ['outside-scope', 'active'], ['old', 'archived']]) {
+    repository.upsertMemory({ id, agentId: 'agent-test', kind: 'event', layer: 'episodic', content: 'A private full record.', status,
+      subjectRole: 'user', subjectKey: 'primary', actorRoles: [
+        { role: 'subject', actorRole: 'user', actorKey: 'primary', isPrimary: true },
+        { role: 'participant', actorRole: 'user', actorKey: 'primary' },
+      ] });
+    repository.linkMemoryEntity({ memoryId: id, entityId: person.id });
+  }
+  const foreign = repository.ensureActorEntity({ agentId: 'foreign-agent', actorRole: 'user', actorKey: 'primary', displayName: 'Avery' }).entity;
+  repository.upsertMemory({ id: 'foreign', agentId: 'foreign-agent', kind: 'event', layer: 'episodic', content: 'Another private record.',
+    subjectRole: 'user', subjectKey: 'primary' });
+  const references = repository.listEntityMemoryReferences({ agentId: 'agent-test', entityIds: [person.id, foreign.id],
+    eligibleMemoryIds: new Set(['allowed', 'old', 'foreign']) });
+  assert.deepEqual(references.map(reference => ({ ...reference })), [
+    { entityId: person.id, memoryId: 'allowed', source: 'actor' },
+    { entityId: person.id, memoryId: 'allowed', source: 'direct' },
+  ], 'roles do not duplicate references and record contents never leave this lookup');
+  assert.deepEqual(repository.listEntityMemoryReferences({ agentId: 'agent-test', entityIds: [person.id], eligibleMemoryIds: new Set() }), []);
+  const historical = repository.listEntityMemoryReferences({ agentId: 'agent-test', entityIds: [person.id],
+    statuses: ['archived'], eligibleMemoryIds: new Set(['old']) });
+  assert.equal(historical.length, 2);
+  assert.ok(historical.every(reference => reference.memoryId === 'old'));
+});
+
 test("promotes the primary user and Agent to stable actor entities above their memories", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const structure = ensureCompanionRelationshipStructure({
     repository,
@@ -3689,7 +3714,8 @@ test("promotes the primary user and Agent to stable actor entities above their m
     companionName: "Agent",
   });
   assert.equal(repeated.user.id, structure.user.id);
-  assert.ok(repeated.user.aliases.includes("用户新称呼"));
+  assert.equal(repeated.user.canonical_name, "用户新称呼");
+  assert.ok(repeated.user.aliases.includes("用户"));
   assert.equal(repeated.relationship.members.find((member) => (
     member.member_role === "user"
   )).entity.id, structure.user.id);
@@ -3724,7 +3750,7 @@ test("promotes the primary user and Agent to stable actor entities above their m
   assert.equal(stableRelationship.updated_at, sentinel);
   assert.ok(stableRelationship.members.every((member) => member.updated_at === sentinel));
 
-  const otherDatabase = openMemoryDatabase(":memory:");
+  const otherDatabase = closeAfterTests(openMemoryDatabase(":memory:"));
   const otherRepository = new MemoryRepository(otherDatabase);
   const otherEntity = otherRepository.upsertEntity({
     agentId: "other-agent",
@@ -3742,7 +3768,7 @@ test("promotes the primary user and Agent to stable actor entities above their m
 });
 
 test("adds only explicit shared long-term memories to a relationship container", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const structure = ensureCompanionRelationshipStructure({
     repository,
@@ -3855,4 +3881,110 @@ test("adds only explicit shared long-term memories to a relationship container",
     [shared.id],
   );
   database.close();
+});
+
+
+test('entity migration preserves actor, relationship and memory IDs while allowing homonyms', () => {
+  const databasePath = path.join(temporaryDirectory('entity-migration-'), 'memory.db');
+  let database = openMemoryDatabase(databasePath);
+  let repository = new MemoryRepository(database);
+  const structure = ensureCompanionRelationshipStructure({ repository, agentId: 'migration-agent',
+    primaryUserId: 'human', primaryUserName: 'Paris', companionId: 'migration-agent', companionName: 'Suzu' });
+  repository.upsertMemory({ id: 'visit', agentId: 'migration-agent', kind: 'event', layer: 'episodic', content: 'Visited Paris.' });
+  const city = repository.upsertEntity({ id: 'original-city', agentId: 'migration-agent', kind: 'place', canonicalName: 'Paris', aliases: ['巴黎'] });
+  repository.linkMemoryEntity({ memoryId: 'visit', entityId: city.id });
+  // Reconstruct the exact v48 entity table around real foreign-key consumers.
+  database.exec(`PRAGMA foreign_keys=OFF;
+    DROP TABLE entity_names;
+    CREATE TABLE legacy_entities(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,kind TEXT NOT NULL,
+      canonical_name TEXT NOT NULL,aliases_json TEXT NOT NULL DEFAULT '[]',metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(agent_id,kind,canonical_name)) STRICT;
+    INSERT INTO legacy_entities SELECT * FROM entities;
+    DROP TABLE entities; ALTER TABLE legacy_entities RENAME TO entities;
+    CREATE UNIQUE INDEX entities_id_agent ON entities(id,agent_id);
+    DELETE FROM schema_migrations WHERE version=49; PRAGMA foreign_keys=ON;`);
+  database.close();
+  database = closeAfterTests(openMemoryDatabase(databasePath));
+  repository = new MemoryRepository(database);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal(repository.getActorEntityBinding({ agentId: 'migration-agent', actorRole: 'user', actorKey: 'human' }).entity_id, structure.user.id);
+  assert.equal(repository.listRelationships('migration-agent')[0].members.length, 2);
+  assert.equal(repository.listMemoryEntities('visit')[0].id, city.id);
+  assert.equal(repository.findEntitiesByName({ agentId: 'migration-agent', kind: 'place', name: '巴黎' })[0].id, city.id);
+  const homonym = repository.upsertEntity({ id: 'another-city', agentId: 'migration-agent', kind: 'place', canonicalName: 'Paris' });
+  assert.notEqual(homonym.id, city.id);
+  assert.equal(repository.findEntitiesByName({ agentId: 'migration-agent', name: 'Paris' }).length, 3);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('entity candidate lookup uses one indexed batch and rolls back cross-agent links', t => {
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
+  const repository = new MemoryRepository(database);
+  repository.upsertEntity({ id: 'city', agentId: 'a', kind: 'place', canonicalName: 'Paris', aliases: ['巴黎'] });
+  repository.upsertEntity({ id: 'person', agentId: 'a', kind: 'person', canonicalName: 'Paris' });
+  repository.upsertEntity({ id: 'foreign', agentId: 'b', kind: 'place', canonicalName: 'Paris' });
+  const queries = [], prepare = database.prepare.bind(database);
+  t.mock.method(database, 'prepare', sql => { if (sql.includes('SELECT DISTINCT entity.* FROM entity_names')) queries.push(sql); return prepare(sql); });
+  assert.deepEqual(new Set(repository.findEntitiesByNames({ agentId: 'a', names: ['Paris', '巴黎', 'Paris'] }).map(entity => entity.id)), new Set(['city', 'person']));
+  assert.equal(queries.length, 1);
+  const plan = prepare('EXPLAIN QUERY PLAN ' + queries[0]).all('a', JSON.stringify(['paris', '巴黎']));
+  assert.ok(plan.some(row => row.detail.includes('entity_names_lookup')), JSON.stringify(plan));
+  repository.upsertMemory({ id: 'event', agentId: 'a', kind: 'event', layer: 'episodic', content: 'Visited Paris.' });
+  assert.throws(() => repository.linkMemoryEntities({ memoryId: 'event', entityIds: ['city', 'foreign'] }), /same Agent/);
+  assert.deepEqual(repository.listMemoryEntities('event'), []);
+});
+
+
+test('declined transaction results roll back nested entity changes while the outer operation continues', () => {
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
+  const repository = new MemoryRepository(database);
+  repository.transaction(() => {
+    repository.upsertEntity({ id: 'kept', agentId: 'a', kind: 'person', canonicalName: 'Lin' });
+    const result = repository.transaction(() => {
+      repository.upsertEntity({ id: 'kept', agentId: 'a', kind: 'person', canonicalName: 'Wrong name' });
+      repository.upsertEntity({ id: 'declined', agentId: 'a', kind: 'person', canonicalName: 'Mira' });
+      repository.bindActorEntity({ agentId: 'a', actorRole: 'other', actorKey: 'guest', entityId: 'declined', displayName: 'Mira' });
+      return { status: 'needs-correction' };
+    }, { rollbackWhen: result => result.status === 'needs-correction' });
+    assert.equal(result.status, 'needs-correction');
+    assert.equal(repository.getEntity('a', 'kept').canonical_name, 'Lin');
+    assert.equal(repository.getEntity('a', 'declined'), null);
+    assert.deepEqual(repository.findEntitiesByName({ agentId: 'a', name: 'Wrong name' }), []);
+    assert.equal(repository.getActorEntityBinding({ agentId: 'a', actorRole: 'other', actorKey: 'guest' }), null);
+    repository.upsertEntity({ id: 'after', agentId: 'a', kind: 'place', canonicalName: 'Paris' });
+  });
+  assert.deepEqual(new Set(repository.listEntities('a').map(entity => entity.id)), new Set(['kept', 'after']));
+});
+
+test('a failed database commit rolls back and permits the next independent write', () => {
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
+  const repository = new MemoryRepository(database);
+  assert.throws(() => repository.transaction(() => {
+    database.exec('PRAGMA defer_foreign_keys=ON');
+    database.prepare('INSERT INTO entity_names(entity_id,agent_id,kind,name_key) VALUES (?,?,?,?)')
+      .run('missing-entity', 'a', 'place', 'orphan');
+  }), /FOREIGN KEY/);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM entity_names').get().n, 0);
+  assert.doesNotThrow(() => repository.upsertEntity({ id: 'valid', agentId: 'a', kind: 'place', canonicalName: 'Paris' }));
+  assert.equal(repository.findEntitiesByName({ agentId: 'a', name: 'Paris' })[0].id, 'valid');
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+
+test("automatic graph creation and cleanup isolate reality within the existing exact world scope", () => {
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
+  const repository = new MemoryRepository(database);
+  for (const [id,reality,worldId,worldFrame] of [['real-a','real','room-a','physical'],['real-b','real','room-a','physical'],['other-room','real','room-b','relational'],['imagined','hypothetical','room-a','physical']]) {
+    repository.upsertMemory({ id, agentId: 'agent-test', kind: 'event', layer: 'episodic', content: 'A museum robot visit.',
+      canonicalKey: 'museum:visit', reality, worldId, worldFrame, eventDate: '2026-07-01' });
+    repository.upsertEmbedding({ memoryId: id, model: 'world-test', vector: [1,0] });
+  }
+  rebuildAssociationGraph({ repository, agentId: 'agent-test' });
+  const edges = database.prepare("SELECT * FROM memory_edges WHERE provenance='association-builder-v1'").all();
+  assert.ok(edges.some(edge => [edge.from_memory_id,edge.to_memory_id].includes('real-a') && [edge.from_memory_id,edge.to_memory_id].includes('real-b')));
+  assert.ok(edges.every(edge => ![edge.from_memory_id,edge.to_memory_id].some(id => ['imagined','other-room'].includes(id))));
+  repository.upsertEdge({ agentId: 'agent-test', fromMemoryId: 'real-a', toMemoryId: 'imagined', relation: 'associated_with', direction: 'undirected',
+    weight: 1, confidence: 1, provenance: 'association-builder-v1' });
+  updateAssociationGraph({ repository, agentId: 'agent-test', memoryIds: ['real-b'] });
+  assert.equal(database.prepare("SELECT count(*) n FROM memory_edges WHERE provenance='association-builder-v1' AND (from_memory_id='imagined' OR to_memory_id='imagined')").get().n, 0);
 });

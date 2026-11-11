@@ -1,3 +1,4 @@
+import { memoryWorldScope, memoryWorldsCompatible, commonMemoryWorld } from '@suzu-memory/core';
 import { MEMORY_STATE_FAMILIES, executionEventSourceView } from "@suzu-memory/core";
 
 function clean(value) {
@@ -102,7 +103,7 @@ function buildObservationView(repository, agentId, observation, limits, requestL
     memory: {
       id: memory.id,
       kind: memory.kind,
-      worldId: memory.world_id, worldFrame: memory.world_frame, reality: memory.reality,
+      ...observation.world,
       content: requireCompleteText(
         memory.content,
         limits.maxMemoryContentChars,
@@ -154,6 +155,7 @@ export function buildCanonicalStateEvidenceSnapshot({
   currentRepresentationLayer = "",
   subjectLabel,
   stateLabel,
+  world = null,
   analysisRequestId = "",
   analysisRequestObservationIds = [],
   maxObservations = 400,
@@ -199,17 +201,29 @@ export function buildCanonicalStateEvidenceSnapshot({
     }
     requestLane = {
       requestId: request.id,
+      semantic: repository.getStateAnalysisRequestSemanticMemory(request.agent_id, request.id),
       observationIds,
       memoryIds: new Set(request.memoryIds),
       sourceIds: new Set(request.sourceIds),
     };
   }
 
+  const semantic = requestLane?.semantic;
+  if (semantic && (semantic.agent_id !== normalizedAgentId || semantic.status === 'deleted'
+    || semantic.metadata?.stateAnalysisDraft !== true || semantic.metadata?.stateAnalysisRequestId !== requestLane.requestId)) {
+    throw new Error('Canonical state review semantic draft does not match its fixed request.');
+  }
+  let fixedWorld = semantic ? memoryWorldScope(semantic) : world ? memoryWorldScope(world) : null;
+  if (world && semantic && !memoryWorldsCompatible(world, semantic, { allowRealSpaces: true })) {
+    return { status: 'blocked', reason: 'world-scope-does-not-match-request', snapshot: null };
+  }
+
   // expand() is deliberately capped at 500 nodes. Keeping this at 499 lets us
   // detect both observation and current-evidence saturation without pretending
   // a truncated graph is complete.
   const observationLimit = boundedInteger(maxObservations, 400, 1, 499);
-  const observations = repository.listStateEvidenceObservations(normalizedAgentId, {
+  let observations = repository.listStateEvidenceObservations(normalizedAgentId, {
+    world: fixedWorld,
     stateFamily: normalizedStateFamily,
     subjectRole: normalizedSubjectRole,
     subjectKey: normalizedSubjectKey,
@@ -225,7 +239,29 @@ export function buildCanonicalStateEvidenceSnapshot({
     return { status: "skipped", reason: "no-current-state-evidence", snapshot: null };
   }
 
+  const charLimit = boundedInteger(maxSnapshotChars, 500_000, 20_000, 2_000_000);
+  const limits = {
+    maxMemoryContentChars: boundedInteger(maxMemoryContentChars, charLimit, 1, charLimit),
+    maxSourceContentChars: boundedInteger(maxSourceContentChars, charLimit, 1, charLimit),
+  };
+  let views = observations.map((observation) => buildObservationView(
+    repository,
+    normalizedAgentId,
+    observation,
+    limits,
+    requestLane,
+  ));
+  if (!fixedWorld) fixedWorld = commonMemoryWorld(views.map(item => item.memory));
+  if (!fixedWorld) return { status: 'blocked', reason: 'world-scope-required', snapshot: {
+    agentId: normalizedAgentId, target: { stateFamily: normalizedStateFamily, subjectRole: normalizedSubjectRole,
+      subjectKey: normalizedSubjectKey, canonicalKey: normalizedCanonicalKey }, observations: views,
+  } };
+  const eligible = new Set(views.filter(item => memoryWorldsCompatible(fixedWorld, item.memory, { allowRealSpaces: true })).map(item => item.id));
+  observations = observations.filter(item => eligible.has(item.id));
+  views = views.filter(item => eligible.has(item.id));
+
   const current = repository.getCurrentCanonicalMemory({
+    ...fixedWorld,
     agentId: normalizedAgentId,
     subjectRole: normalizedSubjectRole,
     subjectKey: normalizedSubjectKey,
@@ -260,18 +296,6 @@ export function buildCanonicalStateEvidenceSnapshot({
     }
   }
 
-  const charLimit = boundedInteger(maxSnapshotChars, 500_000, 20_000, 2_000_000);
-  const limits = {
-    maxMemoryContentChars: boundedInteger(maxMemoryContentChars, charLimit, 1, charLimit),
-    maxSourceContentChars: boundedInteger(maxSourceContentChars, charLimit, 1, charLimit),
-  };
-  const views = observations.map((observation) => buildObservationView(
-    repository,
-    normalizedAgentId,
-    observation,
-    limits,
-    requestLane,
-  ));
   const evidenceGroups = groupObservations(observations, "evidence_group_id");
   const contextGroups = groupObservations(observations, "context_id");
   const qualified = observations.filter((observation) => observation.qualification === "qualified");
@@ -287,11 +311,13 @@ export function buildCanonicalStateEvidenceSnapshot({
       subjectKey: normalizedSubjectKey,
       canonicalKey: normalizedCanonicalKey,
       currentRepresentationLayer: normalizedCurrentRepresentationLayer,
+      world: fixedWorld,
       subjectLabel: clean(subjectLabel),
       stateLabel: clean(stateLabel),
     },
     currentState: current ? {
       id: current.id,
+      ...memoryWorldScope(current),
       kind: current.kind,
       content: requireCompleteText(
         current.content,

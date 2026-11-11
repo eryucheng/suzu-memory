@@ -36,8 +36,10 @@ function batchId(args) {
   return `identity-analysis-${createHash("sha256").update(raw).digest("hex").slice(0, 24)}`;
 }
 
-function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer) {
+function currentView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer, world) {
+  if (!world) return null;
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId,
     subjectRole,
     subjectKey,
@@ -99,9 +101,6 @@ function enforce(role, item, snapshot) {
   }
   if (role === "current-relation") {
     const exists = Boolean(snapshot.currentState);
-    if (item.currentStatePresent !== exists) {
-      throw new Error("Identity current-state presence does not match the read-only snapshot.");
-    }
     if (exists && item.relation === "no_current_state") {
       throw new Error("Identity relation omitted an available current state.");
     }
@@ -379,6 +378,7 @@ export async function evaluateIdentityEvidence({
     memoryIds: normalizedIds,
     ...snapshotOptions,
   });
+  const world = base.world;
   const snapshot = {
     ...base,
     agentId: clean(agentId),
@@ -397,8 +397,7 @@ export async function evaluateIdentityEvidence({
       base.target.subjectRole,
       base.target.subjectKey,
       base.target.canonicalKey,
-      clean(currentRepresentationLayer),
-    ),
+      clean(currentRepresentationLayer), world),
     inputPolicy: {
       ...base.inputPolicy,
       // Request-bound raw speech may discuss or quote someone other than its speaker.

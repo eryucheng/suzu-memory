@@ -2,7 +2,8 @@ const clean = value => String(value ?? '').trim();
 const uniqueStrings = values => [...new Set((Array.isArray(values) ? values : []).map(clean).filter(Boolean))];
 export const MAINTENANCE_LANES = Object.freeze({ embedding: 'embedding', semantic: 'semantic' });
 export const MAINTENANCE_TASK_TYPES = Object.freeze({ memoryEmbedding: 'memory-embedding',
-  retrievalContext: 'retrieval-context', structureProposal: 'structure-proposal', eventContinuity: 'event-continuity' });
+  retrievalContext: 'retrieval-context', structureProposal: 'structure-proposal',
+  structureSummary: 'structure-summary', eventContinuity: 'event-continuity' });
 
 export function memoryMaintenanceTaskPayload({ repository, agentId, batchId, memoryIds }) {
   const memories = memoryIds.map((memoryId) => repository.getMemory(memoryId))
@@ -53,7 +54,7 @@ export function retirePendingMemoryMaintenanceTasks(repository, { agentId, memor
     UPDATE memory_maintenance_tasks SET status = 'completed', completed_at = ?, updated_at = ?,
       result_json = ?, error_message = ''
     WHERE agent_id = ? AND status = 'pending'
-      AND task_type IN ('memory-embedding', 'retrieval-context', 'structure-proposal', 'event-continuity')
+      AND task_type IN ('memory-embedding', 'retrieval-context', 'structure-proposal', 'structure-summary', 'event-continuity')
       AND json_array_length(payload_json, '$.memoryIds') = 1
       AND json_extract(payload_json, '$.memoryIds[0]') = ?
   `).run(new Date().toISOString(), new Date().toISOString(),

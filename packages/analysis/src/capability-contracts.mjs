@@ -73,13 +73,12 @@ export const CAPABILITY_ANALYZERS = Object.freeze({
   }),
   timeCurrentRelation: Object.freeze({
     stateFamily: "capability", role: "time-current-relation",
-    schemaName: "memory-capability-time-current-relation-v1", promptVersion: "capability-time-current-relation-v1",
+    schemaName: "memory-capability-time-current-relation-v2", promptVersion: "capability-time-current-relation-v2",
     promptFile: "capability-time-current-relation-system-prompt.md",
-    schema: resultSchema(["stateTime", "changeCue", "currentStatePresent", "relation", "scopeOverlap"], {
+    schema: resultSchema(["stateTime", "changeCue", "relation", "scopeOverlap"], {
       stateTime: { type: "string", enum: ["current", "historical", "future", "unknown"] },
       changeCue: { type: "string", enum: ["improved", "declined", "lost", "none", "unknown"] },
-      currentStatePresent: { type: "boolean" },
-      relation: { type: "string", enum: ["no_current_state", "equivalent", "supports", "narrows", "broadens", "proficiency_up", "proficiency_down", "same_scope_conflict", "retires", "unrelated", "unknown"] },
+      relation: { type: "string", enum: ["equivalent", "supports", "narrows", "broadens", "proficiency_up", "proficiency_down", "same_scope_conflict", "retires", "unrelated", "unknown"] },
       scopeOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
     }),
   }),
@@ -131,12 +130,10 @@ function parseRoleItem(role, value, index) {
     conditionLabel: clean(value.conditionLabel),
   };
   if (role === "time-current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
     return {
       ...common,
       stateTime: requireEnum(value.stateTime, `analyses[${index}].stateTime`, ["current", "historical", "future", "unknown"]),
       changeCue: requireEnum(value.changeCue, `analyses[${index}].changeCue`, ["improved", "declined", "lost", "none", "unknown"]),
-      currentStatePresent: value.currentStatePresent,
       relation: requireEnum(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "proficiency_up", "proficiency_down", "same_scope_conflict", "retires", "unrelated", "unknown"]),
       scopeOverlap: requireEnum(value.scopeOverlap, `analyses[${index}].scopeOverlap`, ["exact", "partial", "none", "unknown"]),
     };

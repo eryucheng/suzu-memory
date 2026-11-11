@@ -90,12 +90,11 @@ export const IDENTITY_ANALYZERS = Object.freeze({
   currentRelation: Object.freeze({
     stateFamily: "identity",
     role: "current-relation",
-    schemaName: "memory-identity-current-relation-v1",
-    promptVersion: "identity-current-relation-v1",
+    schemaName: "memory-identity-current-relation-v2",
+    promptVersion: "identity-current-relation-v2",
     promptFile: "identity-current-relation-system-prompt.md",
-    schema: schema(["currentStatePresent", "relation", "valueOverlap"], {
-      currentStatePresent: { type: "boolean" },
-      relation: { type: "string", enum: ["no_current_state", "equivalent", "supports", "additional_value", "value_changed", "narrows", "broadens", "retires", "same_scope_conflict", "unrelated", "unknown"] },
+    schema: schema(["relation", "valueOverlap"], {
+      relation: { type: "string", enum: ["equivalent", "supports", "additional_value", "value_changed", "narrows", "broadens", "retires", "same_scope_conflict", "unrelated", "unknown"] },
       valueOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
     }),
   }),
@@ -162,12 +161,8 @@ function parseItem(role, value, index) {
     };
   }
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") {
-      throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    }
     return {
       ...base,
-      currentStatePresent: value.currentStatePresent,
       relation: enumValue(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "additional_value", "value_changed", "narrows", "broadens", "retires", "same_scope_conflict", "unrelated", "unknown"]),
       valueOverlap: enumValue(value.valueOverlap, `analyses[${index}].valueOverlap`, ["exact", "partial", "none", "unknown"]),
     };

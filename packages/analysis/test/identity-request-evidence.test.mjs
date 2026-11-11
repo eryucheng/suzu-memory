@@ -24,8 +24,7 @@ function fixture(t, { selfReport = false, agentId = 'agent-test', batchId = 'ide
       stateLabel: identityLabel || (identityField === 'relationship_status' ? '婚恋状态' : selfReport ? '职业' : '王涟的身份'),
       stateTarget: { identityField: identityField || (selfReport ? 'occupation' : 'other'), fieldCardinality },
       temporalState: 'current', confidence: 0.9, importance: 0.5, actorRoles: [],
-      sourceRefs: built.messages.map(message => message.memoryRef), retentionReason: 'identity',
-      revisionAction: 'add',
+      sourceRefs: built.messages.map(message => message.memoryRef), revisionAction: 'add',
     }] });
   assert.equal(archive.stateAnalysisRequestsQueued, 1, JSON.stringify(archive.candidateResults));
   const request = repository.getStateAnalysisRequest(agentId, archive.candidateResults[0].stateAnalysisRequestId);
@@ -56,8 +55,8 @@ function generatorFor({ selfReport = false, subjectMatch = 'yes', unrelatedSourc
         if (key === 'familyBoundary') return { ...item,
           classification: realCase ? index === 0 ? 'no_identity_fact' : 'relationship_role' : 'identity_fact', sensitivity: 'ordinary' };
         if (key === 'timeRevision') return { ...item, factTime: 'current', revisionCue, timeReference: '' };
-        if (key === 'currentRelation') return { ...item, currentStatePresent: Boolean(snapshot.currentState),
-          relation: snapshot.currentState ? currentRelation : 'no_current_state', valueOverlap: 'none' };
+        if (key === 'currentRelation') return { ...item,
+          relation: snapshot.currentState ? currentRelation : 'unknown', valueOverlap: 'none' };
         throw new Error(`Unexpected analyzer ${key}`);
       }),
     }]));
@@ -163,32 +162,32 @@ test('the actual speaker can still propose a directly reported identity', async 
   assert.equal(result.proposal.subject_key, 'user-test');
 });
 
-for (const invalid of ['missing-name', 'different-name', 'different-scope', 'ambiguous-name']) {
-  test(`invalid third-person target ${invalid} is rejected before any model call`, async t => {
-    const f = fixture(t);
-    const metadata = structuredClone(f.request.metadata);
-    if (invalid === 'missing-name') metadata.subjectName = '';
-    if (invalid === 'different-name') metadata.subjectName = '另一个人';
-    if (invalid === 'different-scope') metadata.actorIdentity.unresolvedActorScope = 'another-session-scope';
-    if (invalid === 'ambiguous-name') metadata.actorIdentity.participants.push(
-      { name: '王涟', actorRole: 'other', actorKey: 'person-a', aliases: [] },
-      { name: '王涟', actorRole: 'other', actorKey: 'person-b', aliases: [] });
-    f.repository.bindStateAnalysisTarget({ agentId: f.agentId, requestId: f.request.id,
-      canonicalKey: f.request.canonical_key, metadata });
-    let calls = 0;
-    const run = () => process(f, async () => { calls++; throw new Error('must not call'); });
-    const result = await run();
-    assert.equal(result.status, 'provisional-review');
-    assert.equal(result.reason, 'request-subject-identity-mismatch');
-    assert.equal(result.evaluation, null);
-    assert.equal(calls, 0);
-    assert.equal((await run()).status, 'already-resolved');
-    assert.equal(calls, 0);
-    const provisional = f.repository.listPendingProvisionalMemories(f.agentId);
-    assert.equal(provisional.length, 1);
-    assert.equal(provisional[0].subject_key, f.request.subject_key, 'review must preserve the original extraction subject');
-  });
-}
+test('state preflight rejects a changed binding against the captured extraction before a model call', async t => {
+  const f = fixture(t);
+  f.database.prepare('UPDATE memory_state_analysis_requests SET subject_key=? WHERE id=?').run('unresolved-person-another', f.request.id);
+  let calls = 0;
+  const result = await process(f, async () => { calls++; throw new Error('must not call'); });
+  assert.equal(result.status, 'provisional-review');
+  assert.equal(result.reason, 'request-subject-identity-mismatch');
+  assert.equal(calls, 0);
+  const provisional = f.repository.listPendingProvisionalMemories(f.agentId);
+  assert.equal(provisional[0].subject_key, f.request.subject_key);
+});
+
+test('a captured state identity survives later duplicate names and changed lookup scope', async t => {
+  const f = fixture(t);
+  const metadata = structuredClone(f.request.metadata);
+  metadata.actorIdentity.unresolvedActorScope = 'later-scope';
+  metadata.actorIdentity.participants.push({ name: '王涟', actorRole: 'other', actorKey: 'another-person', aliases: [] },
+    { name: '王涟', actorRole: 'other', actorKey: 'yet-another-person', aliases: [] });
+  f.repository.bindStateAnalysisTarget({ agentId: f.agentId, requestId: f.request.id,
+    canonicalKey: f.request.canonical_key, metadata });
+  const { calls, generator } = generatorFor();
+  const result = await process(f, generator);
+  assert.equal(calls.length, 1);
+  assert.equal(result.request.subject_key, f.request.subject_key);
+  assert.equal(result.evaluation.status, 'analyzed');
+});
 
 test('third-person analysis still rejects sources outside its own evidence', async t => {
   const f = fixture(t);

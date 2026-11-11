@@ -358,3 +358,24 @@ test("rejects stale preference proposals after another state becomes current", (
   assert.equal(repository.getPreferenceStateProposal("agent-test", proposal.id).review_state, "pending");
   database.close();
 });
+
+
+test("a fictional preference and its closure leave the real preference current", t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const real = currentStablePreference(repository);
+  const evidence = evidenceMemory(repository, { id: 'fiction-choice', content: 'A story character chooses a puzzle.', source: 'Choose a puzzle.', occurredAt: '2026-07-21T12:00:00Z' });
+  const counter = evidenceMemory(repository, { id: 'fiction-counter', content: 'The character stops choosing puzzles.', source: 'Stop choosing puzzles.', occurredAt: '2026-07-22T12:00:00Z' });
+  for (const item of [evidence, counter]) database.prepare("UPDATE memory_nodes SET reality='fictional',world_id='story',world_frame='fictional' WHERE id=?").run(item.memoryId);
+  const args = { agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user', canonicalKey: 'user:preference:puzzle-games',
+    subjectLabel: 'User', objectLabel: 'Puzzles', policyVersion: 'world-test' };
+  const proposal = proposePreferenceState(repository, { ...args, proposedLevel: 'stable_preference', previewStatus: 'stable-preference-review',
+    evidence: [label(evidence, 'active_choice', 'support')] });
+  assert.equal(proposal.transition, 'create'); assert.equal(proposal.previousMemoryId, '');
+  const fictional = resolvePreferenceStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id, action: 'accept' }).memory;
+  const closing = proposePreferenceState(repository, { ...args, proposedLevel: 'no_conclusion', previewStatus: 'behavioral-opposition', evidenceReviewMode: 'full_canonical',
+    evidence: [label(counter, 'counter_behavior', 'opposition')] });
+  assert.equal(closing.previousMemoryId, fictional.id);
+  resolvePreferenceStateProposal(repository, { agentId: 'agent-test', proposalId: closing.id, action: 'accept' });
+  assert.equal(repository.getMemory(fictional.id).status, 'superseded');
+  assert.equal(repository.getMemory(real.id).status, 'active');
+});

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { setTimeout as wait } from 'node:timers/promises';
 
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import { executionEventSourceView, eventSourceMaterial, currentEventSourceExecution,
@@ -13,10 +14,6 @@ function clean(value) {
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function normalizeVector(input) {
@@ -105,12 +102,13 @@ function utteranceRetrievalContext(repository, agentId, memory, sourceView) {
   };
 }
 
-function listSearchableMemories(repository, agentId) {
+function listSearchableMemories(repository, agentId, memoryIds) {
   const result = [];
   let offset = 0;
   while (true) {
     const page = repository.listMemories(agentId, {
       statuses: ["active", "superseded", "disputed"],
+      memoryIds,
       limit: 200,
       offset,
     });
@@ -121,11 +119,11 @@ function listSearchableMemories(repository, agentId) {
   return result;
 }
 
-function listIndexableMemories(repository, agentId) {
-  const searchable = listSearchableMemories(repository, agentId);
+function listIndexableMemories(repository, agentId, memoryIds) {
+  const searchable = listSearchableMemories(repository, agentId, memoryIds);
   const active = searchable.filter(memory => memory.status === 'active');
   const provisional = typeof repository.listPendingProvisionalMemories === "function"
-    ? repository.listPendingProvisionalMemories(agentId, { limit: 5_000 })
+    ? repository.listPendingProvisionalMemories(agentId, { limit: 5_000, memoryIds })
     : [];
   return {
     active,
@@ -142,78 +140,53 @@ function isRetryable(error) {
 }
 
 async function requestVectors(provider, texts, context) {
-  if (typeof provider?.embedMany === "function") {
-    const response = await provider.embedMany(texts, context);
-    return {
-      vectors: response.vectors,
-      model: response.model,
-      requests: [{
-        usage: response.usage || {},
-        requestId: response.requestId || "",
-        metadata: response.metadata || {},
-      }],
-    };
-  }
-  const response = await provider(texts[0], context);
-  return {
-    vectors: [response.vector],
-    model: response.model,
-    requests: [{
-      usage: response.usage || {},
-      requestId: response.requestId || "",
-      metadata: response.metadata || {},
-    }],
-  };
+  const batched = typeof provider?.embedMany === 'function';
+  const response = await (batched ? provider.embedMany(texts, context) : provider(texts[0], context));
+  return { ...response, vectors: batched ? response.vectors : [response.vector] };
 }
 
-async function requestVectorsWithRetry(provider, texts, maxRetries, retryDelayMs, context) {
-  let lastError;
+async function requestVectorsWithRetry(provider, texts, maxRetries, retryDelayMs, context, recordResponse) {
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    assertEventSourceExecutionCurrent();
+    let response;
     try {
-      assertEventSourceExecutionCurrent();
-      const result = await requestVectors(provider, texts, context);
-      assertEventSourceExecutionCurrent();
-      return result;
+      response = await requestVectors(provider, texts, context);
     } catch (error) {
-      lastError = error;
+      await recordResponse(error);
       assertEventSourceExecutionCurrent();
-      if (!isRetryable(error) || attempt >= maxRetries) break;
-      await sleep(Math.min(4_000, retryDelayMs * (2 ** attempt)));
+      if (!isRetryable(error) || attempt >= maxRetries) throw error;
+      await wait(Math.min(4_000, retryDelayMs * (2 ** attempt)), undefined, { signal: context.signal });
+      continue;
     }
+    await recordResponse(response);
+    assertEventSourceExecutionCurrent();
+    return response;
   }
-  throw lastError;
 }
 
 async function recordUsage({
   ledgerPath,
-  requests,
+  response,
   agentId,
   model,
   batchSize,
   dimensions,
 }) {
-  if (!clean(ledgerPath)) return [];
+  if (!clean(ledgerPath) || !response?.usage || !Object.keys(response.usage).length) return [];
   const errors = [];
-  for (const request of requests) {
-    if (!request.usage || !Object.keys(request.usage).length) continue;
-    try {
-      await appendUsageEvent(ledgerPath, {
-        agentId,
-        provider: request.metadata?.provider || "",
-        model,
-        source: "memory-embedding-indexer",
-        feature: "memory-index-embedding",
-        requestId: request.requestId,
-        usage: request.usage,
-        metadata: {
-          ...request.metadata,
-          batchSize,
-          dimensions,
-        },
-      });
-    } catch (error) {
-      errors.push(error.message);
-    }
+  try {
+    await appendUsageEvent(ledgerPath, {
+      agentId,
+      provider: response.metadata?.provider || "",
+      model: clean(response.model) || model,
+      source: "memory-embedding-indexer",
+      feature: "memory-index-embedding",
+      requestId: response.requestId,
+      usage: response.usage,
+      metadata: { ...response.metadata, batchSize, dimensions },
+    });
+  } catch (error) {
+    errors.push(error.message);
   }
   return errors;
 }
@@ -270,7 +243,7 @@ export async function syncMemoryEmbeddings({
 
   const excluded = new Set((Array.isArray(excludedKinds) ? excludedKinds : []).map(clean));
   const selectedIds = new Set((Array.isArray(memoryIds) ? memoryIds : []).map(clean).filter(Boolean));
-  const indexable = listIndexableMemories(repository, normalizedAgentId);
+  const indexable = listIndexableMemories(repository, normalizedAgentId, selectedIds.size ? [...selectedIds] : null);
   const sourceView = executionEventSourceView(repository, normalizedAgentId);
   // Analysis drafts use the same node and vector stores, but are only indexed
   // when explicitly requested; they are not recalled as established memories.
@@ -286,17 +259,18 @@ export async function syncMemoryEmbeddings({
     .filter((memory) => !sourceView || sourceView.allows(memory))
     .filter((memory) => !selectedIds.size || selectedIds.has(memory.id))
     .sort((left, right) => left.id.localeCompare(right.id));
-  const existing = new Map(
-    repository.listEmbeddings(normalizedAgentId, normalizedModel, { includeArchived: true })
-      .map((embedding) => [embedding.memory_id, embedding]),
-  );
   const prepared = eligible.map((memory) => {
     return {
       memory,
       ...prepareMemoryEmbeddingDocument(repository, memory, { sourceView }),
-      current: existing.get(memory.id) || null,
     };
   });
+  const existing = new Map(repository.listEmbeddings(normalizedAgentId, normalizedModel, {
+    includeArchived: true,
+    memoryIds: eligible.map(memory => memory.id),
+    contentHashes: force ? [] : prepared.map(item => item.contentHash),
+  }).map(embedding => [embedding.memory_id, embedding]));
+  for (const item of prepared) item.current = existing.get(item.memory.id) || null;
   const byContent = new Map([...existing.values()].filter(embedding => (
     (!dimensions || embedding.dimensions === dimensions)
     && (!sourceView || sourceView.allows(repository.getMemory(embedding.memory_id)))
@@ -360,6 +334,10 @@ export async function syncMemoryEmbeddings({
           batch.flatMap(item => [item.memory.id, ...(item.retrievalContext?.sourceMemoryIds || [])])),
           signal: currentEventSourceExecution()?.signal,
           model: normalizedModel, dimensions: expectedDimensions },
+        async response => report.usageLoggingErrors.push(...await recordUsage({
+          ledgerPath, response, agentId: normalizedAgentId, model: normalizedModel,
+          batchSize: batch.length, dimensions: expectedDimensions,
+        })),
       );
       if (clean(response.model) && clean(response.model) !== normalizedModel) {
         throw new Error(`Embedding 模型发生变化：预期 ${normalizedModel}，实际 ${response.model}。`);
@@ -380,14 +358,6 @@ export async function syncMemoryEmbeddings({
       report.skipped += written.skipped.length;
       report.failed += written.failures.length;
       report.failures.push(...written.failures);
-      report.usageLoggingErrors.push(...await recordUsage({
-        ledgerPath,
-        requests: response.requests,
-        agentId: normalizedAgentId,
-        model: normalizedModel,
-        batchSize: batch.length,
-        dimensions: expectedDimensions,
-      }));
     } catch (error) {
       assertEventSourceExecutionCurrent();
       report.failed += batch.length;

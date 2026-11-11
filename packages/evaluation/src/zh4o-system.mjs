@@ -47,7 +47,7 @@ function unique(values) {
 }
 
 function copyGeneratorCapabilities(source, target) {
-  for (const key of ["supportsCombinedStateAnalysis", "supportsCombinedConsolidation"]) {
+  for (const key of ["supportsCombinedStateAnalysis", "supportsCombinedConsolidation", "measureRequest", "assertRequestBudget"]) {
     if (Object.hasOwn(source, key)) target[key] = source[key];
   }
   return target;

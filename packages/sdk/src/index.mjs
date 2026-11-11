@@ -23,7 +23,14 @@ export class SuzuMemoryHttpClient {
     this.fetchImpl = fetchImpl;
   }
 
-  async request(pathname, { method = "GET", body } = {}) {
+  async request(pathname, { method = "GET", body, signal } = {}) {
+    const bodySignal = typeof body?.signal?.throwIfAborted === 'function' ? body.signal : undefined;
+    signal ??= bodySignal;
+    signal?.throwIfAborted();
+    if (bodySignal) {
+      const { signal: _signal, ...payload } = body;
+      body = payload;
+    }
     const headers = { accept: "application/json" };
     if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
     if (body !== undefined) headers["content-type"] = "application/json";
@@ -31,8 +38,10 @@ export class SuzuMemoryHttpClient {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
     const payload = await response.json().catch(() => null);
+    signal?.throwIfAborted();
     if (!response.ok || payload?.status !== "success") {
       const error = new Error(payload?.error?.message || `Suzu Memory HTTP ${response.status}.`);
       error.code = payload?.error?.code || "HTTP_ERROR";
@@ -113,7 +122,9 @@ export class SuzuMemoryHttpClient {
       body: options,
     });
   }
-  listMemories(options = {}) { return this.request(`/v1/memories${queryString(options)}`); }
+  listMemories({ statuses, kinds, ...options } = {}) {
+    return this.request(`/v1/memories${queryString({ ...options, status: statuses ?? options.status, kind: kinds ?? options.kind })}`);
+  }
   getMemory(memoryId) { return this.request(`/v1/memories/${encodeURIComponent(memoryId)}`); }
   search(query, options = {}) { return this.request("/v1/search", { method: "POST", body: { query, ...options } }); }
   editMemory(memoryId, patch, options = {}) {
@@ -134,8 +145,8 @@ export class SuzuMemoryHttpClient {
       body: options,
     });
   }
-  listRetrievalTraces(options = {}) {
-    return this.request(`/v1/retrieval-traces${queryString(options)}`);
+  listRetrievalTraces({ resultStatus, ...options } = {}) {
+    return this.request(`/v1/retrieval-traces${queryString({ ...options, status: resultStatus ?? options.status })}`);
   }
   recordRetrievalFeedback(traceIdOrOptions, feedback = {}) {
     const options = traceIdOrOptions && typeof traceIdOrOptions === "object"

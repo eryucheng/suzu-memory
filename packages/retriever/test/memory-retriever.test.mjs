@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -5,13 +6,95 @@ import path from "node:path";
 import test from "node:test";
 
 import { MemoryRepository, memoryRetrievalContextSourceHash, openMemoryDatabase, proposeMemoryRelation, resolveMemoryRelationProposal } from "@suzu-memory/core";
-import { collectBm25SeedScores, lexicalScore, lexicalTerms, planBm25Queries, retrieveMemories, resolveTemporalQuery } from "../src/index.mjs";
-import { fuseCandidateLanes } from "../src/retriever.mjs";
+import { closeRetrievalWorkers, collectBm25SeedScores, lexicalScore, lexicalTerms, planBm25Queries, retrieveMemories, resolveTemporalQuery } from "../src/index.mjs";
+import { fuseCandidateLanes, DEFAULT_RETRIEVAL_OPTIONS } from "../src/retriever.mjs";
+import { renderRecallOutput, joinBoundedSections, formatPrimary } from '../src/context-renderer.mjs';
+
+test('default recall keeps long original statements and returns factual metadata without boilerplate', () => {
+  assert.equal(DEFAULT_RETRIEVAL_OPTIONS.maximumContextChars, 24_000);
+  for (const language of ['zh','en']) {
+    const content=(language==='zh'?'林讲述了徒步的具体经历。':'Lin described the hiking experience. ').repeat(120)
+      +(language==='zh'?'最后确认没有参加露营。':'Finally, Lin confirmed not attending the camp.');
+    const nodes=[{id:'statement',kind:'utterance',content,metadata:{speaker:'Lin'},event_start:'2026-10-20T08:00:00Z'},
+      {id:'summary',kind:'event',content:'Lin did not attend the camp.',event_date:'2026-10-20',known_at:'2026-10-21T08:00:00Z',evidence_mode:'inferred'}];
+    const output=renderRecallOutput({nodes},DEFAULT_RETRIEVAL_OPTIONS);
+    assert.ok(output.context.includes(content));
+    assert.ok(output.context.includes('Lin did not attend the camp.'));
+    assert.match(output.context,/事件日期：2026-10-20；获知时间：2026-10-21/u);
+    assert.match(output.context,/推断：Lin/u);
+    assert.doesNotMatch(output.context,/你想起|我记得|已解析|来源性质|状态性质/u);
+    assert.equal(output.records.length,2);
+    const explicit=renderRecallOutput({nodes}, {...DEFAULT_RETRIEVAL_OPTIONS,maximumMessageChars:200});
+    assert.ok(!explicit.context.includes(content));
+    assert.ok(explicit.context.includes('Lin did not attend the camp.'));
+  }
+});
+
+test('compact attribution keeps each statement intact and distinguishes its subject from its source', () => {
+  for (const [name, named, firstPerson] of [
+    ['林明','林明和米拉参观了博物馆。','我和米拉参观了博物馆。'],
+    ['Lin','Lin visited the museum with Mira.','I visited the museum with Mira.'],
+    ['Dr. Lin','Yesterday Dr. Lin visited the museum with Mira.','I visited the museum with Mira yesterday.'],
+  ]) {
+    const base={id:'fact',kind:'event',subject_key:'person',event_date:'2026-10-20',evidence_mode:'explicit'};
+    const options={maximumContextChars:4000,timeZone:'UTC',actorNames:new Map([['person',name]])};
+    for (const [body, authority, mode, expected] of [
+      [named,'subject_firsthand','explicit',`自述：${named}`],
+      [`2026-10-20，${named}`,'subject_firsthand','explicit',`自述：2026-10-20，${named}`],
+      [firstPerson,'subject_firsthand','explicit',`${name}自述：${firstPerson}`],
+      [named,'hearsay','explicit',`转述：${named}`],
+      [firstPerson,'model_inference','inferred',`推断（关于${name}）：${firstPerson}`],
+      [firstPerson,'unknown','imported',`关于${name}：${firstPerson}`],
+    ]) {
+      const node={...base,content:body,evidence_mode:mode};
+      const rendered=formatPrimary(node,[],{...options,sourceAuthoritiesByMemoryId:new Map([['fact',[authority]]])});
+      assert.ok(rendered.endsWith(expected),rendered);
+      assert.doesNotMatch(rendered,/人物：|主体本人陈述|主体明确表达/u);
+      assert.equal(node.content,body);
+      assert.equal(rendered.split(name).length-1,1,rendered);
+    }
+    const utterance=formatPrimary({...base,kind:'utterance',content:firstPerson,metadata:{speaker:name}},[],options);
+    assert.ok(utterance.endsWith(`${name}：${firstPerson}`));
+    assert.doesNotMatch(utterance,/自述/u);
+  }
+  const namedSubstring=formatPrimary({kind:'event',subject_key:'person',content:'Lindsay asked me to hike.',evidence_mode:'inferred'},[],
+    {maximumContextChars:4000,actorNames:new Map([['person','Lin']])});
+  assert.ok(namedSubstring.endsWith('推断（关于Lin）：Lindsay asked me to hike.'));
+});
+
+test('recall budgets retain complete unequal records when they fit and reuse short records spare capacity', () => {
+  for (const language of ['zh', 'en']) {
+    const options = { maximumContextChars: 1400, maximumMessageChars: 500, timeZone: 'Asia/Shanghai', heading: '', guidance: '' };
+    const fact = language === 'zh' ? '猫的名字是小橘。' : 'Her cat is called Miso.';
+    const long = (language === 'zh' ? '讨论了出游的计划。' : 'Discussed the travel plans. ').repeat(language === 'zh' ? 38 : 14) + fact;
+    const nodes = Array.from({length: 10}, (_, i) => ({ id: `node-${i}`, kind: 'event',
+      content: i ? 'Brief fact.' : long, event_date: '2026-10-31' }));
+    const complete = renderRecallOutput({nodes}, {...options, maximumContextChars: 10000});
+    assert.ok(complete.context.length < options.maximumContextChars);
+    const result = renderRecallOutput({nodes}, options);
+    assert.equal(result.context, complete.context);
+    assert.ok(result.context.includes(fact));
+    assert.equal(result.outputBudget.sectionTruncationApplied, false);
+    for (const maximum of [1, 24, 100, 500]) {
+      const limited = renderRecallOutput({nodes}, {...options, maximumContextChars: maximum});
+      assert.ok(limited.context.length <= maximum);
+      assert.equal(limited.outputBudget.finalTextChars, limited.text.length);
+      for (const record of limited.records) assert.ok(record.text.startsWith(`记忆编号：${record.memoryId}\n`));
+    }
+  }
+  const values = ['x'.repeat(700), 'short', 'y'.repeat(700)];
+  const joined = joinBoundedSections(values, 1000);
+  assert.equal(joined.length, 1000);
+  assert.ok(joined.includes('\nshort\n'));
+  const primary = {kind: 'event', content: 'x'.repeat(750) + 'LAST_FACT', event_date: '2026-10-31'};
+  const text = formatPrimary(primary, [], {maximumContextChars: 1000});
+  assert.ok(text.includes('LAST_FACT'));
+});
 
 function temporaryDatabase() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-retriever-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-retriever-"));
   const databasePath = path.join(root, "memory.db");
-  const database = openMemoryDatabase(databasePath);
+  const database = closeAfterTests(openMemoryDatabase(databasePath));
   return { root, databasePath, database, repository: new MemoryRepository(database) };
 }
 
@@ -25,8 +108,11 @@ test('explicit candidate materialization returns independent readable memories w
   database.close();
   const ordinary = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '星河' });
   assert.equal(ordinary.candidates[0].recallContext, undefined);
+  assert.equal(ordinary.guidance, '');
+  assert.equal(ordinary.context, ordinary.records.map(record => record.text).join('\n\n'));
   const result = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '星河',
-    options: { includeCandidateContext: true, maximumReturnedCandidates: 10 } });
+    options: { includeCandidateContext: true, maximumReturnedCandidates: 10, heading: '', guidance: '项目历史资料：' } });
+  assert.equal(result.context, '项目历史资料：\n\n' + result.records.map(record => record.text).join('\n\n'));
   assert.equal(result.candidates.length, 2);
   for (const candidate of result.candidates) {
     assert.ok(candidate.recallContext.includes(candidate.title));
@@ -147,6 +233,9 @@ test("world scope gates every retrieval route while an explicit cross-world requ
     worldFrame: "fictional",
     eventDate: "2026-08-02",
   });
+  const hypothetical = repository.upsertMemory({ id: 'hypothetical-museum', agentId: 'agent-test', kind: 'event', layer: 'episodic',
+    content: '假如用户在科技馆看了火箭展。', reality: 'hypothetical', worldId: 'real-life', worldFrame: 'physical',
+    subjectRole: 'user', subjectKey: 'user', eventDate: '2026-08-03' });
   // Simulate an old bad edge that predates world isolation. The retriever must
   // still refuse to traverse it inside a scoped recall.
   repository.upsertEdge({
@@ -169,6 +258,7 @@ test("world scope gates every retrieval route while an explicit cross-world requ
   assert.ok(scoped.fragments.some((fragment) => fragment.memoryId === physical.id));
   assert.ok(!scoped.fragments.some((fragment) => fragment.memoryId === fictional.id));
   assert.ok(!scoped.graph.selectedMemoryIds.includes(fictional.id));
+  assert.ok(!scoped.candidates.some(candidate => candidate.memoryId === hypothetical.id));
 
   const crossWorld = await retrieveMemories({
     databasePath,
@@ -179,6 +269,12 @@ test("world scope gates every retrieval route while an explicit cross-world requ
   });
   assert.ok(crossWorld.candidates.some((candidate) => candidate.memoryId === physical.id));
   assert.ok(crossWorld.candidates.some((candidate) => candidate.memoryId === fictional.id));
+  assert.ok(crossWorld.candidates.some((candidate) => candidate.memoryId === hypothetical.id));
+  assert.match(crossWorld.context, /\[假设\]/u);
+  const imagined = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '科技馆的火箭展',
+    world: { id: 'real-life', frame: 'physical', reality: 'hypothetical' } });
+  assert.ok(imagined.fragments.some(fragment => fragment.memoryId === hypothetical.id));
+  assert.ok(!imagined.candidates.some(candidate => candidate.memoryId === physical.id));
 });
 
 test("recalls a pending Agent impression without graph propagation or learning eligibility", async () => {
@@ -228,14 +324,15 @@ test("recalls a pending Agent impression without graph propagation or learning e
   assert.equal(recalled.candidates[0].memoryId, "provisional-go-impression");
   assert.equal(recalled.candidates[0].provisional, true);
   assert.equal(recalled.candidates[0].provisionalReview.reviewDecisionId, decision.id);
-  assert.match(recalled.context, /Agent 在相处中形成、尚未审核的个人印象/u);
+  assert.match(recalled.context, /推断[：（]/u);
+  assert.ok(recalled.context.includes('Agent 猜测用户小时候学过围棋。'));
   assert.deepEqual(recalled.trace.selectedIds, []);
   assert.deepEqual(recalled.trace.metadata.provisionalMemoryIds, ["provisional-go-impression"]);
   assert.deepEqual(recalled.trace.metadata.recalledMemoryIds, []);
   assert.deepEqual(recalled.graph.edgeIds, []);
   assert.equal(recalled.graph.activationField, null);
 
-  const reopened = openMemoryDatabase(databasePath);
+  const reopened = closeAfterTests(openMemoryDatabase(databasePath));
   const reopenedRepository = new MemoryRepository(reopened);
   reopenedRepository.resolveIngestionDecision({
     agentId: "agent-test",
@@ -532,7 +629,7 @@ test("lets a stronger raw utterance become the ordinary recall primary", async (
   assert.equal(result.candidates[0].memoryId, "lunch-verbatim");
 });
 
-test("ordinary recall does not let a stronger raw utterance replace a reviewed memory", async () => {
+test("relationship questions prefer directly matching evidence over incidental mentions of relationships", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "relationship-state",
@@ -613,10 +710,10 @@ test("labels the actual epistemic source of a non-state memory", async () => {
     query: "记得我七月一日去天文馆吗",
   });
   assert.equal(result.status, "ready");
-  assert.match(result.context, /来源性质：主体本人陈述\n/u);
+  assert.match(result.context, /自述：/u);
 });
 
-test("marks imported non-state memory without inventing source authority", async () => {
+test("recalls imported and manually maintained content without inventing source authority", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   repository.upsertMemory({
     id: "legacy-aquarium-event",
@@ -631,15 +728,19 @@ test("marks imported non-state memory without inventing source authority", async
     temporalState: "historical",
     recordedAt: "2026-06-01T02:00:00.000Z",
   });
+  repository.upsertMemory({
+    id: "manual-garden-event", agentId: "agent-test", kind: "event", layer: "episodic",
+    content: "用户以前去过植物园。", subjectRole: "user", subjectKey: "user", reality: "real",
+    evidenceMode: "manual", temporalState: "historical", recordedAt: "2026-06-01T02:00:00.000Z",
+  });
   database.close();
 
-  const result = await retrieveMemories({
-    databasePath,
-    agentId: "agent-test",
-    query: "记得我以前去海洋馆吗",
-  });
-  assert.equal(result.status, "ready");
-  assert.match(result.context, /来源性质：旧资料导入；原有来源分级不完整/u);
+  for (const place of ["海洋馆", "植物园"]) {
+    const result = await retrieveMemories({ databasePath, agentId: "agent-test", query: `记得我以前去${place}吗` });
+    assert.equal(result.status, "ready");
+    assert.ok(result.context.includes(`用户以前去过${place}。`));
+    assert.doesNotMatch(result.context, /自述|参与者陈述|观察记录|推断|转述/u);
+  }
 });
 
 test("keeps current-state correction visible without hiding evidence for the historical focus", async () => {
@@ -868,7 +969,7 @@ test("keeps learned state inert until retrieval explicitly adopts it", async () 
     now: new Date("2026-07-15T12:00:00+08:00"),
   };
   const before = await retrieveMemories(input);
-  const writable = openMemoryDatabase(databasePath);
+  const writable = closeAfterTests(openMemoryDatabase(databasePath));
   writable.prepare(`
     INSERT INTO memory_accessibility_state (
       memory_id, agent_id, value, policy_version,
@@ -1154,7 +1255,7 @@ test("uses explicit affective activation only to rerank already-admitted ordinar
   assert.ok(temporal.trace.metadata.affectiveBias.adjustedCandidateCount >= 0);
   assert.equal(temporal.candidates.find(candidate => candidate.memoryId === "walk-newer").affectiveBias, null);
 
-  const reopened = openMemoryDatabase(databasePath);
+  const reopened = closeAfterTests(openMemoryDatabase(databasePath));
   const reopenedRepository = new MemoryRepository(reopened);
   reopenedRepository.recordAffectiveActivationDecision({
     agentId: "agent-test",
@@ -1209,7 +1310,7 @@ test("returns a persistable retrieval trace without writing it by default", asyn
   assert.deepEqual(result.trace.selectedIds, result.graph.selectedMemoryIds);
   assert.equal(result.trace.contextChars, result.context.length);
 
-  const writable = openMemoryDatabase(databasePath);
+  const writable = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(Number(writable.prepare(`
     SELECT COUNT(*) AS count FROM memory_retrieval_traces
   `).get().count), 0);
@@ -1903,7 +2004,7 @@ test("labels inferred long-term state as a revocable inference instead of report
     query: "解谜游戏",
   });
   assert.equal(result.status, "ready");
-  assert.match(result.context, /状态性质：基于行为与多条证据的推断/u);
+  assert.match(result.context, /推断[：（]/u);
   assert.match(result.context, /选择倾向/u);
 });
 
@@ -2192,8 +2293,9 @@ test("bounds convergence-only route audit without hiding its total", async () =>
   assert.equal(result.seedRouting.omittedConvergenceCandidateCount, 5);
 });
 
-test("falls back to lexical retrieval when the embedding service is unavailable", async () => {
-  const { databasePath, database, repository } = temporaryDatabase();
+test("falls back to lexical retrieval and retains charged embedding failures", async t => {
+  t.after(closeRetrievalWorkers);
+  const { root, databasePath, database, repository } = temporaryDatabase();
   seedMuseumMemory(repository);
   database.close();
   const result = await retrieveMemories({
@@ -2211,6 +2313,23 @@ test("falls back to lexical retrieval when the embedding service is unavailable"
   assert.equal(result.fragments[0].memoryId, "u-user");
   assert.equal(result.seedRouting.routeStatus.vector, "error");
   assert.equal(result.seedRouting.routeStatus.lexical, "matched");
+  const ledgerPath = path.join(root, 'failed-query-usage.jsonl');
+  for (const execution of ['inline', 'worker']) {
+    const recalled = await retrieveMemories({
+      databasePath, agentId: 'agent-test', query: '记得我之前去科技馆吗', usageLedgerPath: ledgerPath,
+      options: { execution },
+      embeddingProvider: async () => { throw Object.assign(new Error('Invalid embedding response'), {
+        model: 'embedding-test', usage: { prompt_tokens: 17, total_tokens: 17 }, requestId: execution,
+      }); },
+    });
+    assert.equal(recalled.status, 'ready');
+    assert.equal(recalled.fragments[0].memoryId, 'u-user');
+    assert.equal(recalled.vector.status, 'error');
+    assert.equal(recalled.vector.usageRecorded, true, execution);
+  }
+  const events = fs.readFileSync(ledgerPath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse);
+  assert.deepEqual(events.map(event => event.requestId), ['inline', 'worker']);
+  assert.equal(events.reduce((sum, event) => sum + event.usage.prompt_tokens, 0), 34);
 });
 
 test("keeps causes edges inert during ordinary recall", async () => {
@@ -2234,7 +2353,7 @@ test("keeps causes edges inert during ordinary recall", async () => {
     now: new Date("2026-07-15T12:00:00+08:00"),
   };
   const before = await retrieveMemories(input);
-  const writable = openMemoryDatabase(databasePath);
+  const writable = closeAfterTests(openMemoryDatabase(databasePath));
   const writableRepository = new MemoryRepository(writable);
   writableRepository.upsertEdge({
     agentId: "agent-test",
@@ -2342,7 +2461,7 @@ for (const content of ['用户以前喜欢解谜游戏。', 'The user used to li
       options: { includeCandidateContext: true } });
     const recalled = result.candidates.find(candidate => candidate.memoryId === 'past-preference-statement');
     assert.ok(recalled, JSON.stringify(result.candidates));
-    assert.match(recalled.recallContext, /主体本人陈述/);
+    assert.match(recalled.recallContext, /自述：/);
     assert.doesNotMatch(recalled.recallContext, /个人印象|基于关联证据的推断/);
     assert.deepEqual(result.trace.selectedIds, []);
   });

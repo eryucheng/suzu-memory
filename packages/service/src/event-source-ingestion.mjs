@@ -4,8 +4,8 @@ import { normalizeEventSource, normalizeEventSourceScope, observeEventSourceScop
 import { parseGeneratedLongTermExtraction, parseGeneratedExtractionRepair } from '@suzu-memory/extraction';
 
 export function validateMemoryExtractionOutput(request, output) {
-  if (request?.schemaName === 'long-term-memory-extraction-repair-v3') return parseGeneratedExtractionRepair(output);
-  if (request?.schemaName !== 'long-term-memory-extraction-v2') {
+  if (request?.schemaName === 'long-term-memory-extraction-repair-v5') return parseGeneratedExtractionRepair(output);
+  if (request?.schemaName !== 'long-term-memory-extraction-v4') {
     throw eventSourceError('MEMORY_EXTRACTION_SCHEMA_UNKNOWN', 'The extraction validator does not own this task schema.');
   }
   return parseGeneratedLongTermExtraction(output);

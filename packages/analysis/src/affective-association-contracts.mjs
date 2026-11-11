@@ -41,11 +41,10 @@ export const AFFECTIVE_ASSOCIATION_ANALYZERS = Object.freeze({
       changeCue: { type: "string", enum: ["strengthened", "weakened", "extinguished", "emotion_changed", "clarified", "denies_prior_state", "none", "unknown"] },
     }) }),
   currentRelation: Object.freeze({ stateFamily: "affective_association", role: "current-relation",
-    schemaName: "memory-affective-current-relation-v1", promptVersion: "affective-current-relation-v1",
+    schemaName: "memory-affective-current-relation-v2", promptVersion: "affective-current-relation-v2",
     promptFile: "affective-current-relation-system-prompt.md",
-    schema: schema(["currentStatePresent", "relation", "scopeOverlap"], {
-      currentStatePresent: { type: "boolean" },
-      relation: { type: "string", enum: ["no_current_state", "equivalent", "supports", "narrows", "broadens", "emotion_changed", "intensity_up", "intensity_down", "same_scope_conflict", "retires", "unrelated", "unknown"] },
+    schema: schema(["relation", "scopeOverlap"], {
+      relation: { type: "string", enum: ["equivalent", "supports", "narrows", "broadens", "emotion_changed", "intensity_up", "intensity_down", "same_scope_conflict", "retires", "unrelated", "unknown"] },
       scopeOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
     }) }),
 });
@@ -73,9 +72,7 @@ function parseItem(role, value, index) {
   if (role === "time-revision") return { ...base,
     stateTime: enumValue(value.stateTime, `analyses[${index}].stateTime`, ["current", "historical", "temporary", "future", "unknown"]),
     changeCue: enumValue(value.changeCue, `analyses[${index}].changeCue`, ["strengthened", "weakened", "extinguished", "emotion_changed", "clarified", "denies_prior_state", "none", "unknown"]) };
-  if (role === "current-relation") { if (typeof value.currentStatePresent !== "boolean") throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    return { ...base, currentStatePresent: value.currentStatePresent,
-      relation: enumValue(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "emotion_changed", "intensity_up", "intensity_down", "same_scope_conflict", "retires", "unrelated", "unknown"]),
+  if (role === "current-relation") { return { ...base, relation: enumValue(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "emotion_changed", "intensity_up", "intensity_down", "same_scope_conflict", "retires", "unrelated", "unknown"]),
       scopeOverlap: enumValue(value.scopeOverlap, `analyses[${index}].scopeOverlap`, ["exact", "partial", "none", "unknown"]) }; }
   throw new Error(`Unknown affective analyzer role: ${role || "(empty)"}.`);
 }

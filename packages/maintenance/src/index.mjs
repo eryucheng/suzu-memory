@@ -24,8 +24,10 @@ import {
   processPlannedConsolidationRuns,
   proposeStructuresForBatch,
   prepareStructureGeneration,
+  refreshStructureSummary,
   runBudgetedMemoryParts,
   memoryBudgetError,
+  blockedMemoryPartsError,
 } from "@suzu-memory/structurer";
 
 
@@ -633,9 +635,8 @@ async function processStructureTasks({ repository, agentId, tasks, batch,
       batch.consolidationRunId = consolidationPlan?.id || "";
       checkpoint();
     }
-    if (batch.parts.some(part => part.status === "blocked")) {
-      throw memoryBudgetError("One or more complete memory items exceed the organization budget; original material is retained for review.");
-    }
+    const blocked = blockedMemoryPartsError(batch.parts, 'One or more complete memory items exceed the organization budget; original material is retained for review.');
+    if (blocked) throw blocked;
     const completed = repository.transaction(() => tasks.map(task => repository.finishMaintenanceTask({
       agentId, taskId: task.id, workerId, result: { status: "completed", structureBatch: batch,
         processedMemoryVersions: batch.memoryVersions, consolidationRunId: batch.consolidationRunId },
@@ -643,8 +644,8 @@ async function processStructureTasks({ repository, agentId, tasks, batch,
     return { reports: batch.parts.map(part => part.result), completed, failed: [] };
   } catch (error) {
     assertEventSourceExecutionCurrent();
-    const blockedIds = error.code === "MEMORY_STRUCTURE_INPUT_TOO_LARGE"
-      ? new Set(batch.parts.filter(part => part.status === "blocked").flatMap(part => part.memoryIds)) : null;
+    const blockedParts = batch.parts.filter(part => part.status === 'blocked');
+    const blockedIds = blockedParts.length ? new Set(blockedParts.flatMap(part => part.memoryIds)) : null;
     const completed = [];
     const failed = repository.transaction(() => tasks.flatMap(task => {
       if (blockedIds && !(task.payload.memoryIds || []).some(id => blockedIds.has(id))) {
@@ -656,7 +657,7 @@ async function processStructureTasks({ repository, agentId, tasks, batch,
       }
       return [repository.failMaintenanceTask({
       agentId, taskId: task.id, workerId, errorMessage: error.message,
-      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MAX_TOKENS"].includes(error.code),
+      retry: !["MEMORY_STRUCTURE_INPUT_TOO_LARGE", "MEMORY_STRUCTURE_OUTPUT_FULL", "MEMORY_OUTPUT_LIMIT", "MAX_TOKENS"].includes(error.code),
       errorDetails: { lane: "semantic", taskType: "structure-proposal", memoryIds: batch.memoryIds,
         stage: "structure-proposal", errorCode: clean(error.code), errorName: clean(error.name),
         providerDiagnostics: error.diagnostics || {} },
@@ -684,6 +685,7 @@ export async function runSemanticTaskMaintenance({
   if (typeof retrievalContextGenerator === "function" || retrievalContextGenerator === null) {
     supported.push(MAINTENANCE_TASK_TYPES.retrievalContext);
   }
+  if (typeof structureGenerator === 'function') supported.push(MAINTENANCE_TASK_TYPES.structureSummary);
   if (!supported.length && typeof structureGenerator !== "function") {
     return { status: "disabled", reason: "semantic-providers-not-configured", selected: 0 };
   }
@@ -710,6 +712,24 @@ export async function runSemanticTaskMaintenance({
     task.task_type === MAINTENANCE_TASK_TYPES.structureProposal
   ));
   const results = {};
+  const summaries = claimed.tasks.filter(task => task.task_type === MAINTENANCE_TASK_TYPES.structureSummary);
+  if (summaries.length) {
+    const completed = [], failed = [];
+    for (const task of summaries) {
+      try {
+        const result = await refreshStructureSummary({ repository, agentId: normalizedAgentId,
+          memoryId: task.payload.memoryIds[0], expectedSummary: task.payload.expectedSummary,
+          generator: structureGenerator, usageLedgerPath, batchId: task.id });
+        completed.push(repository.finishMaintenanceTask({ agentId: normalizedAgentId, taskId: task.id, workerId, result }));
+      } catch (error) {
+        assertEventSourceExecutionCurrent();
+        failed.push(repository.failMaintenanceTask({ agentId: normalizedAgentId, taskId: task.id, workerId,
+          errorMessage: error.message, errorDetails: { stage: 'structure-summary', errorCode: error.code || '' },
+          retry: !['MEMORY_STRUCTURE_INPUT_TOO_LARGE', 'MAX_TOKENS'].includes(error.code) }));
+      }
+    }
+    results.summaries = { completed, failed };
+  }
   if (contexts.length) {
     try {
       results.retrievalContexts = retrievalContextGenerator === null ? {
@@ -800,13 +820,14 @@ export async function runEventContinuityMaintenance({ repository, agentId, gener
         },
         execute: (part, prepared) => applyEventContinuity({ repository, agentId, prepared, generator, usageLedgerPath }),
       });
-      if (progress.parts.some(part => part.status === 'blocked')) throw memoryBudgetError('Complete event continuity evidence exceeds the request budget.');
+      const blocked = blockedMemoryPartsError(progress.parts, 'Complete event continuity evidence exceeds the request budget.');
+      if (blocked) throw blocked;
       completed.push(repository.finishMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
         result: { eventContinuityProgress: progress } }));
     } catch (error) {
       assertEventSourceExecutionCurrent();
       failed.push(repository.failMaintenanceTask({ agentId, taskId: task.id, workerId: claimed.workerId,
-        errorMessage: error.message, retry: !['MAX_TOKENS', 'MEMORY_STRUCTURE_INPUT_TOO_LARGE',
+        errorMessage: error.message, retry: !['MAX_TOKENS', 'MEMORY_STRUCTURE_INPUT_TOO_LARGE', 'MEMORY_STRUCTURE_OUTPUT_FULL', 'MEMORY_OUTPUT_LIMIT',
           'MEMORY_EVENT_CONTINUITY_COVERAGE', 'MEMORY_TASK_SCHEMA_INVALID'].includes(error.code),
           errorDetails: { stage: 'event-continuity', memoryIds: task.payload.memoryIds, errorCode: error.code || '',
             providerDiagnostics: error.diagnostics || {} },
@@ -983,7 +1004,8 @@ export function maintenanceWorkStatus(status, providers = {}, { lane = 'all' } =
       ? typeof providers.generator === 'function' && typeof providers.embedding === 'function'
       : type === MAINTENANCE_TASK_TYPES.retrievalContext
         ? typeof providers.retrievalContextGenerator === 'function' || providers.retrievalContextGenerator === null
-        : type === MAINTENANCE_TASK_TYPES.structureProposal && typeof providers.structureGenerator === 'function';
+        : [MAINTENANCE_TASK_TYPES.structureProposal, MAINTENANCE_TASK_TYPES.structureSummary].includes(type)
+          && typeof providers.structureGenerator === 'function';
   const pending = { tasks: 0, stateRequests: 0, consolidation: 0 };
   const completed = { tasks: 0, stateRequests: 0, consolidation: 0 };
   let allPending = 0, failures = 0, deferredTasks = 0;

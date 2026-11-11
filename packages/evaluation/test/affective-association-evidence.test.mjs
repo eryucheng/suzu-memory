@@ -118,12 +118,6 @@ test("keeps provider failure as audit only", async () => {
   const result = await evaluate(fixture, record, analyzers); assert.equal(result.status, "incomplete");
   assert.deepEqual(result.failedRoles, ["associationBasis"]); assert.deepEqual(result.observations, []); fixture.database.close();
 });
-test("rejects a current-state comparison that invents an absent affective link", async () => {
-  const fixture = setup(); const record = fixture.add({ id: "invented-current", content: "用户描述情绪触发。",
-    sourceContent: "想到科技馆我会怀念。" });
-  const result = await evaluate(fixture, record, analyzersFor(record, { currentStatePresent: true, relation: "supports", scopeOverlap: "exact" }));
-  assert.equal(result.status, "incomplete"); assert.deepEqual(result.failedRoles, ["currentRelation"]); fixture.database.close();
-});
 test("compares affective evidence only with the caller-selected representation layer", async () => {
   const fixture = setup({ withCurrent: true, currentRepresentationLayer: "established" });
   const record = fixture.add({ id: "reported-layer", content: "用户直接报告科技馆会引起怀念。",

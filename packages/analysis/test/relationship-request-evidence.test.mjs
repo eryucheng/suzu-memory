@@ -5,25 +5,28 @@ import { archiveLongTermEvidence, buildLongTermExtractionInput } from '@suzu-mem
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 import { processStateAnalysisRequest } from '../src/index.mjs';
 
-function fixture(t, texts, { independentReverse = false, sameTime = false } = {}) {
+function fixture(t, texts, { independentReverse = false, sameTime = false, sameName = false, reality = 'real', worldId = 'primary', worldFrame = 'unknown' } = {}) {
   const database = openMemoryDatabase(':memory:');
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
   const identity = { companionId: 'melanie', companionName: 'Melanie', primaryUserId: 'caroline', primaryUserName: 'Caroline' };
+  if (sameName) identity.companionName = identity.primaryUserName = 'Echo';
   const built = buildLongTermExtractionInput({ identity, memoryOwner: 'Melanie', userName: 'Caroline',
-    messages: texts.map(([role, text], i) => ({ id: `message-${i}`, role,
-      speaker: role === 'user' ? 'Caroline' : 'Melanie', text,
+    messages: texts.map(([role, text, knownAt], i) => ({ id: `message-${i}`, role,
+      speaker: role === 'user' ? identity.primaryUserName : identity.companionName, text, worldId, worldFrame,
+      ...(knownAt ? { knownAt } : {}),
       timestamp: `2026-10-20T10:0${sameTime ? 0 : i}:00.000Z` })) });
   const candidate = { kind: 'relationship', stateFamily: 'relationship', title: 'Support',
     content: texts.filter(([role]) => role === 'user').map(([, text]) => text).join('\n'),
-    subjectRole: 'user', subjectName: 'Caroline', canonicalKey: 'caroline-support-melanie',
-    stateLabel: 'Support', stateTarget: { counterpartRole: 'agent', counterpartName: 'Melanie', relationshipDimension: 'support' },
-    reality: 'real', evidenceMode: 'explicit', temporalState: 'current', revisionAction: 'add',
-    retentionReason: 'relationship', confidence: 0.9, importance: 0.5, actorRoles: [],
+    subjectRole: 'user', subjectName: identity.primaryUserName, subjectKey: 'caroline', canonicalKey: 'caroline-support-melanie',
+    stateLabel: 'Support', stateTarget: { counterpartRole: 'agent', counterpartName: identity.companionName, counterpartKey: 'melanie', relationshipDimension: 'support' },
+    reality, evidenceMode: 'explicit', temporalState: 'current', revisionAction: 'add',
+    confidence: 0.9, importance: 0.5, actorRoles: [],
     sourceRefs: built.messages.map(message => message.memoryRef) };
   const reverse = independentReverse ? { ...candidate, subjectRole: 'agent', subjectName: 'Melanie',
+    subjectKey: 'melanie',
     canonicalKey: 'melanie-support-caroline', content: texts.filter(([role]) => role === 'assistant').map(([, text]) => text).join('\n'),
-    stateTarget: { counterpartRole: 'user', counterpartName: 'Caroline', relationshipDimension: 'support' },
+    stateTarget: { counterpartRole: 'user', counterpartName: 'Caroline', counterpartKey: 'caroline', relationshipDimension: 'support' },
     sourceRefs: built.messages.filter(message => message.role === 'assistant').map(message => message.memoryRef) } : null;
   const archive = archiveLongTermEvidence({ repository, agentId: 'melanie', identity,
     messages: built.messages, batchId: 'support-batch', recordedAt: '2026-10-20T10:10:00.000Z', generatedMemories: [candidate, reverse].filter(Boolean) });
@@ -31,7 +34,7 @@ function fixture(t, texts, { independentReverse = false, sameTime = false } = {}
   return { repository, request: repository.getStateAnalysisRequest('melanie', archive.candidateResults[0].stateAnalysisRequestId) };
 }
 
-function generatorFor({ comparison = 'supports', forgedReference = false,
+function generatorFor({ comparison = 'supports', outsideEvidence = false,
   groundingDimension = 'support', duplicateSupport = false, counterpartAttribution = 'explicit_counterpart_statement',
   counterpartDirection } = {}) {
   const calls = [];
@@ -61,9 +64,9 @@ function generatorFor({ comparison = 'supports', forgedReference = false,
       if (key === 'scopeTime') return { ...common, stateTime: 'current', duration: 'ongoing', revocationCue: 'none' };
       const reference = snapshot.relationshipComparison;
       const peer = reference && reference.memoryId !== memory.id;
-      return { ...common, currentStatePresent: false, relation: 'no_current_state', scopeOverlap: 'unknown',
-        comparisonMemoryId: peer ? forgedReference ? 'outside-the-request' : reference.memoryId : '',
-        comparisonRelation: peer ? comparison : 'no_comparison', comparisonScopeOverlap: peer ? 'exact' : 'unknown' };
+      return { ...common, sourceIds: peer && outsideEvidence ? ['outside-the-request'] : common.sourceIds,
+        relation: 'unknown', scopeOverlap: 'unknown',
+        comparisonRelation: peer ? comparison : 'unknown', comparisonScopeOverlap: peer ? 'exact' : 'unknown' };
     }) });
     const output = request.combinedAnalyzerKeys
       ? { results: Object.fromEntries(roles.map(key => [key, outputFor(key)])) } : outputFor('currentRelation');
@@ -75,6 +78,32 @@ function generatorFor({ comparison = 'supports', forgedReference = false,
 
 const process = (f, generator, requestId = f.request.id) => processStateAnalysisRequest({
   repository: f.repository, agentId: 'melanie', requestId, generator });
+
+test('derived reverse relationships retain fixed same-name identities, entity links and fictional scope', async t => {
+  const f = fixture(t, [['user', 'I will support you.'],
+    ['assistant', 'I support you too.', '2026-10-20T12:00:00Z'],
+    ['assistant', 'You can count on me.', '2026-10-20T11:00:00Z']],
+    { sameName: true, reality: 'fictional', worldId: 'novel', worldFrame: 'fictional' });
+  const { generator } = generatorFor();
+  const result = await process(f, generator);
+  const reverse = result.evaluation.counterpartRequests[0];
+  assert.ok(reverse);
+  const decision = f.repository.getIngestionDecisionByBatchCandidate('melanie', reverse.batch_id, reverse.candidate_index);
+  assert.equal(decision.candidate.subjectKey, 'melanie');
+  assert.equal(decision.candidate.stateTarget.counterpartKey, 'caroline');
+  assert.equal(decision.candidate.reality, 'fictional');
+  assert.equal(decision.known_at, '2026-10-20T11:00:00.000Z');
+  const draft = f.repository.materializeStateAnalysisMemory('melanie', reverse.id);
+  assert.equal(draft.world_id, 'novel');
+  assert.equal(draft.world_frame, 'fictional');
+  assert.equal(draft.reality, 'fictional');
+  assert.equal(draft.known_at, decision.known_at);
+  assert.deepEqual(new Set(f.repository.listMemoryEntities(draft.id).map(entity => entity.id)), new Set(f.request.metadata.entityIds));
+  const processed = await process(f, generator, reverse.id);
+  assert.equal(processed.status, 'proposal-pending', JSON.stringify(processed));
+  assert.equal(processed.proposal.subject_key, 'melanie');
+  assert.equal(processed.proposal.draft.counterpart.key, 'caroline');
+});
 
 for (const texts of [
   [['user', 'We can always be there for each other.'], ['assistant', 'I am here for you too.'], ['user', 'Your support makes life easier.']],
@@ -203,9 +232,9 @@ for (const comparison of ['unknown', 'same_scope_conflict', 'unrelated']) {
   });
 }
 
-test('peer comparison cannot reference evidence outside its fixed request', async t => {
+test('peer comparison cannot cite source evidence outside its fixed request', async t => {
   const f = fixture(t, [['user', 'I value our friendship.'], ['user', 'I am here for you.']]);
-  const { generator } = generatorFor({ forgedReference: true });
+  const { generator } = generatorFor({ outsideEvidence: true });
   const result = await process(f, generator);
   assert.equal(result.status, 'retry-pending');
   assert.deepEqual(result.evaluation.failedRoles, ['currentRelation']);
@@ -239,11 +268,16 @@ test('same-time compatible statements use one consistent comparison reference', 
   const result = await process(f, generator);
   assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
   assert.equal(result.review.consideredObservationIds.length, 3);
+  const reference = result.evaluation.snapshot.relationshipComparison.memoryId;
+  for (const relation of result.evaluation.analyses.currentRelation) {
+    assert.equal(relation.currentStatePresent, false);
+    assert.equal(relation.comparisonMemoryId, relation.memoryId === reference ? '' : reference);
+  }
 });
 
-test('keeps complete evidence and retries only the item missing its required comparison', async t => {
+test('keeps complete evidence and retries only the comparison with invalid source evidence', async t => {
   const f = fixture(t, [['user', 'I value our friendship.'], ['user', 'I am here for you.']]);
-  const first = generatorFor({ forgedReference: true });
+  const first = generatorFor({ outsideEvidence: true });
   const result = await process(f, first.generator);
   assert.equal(result.status, 'retry-pending');
   assert.equal(result.evaluation.observations.filter(item => item.qualification === 'qualified').length, 1);

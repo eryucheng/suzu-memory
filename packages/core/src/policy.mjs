@@ -1,3 +1,4 @@
+import { memoryWorldScope } from './ontology.mjs';
 import {
   EVIDENCE_MODES,
   MEMORY_ACTOR_ROLES,
@@ -354,7 +355,7 @@ function nodeAsCandidate(node) {
     subjectRole: node.subject_role,
     subjectKey: node.subject_key,
     canonicalKey: node.canonical_key,
-    reality: node.reality,
+    ...memoryWorldScope(node),
     evidenceMode: node.evidence_mode,
     representationLayer: node.representation_layer,
     stateFamily: node.state_family,
@@ -411,6 +412,7 @@ export function applyMemoryCandidate(repository, input, options = {}) {
 
   const existing = candidate.canonicalKey
     ? repository.findCanonicalMemories({
+      ...memoryWorldScope(candidate),
       agentId: candidate.agentId,
       subjectRole: candidate.subjectRole,
       subjectKey: candidate.subjectKey,
@@ -616,12 +618,13 @@ export function resolveMemoryIngestionReview(repository, {
         candidate: result.candidate,
       };
     }
+    repository.linkMemoryEntities({ memoryId: result.memory.id, entityIds: reviewedCandidate.entityIds || [] });
     const resolved = repository.resolveIngestionDecision({
       agentId: normalizedAgentId,
       decisionId: normalizedDecisionId,
       resolution: "accepted",
       memoryId: result.memory.id,
-      resolvedCandidate: result.candidate,
+      resolvedCandidate: { ...reviewedCandidate, ...result.candidate },
       note,
       resolvedBy,
     });

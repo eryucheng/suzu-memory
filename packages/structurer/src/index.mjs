@@ -1,6 +1,8 @@
 export {
   buildStructureGenerationInput,
   MEMORY_STRUCTURE_OUTPUT_SCHEMA,
+  MEMORY_STRUCTURE_SUMMARY_SCHEMA,
+  parseStructureSummary,
   parseStructureGeneration,
   proposalSchemaForLimit,
 } from "./prompt.mjs";
@@ -16,9 +18,10 @@ export {
 export {
   proposeStructuresForBatch,
   prepareStructureGeneration,
+  refreshStructureSummary,
 } from "./service.mjs";
 
-export { runBudgetedMemoryParts, memoryBudgetError } from "./budgeted-parts.mjs";
+export { runBudgetedMemoryParts, memoryBudgetError, blockedMemoryPartsError } from "./budgeted-parts.mjs";
 
 export {
   buildRelationSnapshot,
@@ -27,6 +30,7 @@ export {
 export {
   buildRelationGenerationInput,
   MEMORY_RELATION_OUTPUT_SCHEMA,
+  relationOutputSchema,
   parseRelationGeneration,
 } from "./relation-prompt.mjs";
 

@@ -5,6 +5,8 @@ const state = {
   view: "reviews",
 };
 
+let overviewRequest = 0;
+
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -57,7 +59,9 @@ async function api(pathname, options = {}) {
   const headers = { accept: "application/json", ...(options.headers || {}) };
   if (state.apiKey) headers.authorization = `Bearer ${state.apiKey}`;
   if (options.body !== undefined) headers["content-type"] = "application/json";
-  const response = await fetch(pathname, {
+  const base = document.querySelector('meta[name="suzu-memory-api-base"]')?.content;
+  const endpoint = base ? new URL(pathname.replace(/^\//u, ''), new URL(base, location.href)) : pathname;
+  const response = await fetch(endpoint, {
     ...options,
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -232,38 +236,45 @@ function renderDetail(detail) {
 }
 
 async function loadDetail(type, id) {
-  state.selected = { type, id };
+  const selection = state.selected = { type, id };
   renderReviews();
   $("#review-detail").innerHTML = empty("正在读取候选证据…");
   try {
     const detail = await api(`/v1/review-console/proposals/${encodeURIComponent(type)}/${encodeURIComponent(id)}`);
-    if (state.selected?.id !== id || state.selected?.type !== type) return;
-    state.selected.detail = detail;
+    if (state.selected !== selection) return;
+    selection.detail = detail;
     renderDetail(detail);
   } catch (error) {
+    if (state.selected !== selection) return;
     $("#review-detail").innerHTML = `<div class="empty-detail"><h2>无法读取候选</h2><p>${escapeHtml(error.message)}</p></div>`;
     toast(error.message, true);
   }
 }
 
-async function loadOverview({ preserveSelection = true } = {}) {
+async function loadOverview({ preserveSelection = true, refreshDetail = true } = {}) {
+  const request = ++overviewRequest;
+  const selection = state.selected;
   $("#connection-dot").className = "connection-dot";
   const params = new URLSearchParams({ state: $("#state-filter").value, limit: "100" });
   if ($("#type-filter").value) params.set("type", $("#type-filter").value);
   try {
-    state.overview = await api(`/v1/review-console?${params}`);
+    const overview = await api(`/v1/review-console?${params}`);
+    if (request !== overviewRequest) return;
+    state.overview = overview;
     $("#connection-dot").className = "connection-dot online";
     $("#agent-id").textContent = state.overview.agentId;
     renderMetrics();
     renderReviews();
     renderPipeline();
     renderStorage();
+    if (state.selected !== selection || (!refreshDetail && preserveSelection && selection)) return;
     if (!preserveSelection) state.selected = null;
     const stillPresent = state.overview.reviews.items.find((item) => (
       item.id === state.selected?.id && item.type === state.selected?.type
     ));
-    if (stillPresent) await loadDetail(stillPresent.type, stillPresent.id);
-    else if (state.view === "reviews" && state.overview.reviews.items.length) {
+    if (stillPresent) {
+      if (refreshDetail) await loadDetail(stillPresent.type, stillPresent.id);
+    } else if (state.view === "reviews" && state.overview.reviews.items.length) {
       const first = state.overview.reviews.items[0];
       await loadDetail(first.type, first.id);
     } else if (!state.overview.reviews.items.length) {
@@ -271,6 +282,7 @@ async function loadOverview({ preserveSelection = true } = {}) {
       $("#review-detail").innerHTML = `<div class="empty-detail"><span class="empty-orbit"></span><h2>当前队列已处理完</h2><p>切换审核状态可以查看过去的判断记录。</p></div>`;
     }
   } catch (error) {
+    if (request !== overviewRequest) return;
     $("#connection-dot").className = "connection-dot error";
     $("#agent-id").textContent = "连接失败";
     toast(error.message, true);
@@ -278,7 +290,8 @@ async function loadOverview({ preserveSelection = true } = {}) {
 }
 
 async function resolveSelected(action) {
-  const selected = state.selected?.detail;
+  const selection = state.selected;
+  const selected = selection?.detail;
   if (!selected) return;
   const reason = $("#decision-reason")?.value || "";
   const endpoint = action === "revoke"
@@ -296,7 +309,8 @@ async function resolveSelected(action) {
     const humanFallback = ["ingestion", "maintenance-failure"].includes(selected.type);
     if (result?.resolution?.status === "needs-correction") {
       toast("候选仍不完整，已保留在人工审核队列", true);
-      await loadDetail(selected.type, selected.id);
+      if (state.selected === selection) await loadDetail(selected.type, selected.id);
+      else await loadOverview({ refreshDetail: false });
       return;
     }
     toast(action === "accept"
@@ -304,11 +318,12 @@ async function resolveSelected(action) {
       : action === "dismiss"
         ? humanFallback ? "已保留基础记忆并结束该升级项" : "候选已驳回"
         : "关系已安全撤销");
-    state.selected = null;
-    await loadOverview({ preserveSelection: false });
+    const current = state.selected === selection;
+    if (current) state.selected = null;
+    await loadOverview({ refreshDetail: current });
   } catch (error) {
     toast(error.message, true);
-    buttons.forEach((button) => { button.disabled = false; });
+    if (state.selected === selection) buttons.forEach((button) => { button.disabled = false; });
   }
 }
 

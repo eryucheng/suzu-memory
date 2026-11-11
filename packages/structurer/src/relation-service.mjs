@@ -9,14 +9,16 @@ import { proposeMemoryRelation } from "@suzu-memory/core";
 import { enforceRelationCandidatePolicy } from "./relation-candidate-policy.mjs";
 import {
   buildRelationGenerationInput,
-  MEMORY_RELATION_OUTPUT_SCHEMA,
+  relationOutputSchema,
   parseRelationGeneration,
 } from "./relation-prompt.mjs";
 import { buildRelationSnapshot } from "./relation-snapshot.mjs";
-import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit, proposalSchemaForLimit } from './prompt.mjs';
+import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit } from './prompt.mjs';
+import { withGenerationReferences, assertGenerationRequestBudget, RELATION_REQUEST_CHARACTERS } from './generation-input.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "relation-system-prompt.md");
+const EXCERPT_INSTRUCTIONS = '标有 excerpt 的 sourceRecords 保留了原话中的因果片段。结合 memories 判断因果时，先检查片段是否足以核实两端事件、因果方向及必要条件。涉及未给出的上下文、跨轮指代或条件时，返回 needsFullEvidence: true 和空 proposals，获取完整原话后再判断；证据充足时返回 needsFullEvidence: false 并给出提案。';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -59,6 +61,7 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
 export function prepareRelationGeneration({
   repository, agentId, batchId, memoryIds,
   snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator, maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
+  maximumRequestCharacters = RELATION_REQUEST_CHARACTERS,
 }) {
   const limit = proposalCountLimit(maximumProposals);
   if (limit === 0) return { snapshot: null, request: null, reason: 'proposal-budget-zero' };
@@ -67,19 +70,29 @@ export function prepareRelationGeneration({
     agentId: agentId,
     batchId: batchId,
     memoryIds: memoryIds,
-    ...snapshotOptions,
+    maxSnapshotChars: Infinity, ...snapshotOptions,
   });
   if (snapshot.memories.length < 2 || !snapshot.sourceRecords.length) return { snapshot, request: null, reason: snapshot.memories.length < 2 ? "fewer-than-two-eligible-memories" : "no-source-evidence" };
   const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
-  const request = {
-    input: buildRelationGenerationInput(snapshot),
-    systemPrompt,
-    schema: proposalSchemaForLimit(MEMORY_RELATION_OUTPUT_SCHEMA, limit),
+  const buildRequest = excerpted => withGenerationReferences({
+    input: buildRelationGenerationInput(snapshot, { excerpted }),
+    systemPrompt: excerpted ? `${systemPrompt}\n\n${EXCERPT_INSTRUCTIONS}` : systemPrompt,
+    schema: relationOutputSchema(limit, { excerpted }),
     schemaName: "memory-relation-proposals-v1",
     ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
-  };
-  generator?.assertRequestBudget?.(request);
-  return { snapshot, request };
+  });
+  const fullRequest = buildRequest(false);
+  assertGenerationRequestBudget(fullRequest, maximumRequestCharacters, generator);
+  if (snapshot.sourceExcerpts?.size) {
+    const request = buildRequest(true);
+    const requestSize = value => generator?.measureRequest ? generator.measureRequest(value)
+      : value.modelInput.length + value.systemPrompt.length + JSON.stringify(value.schema).length;
+    if (requestSize(request) < requestSize(fullRequest)) {
+      assertGenerationRequestBudget(request, maximumRequestCharacters, generator);
+      return { snapshot, request, fullRequest };
+    }
+  }
+  return { snapshot, request: fullRequest };
 }
 
 export async function proposeRelationsForBatch({
@@ -88,11 +101,13 @@ export async function proposeRelationsForBatch({
   batchId = "",
   memoryIds = [],
   generator,
+  fullEvidenceGenerator = generator,
   usageLedgerPath = "",
   systemPromptPath = DEFAULT_PROMPT_PATH,
   snapshotOptions = {},
   candidatePolicy = {},
   maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
+  maximumRequestCharacters = RELATION_REQUEST_CHARACTERS,
   preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory relation structurer requires a repository.");
@@ -108,23 +123,33 @@ export async function proposeRelationsForBatch({
   const limit = proposalCountLimit(maximumProposals);
   const prepared = (limit > 0 ? preparedGeneration : null) || prepareRelationGeneration({
     repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
-    snapshotOptions, systemPromptPath, generator, maximumProposals: limit,
+    snapshotOptions, systemPromptPath, generator, maximumProposals: limit, maximumRequestCharacters,
   });
-  const { snapshot, request } = prepared;
+  const { snapshot, request, fullRequest } = prepared;
   if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
     snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
   if (request.schema.properties.proposals.maxItems !== limit) throw new Error('Prepared relation request does not match maximumProposals.');
-  generator.assertRequestBudget?.(request);
-  const generation = await generator(request);
   const warnings = [];
-  const usageRecorded = await recordUsage({
-    generation,
-    usageLedgerPath,
-    agentId: normalizedAgentId,
-    batchId: normalizedBatchId,
-    warnings,
-  });
-  const parsed = parseRelationGeneration(generation?.output, { maximumProposals });
+  let usageRecorded = false;
+  const generate = async (provider, input) => {
+    provider.assertRequestBudget?.(input);
+    let result;
+    try { result = await provider(input); }
+    catch (error) {
+      await recordUsage({ generation: error, usageLedgerPath, agentId: normalizedAgentId, batchId: normalizedBatchId, warnings });
+      throw error;
+    }
+    const recorded = await recordUsage({ generation: result, usageLedgerPath,
+      agentId: normalizedAgentId, batchId: normalizedBatchId, warnings });
+    usageRecorded ||= recorded;
+    return result;
+  };
+  let generation = await generate(generator, request);
+  let parsed = parseRelationGeneration(generation?.output, { maximumProposals });
+  if (fullRequest && parsed.needsFullEvidence !== false) {
+    generation = await generate(fullEvidenceGenerator, fullRequest);
+    parsed = parseRelationGeneration(generation?.output, { maximumProposals });
+  }
   const proposed = [];
   const duplicates = [];
   const rejected = [];
@@ -148,7 +173,8 @@ export async function proposeRelationsForBatch({
     }
   }
   return {
-    status: proposed.length ? "proposed" : duplicates.length ? "duplicates-only" : "no-valid-proposals",
+    status: parsed.proposals.length === limit ? 'capacity-reached'
+      : proposed.length ? "proposed" : duplicates.length ? "duplicates-only" : "no-valid-proposals",
     batchId: normalizedBatchId,
     snapshot,
     proposed,

@@ -1,3 +1,4 @@
+import { createExtractionEntityBinder, resolveExtractedCandidateStateTarget } from '@suzu-memory/extraction';
 import fs from "node:fs";
 export { createMemorySearchSession, MEMORY_SEARCH_TOOL } from './search-session.mjs';
 import path from "node:path";
@@ -17,6 +18,7 @@ import {
   assertEventSourceExecutionCurrent,
   currentEventSourceExecution,
   executionEventSourceView,
+  isStatefulMemoryKind,
   ensureCompanionRelationshipStructure,
   enqueueMemoryMaintenanceTasks,
   materializePendingMemoryStructureProposals,
@@ -1053,6 +1055,21 @@ export class MemoryService {
           return { type: normalizedType, id, action: normalizedAction,
             resolution: { status: 'needs-correction', decision: current, memory: null, reasons: ['ambiguous-participant-identity'] } };
         }
+        if (current.review_state === 'pending' && input?.sourceWorlds.length > 1) {
+          return { type: normalizedType, id, action: normalizedAction,
+            resolution: { status: 'needs-correction', decision: current, memory: null, reasons: ['mixed-world-evidence-needs-resolution'] } };
+        }
+        if (input?.candidate.entityMentions?.length && !Array.isArray(input.candidate.entityIds)) {
+          input.candidate = createExtractionEntityBinder(repository, this.agentId, [input.candidate],
+            input.candidate.metadata?.actorIdentity?.participants, current.batch_id)(input.candidate, {
+              reality: input.candidate.reality, world_id: input.candidate.worldId || 'primary',
+              world_frame: input.candidate.worldFrame || 'unknown',
+            });
+        }
+        if (input && isStatefulMemoryKind(input.candidate.kind)) {
+          input.candidate.metadata = { ...input.candidate.metadata,
+            stateTarget: resolveExtractedCandidateStateTarget(input.candidate, this.agentId, input.candidate.metadata?.actorIdentity || {}) };
+        }
         const resolution = resolveMemoryIngestionReview(repository, {
           agentId: this.agentId,
           decisionId: id,
@@ -1237,7 +1254,7 @@ export class MemoryService {
         resolution,
         maintenance,
       };
-    }));
+    }, { rollbackWhen: result => result.type === 'ingestion' && result.resolution.status === 'needs-correction' }));
   }
 
   revokeHighLevelRelation(proposalId, {
@@ -1429,11 +1446,12 @@ export class MemoryService {
         : {};
       const requestedWorldId = clean(requestedWorld.id || requestedWorld.worldId);
       const requestedWorldFrame = clean(requestedWorld.frame || requestedWorld.worldFrame);
-      const hasRequestedWorld = Boolean(requestedWorldId || requestedWorldFrame);
+      const hasRequestedWorld = Boolean(requestedWorldId || requestedWorldFrame || clean(requestedWorld.reality));
       const worldScope = hasRequestedWorld
         ? {
           id: requestedWorldId || this.defaults.defaultWorldId,
           frame: requestedWorldFrame || this.defaults.defaultWorldFrame,
+          ...(clean(requestedWorld.reality) ? { reality: clean(requestedWorld.reality) } : {}),
         }
         : {};
       const providedQueryPerspective = queryPerspective && typeof queryPerspective === "object"

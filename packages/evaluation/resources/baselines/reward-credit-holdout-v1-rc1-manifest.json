@@ -14,7 +14,7 @@
     "casesPerCategory": 6
   },
   "inputHashes": {
-    "fixtureSha256": "71108f95e5c809f17dfbe44211261dc16758eb3b5416ba9f5e939389c4ca59f2",
+    "fixtureSha256": "e91dd45a92117166235322eb48d63fb60c7635b81f8e0eadb8fc693d7b008c98",
     "outcomePromptSha256": "88df647bc348d53288c5cf6899cbf9d09eb5d7543da64b121e777e8353f1615a",
     "targetPromptSha256": "e6ed1c70381841dafd47c39ba17eab83932926913bf75f9ba74d0bdbef465b56",
     "creditPromptSha256": "26acc940694ec3fa629c4ebe64c0481396ffc11dd63f7d9e9321c3a4f5b86380"

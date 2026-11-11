@@ -49,8 +49,11 @@ function currentStateView(
   subjectKey,
   canonicalKey,
   representationLayer = "",
+  world = null,
 ) {
+  if (!world) return null;
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId, subjectRole, subjectKey, canonicalKey, representationLayer, stateFamily: "goal",
     includePending: representationLayer === "reported",
     includeHistorical: representationLayer === "reported",
@@ -109,9 +112,6 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   assertSubjectBoundary(role, analysis, memory, snapshot.target);
   if (role === "current-relation") {
     const hasCurrent = Boolean(snapshot.currentState);
-    if (analysis.currentStatePresent !== hasCurrent) {
-      throw new Error("Goal current-state presence does not match the read-only snapshot.");
-    }
     if (hasCurrent && analysis.relation === "no_current_state") {
       throw new Error("Goal relation cannot omit an available current state.");
     }
@@ -383,6 +383,7 @@ export async function evaluateGoalEvidence({
     memoryIds: normalizedMemoryIds,
     ...snapshotOptions,
   });
+  const world = baseSnapshot.world;
   const snapshot = {
     ...baseSnapshot,
     agentId: clean(agentId),
@@ -398,8 +399,7 @@ export async function evaluateGoalEvidence({
       baseSnapshot.target.subjectRole,
       baseSnapshot.target.subjectKey,
       baseSnapshot.target.canonicalKey,
-      clean(currentRepresentationLayer),
-    ),
+      clean(currentRepresentationLayer), world),
     inputPolicy: {
       ...baseSnapshot.inputPolicy,
       currentStateIsReadOnly: true,

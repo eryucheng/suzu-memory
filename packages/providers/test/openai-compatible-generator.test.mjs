@@ -41,6 +41,41 @@ test('generation timeout covers response bodies and retries with a fresh request
   }
 });
 
+test('caller cancellation stops response reads and every transport retry wait', { timeout: 3000 }, async () => {
+  for (const phase of ['body', 'network', 'envelope', 'http']) {
+    const controller = new AbortController();
+    const reason = new DOMException('User cancelled generation.', 'AbortError');
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    let calls = 0, requestSignal;
+    const generate = createOpenAiCompatibleStructuredGenerator({
+      connection: { baseUrl: 'https://provider.invalid', model: 'fixture', apiKey: 'fixture', transportRetryDelayMs: 5000 },
+      fetchImpl: async (_url, { signal }) => {
+        calls++;
+        requestSignal = signal;
+        if (phase === 'body') return { ...response({}), text: () => new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          started();
+        }) };
+        started();
+        if (phase === 'network') throw new Error('Connection interrupted');
+        return response(phase === 'envelope' ? 'not-json' : {}, { status: phase === 'http' ? 503 : 200 });
+      },
+    });
+    const pending = generate({ input: 'evidence', signal: controller.signal });
+    const rejected = assert.rejects(pending, { name: 'AbortError' });
+    await entered;
+    // Give the completed transport failure a turn to enter its retry wait.
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort(reason);
+    assert.equal(requestSignal.aborted, true, phase);
+    await rejected;
+    assert.equal(calls, 1, phase);
+    await assert.rejects(generate({ signal: controller.signal }), { name: 'AbortError' });
+    assert.equal(calls, 1, 'An already cancelled request must not be sent.');
+  }
+});
+
 test('output truncation is a typed failure with usage and is not repeated as a transport retry', async () => {
   let calls = 0;
   const generate = createOpenAiCompatibleStructuredGenerator({
@@ -193,6 +228,11 @@ test("strict tool mode sends the supplied schema to the configured endpoint and 
 
 test("strict tools expand conditional objects without requiring forbidden fields or mutating the owner schema", async () => {
   const schema = { type: 'object', additionalProperties: false, required: ['memories'], properties: {
+    entities: { type: ['array', 'null'], items: { type: 'string' } },
+    time: { type: ['object', 'null'], anyOf: [{ type: 'null' }, {
+      type: 'object', additionalProperties: false, required: [],
+      properties: { date: { type: ['string', 'null'] } },
+    }] },
     memories: { type: 'array', items: {
       type: 'object', additionalProperties: false, required: ['family', 'content'],
       properties: { family: { type: 'string', enum: ['identity', 'event'] },
@@ -219,6 +259,15 @@ test("strict tools expand conditional objects without requiring forbidden fields
     assert.deepEqual((await generate({ schema, schemaName: 'conditional' })).output, { memories: [] });
   }
   const [identity, event] = requests[0].tools[0].function.parameters.properties.memories.items.anyOf;
+  const parameters = requests[0].tools[0].function.parameters;
+  assert.ok(Array.isArray(parameters.properties.entities.anyOf), 'Strict providers require anyOf for nullable arrays.');
+  assert.deepEqual(parameters.properties.entities.anyOf[0], { type: 'array', items: { type: 'string' } });
+  assert.equal(parameters.properties.entities.anyOf[1].type, 'null');
+  const time = parameters.properties.time.anyOf[0];
+  assert.equal(time.type, 'object');
+  assert.deepEqual(time.required, ['date']);
+  assert.deepEqual(time.properties.date, { type: ['string', 'null'] });
+  assert.deepEqual(parameters.properties.time.anyOf[1], { type: 'null' });
   assert.deepEqual(identity.properties.family.enum, ['identity']);
   assert.deepEqual(identity.required, ['family', 'content', 'target']);
   assert.deepEqual(identity.properties.target, { ...original.properties.memories.items.properties.target,

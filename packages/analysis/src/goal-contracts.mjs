@@ -104,15 +104,14 @@ export const GOAL_ANALYZERS = Object.freeze({
   currentRelation: Object.freeze({
     stateFamily: "goal",
     role: "current-relation",
-    schemaName: "memory-goal-current-relation-v1",
-    promptVersion: "goal-current-relation-v1",
+    schemaName: "memory-goal-current-relation-v2",
+    promptVersion: "goal-current-relation-v2",
     promptFile: "goal-current-relation-system-prompt.md",
-    schema: resultSchema(["currentStatePresent", "relation"], {
-      currentStatePresent: { type: "boolean" },
+    schema: resultSchema(["relation"], {
       relation: {
         type: "string",
         enum: [
-          "no_current_state", "same_goal", "progress_update", "pauses", "resumes",
+          "same_goal", "progress_update", "pauses", "resumes",
           "completes", "cancels", "narrower_step", "broader_goal", "replaces",
           "conflict", "unrelated", "unknown",
         ],
@@ -190,12 +189,8 @@ function parseRoleItem(role, value, index) {
     };
   }
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") {
-      throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    }
     return {
       ...common,
-      currentStatePresent: value.currentStatePresent,
       relation: requireEnum(value.relation, `analyses[${index}].relation`, [
         "no_current_state", "same_goal", "progress_update", "pauses", "resumes",
         "completes", "cancels", "narrower_step", "broader_goal", "replaces",

@@ -1,3 +1,7 @@
+export { ENTITY_KINDS, normalizedEntityName, entityNameKey, entityNameKeys } from './entity-identity.mjs';
+export { withModelReferences } from './model-references.mjs';
+export { locateCausalExcerpt, readCausalExcerpt } from './causal-evidence.mjs';
+export { conceptSearchText } from './search-index.mjs';
 export { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES, memoryMaintenanceTaskPayload, enqueueMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
 export { createStateReadView, isProvisionalMemory, isStructuredStateMemory, STATE_REPRESENTATION_LAYERS } from './state-read.mjs';
 export { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, timestampInTimeZone, sourceCalendarTimeKnown, modelCalendarFields } from './calendar-time.mjs';
@@ -26,6 +30,7 @@ export {
 
 export {
   MemoryRepository,
+  inputEventContentHash,
 } from "./repository.mjs";
 
 export {
@@ -68,6 +73,8 @@ export {
   TEMPORAL_STATES,
   WORLD_FRAMES,
   memoryWorldsCompatible,
+  memoryWorldScope,
+  commonMemoryWorld,
   isBigNeuronKind,
   isLegacyMemoryKind,
   isMemoryKindAllowedForStateFamily,
@@ -112,6 +119,7 @@ export {
 
 export {
   readReportedStateDraft,
+  readStateAnalysisSemanticMemory,
   resolveReportedStateProposal,
   materializeReportedStateProposal,
   materializePendingReportedStateProposals,

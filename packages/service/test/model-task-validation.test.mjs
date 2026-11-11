@@ -2,30 +2,28 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as analysis from '@suzu-memory/analysis';
 import { createRelatedAnalyzerBatch } from '../../analysis/src/related-analyzer-batch.mjs';
-import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedLongTermExtraction, normalizeGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA } from '@suzu-memory/embedding-indexer';
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '../src/index.mjs';
 import { createOpenAiCompatibleStructuredGenerator } from '../../providers/src/index.mjs';
 
-test('extraction target branches expose only their family fields and reject cross-family objects', async () => {
-  const request = { schemaName: 'long-term-memory-extraction-v2', schema: LONG_TERM_EXTRACTION_SCHEMA };
+test('extraction contracts retain typed targets without replicating the common memory body', async () => {
+  const request = { schemaName: 'long-term-memory-extraction-v4', schema: LONG_TERM_EXTRACTION_SCHEMA };
   const original = structuredClone(request.schema);
   let wireSchema;
   const generator = createOpenAiCompatibleStructuredGenerator({
     connection: { baseUrl: 'https://api.example.test', model: 'fixture', apiKey: 'secret', structuredOutputMode: 'strict-tool' },
     fetchImpl: async (_url, options) => {
-      wireSchema = JSON.parse(options.body).tools[0].function.parameters;
-      const schemaName = JSON.parse(options.body).tools[0].function.name;
+      const tool = JSON.parse(options.body).tools[0].function;
+      wireSchema = tool.parameters;
       return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{
-        function: { name: schemaName, arguments: schemaName === 'long-term-memory-extraction-repair-v3' ? '{"results":[]}' : '{"memories":[]}' },
+        function: { name: tool.name, arguments: tool.name.endsWith('repair-v4') ? '{"results":[]}' : '{"memories":[]}' },
       }] } }] }) };
     },
   });
   await generator(request);
   assert.deepEqual(request.schema, original);
-  const wireBranches = wireSchema.properties.memories.items.anyOf;
-  assert.equal(wireBranches.length, LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.anyOf.length);
   const verifyStrictObjects = schema => {
     if (schema.type === 'object') {
       assert.equal(schema.additionalProperties, false);
@@ -36,73 +34,50 @@ test('extraction target branches expose only their family fields and reject cros
     schema.anyOf?.forEach(verifyStrictObjects);
   };
   verifyStrictObjects(wireSchema);
-  const base = { kind: 'fact', title: '小林负责蓝色书架', content: '小林负责蓝色书架。',
-    subjectRole: 'other', subjectName: '小林', actorRoles: [], canonicalKey: 'bookshelf-responsibility',
-    stateFamily: 'identity', stateLabel: '负责的书架', reality: 'real', evidenceMode: 'explicit',
-    temporalState: 'current', revisionAction: 'add', retentionReason: 'identity',
-    eventDate: '', eventStart: '', eventEnd: '', confidence: 0.9, importance: 0.5, sourceRefs: ['M0001'] };
+  assert.equal(Object.hasOwn(wireSchema.properties.memories.items, 'anyOf'), false);
+  const base = { title: '小林负责蓝色书架', content: '小林负责蓝色书架。',
+    subject: { name: '小林' }, actors: [], reality: 'real', evidenceMode: 'explicit',
+    temporalState: 'current', revisionAction: 'add', time: null, confidence: 0.9, importance: 0.5, sourceRefs: ['M0001'] };
   const targets = {
     identity: { identityField: 'other', fieldCardinality: 'single' },
-    belief: { objectRole: 'world', objectName: '天气' },
-    relationship: { counterpartRole: 'other', counterpartName: 'Mio', relationshipDimension: 'support' },
-    affective_association: { triggerRole: 'world', triggerName: 'flowers' },
+    belief: { object: { world: '天气' } },
+    relationship: { counterpart: { name: 'Mio' }, dimension: 'support' },
+    affective_association: { trigger: { world: 'flowers' } },
   };
-  const alternatives = LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.anyOf;
-  for (const [family, target] of Object.entries(targets)) {
-    const branch = alternatives.find(item => item.properties.stateFamily.enum[0] === family);
-    const wireBranch = wireBranches.find(item => item.properties.stateFamily.enum[0] === family);
-    assert.deepEqual(wireBranch.properties.stateTarget, {
-      ...original.properties.memories.items.properties.stateTarget, ...branch.properties.stateTarget,
-    });
-    assert.deepEqual(Object.keys(branch.properties.stateTarget.properties).sort(), Object.keys(target).sort());
-    const candidate = { ...base, stateFamily: family, stateTarget: target,
-      ...(family === 'belief' ? { kind: 'belief_state', retentionReason: 'explicit_belief' } : {}),
-      ...(family === 'affective_association' ? { kind: 'belief_state', retentionReason: 'state_change' } : {}),
-      ...(family === 'relationship' ? { kind: 'relationship', retentionReason: 'relationship' } : {}) };
+  for (const [category, target] of Object.entries(targets)) {
+    const candidate = { ...base, classification: { category, key: 'bookshelf-responsibility', label: '负责的书架', target } };
     const output = { memories: [candidate] };
-    assert.deepEqual(validateMemoryTaskOutput(request, output).memories[0].stateTarget, target);
-    assert.throws(() => validateMemoryTaskOutput(request, {
-      memories: [{ ...candidate, retentionReason: 'explicit_preference' }],
-    }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
-    for (const wrong of [{}, { ...target, objectName: '无关人物', direction: 'holder_to_counterpart' }]) {
-      const invalid = { memories: [{ ...candidate, stateTarget: wrong }] };
+    assert.deepEqual(validateMemoryTaskOutput(request, output), output);
+    for (const wrong of [{}, { ...target, unrelatedPerson: '无关人物' }]) {
+      const invalid = { memories: [{ ...candidate, classification: { ...candidate.classification, target: wrong } }] };
       assert.throws(() => validateMemoryTaskOutput(request, invalid), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
-      assert.throws(() => parseGeneratedLongTermExtraction(invalid), /stateTarget/);
+      assert.throws(() => parseGeneratedLongTermExtraction(invalid), /target/);
     }
-    const { stateTarget, ...missing } = candidate;
-    assert.throws(() => validateMemoryTaskOutput(request, { memories: [missing] }));
+    const { target: ignored, ...missing } = candidate.classification;
+    assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...candidate, classification: missing }] }));
   }
-  const event = { ...base, kind: 'event', stateFamily: 'not_applicable', canonicalKey: '', stateLabel: '', retentionReason: 'episodic_event' };
-  const eventBranch = wireBranches.find(item => item.properties.stateFamily.enum.includes('not_applicable'));
-  assert.equal(Object.hasOwn(eventBranch.properties, 'stateTarget'), false);
-  assert.deepEqual(eventBranch.properties.kind.enum, ['event', 'reflection']);
-  assert.deepEqual(wireBranches.find(item => item.properties.stateFamily.enum.includes('goal')).properties.kind.enum,
-    ['plan', 'commitment', 'open_loop']);
-  assert.deepEqual(wireBranches.find(item => item.properties.stateFamily.enum.includes('preference')).properties.kind.enum,
-    ['preference']);
-  for (const [key, value] of Object.entries(original.properties.memories.items.properties)) {
-    if (['stateTarget', 'stateFamily', 'kind', 'retentionReason'].includes(key)) continue;
-    for (const branch of wireBranches) assert.deepEqual(branch.properties[key], value);
+  const event = { ...base, classification: { category: 'event' } };
+  for (const invalid of [{ ...event, classification: { category: ['event'] } }, { ...event, subject: { ref: ['P1'] } }]) {
+    assert.throws(() => validateMemoryTaskOutput(request, { memories: [invalid] }));
+    assert.throws(() => parseGeneratedLongTermExtraction({ memories: [invalid] }));
   }
-  assert.equal(Object.hasOwn(validateMemoryTaskOutput(request, { memories: [event] }).memories[0], 'stateTarget'), false);
-  for (const schemaName of ['long-term-memory-extraction-v2']) {
-    const output = { memories: [{ ...event, stateTarget: null }] };
-    const originalOutput = structuredClone(output);
-    const normalized = validateMemoryTaskOutput({ ...request, schemaName }, output);
-    assert.equal(Object.hasOwn(normalized.memories[0], 'stateTarget'), false);
-    assert.deepEqual(output, originalOutput);
+  assert.deepEqual(validateMemoryTaskOutput(request, { memories: [event] }).memories, [event]);
+  const causal = { memories: [{ ...event, title: '参观取消', content: '小林因为博物馆闭馆取消了参观。' }],
+    causalExcerpts: [{ sourceRef: 'M0001', start: '因为博物馆闭馆', end: '取消了参观。' }] };
+  assert.deepEqual(validateMemoryTaskOutput(request, causal), causal);
+  assert.throws(() => validateMemoryTaskOutput(request, { ...causal,
+    causalExcerpts: [{ ...causal.causalExcerpts[0], start: 123 }] }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
+  for (const field of ['retentionReason', 'stateFamily', 'canonicalKey']) {
+    assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, [field]: '' }] }));
   }
-  assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, stateTarget: {} }] }));
-  assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...base, stateTarget: null }] }));
-  assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, stateTarget: null, unexpected: null }] }));
-  const repair = { schemaName: 'long-term-memory-extraction-repair-v3', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
-  const repairOutput = { results: [{ candidateIndex: 3, status: 'repaired', memories: [{ ...event, stateTarget: null }] }] };
-  assert.equal(Object.hasOwn(validateMemoryTaskOutput(repair, repairOutput).results[0].memories[0], 'stateTarget'), false);
+  assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ ...event, classification: { category: 'event', label: '' } }] }));
+  assert.throws(() => normalizeGeneratedLongTermExtraction({ memories: [{ ...event, subject: { ref: 'P99' } }] }, { participants: [] }), /未知人物引用/);
+  const repair = { schemaName: 'long-term-memory-extraction-repair-v5', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
+  const repaired = { results: [{ candidateIndex: 3, status: 'repaired', memories: [event] }] };
+  assert.deepEqual(validateMemoryTaskOutput(repair, repaired), repaired);
   await generator(repair);
   verifyStrictObjects(wireSchema);
-  const mixed = { ...base, stateTarget: { ...targets.identity, objectRole: 'other', objectName: '小林' } };
-  assert.throws(() => parseGeneratedLongTermExtraction({ memories: [mixed] }), /不适用：objectRole, objectName/);
-  assert.throws(() => assertMemoryTaskRequest({ ...request, schemaName: 'long-term-memory-extraction-v1' }), /Unknown Memory task/);
+  assert.throws(() => assertMemoryTaskRequest({ ...request, schemaName: 'long-term-memory-extraction-v2' }), /Unknown Memory task/);
 });
 
 for (const [name, definitions] of Object.entries(analysis).filter(([key]) => key.endsWith('_ANALYZERS'))) {
@@ -140,18 +115,18 @@ for (const [name, definitions] of Object.entries(analysis).filter(([key]) => key
 }
 
 test('extraction, repair, structure, relation and attribution use their registered owner contracts', () => {
-  for (const schemaName of ['long-term-memory-extraction-v2']) {
+  for (const schemaName of ['long-term-memory-extraction-v4']) {
     const request = { schemaName, schema: LONG_TERM_EXTRACTION_SCHEMA };
     validateMemoryTaskOutput(request, { memories: [] });
     assert.throws(() => validateMemoryTaskOutput(request, { memories: [{ content: 'unsupported' }] }));
   }
-  const repair = { schemaName: 'long-term-memory-extraction-repair-v3', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
+  const repair = { schemaName: 'long-term-memory-extraction-repair-v5', schema: LONG_TERM_EXTRACTION_REPAIR_SCHEMA };
   validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'rejected', reason: 'No supporting source.' }] });
   validateMemoryTaskOutput(repair, { results: [] });
   assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'repaired', memories: [] }] }));
   assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'rejected', reason: '' }] }));
   assert.throws(() => validateMemoryTaskOutput(repair, { memories: [] }));
-  for (const [schemaName, schema] of [['memory-structure-proposals-v1', MEMORY_STRUCTURE_OUTPUT_SCHEMA], ['memory-relation-proposals-v1', MEMORY_RELATION_OUTPUT_SCHEMA]]) {
+  for (const [schemaName, schema] of [['memory-structure-proposals-v2', MEMORY_STRUCTURE_OUTPUT_SCHEMA], ['memory-relation-proposals-v1', MEMORY_RELATION_OUTPUT_SCHEMA]]) {
     validateMemoryTaskOutput({ schemaName, schema }, { proposals: [] });
     assert.throws(() => validateMemoryTaskOutput({ schemaName, schema }, { proposals: [{}] }));
   }

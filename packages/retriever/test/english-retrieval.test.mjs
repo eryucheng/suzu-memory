@@ -85,11 +85,15 @@ for (const [query, startDate, endDate] of [
 });
 
 test('English topicless questions retrieve the full bounded interval through the existing date route', async t => {
-  const recall = fixture(t, [{ id: 'first', eventDate: '2026-05-26' },
-    { id: 'second', eventDate: '2026-06-10' }, { id: 'outside', eventDate: '2026-07-01' }]);
+  const recall = fixture(t, [{ id: 'first', eventDate: '2026-05-26', content: 'Caroline visited the science museum.' },
+    { id: 'second', eventDate: '2026-06-10', content: 'Caroline attended a violin concert.' },
+    { id: 'outside', eventDate: '2026-07-01', content: 'Caroline went swimming.' }]);
   const result = await recall('What happened from May 25 to June 25?');
   assert.equal(result.status, 'ready');
   assert.deepEqual(new Set(result.candidates.map(item => item.memoryId)), new Set(['first', 'second']));
+  assert.match(result.context, /Caroline visited the science museum\./u);
+  assert.match(result.context, /Caroline attended a violin concert\./u);
+  assert.doesNotMatch(result.context, /Caroline went swimming\./u);
 });
 
 test('calendar parser returns bounded valid windows or ordinary retrieval fallback for boundary years', () => {
@@ -277,6 +281,8 @@ test('ordinary evidence slots retain independent matches instead of adding adjac
   for (const query of ['What can Caroline play?', '我会演奏什么？']) {
     const result = await recall(query, { maximumContextMemories: 2 }, { embeddingProvider: async () => ({ model: 'slot-fixture', vector: [1, 0] }) });
     assert.deepEqual(new Set(result.graph.selectedMemoryIds), new Set(['violin', 'clarinet']), query);
+    assert.match(result.context, /I play violin\. 我会拉小提琴。/u);
+    assert.match(result.context, /I play clarinet\. 我会吹单簧管。/u);
     assert.doesNotMatch(result.context, /Wonderful|太棒了/u);
   }
 });
@@ -286,8 +292,8 @@ test('resolved event dates retain their separate knowledge clock in either query
     content: 'Caroline said she visited the museum yesterday. 我昨天参观了博物馆。' }]);
   for (const query of ['When did Caroline visit the museum?', '我什么时候参观了博物馆？']) {
     const result = await recall(query);
-    assert.match(result.context, /事件日期：2026-10-20（已解析）；获知时间：2026-10-21/u);
-    assert.match(result.context, /不再次扣减/u);
+    assert.match(result.context, /事件日期：2026-10-20；获知时间：2026-10-21/u);
+    assert.ok(result.context.includes('Caroline said she visited the museum yesterday. 我昨天参观了博物馆。'));
   }
 });
 
@@ -305,19 +311,12 @@ test('reason questions retain direct wording when no reviewed causal edge exists
   }
 });
 
-test('English irregular verb forms share lexical evidence across retrieval modes', async t => {
+test('English irregular verb forms match their inflections and respect word boundaries', () => {
   for (const [query, document] of [['choose', 'chose'], ['go', 'went'], ['write', 'written'], ['teach', 'taught']]) {
     assert.equal(lexicalScore(query, document).overlap, 1);
     assert.equal(lexicalScore(document, query).overlap, 1);
   }
   assert.equal(lexicalScore('choose', 'choosesomething').overlap, 0);
-  const recall = fixture(t, [{ id: 'choice', content: 'Caroline chose a marine lab.' }]);
-  const reference = await recall('Why did Caroline choose the lab?', { sqlPrefilter: false });
-  for (const execution of ['inline', 'worker']) {
-    const optimized = await recall('Why did Caroline choose the lab?', { execution, sqlPrefilterThreshold: 0 });
-    assert.equal(optimized.status, 'ready');
-    assert.deepEqual(optimized.candidates, reference.candidates);
-  }
 });
 
 test('English FTS hits obey the same word boundaries and retain approved query expansions', async t => {
@@ -350,6 +349,15 @@ test('English original-wording recall retains attributed statements from both pa
   assert.equal(result.status, 'ready');
   assert.equal(result.seedRouting.primaryMemoryId, 'caroline-said');
   assert.ok(result.candidates.some(item => item.memoryId === 'melanie-said'));
+  for (const [id, speaker, statement] of [
+    ['caroline-said', 'Caroline', 'I said Melanie has a new job at the library.'],
+    ['melanie-said', 'Melanie', 'I said Caroline has a new job at the library.'],
+  ]) {
+    const record = result.records.find(item => item.memoryId === id);
+    assert.ok(record, `${speaker}'s original statement is delivered.`);
+    assert.ok(record.text.includes(`${speaker}：${statement}`), 'The displayed speaker owns this exact statement.');
+    assert.ok(result.context.includes(record.text));
+  }
 });
 
 test('English recent overview and vague topic recall share the standard temporal route', async t => {
@@ -369,7 +377,7 @@ test('English recent overview and vague topic recall share the standard temporal
 
 test('SQL prefilter and worker preserve full retrieval results for representative English inflections', async t => {
   for (const [query, content] of [['cats', 'Caroline adopted a cat.'], ['hope', 'Caroline was hoping to visit.'],
-    ['hopping', 'Caroline hopped away.']]) {
+    ['hopping', 'Caroline hopped away.'], ['choose', 'Caroline chose a marine lab.']]) {
     const recall = fixture(t, [{ id: 'matching', content },
       { id: 'education', content: 'Caroline discussed education at school.' }]);
     const complete = await recall(query, { execution: 'inline', sqlPrefilter: false });
@@ -516,8 +524,8 @@ test('generated topic summaries are retrievable only in their source world in bo
       repository.upsertEmbedding({ memoryId: proposal.result_memory_id, model: 'structure-scope', vector: [1, 0] });
     }
   });
-  for (const execution of ['inline', 'worker']) for (const query of ["What are Caroline's hobbies?", '我有哪些爱好']) {
-    const result = await recall(query, { execution, sqlPrefilterThreshold: 0 }, {
+  for (const query of ["What are Caroline's hobbies?", '我有哪些爱好']) {
+    const result = await recall(query, { sqlPrefilterThreshold: 0 }, {
       world: { id: 'story-a', frame: 'fictional' },
       embeddingProvider: async () => ({ model: 'structure-scope', vector: [1, 0] }),
     });

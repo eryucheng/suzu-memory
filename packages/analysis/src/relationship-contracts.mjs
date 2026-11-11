@@ -71,14 +71,12 @@ export const RELATIONSHIP_ANALYZERS = Object.freeze({
   }),
   currentRelation: Object.freeze({
     stateFamily: "relationship", role: "current-relation",
-    schemaName: "memory-relationship-current-relation-v2", promptVersion: "relationship-current-relation-v2",
+    schemaName: "memory-relationship-current-relation-v3", promptVersion: "relationship-current-relation-v3",
     promptFile: "relationship-current-relation-system-prompt.md",
-    schema: resultSchema(["currentStatePresent", "relation", "scopeOverlap", "comparisonMemoryId", "comparisonRelation", "comparisonScopeOverlap"], {
-      currentStatePresent: { type: "boolean" },
-      relation: { type: "string", enum: ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "revokes", "replaces", "unrelated", "unknown"] },
+    schema: resultSchema(["relation", "scopeOverlap", "comparisonRelation", "comparisonScopeOverlap"], {
+      relation: { type: "string", enum: ["equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "revokes", "replaces", "unrelated", "unknown"] },
       scopeOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
-      comparisonMemoryId: { type: "string" },
-      comparisonRelation: { type: "string", enum: ["no_comparison", "equivalent", "supports", "same_scope_conflict", "unrelated", "unknown"] },
+      comparisonRelation: { type: "string", enum: ["equivalent", "supports", "same_scope_conflict", "unrelated", "unknown"] },
       comparisonScopeOverlap: { type: "string", enum: ["exact", "partial", "none", "unknown"] },
     }),
   }),
@@ -125,12 +123,9 @@ function parseRoleItem(role, value, index) {
     revocationCue: requireEnum(value.revocationCue, `analyses[${index}].revocationCue`, ["explicit", "none", "unknown"]),
   };
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
     return {
-      ...common, currentStatePresent: value.currentStatePresent,
-      relation: requireEnum(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "revokes", "replaces", "unrelated", "unknown"]),
+      ...common, relation: requireEnum(value.relation, `analyses[${index}].relation`, ["no_current_state", "equivalent", "supports", "narrows", "broadens", "same_scope_conflict", "revokes", "replaces", "unrelated", "unknown"]),
       scopeOverlap: requireEnum(value.scopeOverlap, `analyses[${index}].scopeOverlap`, ["exact", "partial", "none", "unknown"]),
-      comparisonMemoryId: clean(value.comparisonMemoryId),
       comparisonRelation: requireEnum(value.comparisonRelation, `analyses[${index}].comparisonRelation`, ["no_comparison", "equivalent", "supports", "same_scope_conflict", "unrelated", "unknown"]),
       comparisonScopeOverlap: requireEnum(value.comparisonScopeOverlap, `analyses[${index}].comparisonScopeOverlap`, ["exact", "partial", "none", "unknown"]),
     };

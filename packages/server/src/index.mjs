@@ -252,9 +252,15 @@ export function createMemoryHttpServer({
   const memory = service || createMemoryService(serviceOptions);
   const key = clean(apiKey);
   const bodyLimit = normalizeBodyLimit(maxBodyBytes);
+  let lifetime = new AbortController();
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", "http://localhost");
     const method = clean(request.method).toUpperCase();
+    const operation = new AbortController();
+    const signal = AbortSignal.any([lifetime.signal, operation.signal]);
+    const disconnected = () => { if (!response.writableEnded) operation.abort(new DOMException('HTTP client disconnected.', 'AbortError')); };
+    request.once('aborted', disconnected);
+    response.once('close', disconnected);
     try {
       const consoleAsset = method === "GET" ? getMemoryConsoleAsset(url.pathname) : null;
       if (consoleAsset) {
@@ -330,6 +336,8 @@ export function createMemoryHttpServer({
       if (method === "POST" && url.pathname === "/v1/input-batches/process") {
         const body = await readJson(request, bodyLimit);
         success(response, await memory.processPendingEvents({
+          signal,
+          chunkPolicy: body.chunkPolicy,
           maximumEvents: integer(body.maximumEvents, 100, 500),
           maximumContentCharacters: integer(
             body.maximumContentCharacters,
@@ -365,12 +373,16 @@ export function createMemoryHttpServer({
       if (method === "GET" && url.pathname === "/v1/maintenance") {
         success(response, memory.maintenanceStatus({
           limit: integer(url.searchParams.get("limit"), 100, 500),
+          lane: clean(url.searchParams.get('lane')) || 'all',
+          minimumStructureMemories: integer(url.searchParams.get('minimumStructureMemories'), undefined, 500),
         }));
         return;
       }
       if (method === "POST" && url.pathname === "/v1/maintenance/run") {
         const body = await readJson(request, bodyLimit);
         success(response, await memory.runMaintenance({
+          signal,
+          chunkPolicy: body.chunkPolicy,
           lane: clean(body.lane) || "all",
           processInputEvents: body.processInputEvents !== false,
           maximumInputBatches: integer(body.maximumInputBatches, 1, 20),
@@ -504,6 +516,7 @@ export function createMemoryHttpServer({
       if (method === "POST" && url.pathname === "/v1/search") {
         const body = await readJson(request, bodyLimit);
         success(response, await memory.search(body.query, {
+          signal,
           now: body.now,
           anchors: body.anchors,
           anchorSelection: body.anchorSelection,
@@ -512,6 +525,8 @@ export function createMemoryHttpServer({
           allowCrossWorld: body.allowCrossWorld,
           options: body.options,
           persistTrace: body.persistTrace !== false,
+          reactivate: body.reactivate,
+          activationId: body.activationId,
         }));
         return;
       }
@@ -566,8 +581,12 @@ export function createMemoryHttpServer({
       }
       failure(response, 404, "NOT_FOUND", "Endpoint was not found.");
     } catch (error) {
+      if (response.destroyed) return;
       const mapped = publicFailure(error);
       failure(response, mapped.statusCode, mapped.code, mapped.message);
+    } finally {
+      request.off('aborted', disconnected);
+      response.off('close', disconnected);
     }
   });
 
@@ -575,6 +594,7 @@ export function createMemoryHttpServer({
     service: memory,
     server,
     async listen({ host = "127.0.0.1", port = 37779 } = {}) {
+      if (lifetime.signal.aborted) lifetime = new AbortController();
       const normalizedHost = clean(host) || "127.0.0.1";
       const normalizedPort = Math.max(0, Math.min(65535, Math.trunc(Number(port) || 0)));
       if (!isLoopback(normalizedHost) && !key) {
@@ -602,8 +622,9 @@ export function createMemoryHttpServer({
       };
     },
     async close() {
-      if (!server.listening) return;
-      await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      lifetime.abort(new DOMException('Memory HTTP server closed.', 'AbortError'));
+      if (server.listening) await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      if (!service) await memory.close();
     },
   };
 }

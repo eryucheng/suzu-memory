@@ -1,6 +1,6 @@
 const parse = value => { try { return JSON.parse(value); } catch { return {}; } };
 const ELIGIBILITY_FIELDS = new Set(['id', 'agent_id', 'status', 'kind', 'layer', 'subject_role', 'subject_key',
-  'state_family', 'canonical_key', 'state_phase', 'temporal_state', 'world_id', 'world_frame',
+  'state_family', 'canonical_key', 'state_phase', 'temporal_state', 'reality', 'world_id', 'world_frame',
   'known_at', 'recorded_at', 'event_date', 'event_start', 'valid_from', 'valid_to', 'importance', 'confidence', 'metadata_json']);
 
 /** Keep eligibility fields available for every node. Read bodies only when a

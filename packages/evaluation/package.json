@@ -3,9 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./benchmark": "./src/benchmark.mjs",
+    "./benchmark-cli": "./src/benchmark-cli.mjs",
+    "./benchmark-progress": "./src/benchmark-progress.mjs"
+  },
   "bin": {
     "suzu-memory-eval": "./src/cli.mjs",
+    "suzu-memory-benchmark": "./src/benchmark-cli.mjs",
     "suzu-memory-zh4o-system": "./src/zh4o-system-cli.mjs",
     "suzu-memory-zh4o-source": "./src/zh4o-source-cli.mjs"
   },

@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -15,7 +16,7 @@ import { createMemoryService } from "@suzu-memory/service";
 import { createMemoryHttpServer } from "../src/index.mjs";
 
 function temporaryDirectory() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-server-"));
+  return createTestDirectory(path.join(os.tmpdir(), "suzu-memory-server-"));
 }
 
 async function json(response) {
@@ -25,10 +26,10 @@ async function json(response) {
 }
 
 test("local HTTP product surface reuses Service status, retrieval and editing", async (context) => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "companion-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "companion-test" }));
   service.initialize();
   let proposalId = "";
-  const database = openMemoryDatabase(service.paths.databasePath);
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
   try {
     const repository = new MemoryRepository(database);
     repository.upsertMemory({
@@ -73,7 +74,7 @@ test("local HTTP product surface reuses Service status, retrieval and editing", 
   } finally {
     database.close();
   }
-  const controller = createMemoryHttpServer({ service, apiKey: "test-key" });
+  const controller = closeAfterTests(createMemoryHttpServer({ service, apiKey: "test-key" }));
   context.after(() => controller.close());
   const address = await controller.listen({ port: 0 });
 
@@ -167,9 +168,9 @@ test("local HTTP product surface reuses Service status, retrieval and editing", 
 });
 
 test("server refuses an unauthenticated non-loopback binding", async () => {
-  const controller = createMemoryHttpServer({
+  const controller = closeAfterTests(createMemoryHttpServer({
     serviceOptions: { dataRoot: temporaryDirectory(), agentId: "companion-test" },
-  });
+  }));
   await assert.rejects(
     controller.listen({ host: "0.0.0.0", port: 0 }),
     /requires an API key/u,
@@ -177,7 +178,7 @@ test("server refuses an unauthenticated non-loopback binding", async () => {
 });
 
 test("HTTP hides unexpected internal errors behind a stable server failure", async (context) => {
-  const controller = createMemoryHttpServer({
+  const controller = closeAfterTests(createMemoryHttpServer({
     service: {
       agentId: "companion-test",
       initialize() { return { status: "ready" }; },
@@ -185,7 +186,7 @@ test("HTTP hides unexpected internal errors behind a stable server failure", asy
         throw new Error("sqlite failed while opening C:/private/path/memory.db");
       },
     },
-  });
+  }));
   context.after(() => controller.close());
   const address = await controller.listen({ port: 0 });
   const response = await fetch(`${address.baseUrl}/v1/status`);
@@ -217,10 +218,10 @@ test("server accepts the same portable config used by CLI and SDK", async (conte
     server: { host: "127.0.0.1", port: 0, maxBodyBytes: 2_000_000 },
   }), "utf8");
   const config = loadMemoryConfig(configPath);
-  const controller = createMemoryHttpServer({
-    service: createMemoryServiceFromConfig(config),
+  const controller = closeAfterTests(createMemoryHttpServer({
+    service: closeAfterTests(createMemoryServiceFromConfig(config)),
     maxBodyBytes: config.server.maxBodyBytes,
-  });
+  }));
   context.after(() => controller.close());
   const address = await controller.listen(config.server);
   const status = await json(await fetch(`${address.baseUrl}/v1/status`));
@@ -246,7 +247,7 @@ test("server accepts the same portable config used by CLI and SDK", async (conte
 
 test("HTTP search forwards an explicit world scope without forcing one for callers", async (context) => {
   const calls = [];
-  const controller = createMemoryHttpServer({
+  const controller = closeAfterTests(createMemoryHttpServer({
     apiKey: "test-key",
     service: {
       agentId: "companion-test",
@@ -256,7 +257,7 @@ test("HTTP search forwards an explicit world scope without forcing one for calle
         return { status: "ready", candidates: [], fragments: [], context: "" };
       },
     },
-  });
+  }));
   context.after(() => controller.close());
   const address = await controller.listen({ port: 0 });
   const response = await json(await fetch(`${address.baseUrl}/v1/search`, {
@@ -270,27 +271,29 @@ test("HTTP search forwards an explicit world scope without forcing one for calle
       world: { id: "daily-life", frame: "physical" },
       allowCrossWorld: true,
       persistTrace: false,
+      reactivate: true,
+      activationId: "http-world-recall",
     }),
   }));
   assert.equal(response.data.status, "ready");
-  assert.deepEqual(calls, [{
-    query: "科技馆里的机器人展",
-    options: {
-      now: undefined,
-      anchors: undefined,
-      anchorSelection: undefined,
-      queryPerspective: undefined,
-      world: { id: "daily-life", frame: "physical" },
-      allowCrossWorld: true,
-      options: undefined,
-      persistTrace: false,
-    },
-  }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].query, "科技馆里的机器人展");
+  assert.deepEqual(calls[0].options.world, { id: "daily-life", frame: "physical" });
+  assert.equal(calls[0].options.allowCrossWorld, true);
+  assert.equal(calls[0].options.persistTrace, false);
+  assert.equal(calls[0].options.reactivate, true);
+  assert.equal(calls[0].options.activationId, "http-world-recall");
+  assert.equal(typeof calls[0].options.signal?.throwIfAborted, "function");
+  await json(await fetch(address.baseUrl + "/v1/search", {
+    method: "POST", headers: { authorization: "Bearer test-key", "content-type": "application/json" },
+    body: JSON.stringify({ query: "普通查询" }),
+  }));
+  assert.equal(calls[1].options.world, undefined, "An omitted world is left for the service to resolve.");
 });
 
 test("HTTP event endpoint is idempotent and exposes pending input without running a model", async (context) => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "companion-test" });
-  const controller = createMemoryHttpServer({ service });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "companion-test" }));
+  const controller = closeAfterTests(createMemoryHttpServer({ service }));
   context.after(() => controller.close());
   const address = await controller.listen({ port: 0 });
   const event = {
@@ -361,7 +364,7 @@ test("HTTP event processing forwards lease settings and exposes explicit recover
       return { recovered: 1, batches: [] };
     },
   };
-  const controller = createMemoryHttpServer({ service });
+  const controller = closeAfterTests(createMemoryHttpServer({ service }));
   context.after(() => controller.close());
   const address = await controller.listen({ port: 0 });
   const headers = { "content-type": "application/json" };
@@ -374,6 +377,7 @@ test("HTTP event processing forwards lease settings and exposes explicit recover
       maximumContentCharacters: 32_000,
       candidateEventIds: ["input-1", "input-2"],
       leaseSeconds: 1234,
+      chunkPolicy: { hostId: "http-host", sessionId: "http-session", flush: false },
       now: "2026-08-05T03:00:00.000Z",
     }),
   }));
@@ -387,7 +391,10 @@ test("HTTP event processing forwards lease settings and exposes explicit recover
     }),
   }));
 
-  assert.deepEqual(calls, [
+  assert.equal(typeof calls[0].options.signal?.throwIfAborted, "function");
+  const { signal: _signal, chunkPolicy, ...processing } = calls[0].options;
+  assert.deepEqual(chunkPolicy, { hostId: "http-host", sessionId: "http-session", flush: false });
+  assert.deepEqual([{ ...calls[0], options: processing }, calls[1]], [
     {
       method: "process",
       options: {
@@ -407,4 +414,17 @@ test("HTTP event processing forwards lease settings and exposes explicit recover
       },
     },
   ]);
+});
+
+test("HTTP server closes the Memory instance it owns and leaves injected Memory to its caller", async () => {
+  const owned = createMemoryHttpServer({ serviceOptions: { dataRoot: temporaryDirectory(), agentId: "owned-http" } });
+  const closeOwned = owned.service.close.bind(owned.service);
+  let ownedCloses = 0, borrowedCloses = 0;
+  owned.service.close = async () => { ownedCloses++; await closeOwned(); };
+  const borrowed = createMemoryHttpServer({ service: {
+    agentId: "borrowed-http", initialize() {}, close() { borrowedCloses++; },
+  } });
+  await owned.close(); await borrowed.close();
+  assert.equal(ownedCloses, 1);
+  assert.equal(borrowedCloses, 0);
 });

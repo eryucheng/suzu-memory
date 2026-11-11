@@ -1,5 +1,5 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -49,7 +49,7 @@ test('English intervention uses history, current-time and conversational acknowl
 });
 
 function temporaryDirectory() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-host-adapter-"));
+  return createTestDirectory(path.join(os.tmpdir(), "suzu-memory-host-adapter-"));
 }
 
 function fakeMemory() {
@@ -560,7 +560,7 @@ test("executeChatTurn keeps a completed reply when archival fails", async () => 
 
 test("adapter lifecycle persists events, response use, and next-message feedback in the real Service", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot,
     agentId: IDENTITY.spaceId,
     defaults: {
@@ -569,7 +569,7 @@ test("adapter lifecycle persists events, response use, and next-message feedback
       companionId: IDENTITY.companionId,
       memoryOwner: IDENTITY.companionName,
     },
-  });
+  }));
   service.initialize();
   service.withRepository((repository) => repository.upsertMemory({
     id: "museum-memory",
@@ -627,7 +627,7 @@ test("adapter lifecycle persists events, response use, and next-message feedback
   assert.equal(observations.length, 1);
   assert.equal(observations[0].feedback_text, "对，就是那个机器人展。");
 
-  const database = openMemoryDatabase(service.paths.databasePath, { readOnly: true });
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath, { readOnly: true }));
   try {
     const repository = new MemoryRepository(database);
     assert.equal(repository.getMemory("museum-memory").importance, 0.5);
@@ -638,7 +638,7 @@ test("adapter lifecycle persists events, response use, and next-message feedback
 
 test("host flush uses the shared length planner and preserves the two batch boundaries", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot,
     agentId: IDENTITY.spaceId,
     defaults: {
@@ -648,7 +648,7 @@ test("host flush uses the shared length planner and preserves the two batch boun
       memoryOwner: IDENTITY.companionName,
       ingestion: { maximumCoreMessages: 2 },
     },
-  });
+  }));
   service.initialize();
   const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "codex", identity: IDENTITY });
   await adapter.afterReply({
@@ -682,7 +682,7 @@ test("host flush uses the shared length planner and preserves the two batch boun
 
 test("a later host turn can be archived after earlier turns are already archived", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot,
     agentId: IDENTITY.spaceId,
     defaults: {
@@ -691,7 +691,7 @@ test("a later host turn can be archived after earlier turns are already archived
       companionId: IDENTITY.companionId,
       memoryOwner: IDENTITY.companionName,
     },
-  });
+  }));
   service.initialize();
   const adapter = createChatHostMemoryAdapter({ memory: service, hostId: "codex", identity: IDENTITY });
   await adapter.afterReply({
@@ -732,7 +732,7 @@ test("a later host turn can be archived after earlier turns are already archived
 
 test("a fresh adapter discovers persisted pending host sessions after restart", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot,
     agentId: IDENTITY.spaceId,
     defaults: {
@@ -741,7 +741,7 @@ test("a fresh adapter discovers persisted pending host sessions after restart", 
       companionId: IDENTITY.companionId,
       memoryOwner: IDENTITY.companionName,
     },
-  });
+  }));
   const firstProcess = createChatHostMemoryAdapter({ memory: service, hostId: "codex", identity: IDENTITY });
   await firstProcess.afterReply({
     sessionId: "recover-after-restart",

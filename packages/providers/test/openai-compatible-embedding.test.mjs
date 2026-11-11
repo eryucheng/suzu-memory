@@ -30,6 +30,8 @@ test("OpenAI compatible embedding provider supports ordered batches without brea
   const batch = await provider.embedMany(["甲", "乙"]);
   assert.equal(batch.vectors.length, 2);
   assert.equal(batch.vectors[0].length, 3);
+  assert.ok(Math.abs(batch.vectors[0][0] - 1 / Math.sqrt(2)) < 1e-6);
+  assert.ok(Math.abs(batch.vectors[1][0] - 2 / Math.sqrt(5)) < 1e-6);
   assert.equal(batch.requestId, "request-1");
   assert.deepEqual(requests[0].body, {
     model: "embedding-test",
@@ -42,4 +44,27 @@ test("OpenAI compatible embedding provider supports ordered batches without brea
   assert.equal(single.vectors.length, 1);
   assert.equal(provider.model, "embedding-test");
   assert.equal(provider.dimensions, 3);
+});
+
+test('rejects ambiguous batches and unusable vectors while retaining the charged response', async () => {
+  for (const data of [
+    [{ index: 0, embedding: [1, 0] }, { index: 0, embedding: [0, 1] }],
+    [{ index: 0, embedding: [1, 0] }, { index: 2, embedding: [0, 1] }],
+    [{ index: 0, embedding: [1, 0] }, { embedding: [0, 1] }],
+    [{ index: 0, embedding: [0, 0] }, { index: 1, embedding: [0, 1] }],
+  ]) {
+    const provider = createOpenAiCompatibleEmbeddingProvider({
+      baseUrl: 'https://example.test/v1', apiKey: 'test-key', model: 'embedding-test',
+      fetchImplementation: async () => new Response(JSON.stringify({
+        data, model: 'embedding-test', usage: { prompt_tokens: 17, total_tokens: 17 },
+      }), { headers: { 'x-request-id': 'charged-invalid-response' } }),
+    });
+    await assert.rejects(provider.embedMany(['Caroline likes swimming.', 'Melanie likes hiking.']), error => {
+      assert.match(error.message, /index|向量/u);
+      assert.deepEqual(error.usage, { prompt_tokens: 17, total_tokens: 17 });
+      assert.equal(error.model, 'embedding-test');
+      assert.equal(error.requestId, 'charged-invalid-response');
+      return true;
+    });
+  }
 });

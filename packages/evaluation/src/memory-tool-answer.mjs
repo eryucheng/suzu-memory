@@ -1,18 +1,21 @@
 /** Drive the reader's normal tool calls; the memory service never calls a planner model. */
-export async function answerWithMemoryTools({ messages, complete, searchSession, signal }) {
+export async function answerWithMemoryTools({ messages, complete, searchSession, signal, requireSearch = false }) {
   const history = structuredClone(messages), steps = [];
   for (let step = 0; step <= searchSession.limits.maximumSearches; step++) {
     signal?.throwIfAborted();
     const remaining = searchSession.remaining();
     const canSearch = remaining.searches > 0 && step < searchSession.limits.maximumSearches;
+    const mustSearch = requireSearch && searchSession.stats.searches === 0;
     const response = await complete(history, { signal,
-      tools: canSearch ? [{ type: 'function', function: searchSession.tool }] : undefined });
+      tools: canSearch ? [{ type: 'function', function: searchSession.tool }] : undefined,
+      ...(canSearch && mustSearch ? { toolChoice: { type: 'function', function: { name: searchSession.tool.name } } } : {}) });
     const message = response.message;
     if (!message || message.role !== 'assistant') throw new Error('Missing assistant message.');
     steps.push({ ...response, message: structuredClone(message) });
     history.push(message);
     const calls = message.tool_calls || [];
     if (!calls.length) {
+      if (mustSearch) throw Object.assign(new Error('The memory answer requires a search before a final answer.'), { code: 'MEMORY_SEARCH_REQUIRED' });
       if (!message.content?.trim()) throw new Error('Missing final answer.');
       return { answer: message.content.trim(), steps, messages: history, search: { ...searchSession.stats } };
     }

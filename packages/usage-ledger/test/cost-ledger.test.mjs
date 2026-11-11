@@ -1,5 +1,5 @@
+import { createTestDirectory } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -90,7 +90,7 @@ test("matches custom prices by event timestamp without changing older events", (
 });
 
 test("appends and reads a raw usage event without storing a price snapshot", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-ledger-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-ledger-"));
   const ledgerPath = path.join(root, "events.jsonl");
   await appendUsageEvent(ledgerPath, {
     agentId: "agent-test",
@@ -109,4 +109,18 @@ test("appends and reads a raw usage event without storing a price snapshot", asy
   assert.equal(stored.events[0].units.inputTokens, 184);
   assert.equal(Object.hasOwn(stored.events[0], "price"), false);
   assert.equal(Object.hasOwn(stored.events[0], "amountCny"), false);
+});
+
+test("DeepSeek standard and partial cache usage retain every input token in cost units", () => {
+  for (const [label, usage, uncached, cached, amount] of [
+    ["standard OpenAI", { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }, 1_000_000, 0, 9],
+    ["OpenAI cached details", { prompt_tokens: 3_000_000, prompt_tokens_details: { cached_tokens: 1_000_000 }, completion_tokens: 3_000_000 }, 2_000_000, 1_000_000, 24.025],
+    ["native hit without miss", { prompt_tokens: 3_000_000, prompt_cache_hit_tokens: 1_000_000, completion_tokens: 3_000_000 }, 2_000_000, 1_000_000, 24.025],
+    ["native miss without hit", { prompt_tokens: 3_000_000, prompt_cache_miss_tokens: 2_000_000, completion_tokens: 3_000_000 }, 2_000_000, 1_000_000, 24.025],
+  ]) {
+    const result = calculateCost({ model: "deepseek-v4-pro", timestamp: "2026-07-30T00:00:00.000Z", usage });
+    assert.equal(result.units.inputUncachedTokens, uncached, label);
+    assert.equal(result.units.inputCachedTokens, cached, label);
+    assert.ok(Math.abs(result.amountCny - amount) < 0.000001, label);
+  }
 });

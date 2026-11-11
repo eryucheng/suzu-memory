@@ -67,7 +67,7 @@ function memoryView(repository, memory, maximumContentChars) {
   };
 }
 
-function containerView(repository, memory, maximumContentChars, maximumMemberIds, sourceView, materialIds) {
+function containerView(repository, memory, maximumContentChars, maximumMemberIds, sourceView, materialIds, continuityMemories) {
   const allMembers = memory.kind === "episode"
     ? repository.listEpisodeMembers({
       agentId: memory.agent_id,
@@ -83,13 +83,59 @@ function containerView(repository, memory, maximumContentChars, maximumMemberIds
   if (members.length > maximumMemberIds) {
     throw memoryBudgetError(`Container ${memory.id} exceeds the complete ${maximumMemberIds}-member budget.`);
   }
-  for (const member of members) materialIds.add(member.id);
+  for (const member of members) {
+    materialIds.add(member.id);
+    continuityMemories.set(member.id, member);
+  }
   return {
     ...memoryView(repository, memory, maximumContentChars),
     memberIds: members.map((member) => member.id),
     memberCount: members.length,
     memberIdsTruncated: false,
   };
+}
+
+function eventContinuityView(repository, agentId, memories, sourceView) {
+  const ids = [...memories.values()].filter(memory => memory.kind === "event"
+    && memory.layer !== "provisional" && ["active", "superseded"].includes(memory.status))
+    .map(memory => memory.id).sort();
+  if (ids.length < 2) return null;
+  const selected = JSON.stringify(ids);
+  const links = repository.database.prepare(`
+    SELECT from_memory_id, to_memory_id, relation,
+      json_extract(metadata_json, '$.evidenceSourceIds') AS evidence_source_ids FROM memory_edges
+    WHERE agent_id = ? AND from_memory_id IN (SELECT value FROM json_each(?))
+      AND to_memory_id IN (SELECT value FROM json_each(?))
+      AND relation IN ('same_thread', 'completes', 'cancels', 'corrects')
+      AND provenance IN ('event-continuity-v1', 'event-continuity-human-v1')
+    ORDER BY from_memory_id, to_memory_id, relation
+  `).all(agentId, selected, selected);
+  const neighbors = new Map(), transitions = [];
+  for (const link of links) {
+    if (sourceView) {
+      const evidence = JSON.parse(link.evidence_source_ids || "null");
+      if (!Array.isArray(evidence) || !evidence.length
+        || evidence.some(id => !sourceView.sourceIds.has(id))) continue;
+    }
+    const from = link.from_memory_id, to = link.to_memory_id;
+    if (!neighbors.has(from)) neighbors.set(from, new Set());
+    if (!neighbors.has(to)) neighbors.set(to, new Set());
+    neighbors.get(from).add(to);
+    neighbors.get(to).add(from);
+    if (link.relation !== "same_thread") transitions.push({ fromMemoryId: from, toMemoryId: to, relation: link.relation });
+  }
+  const groups = [], seen = new Set();
+  for (const id of ids) {
+    if (seen.has(id) || !neighbors.has(id)) continue;
+    const members = [id]; seen.add(id);
+    for (let index = 0; index < members.length; index++) {
+      for (const next of neighbors.get(members[index])) {
+        if (!seen.has(next)) { seen.add(next); members.push(next); }
+      }
+    }
+    groups.push(members.sort());
+  }
+  return groups.length ? { groups, transitions } : null;
 }
 
 function checkedMemory(repository, agentId, id, label) {
@@ -123,7 +169,8 @@ export function buildStructureSnapshot({
   const containerLimit = Math.min(50, Math.max(0, Math.trunc(Number(maxContainers) || 12)));
   const memberLimit = completeLimit(maxMemberIdsPerContainer);
   const perMemoryLimit = completeLimit(maxContentChars);
-  const characterLimit = Math.min(200_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 32_000)));
+  const characterLimit = maxSnapshotChars === Infinity ? Infinity
+    : Math.min(200_000, Math.max(4_000, Math.trunc(Number(maxSnapshotChars) || 32_000)));
   const excluded = [];
   const current = [];
   if (requestedIds.length > memoryLimit) {
@@ -220,13 +267,17 @@ export function buildStructureSnapshot({
     }
     retrospectiveContext = { triggerMemoryIds, historicalMemoryIds };
   }
+  const continuityMemories = new Map(current.map(memory => [memory.id, memory]));
+  const candidateContainers = candidateIds.slice(0, containerLimit).map((id) => (
+    containerView(repository, repository.getMemory(id), perMemoryLimit, memberLimit, sourceView, materialIds, continuityMemories)
+  ));
+  const eventContinuity = eventContinuityView(repository, normalizedAgentId, continuityMemories, sourceView);
   const snapshot = {
     schemaVersion: 1,
     batchId: clean(batchId),
     currentMemories: current.map((memory) => memoryView(repository, memory, perMemoryLimit)),
-    candidateContainers: candidateIds.slice(0, containerLimit).map((id) => (
-      containerView(repository, repository.getMemory(id), perMemoryLimit, memberLimit, sourceView, materialIds)
-    )),
+    candidateContainers,
+    ...(eventContinuity ? { eventContinuity } : {}),
     retrospectiveContext,
     inputPolicy: {
       includesRawUtterances: false,

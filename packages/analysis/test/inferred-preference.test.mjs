@@ -4,6 +4,17 @@ import { MemoryRepository, openMemoryDatabase, resolvePreferenceStateProposal } 
 import { processPendingStateAnalysisRequests, accumulateInferredPreference } from '../src/index.mjs';
 import { buildReviewProposalDetail } from '../../service/src/review-console.mjs';
 
+function bindSemanticWorld(fixture, request, world) {
+  const draft = fixture.repository.upsertMemory({ id: `semantic-${request.id}`, agentId: request.agent_id,
+    kind: 'derived_hypothesis', layer: 'provisional', status: 'archived', title: 'Preference draft', content: 'A fixed preference draft.',
+    subjectRole: request.subject_role, subjectKey: request.subject_key, canonicalKey: request.canonical_key,
+    stateFamily: 'preference', representationLayer: 'inferred', evidenceMode: 'inferred', ...world,
+    metadata: { stateAnalysisDraft: true, stateAnalysisRequestId: request.id } });
+  fixture.repository.database.prepare('UPDATE memory_state_analysis_requests SET metadata_json=? WHERE agent_id=? AND id=?')
+    .run(JSON.stringify({ ...request.metadata, semanticMemoryId: draft.id }), request.agent_id, request.id);
+  return fixture.repository.getStateAnalysisRequest(request.agent_id, request.id);
+}
+
 function setup(t) {
   const database = openMemoryDatabase(':memory:');
   t.after(() => database.close());
@@ -85,6 +96,54 @@ test('accumulates three independent choices across days and spaces with one mode
   assert.equal(f.repository.getMemory(pending[0].id).status, 'deleted');
   accumulateInferredPreference({ repository: f.repository, request });
   assert.equal(f.repository.listPendingProvisionalMemories('owner').length, 0);
+});
+
+test('fixed semantic worlds drive accumulation, observation reads and pending replacement while raw dialogue remains real', async t => {
+  const f = setup(t);
+  const story = { reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' };
+  for (const [index,day,space] of [[1,10,'library'],[2,10,'reading-room'],[3,11,'club']]) {
+    bindSemanticWorld(f, f.add(index,{day,space}), story); await f.run();
+  }
+  let pending = f.repository.listPreferenceStateProposals('owner', { reviewStates: ['pending'] });
+  assert.equal(pending.length, 1); const oldStory = pending[0];
+  const storyEvidence = f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', world: story, limit: 100 });
+  assert.equal(storyEvidence.length, 3);
+  for (const observation of storyEvidence) {
+    assert.deepEqual(observation.world, story);
+    assert.deepEqual(f.repository.getStateEvidenceObservation('owner', observation.id).world, story);
+    assert.equal(f.repository.getMemory(observation.memory_id).reality, 'real');
+  }
+  for (const [index,day,space] of [[4,12,'library'],[5,12,'reading-room'],[6,13,'club']]) { f.add(index,{day,space}); await f.run(); }
+  pending = f.repository.listPreferenceStateProposals('owner', { reviewStates: ['pending'] });
+  assert.equal(pending.length, 2); const real = pending.find(item => item.id !== oldStory.id);
+  const next = bindSemanticWorld(f, f.add(7,{day:14,space:'story-club'}), story);
+  const result = (await f.run()).results[0];
+  assert.equal(result.status, 'proposal-pending');
+  assert.equal(result.preferenceProposal.evidence.length, 4);
+  assert.equal(f.repository.getPreferenceStateProposal('owner', oldStory.id).review_state, 'dismissed');
+  assert.equal(f.repository.getPreferenceStateProposal('owner', real.id).review_state, 'pending');
+  assert.deepEqual(result.preferenceProposal.metadata.observationIds.sort(),
+    f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', world: story, limit: 100 }).map(item => item.id).sort());
+  assert.equal(f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', world: story, limit: 1 })[0].memory_id, next.memoryIds[0]);
+  assert.equal(f.calls(), 7);
+});
+
+test('observation world owner supports legacy run provenance and falls back without accepting another Agent semantic ID', async t => {
+  const f = setup(t); const request = bindSemanticWorld(f, f.add(1), { reality: 'fictional', worldId: 'story', worldFrame: 'fictional' });
+  await f.run();
+  let observation = f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', limit: 1 })[0];
+  assert.equal(observation.world.reality, 'fictional');
+  const payload = { ...observation.payload }; delete payload.analysisRequest;
+  f.repository.database.prepare('UPDATE memory_state_evidence_observations SET payload_json=? WHERE id=?').run(JSON.stringify(payload), observation.id);
+  assert.equal(f.repository.getStateEvidenceObservation('owner', observation.id).world.reality, 'fictional');
+  const foreign = f.repository.upsertMemory({ id: 'foreign-semantic', agentId: 'other', kind: 'fact', layer: 'provisional', content: 'Other Agent draft.',
+    reality: 'fictional', worldId: 'foreign-story', worldFrame: 'fictional', metadata: { stateAnalysisDraft: true, stateAnalysisRequestId: request.id } });
+  f.repository.database.prepare('UPDATE memory_state_analysis_requests SET metadata_json=? WHERE id=?').run(JSON.stringify({ semanticMemoryId: foreign.id }), request.id);
+  observation = f.repository.getStateEvidenceObservation('owner', observation.id);
+  assert.equal(observation.world.reality, 'real');
+  assert.equal(f.repository.getStateAnalysisRequestSemanticMemory('owner', request.id), null);
+  assert.equal(f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', world: { reality: 'fictional', worldId: 'foreign-story', worldFrame: 'fictional' }, limit: 1 }).length, 0);
+  assert.equal(f.repository.listStateEvidenceObservations('owner', { stateFamily: 'preference', world: { reality: 'real', worldId: 'another-room', worldFrame: 'physical' }, limit: 1 }).length, 1);
 });
 
 test('repeated days in one space do not satisfy distinct context support', async t => {

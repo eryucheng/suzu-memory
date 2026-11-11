@@ -1,5 +1,5 @@
+import { createTestDirectory } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
 } from "../src/index.mjs";
 
 test("runtime resolves portable storage and stable Agent identity", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-runtime-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-memory-runtime-"));
   const agentId = stableAgentId(path.join(root, "agent"));
   assert.match(agentId, /^agent-[a-f0-9]{16}$/u);
   assert.equal(resolveMemoryDataRoot({ configuredRoot: path.join(root, "data") }), path.join(root, "data"));

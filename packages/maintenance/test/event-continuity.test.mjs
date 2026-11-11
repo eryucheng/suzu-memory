@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MemoryRepository, openMemoryDatabase, resolveEventContinuityReview, withEventSourceExecution } from '@suzu-memory/core';
 import { prepareEventContinuity, applyEventContinuity } from '@suzu-memory/analysis';
+import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 import { runEventContinuityMaintenance, runImmediateMemoryMaintenance, runEmbeddingMaintenance } from '../src/index.mjs';
 
@@ -317,6 +318,46 @@ function matched(memory, candidate) {
   return { memoryId: memory.id, resolution: 'matched', candidateId: candidate.id, relation: 'same_thread',
     memorySourceIds: [memory.sources[0].id], candidateSourceIds: [candidate.sources[0].id], rationale: '两端原文明示同一件具体事项。' };
 }
+
+test('event matching and citation repair exchange local references and store canonical evidence', async t => {
+  const f = fixture(t);
+  const historical = f.seed('event-1');
+  await f.run();
+  const incoming = f.seed('event-2');
+  const evidence = [historical, incoming].map(memory => f.repository.getMemoryDetail('owner', memory.id).sources[0]);
+  let calls = 0;
+  const generator = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture' },
+    fetchImpl: async (_url, { body }) => {
+      const { messages } = JSON.parse(body);
+      const input = JSON.parse(messages[1].content);
+      const memory = input.memories.find(row => row.content === incoming.content);
+      const candidate = input.memories.find(row => row.content === historical.content);
+      assert.notEqual(memory.id, incoming.id);
+      assert.notEqual(candidate.id, historical.id);
+      assert.deepEqual(input.events[0].candidateIds, [candidate.id]);
+      assert.equal(input.events[0].memoryId, memory.id);
+      for (const [row, source] of [[candidate, evidence[0]], [memory, evidence[1]]]) {
+        assert.equal(row.sources[0].content, source.content);
+        assert.notEqual(row.sources[0].id, source.id);
+      }
+      const match = matched(memory, candidate);
+      if (++calls === 1) match.candidateSourceIds = match.memorySourceIds;
+      else {
+        const previous = input.validationErrors[0].previousDecision;
+        assert.equal(previous.candidateId, candidate.id);
+        assert.deepEqual(previous.candidateSourceIds, match.memorySourceIds);
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ matches: [match] }) } }] });
+    },
+  });
+  const result = await f.run({ generator });
+  assert.equal(result.failed.length, 0);
+  assert.equal(calls, 2);
+  const decision = f.repository.getMemory(incoming.id).metadata.eventContinuity;
+  assert.equal(decision.targetMemoryId, historical.id);
+  assert.deepEqual(new Set(decision.evidenceSourceIds), new Set(evidence.map(source => source.id)));
+});
 
 for (const outcome of ['corrected', 'invalid', 'new', 'ambiguous']) test(`citation repair isolates one invalid decision and keeps four valid decisions: ${outcome}`, async t => {
   const f = fixture(t);

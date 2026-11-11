@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import {
   DEFAULT_LENGTH_ARCHIVE_POLICY,
-  logicalArchiveEventId,
 } from "@suzu-memory/ingestion";
 
 export {
@@ -399,6 +398,7 @@ export class ChatHostMemoryAdapter {
         world: {
           id: clean(world?.id) || this.identity.defaultWorldId,
           frame: clean(world?.frame) || this.identity.defaultWorldFrame,
+          ...(clean(world?.reality) ? { reality: clean(world.reality) } : {}),
         },
         allowCrossWorld: Boolean(world?.allowCrossWorld),
         options: recallOptions.options,
@@ -554,10 +554,7 @@ export class ChatHostMemoryAdapter {
     const reports = [];
     for (const pendingSessionId of processInputEvents && sessionIds.length ? sessionIds : [""]) {
       const chunkPolicy = { ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...this.memory.defaults?.ingestion,
-        hostId: this.hostId, sessionId: pendingSessionId, flush,
-        resolveReply: row => row.metadata?.host?.role === "companion" ? {
-          id: row.metadata.host.turnId, complete: true, lastEventId: logicalArchiveEventId(row),
-        } : null };
+        hostId: this.hostId, sessionId: pendingSessionId, flush };
       try {
         reports.push({ sessionId: pendingSessionId, result: await this.memory.runMaintenance({
           ...options, processInputEvents: processInputEvents && Boolean(pendingSessionId), chunkPolicy,

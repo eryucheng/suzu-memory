@@ -132,17 +132,15 @@ export const VALUE_ANALYZERS = Object.freeze({
   currentRelation: Object.freeze({
     stateFamily: "value",
     role: "current-relation",
-    schemaName: "memory-value-current-relation-v1",
-    promptVersion: "value-current-relation-v1",
+    schemaName: "memory-value-current-relation-v2",
+    promptVersion: "value-current-relation-v2",
     promptFile: "value-current-relation-system-prompt.md",
     schema: resultSchema(
-      ["currentStatePresent", "relation", "scopeOverlap"],
+      ["relation", "scopeOverlap"],
       {
-        currentStatePresent: { type: "boolean" },
         relation: {
           type: "string",
           enum: [
-            "no_current_state",
             "equivalent",
             "supports",
             "narrows",
@@ -251,12 +249,8 @@ function parseRoleItem(role, value, index) {
     };
   }
   if (role === "current-relation") {
-    if (typeof value.currentStatePresent !== "boolean") {
-      throw new Error(`analyses[${index}].currentStatePresent must be boolean.`);
-    }
     return {
       ...common,
-      currentStatePresent: value.currentStatePresent,
       relation: requireEnum(value.relation, `analyses[${index}].relation`, [
         "no_current_state",
         "equivalent",

@@ -1,4 +1,4 @@
-import { preferenceEvidenceMemoryIds } from './preference-specialist-merge.mjs';
+import { preferenceEvidenceRetryMemoryIds } from './preference-specialist-merge.mjs';
 import { invokeEvidenceAnalyzer, recordAnalyzerInvocations } from './related-analyzer-batch.mjs';
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -88,7 +88,7 @@ function enforceSpecialistBoundary(role, analysis, snapshot) {
 
 async function invokeAnalyzer(options) {
   return invokeEvidenceAnalyzer({ ...options,
-    buildInput: (snapshot, definition) => buildPreferenceSpecialistGenerationInput(snapshot, definition.role),
+    buildInput: buildPreferenceSpecialistGenerationInput,
     parseGeneration: parsePreferenceSpecialistGeneration, enforceBoundary: enforceSpecialistBoundary });
 }
 
@@ -168,9 +168,9 @@ export async function evaluatePreferenceEvidenceSpecialists({
     repository, agentId, batchId, stateFamily: 'preference', snapshot, invocations, usageLedgerPath,
     metadata: key => ({ specialistKey: key, automaticMemoryWriteAllowed: false }),
   });
-  const completeMemoryIds = preferenceEvidenceMemoryIds({ snapshot, analyses, runs });
+  const retryMemoryIds = preferenceEvidenceRetryMemoryIds({ snapshot, analyses, runs });
   const hasAnyAnalysis = Object.values(analyses).some((items) => items.length);
-  const status = failedRoles.length ? (completeMemoryIds.length ? "partial" : "incomplete")
+  const status = retryMemoryIds.length ? "incomplete" : failedRoles.length ? "partial"
     : hasAnyAnalysis ? "analyzed" : "abstained";
   return {
     status,
@@ -182,6 +182,7 @@ export async function evaluatePreferenceEvidenceSpecialists({
     analyses,
     rejected,
     failedRoles,
+    retryMemoryIds,
     warnings,
     automaticMemoryWriteAllowed: false,
   };

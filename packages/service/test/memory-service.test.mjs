@@ -1,11 +1,15 @@
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from 'node:sqlite';
 
 import {
   MemoryRepository,
+  inputEventContentHash,
   SCHEMA_VERSION,
   memoryRetrievalContextSourceHash,
   openMemoryDatabase,
@@ -18,11 +22,11 @@ import {
 } from "../src/index.mjs";
 
 function temporaryDirectory() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-service-"));
+  return createTestDirectory(path.join(os.tmpdir(), "suzu-memory-service-"));
 }
 
 function seedMemory(service) {
-  const database = openMemoryDatabase(service.paths.databasePath);
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
   try {
     const repository = new MemoryRepository(database);
     repository.upsertMemory({
@@ -73,7 +77,6 @@ function generatedEventCandidate() {
     evidenceMode: "explicit",
     temporalState: "historical",
     revisionAction: "add",
-    retentionReason: "significant_event",
     eventDate: "2026-08-04",
     eventStart: "2026-08-04T03:00:00.000Z",
     eventEnd: "",
@@ -88,7 +91,7 @@ test("service resolves one portable Agent scope and initializes the existing sch
   const paths = resolveMemoryServicePaths({ dataRoot, agentId: "agent-test" });
   assert.equal(paths.databasePath, path.join(dataRoot, "agents", "agent-test", "memory", "memory.db"));
 
-  const service = createMemoryService({ dataRoot, agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: "agent-test" }));
   const status = service.initialize();
   assert.equal(status.status, "ready");
   assert.equal(status.agentId, "agent-test");
@@ -107,28 +110,38 @@ test("service resolves one portable Agent scope and initializes the existing sch
   assert.equal(identity.relationships[0].members.length, 2);
 });
 
-test("service initializes schema and identity roots only once before ordinary repository reads", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
-  const initialize = service.initialize.bind(service);
-  let initializeCalls = 0;
-  service.initialize = (...args) => {
-    initializeCalls += 1;
-    return initialize(...args);
-  };
-  service.listMemories();
-  service.listMemories();
-  service.listInputEvents();
-  assert.equal(initializeCalls, 1);
-  service.info();
-  assert.equal(initializeCalls, 2);
+test("ordinary service reads preserve initialized identities without repeating identity queries or writes", t => {
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
+  const initialized = service.initialize();
+  const prepare = DatabaseSync.prototype.prepare;
+  const identityReads = [], writes = [];
+  t.mock.method(DatabaseSync.prototype, 'prepare', function(sql) {
+    const statement = prepare.call(this, sql);
+    return new Proxy(statement, { get(target, key) {
+      const value = target[key];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        const result = value.apply(target, args);
+        if (['get', 'all', 'iterate'].includes(key) && /\bFROM\s+(entities|actor_entity_bindings|relationships)\b/iu.test(sql)) identityReads.push(sql);
+        if (key === 'run' && Number(result.changes) > 0) writes.push({ sql, changes: Number(result.changes) });
+        return result;
+      };
+    } });
+  });
+  assert.equal(service.listMemories().total, 0);
+  assert.equal(service.listMemories().total, 0);
+  assert.equal(service.listInputEvents().total, 0);
+  assert.deepEqual(identityReads, [], 'Ordinary reads do not re-query the identity structure.');
+  assert.deepEqual(writes, [], 'Ordinary reads change no stored rows.');
+  assert.deepEqual(service.info().identityStructure, initialized.identityStructure);
 });
 
 test('read-only service opens existing data without identity writes and rejects writes through repository callbacks', async t => {
   const options = { dataRoot: temporaryDirectory(), agentId: 'read-only-test' };
-  const writer = createMemoryService({ ...options, defaults: { relationshipLabel: 'original' } });
+  const writer = closeAfterTests(createMemoryService({ ...options, defaults: { relationshipLabel: 'original' } }));
   writer.initialize();
   seedMemory(writer);
-  const reader = createMemoryService({ ...options, readOnly: true, defaults: { relationshipLabel: 'query-label' } });
+  const reader = closeAfterTests(createMemoryService({ ...options, readOnly: true, defaults: { relationshipLabel: 'query-label' } }));
   t.after(async () => { await reader.close(); await writer.close(); fs.rmSync(options.dataRoot, { recursive: true, force: true }); });
   assert.equal(reader.initialize().identityStructure, null);
   assert.throws(() => reader.backupDatabase(), /Read-only memory service/);
@@ -146,14 +159,14 @@ test('read-only service opens existing data without identity writes and rejects 
 test('read-only initialization does not create a missing database', () => {
   const dataRoot = temporaryDirectory();
   try {
-    const reader = createMemoryService({ dataRoot, agentId: 'missing', readOnly: true });
+    const reader = closeAfterTests(createMemoryService({ dataRoot, agentId: 'missing', readOnly: true }));
     assert.throws(() => reader.initialize(), /unable to open|cannot open/i);
     assert.equal(fs.existsSync(reader.paths.databasePath), false);
   } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
 });
 
 test("service reuses repository editing, deletion, restoration and provenance detail", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   seedMemory(service);
 
@@ -172,7 +185,7 @@ test("service reuses repository editing, deletion, restoration and provenance de
 });
 
 test("service persists the real retriever trace without changing retrieval behavior", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   seedMemory(service);
 
@@ -227,7 +240,7 @@ test("service persists the real retriever trace without changing retrieval behav
 });
 
 test("trace persistence and activation can be selected independently", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   seedMemory(service);
   const options = { now: "2026-07-30T12:00:00.000Z" };
@@ -245,7 +258,7 @@ test("trace persistence and activation can be selected independently", async () 
   assert.equal(replay.trace.reactivation.applied, 0);
   assert.equal(service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")).activation_count, 1);
   service.reactivateRecall({ activationId: "message-b", memoryIds: ["event-museum"], now: options.now });
-  const reopened = createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId });
+  const reopened = closeAfterTests(createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId }));
   assert.equal(reopened.reactivateRecall({ activationId: "message-a", memoryIds: ["event-museum"], now: options.now }).applied, 0);
   assert.equal(reopened.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")).activation_count, 2);
   assert.equal(reopened.reactivateRecall({ activationId: "policy-off", memoryIds: ["event-museum"],
@@ -255,13 +268,13 @@ test("trace persistence and activation can be selected independently", async () 
 });
 
 test("receipt migration preserves existing activation state", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   seedMemory(service);
   const recalled = await service.search("科技馆", { reactivate: true });
   const previous = service.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum"));
   service.withRepository((_repository, database) => database.exec("DROP TABLE memory_recall_reactivation_receipts; DELETE FROM schema_migrations WHERE version=44"));
-  const migrated = createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId });
+  const migrated = closeAfterTests(createMemoryService({ dataRoot: service.paths.dataRoot, agentId: service.agentId }));
   assert.equal(migrated.info().database.schemaVersion, SCHEMA_VERSION);
   assert.deepEqual(migrated.withRepository(repository => repository.getMemoryRecallReactivationState(service.agentId, "event-museum")), previous);
   const reapplication = migrated.withRepository(repository => repository.applyRecallReactivation({ agentId: service.agentId,
@@ -270,9 +283,9 @@ test("receipt migration preserves existing activation state", async () => {
 });
 
 test("service scopes explicit worlds end-to-end without breaking unscoped callers", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
-  const database = openMemoryDatabase(service.paths.databasePath);
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
   try {
     const repository = new MemoryRepository(database);
     for (const value of [
@@ -336,11 +349,11 @@ test("service scopes explicit worlds end-to-end without breaking unscoped caller
 });
 
 test("service allows an explicit retrieval configuration to disable product natural decay", async () => {
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-test",
     defaults: { retrieval: { naturalDecay: { enabled: false } } },
-  });
+  }));
   service.initialize();
   seedMemory(service);
 
@@ -352,7 +365,7 @@ test("service allows an explicit retrieval configuration to disable product natu
 });
 
 test("service exposes the existing structured brain snapshot", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   seedMemory(service);
   const snapshot = service.brainSnapshot({ cachePath: "" });
@@ -368,7 +381,7 @@ test("service exposes the existing structured brain snapshot", () => {
 });
 
 test("service exposes a durable full association-graph rebuild", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   service.withRepository((repository) => {
     for (const [id, eventDate] of [
@@ -399,7 +412,7 @@ test("service exposes a durable full association-graph rebuild", () => {
 });
 
 test("service uses pending structural nodes immediately and confirms them after review", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   const proposal = service.withRepository((repository) => {
     for (const [id, content] of [
@@ -487,7 +500,7 @@ test("service uses pending structural nodes immediately and confirms them after 
 });
 
 test("service exposes terminal maintenance failures in the human review queue", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   const task = service.withRepository((repository) => {
     repository.upsertMemory({
@@ -568,7 +581,7 @@ test("service exposes terminal maintenance failures in the human review queue", 
 });
 
 test("service exposes quarantined input with its original text for human review", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.appendEvent({
     protocolVersion: 1,
     eventId: "quarantined-input-event",
@@ -599,7 +612,7 @@ test("service exposes quarantined input with its original text for human review"
 });
 
 test("service exposes exhausted retrospective consolidation without discarding base memories", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   const run = service.withRepository((repository) => {
     for (const id of ["consolidation-trigger", "consolidation-history"]) {
@@ -660,7 +673,7 @@ test("service exposes exhausted retrospective consolidation without discarding b
 });
 
 test("service keeps base evidence, retries enrichment three times, and lets a human decide the existing candidate", async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   const seeded = service.withRepository((repository) => {
     const source = repository.upsertSource({
@@ -732,7 +745,6 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
       reality: "real",
       evidenceMode: "explicit",
       temporalState: "current",
-      retentionReason: "explicit_preference",
       confidence: 0.95,
       importance: 0.7,
       sourceRefs: [source.external_id],
@@ -798,7 +810,7 @@ test("service keeps base evidence, retries enrichment three times, and lets a hu
 });
 
 test("dismissing an enrichment candidate keeps its original evidence", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   service.initialize();
   const decision = service.withRepository((repository) => {
     const source = repository.upsertSource({
@@ -875,11 +887,11 @@ test("service keeps the repository open until asynchronous existing services fin
   });
   embeddingProvider.model = "test-embedding";
   embeddingProvider.dimensions = 3;
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-test",
     providers: { embedding: embeddingProvider },
-  });
+  }));
   service.initialize();
   seedMemory(service);
 
@@ -890,18 +902,18 @@ test("service keeps the repository open until asynchronous existing services fin
 });
 
 test("service appends companion events without analysis and processes them later", async () => {
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "companion-test",
     defaults: { memoryOwner: "Companion", userName: "User" },
-  });
+  }));
   const appended = service.appendEvent(inputEvent());
   assert.equal(appended.inserted, 1);
   assert.equal(service.listInputEvents().total, 1);
   assert.equal(service.listMemories({ statuses: [] }).total, 0);
   const processed = await service.processPendingEvents({
     now: "2026-08-04T03:05:00.000Z",
-    memoriesOverride: [],
+    memoriesOverride: extractionModelFixture([]),
   });
   assert.equal(processed.status, "processed");
   assert.equal(service.listInputEvents({ statuses: ["archived"] }).total, 1);
@@ -910,11 +922,11 @@ test("service appends companion events without analysis and processes them later
 });
 
 test("service retries a degraded long-term extraction from retained raw events after human review", async () => {
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "retry-long-term-extraction",
     defaults: { memoryOwner: "Companion", userName: "User" },
-  });
+  }));
   service.appendEvent(inputEvent("retry-long-term-event"));
   let failedAttempts = 0;
   const failingGenerator = async () => {
@@ -942,7 +954,7 @@ test("service retries a degraded long-term extraction from retained raw events a
     actor: "human:test",
     reason: "provider recovered",
     now: "2026-08-04T03:10:00.000Z",
-    generator: async () => ({ output: { memories: [generatedEventCandidate()] }, usage: {} }),
+    generator: async () => ({ output: extractionModelFixture({ memories: [generatedEventCandidate()] }), usage: {} }),
   });
   assert.equal(retried.status, "retried");
   assert.equal(retried.reviewTask.review_state, "accepted");
@@ -955,7 +967,7 @@ test('service persists unresolved repair candidates and retries only the remaini
   const options = { dataRoot: temporaryDirectory(), agentId: 'partial-extraction-repair',
     defaults: { memoryOwner: 'Companion', userName: 'User' } };
   t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
-  const service = createMemoryService(options);
+  const service = closeAfterTests(createMemoryService(options));
   service.appendEvent(inputEvent('repair-persistence'));
   const first = { ...generatedEventCandidate(), title: 'First repaired event', content: 'User and Companion completed the design.' };
   const second = { ...generatedEventCandidate(), title: 'Second repaired event', content: 'User and Companion agreed on the event boundary.' };
@@ -967,11 +979,11 @@ test('service persists unresolved repair candidates and retries only the remaini
   const processed = await service.processPendingEvents({ now: '2026-08-04T03:05:00.000Z',
     generator: async request => {
       calls++;
-      if (calls === 1) return { output: { memories: [invalid(first), invalid(second), invalid(third)] } };
+      if (calls === 1) return { output: extractionModelFixture({ memories: [invalid(first), invalid(second), invalid(third)] }) };
       const candidates = JSON.parse(request.input).candidates;
       if (calls === 2) {
         assert.deepEqual(candidates.map(item => item.candidateIndex), [0, 1, 2]);
-        return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [first, firstDetail] }] } };
+        return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [first, firstDetail] }] }) };
       }
       assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
       return { output: { results: [] } };
@@ -986,12 +998,12 @@ test('service persists unresolved repair candidates and retries only the remaini
   const batch = service.listInputBatches()[0];
   assert.equal(batch.output.degraded, true);
   assert.equal(batch.output.unresolvedCandidateCount, 2);
-  const resumed = createMemoryService(options);
+  const resumed = closeAfterTests(createMemoryService(options));
   let retryCalls = 0;
   const partial = await resumed.retryLongTermExtractionFailure(review.id, { now: '2026-08-04T03:10:00.000Z',
     generator: async request => {
       retryCalls++;
-      assert.equal(request.schemaName, 'long-term-memory-extraction-repair-v3');
+      assert.equal(request.schemaName, 'long-term-memory-extraction-repair-v5');
       const candidates = JSON.parse(request.input).candidates;
       if (retryCalls > 1) {
         assert.deepEqual(candidates.map(item => item.candidateIndex), [2]);
@@ -999,7 +1011,7 @@ test('service persists unresolved repair candidates and retries only the remaini
       }
       assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
       assert.equal(candidates[0].candidate.title, second.title);
-      return { output: { results: [{ candidateIndex: 1, status: 'repaired', memories: [second, secondDetail] }] } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 1, status: 'repaired', memories: [second, secondDetail] }] }) };
     } });
   assert.equal(retryCalls, 3);
   assert.equal(partial.status, 'retry-degraded');
@@ -1008,7 +1020,7 @@ test('service persists unresolved repair candidates and retries only the remaini
   const retried = await resumed.retryLongTermExtractionFailure(partial.reviewTask.id, { now: '2026-08-04T03:15:00.000Z',
     generator: async request => {
       assert.deepEqual(JSON.parse(request.input).candidates.map(item => item.candidateIndex), [2]);
-      return { output: { results: [{ candidateIndex: 2, status: 'repaired', memories: [third] }] } };
+      return { output: extractionModelFixture({ results: [{ candidateIndex: 2, status: 'repaired', memories: [third] }] }) };
     } });
   assert.equal(retried.status, 'retried');
   assert.equal(retried.reviewTask.review_state, 'accepted');
@@ -1027,7 +1039,7 @@ test('concurrent split repairs append once and preserve earlier valid records', 
   const options = { dataRoot: temporaryDirectory(), agentId: 'concurrent-split-repair',
     defaults: { memoryOwner: 'Companion', userName: 'User' } };
   t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
-  const service = createMemoryService(options);
+  const service = closeAfterTests(createMemoryService(options));
   service.appendEvent(inputEvent('split-concurrent-source'));
   const valid = { ...generatedEventCandidate(), title: 'Previously valid event', content: 'User confirmed the design.' };
   const split = [
@@ -1035,8 +1047,8 @@ test('concurrent split repairs append once and preserve earlier valid records', 
     { ...valid, title: 'Second split event', content: 'User confirmed the output boundary.' },
   ];
   const processed = await service.processPendingEvents({ generator: async request => ({ output:
-    request.schemaName === 'long-term-memory-extraction-v2'
-      ? { memories: [{ ...split[0], kind: 'invalid-kind' }, valid] } : { results: [] } }) });
+    extractionModelFixture(request.schemaName === 'long-term-memory-extraction-v4'
+      ? { memories: [{ ...split[0], kind: 'invalid-kind' }, valid] } : { results: [] }) }) });
   const originalId = processed.candidateResults[0].memoryId;
   const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
   let release, ready, entered = 0;
@@ -1046,7 +1058,7 @@ test('concurrent split repairs append once and preserve earlier valid records', 
     assert.deepEqual(JSON.parse(request.input).candidates.map(item => item.candidateIndex), [0]);
     if (++entered === 2) ready();
     await gate;
-    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: split }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: split }] }) };
   };
   const pending = Promise.allSettled([
     service.retryLongTermExtractionFailure(review.id, { generator }),
@@ -1063,11 +1075,11 @@ test('concurrent split repairs append once and preserve earlier valid records', 
 });
 
 for (const timing of ['before', 'during']) test('candidate repair cannot restore a withdrawn source: ' + timing, async () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'withdrawn-repair-' + timing,
-    defaults: { memoryOwner: 'Companion', userName: 'User' } });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'withdrawn-repair-' + timing,
+    defaults: { memoryOwner: 'Companion', userName: 'User' } }));
   service.appendEvent(inputEvent('withdrawn-source'));
-  await service.processPendingEvents({ generator: async request => ({ output: request.schemaName === 'long-term-memory-extraction-v2'
-    ? { memories: [{ ...generatedEventCandidate(), eventDate: 'invalid' }] } : { results: [] } }) });
+  await service.processPendingEvents({ generator: async request => ({ output: extractionModelFixture(request.schemaName === 'long-term-memory-extraction-v4'
+    ? { memories: [{ ...generatedEventCandidate(), eventDate: 'invalid' }] } : { results: [] }) }) });
   const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
   const retract = () => service.reviseEvent('withdrawn-source', { action: 'retract', reason: 'Source withdrawn.' });
   if (timing === 'before') retract();
@@ -1075,14 +1087,14 @@ for (const timing of ['before', 'during']) test('candidate repair cannot restore
   await assert.rejects(service.retryLongTermExtractionFailure(review.id, { generator: async () => {
     calls++;
     if (timing === 'during') retract();
-    return { output: { results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate()] }] } };
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate()] }] }) };
   } }), /Only active archived/);
   assert.equal(calls, timing === 'before' ? 0 : 1);
   assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 0);
 });
 
 test("service carries configured identities from input through archive into entity-seeded recall", async () => {
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "identity-e2e",
     defaults: {
@@ -1091,7 +1103,7 @@ test("service carries configured identities from input through archive into enti
       primaryUserId: "caroline",
       companionId: "melanie",
     },
-  });
+  }));
   service.appendEvent({
     protocolVersion: 1,
     eventId: "identity-e2e-event",
@@ -1107,7 +1119,7 @@ test("service carries configured identities from input through archive into enti
   });
   await service.processPendingEvents({
     now: "2026-08-04T03:05:00.000Z",
-    memoriesOverride: [{
+    memoriesOverride: extractionModelFixture([{
       ...generatedEventCandidate(),
       title: "早餐后的委员会会议",
       content: "She attended an important committee meeting after breakfast.",
@@ -1115,7 +1127,7 @@ test("service carries configured identities from input through archive into enti
       actorRoles: [
         { role: "experiencer", actorRole: "user", actorName: "Caroline", confidence: 1 },
       ],
-    }],
+    }]),
   });
 
   const identities = service.withRepository((repository) => {
@@ -1147,8 +1159,8 @@ test("service embeds new memories while structure maintenance accumulates", asyn
   const schemas = [];
   const generator = async ({ schemaName }) => {
     schemas.push(schemaName);
-    if (schemaName === "long-term-memory-extraction-v2") {
-      return { output: { memories: [generatedEventCandidate()] }, usage: {} };
+    if (schemaName === "long-term-memory-extraction-v4") {
+      return { output: extractionModelFixture({ memories: [generatedEventCandidate()] }), usage: {} };
     }
     if (schemaName === "memory_retrieval_context_proposal_v1") {
       return {
@@ -1162,7 +1174,7 @@ test("service embeds new memories while structure maintenance accumulates", asyn
     if (schemaName === "memory_retrieval_context_critic_v1") {
       return { output: { approved: true, issues: [] }, usage: {} };
     }
-    if (schemaName === "memory-structure-proposals-v1") {
+    if (schemaName === "memory-structure-proposals-v2") {
       return { output: { proposals: [] }, usage: {} };
     }
     throw new Error(`Unexpected schema: ${schemaName}`);
@@ -1174,12 +1186,12 @@ test("service embeds new memories while structure maintenance accumulates", asyn
   });
   embedding.model = "test-embedding";
   embedding.dimensions = 3;
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "companion-test",
     defaults: { memoryOwner: "Companion", userName: "User" },
     providers: { generator, embedding },
-  });
+  }));
   service.appendEvent(inputEvent("maintenance-event-1"));
   const result = await service.runMaintenance({ lane: "all" });
   assert.equal(result.semantic.inputBatches[0].status, "processed");
@@ -1194,7 +1206,7 @@ test("service embeds new memories while structure maintenance accumulates", asyn
     new Set(["event", "utterance"]),
   );
   assert.deepEqual(schemas, [
-    "long-term-memory-extraction-v2",
+    "long-term-memory-extraction-v4",
   ]);
   const status = service.maintenanceStatus();
   assert.equal(status.pendingInputEvents, 0);
@@ -1212,7 +1224,7 @@ test("a recoverable semantic failure does not prevent the embedding lane from ru
   });
   embedding.model = "test-embedding";
   embedding.dimensions = 3;
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "companion-test",
     providers: {
@@ -1221,7 +1233,7 @@ test("a recoverable semantic failure does not prevent the embedding lane from ru
       },
       embedding,
     },
-  });
+  }));
   service.initialize();
   service.withRepository((repository) => {
     repository.upsertMemory({
@@ -1248,10 +1260,10 @@ test("a recoverable semantic failure does not prevent the embedding lane from ru
 });
 
 test("service creates verified backups and restores them with an automatic safety snapshot", () => {
-  const service = createMemoryService({
+  const service = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-test",
-  });
+  }));
   service.initialize();
   seedMemory(service);
   const backup = service.backupDatabase({ now: "2026-08-05T04:00:00.000Z" });
@@ -1278,14 +1290,21 @@ test("service creates verified backups and restores them with an automatic safet
   );
 });
 
-test("service imports another Agent database by rebinding its scoped records to the target Agent", () => {
-  const source = createMemoryService({
+test("service imports another Agent database by rebinding its scoped records to the target Agent", async () => {
+  const source = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-source",
     defaults: { companionId: "agent-source", memoryOwner: "旧联系人" },
-  });
+  }));
   source.initialize();
   source.withRepository((repository) => {
+    repository.upsertMemory({ id: 'independent-imported-person', agentId: 'agent-source', kind: 'event', layer: 'episodic',
+      content: 'A colleague mentioned agent:agent-source in a document.', subjectRole: 'other',
+      subjectKey: 'person:agent-source-friend',
+      metadata: { quotedText: 'agent:agent-source', displayName: 'agent-source',
+        actor: { role: 'agent', key: 'agent-source' } } });
+    repository.upsertSource({ id: 'independent-imported-source', agentId: 'agent-source', sourceKind: 'note',
+      externalId: 'trip', sourceLocator: 'notes/agent-source/trip', content: 'A colleague visited the museum.' });
     repository.upsertMemory({
       id: "imported-agent-memory",
       agentId: "agent-source",
@@ -1302,11 +1321,28 @@ test("service imports another Agent database by rebinding its scoped records to 
     });
   });
 
-  const target = createMemoryService({
+  const importScope = agentId => ({ owner: 'import-test', agentId, eventUpperBound: 1, clears: [] });
+  const importedEvent = { occurredAt: '2026-08-10T12:00:00Z', content: { text: 'I visited the lighthouse museum.' },
+    source: { version: 1, owner: 'import-test', eventId: 'museum-message', spaceId: 'museum-chat',
+      commitSequence: 1, eventType: 'message.created', recipientAgentId: source.agentId,
+      recipientAgentIds: [source.agentId], sender: { kind: 'local-user', id: 'user' },
+      topology: { kind: 'direct-user-agent-dm', participants: [{ kind: 'local-user', id: 'user' }, { kind: 'agent', id: source.agentId }] } } };
+  source.appendEventSources({ scope: importScope(source.agentId), events: [importedEvent] });
+  source.withRepository(repository => {
+    const { batch } = repository.claimPendingInputEvents(source.agentId, { workerId: 'import-fixture' });
+    repository.recordInputBatchProcessingFailure(source.agentId, batch.id,
+      { leaseOwner: 'import-fixture', failure: { message: 'temporary transport failure' } });
+    repository.completeInputBatch(source.agentId, batch.id, { success: false, leaseOwner: 'import-fixture' });
+  });
+  assert.equal(source.appendEventSources({ scope: importScope(source.agentId), events: [importedEvent] }).reused, 1);
+  await source.processPendingEvents({ sourceScope: importScope(source.agentId), runMaintenance: false,
+    generator: async () => ({ output: { memories: [] } }) });
+
+  const target = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-target",
     defaults: { companionId: "agent-target", memoryOwner: "新联系人" },
-  });
+  }));
   target.initialize();
   target.withRepository((repository) => {
     repository.upsertMemory({
@@ -1357,20 +1393,65 @@ test("service imports another Agent database by rebinding its scoped records to 
   assert.equal(rebound.relationships.some((relationship) => relationship.relationship_key.includes("agent:agent-source")), false);
   assert.equal(rebound.indexed.agent_id, "agent-target");
   assert.equal(rebound.retainedTargetMemory, null);
+  const independent = target.getMemory('independent-imported-person').memory;
+  assert.equal(independent.subject_key, 'person:agent-source-friend');
+  assert.equal(target.withRepository(repository => repository.getSource('independent-imported-source')).source_locator,
+    'notes/agent-source/trip');
+  assert.equal(independent.metadata.quotedText, 'agent:agent-source');
+  assert.equal(independent.metadata.displayName, 'agent-source');
+  assert.equal(independent.metadata.actor.key, 'agent-target');
+  const importedInput = target.listInputEvents({ statuses: ['archived'] }).items[0];
+  assert.equal(inputEventContentHash(importedInput), importedInput.input_hash);
+  assert.equal(importedInput.metadata.eventSource.recipientAgentId, target.agentId);
+  assert.deepEqual(importedInput.metadata.eventSource.recipientAgentIds, [target.agentId]);
+  const recall = await target.search('lighthouse museum', { persistTrace: false, sourceScope: importScope(target.agentId) });
+  assert.equal(recall.status, 'ready');
+  assert.match(recall.context, /lighthouse museum/);
+  const replay = target.appendEventSources({ scope: importScope(target.agentId), events: [{ ...importedEvent,
+    source: { ...importedEvent.source, recipientAgentId: target.agentId, recipientAgentIds: [target.agentId],
+      topology: { ...importedEvent.source.topology, participants: [{ kind: 'local-user', id: 'user' }, { kind: 'agent', id: target.agentId }] } } }] });
+  assert.equal(replay.reused, 1, 'Imported product Events must retain replay identity after ownership migration.');
 
   assert.deepEqual(source.inspectDatabaseImport(source.paths.databasePath).agentIds, ["agent-source"]);
+
+  const erasedScope = { ...importScope(source.agentId), eventUpperBound: 2,
+    clears: [{ spaceId: 'erased-chat', throughSequence: 2 }] };
+  source.appendEventSources({ scope: { ...erasedScope, clears: [] }, events: [{ ...importedEvent,
+    content: { text: 'This private note must stay erased.' },
+    source: { ...importedEvent.source, eventId: 'erased-message', spaceId: 'erased-chat', commitSequence: 2 } }] });
+  await source.processPendingEvents({ sourceScope: { ...erasedScope, clears: [] }, runMaintenance: false,
+    generator: async () => ({ output: { memories: [] } }) });
+  source.eraseEventSources({ id: 'erase-before-import', scope: erasedScope });
+  target.importDatabaseAsAgent(source.paths.databasePath, { confirmAgentId: target.agentId });
+  const afterErasure = await target.search('lighthouse museum', { persistTrace: false,
+    sourceScope: { ...erasedScope, agentId: target.agentId } });
+  assert.equal(afterErasure.status, 'ready');
+  target.withRepository((repository, database) => {
+    const erased = database.prepare("SELECT id FROM memory_input_events WHERE agent_id=? AND json_extract(metadata_json,'$.eventSourceErased')=1").get(target.agentId);
+    assert.ok(erased);
+    assert.throws(() => database.prepare('UPDATE memory_input_events SET content_json=? WHERE id=?')
+      .run(JSON.stringify({ text: 'Restored private note' }), erased.id), /EVENT_SOURCE_ERASED/);
+  });
+
+  const encodedSource = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'Agent Source/Ä' }));
+  const encodedTarget = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'Target Agent/B' }));
+  encodedSource.initialize();
+  encodedTarget.importDatabaseAsAgent(encodedSource.paths.databasePath, { confirmAgentId: encodedTarget.agentId });
+  const relationships = encodedTarget.withRepository(repository => repository.listRelationships(encodedTarget.agentId));
+  assert.equal(relationships.length, 1, 'Import must migrate the original relationship instead of creating a second primary dyad.');
+  assert.ok(relationships[0].relationship_key.endsWith('|agent:target%20agent%2fb'));
 });
 
 test("service rejects an unscoped database instead of reporting a no-op import", () => {
   const sourceDirectory = temporaryDirectory();
   const sourcePath = path.join(sourceDirectory, "unscoped-memory.db");
-  const sourceDatabase = openMemoryDatabase(sourcePath);
+  const sourceDatabase = closeAfterTests(openMemoryDatabase(sourcePath));
   sourceDatabase.close();
 
-  const target = createMemoryService({
+  const target = closeAfterTests(createMemoryService({
     dataRoot: temporaryDirectory(),
     agentId: "agent-target",
-  });
+  }));
   target.initialize();
 
   assert.throws(
@@ -1380,7 +1461,7 @@ test("service rejects an unscoped database instead of reporting a no-op import",
 });
 
 test("service rejects a backup whose manifest hash no longer matches", () => {
-  const service = createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: "agent-test" }));
   const backup = service.backupDatabase({ now: "2026-08-05T04:10:00.000Z" });
   fs.appendFileSync(backup.databasePath, "tampered", "utf8");
   assert.throws(

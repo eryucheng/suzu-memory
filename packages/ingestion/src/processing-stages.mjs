@@ -5,10 +5,9 @@ import {
   DIRECT_USER_AGENT_DM_TOPOLOGY,
   loadLongTermExtractionSystemPrompt,
   LONG_TERM_EXTRACTION_SCHEMA,
-  parseGeneratedLongTermExtraction,
-  normalizeExtractionParticipantRoles,
+  normalizeGeneratedLongTermExtraction, extractionEntityScope,
 } from "@suzu-memory/extraction";
-import { ensureCompanionRelationshipStructure } from "@suzu-memory/core";
+import { ensureCompanionRelationshipStructure, locateCausalExcerpt } from "@suzu-memory/core";
 import { currentEventSourceExecution, eventSourceMaterial, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { runImmediateMemoryMaintenance } from "@suzu-memory/maintenance";
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
@@ -39,15 +38,31 @@ function looseExtractionObject(output) {
   }
 }
 
+function annotateCausalSources(messages, excerpts) {
+  if (!Array.isArray(excerpts) || !excerpts.length) return messages;
+  const byRef = new Map();
+  for (const item of excerpts) {
+    if (!item || typeof item.sourceRef !== 'string') continue;
+    byRef.set(item.sourceRef, byRef.has(item.sourceRef) ? null : item);
+  }
+  return messages.map(message => {
+    const hint = byRef.get(message.memoryRef);
+    const causalExcerpt = hint && locateCausalExcerpt(message.text, hint);
+    return causalExcerpt ? { ...message, causalExcerpt } : message;
+  });
+}
+
 function retainValidExtractionCandidates(output, context) {
   const parsed = looseExtractionObject(output);
   if (!parsed || !Array.isArray(parsed.memories)) return null;
+  // A malformed shared table cannot be salvaged by validating rows in isolation.
+  try { normalizeGeneratedLongTermExtraction({ entities: parsed.entities, memories: [] }, context); } catch { return null; }
   const memories = [];
   const rejected = [];
   const invalidCandidates = [];
   parsed.memories.forEach((candidate, index) => {
     try {
-      memories.push(parseGeneratedLongTermExtraction({ memories: [candidate] }, context).memories[0]);
+      memories.push(normalizeGeneratedLongTermExtraction({ ...(parsed.entities ? { entities: parsed.entities } : {}), memories: [candidate] }, context).memories[0]);
     } catch (error) {
       rejected.push({ index, reason: clean(error?.message).slice(0, 500) });
       invalidCandidates.push(candidate);
@@ -58,6 +73,7 @@ function retainValidExtractionCandidates(output, context) {
     rejected,
     invalidCandidates,
     originalCount: parsed.memories.length,
+    entities: parsed.entities,
   };
 }
 
@@ -297,7 +313,7 @@ export function buildCompanionExtractionRequest({
     input: built.input,
     systemPrompt: clean(systemPrompt) || loadLongTermExtractionSystemPrompt(),
     schema: LONG_TERM_EXTRACTION_SCHEMA,
-    schemaName: "long-term-memory-extraction-v2",
+    schemaName: "long-term-memory-extraction-v4",
   } };
 }
 
@@ -306,7 +322,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
   memoriesOverride = null, systemPrompt = '', timeZone }) {
   const { built, request: generationRequest } = buildCompanionExtractionRequest({ events,
     previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt, timeZone });
-  const timeContext = { messages: built.messages, timeZone: built.timeZone };
+  const timeContext = built;
   if (Array.isArray(memoriesOverride)) {
     return {
       timeZone: built.timeZone,
@@ -317,7 +333,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       continuationGuidanceMessages: built.continuationGuidanceMessages,
       input: built.input,
       generation: {
-        output: parseGeneratedLongTermExtraction({ memories: memoriesOverride }, timeContext),
+        output: normalizeGeneratedLongTermExtraction({ memories: memoriesOverride }, timeContext),
         usage: {},
         model: "",
         requestId: "",
@@ -339,9 +355,10 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
   }
   const generation = await generator(generationRequest);
   assertEventSourceExecutionCurrent();
+  const messages = annotateCausalSources(built.messages, looseExtractionObject(generation.output)?.causalExcerpts);
   let parsedOutput;
   try {
-    parsedOutput = parseGeneratedLongTermExtraction(generation.output, timeContext);
+    parsedOutput = normalizeGeneratedLongTermExtraction(generation.output, timeContext);
   } catch (validationError) {
     const salvage = retainValidExtractionCandidates(generation.output, timeContext);
     const initialRequestId = generation.requestId;
@@ -353,7 +370,9 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     if (candidates.length) {
       try {
         repair = await repairExtractionCandidates({
-          state: { candidates, messages: built.messages, participants: built.participants, timeZone: built.timeZone }, generator,
+          state: { candidates, entityScope: extractionEntityScope(built.messages), ...(salvage?.entities ? { entities: salvage.entities } : {}), messages, participants: built.participants, timeZone: built.timeZone,
+            contextWindows: built.archiveWindows.filter(window => window.previousContextMessages.length || window.continuationGuidanceMessages.length)
+              .map(({ id, label, previousContextMessages, continuationGuidanceMessages }) => ({ id, label, previousContextMessages, continuationGuidanceMessages })) }, generator,
           sourceMaterial: generationRequest.sourceMaterial,
         });
       } catch (error) {
@@ -393,8 +412,6 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       },
     });
   }
-  const participantNormalization = normalizeExtractionParticipantRoles(parsedOutput, built.participants);
-  parsedOutput = participantNormalization.output;
   generation.output = parsedOutput;
   generation.metadata = {
     ...(generation.metadata || {}),
@@ -405,12 +422,10 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     finalCandidateCount: generation.metadata?.finalCandidateCount ?? parsedOutput.memories.length,
     unresolvedCandidateCount: generation.metadata?.unresolvedCandidateCount ?? (generation.metadata?.candidateValidationIncomplete ? null : 0),
     candidateValidationIncomplete: generation.metadata?.candidateValidationIncomplete ?? false,
-    knownParticipantRoleCorrectionCount: participantNormalization.corrections.length,
-    knownParticipantRoleCorrections: participantNormalization.corrections,
   };
   return {
     timeZone: built.timeZone,
-    messages: built.messages,
+    messages,
     participants: built.participants,
     archiveWindows: built.archiveWindows,
     previousContextMessages: built.previousContextMessages,
@@ -468,14 +483,18 @@ export async function retryCompanionExtractionRepair({ repository, agentId, task
   };
   assertSourcesAvailable();
   const execution = currentEventSourceExecution();
-  const sourceMaterial = execution?.sourceScope ? eventSourceMaterial(repository, agentId, [], [], task.payload.eventIds) : undefined;
-  const repair = await repairExtractionCandidates({ state, generator, sourceMaterial });
-  const normalized = normalizeExtractionParticipantRoles({ memories: repair.memories }, state.participants);
-  const generation = { output: normalized.output,
-    usage: combinedNumericUsage(...repair.generations.map(item => item.usage)),
-    durationMs: repair.generations.reduce((sum, item) => sum + Number(item.durationMs || 0), 0),
-    model: repair.generations.at(-1)?.model, requestId: repair.generations.at(-1)?.requestId,
-    metadata: { extractionRepair: repair.state, repairAttempts: repair.generations.length,
+  const contextMessages = (state.contextWindows || []).flatMap(window => [
+    ...window.previousContextMessages, ...window.continuationGuidanceMessages,
+  ]);
+  const materialInputIds = [...new Set([...task.payload.eventIds,
+    ...contextMessages.flatMap(message => message.inputEventIds || [message.inputEventId]).filter(Boolean)])];
+  const sourceMaterial = execution?.sourceScope ? eventSourceMaterial(repository, agentId, [], [], materialInputIds) : undefined;
+  const usageWarnings = [];
+  const repair = await repairExtractionCandidates({ state, sourceMaterial,
+    generator: recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
+      agentId, batchId: task.payload.batchId, warnings: usageWarnings }) });
+  const generation = { output: { memories: repair.memories },
+    metadata: { ...repair.generations.at(-1)?.metadata, extractionRepair: repair.state, repairAttempts: repair.generations.length,
       repairRejectedCandidates: repair.rejected, repairRejectedCandidateCount: repair.rejected.length,
       unresolvedCandidateCount: repair.state?.candidates.length || 0, candidateValidationIncomplete: Boolean(repair.state) } };
   const failure = extractionRepairFailure(generation);
@@ -503,9 +522,7 @@ export async function retryCompanionExtractionRepair({ repository, agentId, task
     return { status: 'processed', ...archive, failureReviewTask, postProcessing,
       generationDiagnostics: { ...generation.metadata, degraded: Boolean(failure) } };
   });
-  const warning = await recordCompanionEventGenerationUsage({ usageLedgerPath, executionTime,
-    agentId, batchId: task.payload.batchId, generation });
-  result.warnings = [...(result.postProcessing.warnings || []), ...(warning ? [warning] : [])];
+  result.warnings = [...(result.postProcessing.warnings || []), ...usageWarnings];
   return result;
 }
 
@@ -627,14 +644,44 @@ export function runCompanionEventPostProcessing({
   };
 }
 
-export async function recordCompanionEventGenerationUsage({
+export function recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
+  agentId, batchId, warnings }) {
+  if (typeof generator !== 'function') return generator;
+  // Forward function properties and methods, including non-enumerable provider
+  // capabilities, while charging each returned or failed receipt before callers
+  // validate sources, repair output, or persist a batch.
+  return new Proxy(generator, {
+    async apply(target, receiver, args) {
+      let generation;
+      let failed = false;
+      try {
+        generation = await Reflect.apply(target, receiver, args);
+        return generation;
+      } catch (error) {
+        generation = error;
+        failed = true;
+        throw error;
+      } finally {
+        const warning = await recordCompanionEventGenerationUsage({
+          usageLedgerPath, executionTime, agentId, batchId,
+          generation: failed ? { model: generation?.model, requestId: generation?.requestId,
+            usage: generation?.usage, durationMs: generation?.durationMs,
+            metadata: { ...generation?.metadata, failed: true, errorCode: generation?.code || '' } } : generation,
+        });
+        if (warning) warnings.push(warning);
+      }
+    },
+  });
+}
+
+async function recordCompanionEventGenerationUsage({
   usageLedgerPath,
   executionTime,
   agentId,
   batchId,
   generation,
 }) {
-  if (!clean(usageLedgerPath) || !generation.model || !generation.usage
+  if (!clean(usageLedgerPath) || !generation?.model || !generation?.usage
     || !Object.keys(generation.usage).length) return "";
   try {
     await appendUsageEvent(usageLedgerPath, {

@@ -155,7 +155,12 @@ memory.recoverEventSourceCleanups();
 
 ## 提取校验与验证
 
-`@suzu-memory/service` 导出 `validateMemoryExtractionOutput(request, output)`，使用正式 extraction parser，支持 `long-term-memory-extraction-v2` 和 `long-term-memory-extraction-repair-v2`，拒绝未知 schema。service 显式声明 extraction 依赖；usage-ledger 显式声明 core 依赖，锁文件同步。
+`@suzu-memory/service` 导出 `validateMemoryExtractionOutput(request, output)`，使用正式 extraction parser，支持 `long-term-memory-extraction-v4` 和 `long-term-memory-extraction-repair-v5`，拒绝未知 schema。service 显式声明 extraction 依赖；usage-ledger 显式声明 core 依赖，锁文件同步。
+
+抽取 v3 的模型输出使用 `classification` 选择语义类别，`subject` 和 `actors[].person` 引用本批人物表中的 `P` 编号，表外人物使用明确名称，`time` 保存已知日期或时刻，未知时为 `null`。类别对应的状态目标由同一合同限定。
+
+`parseGeneratedLongTermExtraction` 校验模型输出；`normalizeGeneratedLongTermExtraction(output, built)` 使用 `buildLongTermExtractionInput` 返回的人物表，将其转换成归档所需的主体、人物角色和状态目标。正常事件处理入口已完成这一步；直接调用 `archiveLongTermEvidence` 的接入方传入转换后的 `memories`。人物引用只在所属批次解析，真实身份及存储键由程序处理。
+
 
 `packages/service/test/event-source-contracts.test.mjs` 使用真实 SQLite、既有提取/检索/embedding API、备份和外键校验。覆盖 v41 有数据迁移、其他 Agent/本地用户/Space、长分片和修订正文、混合来源、同批恢复、跨 Agent 保留、范围检索、迟到提取/embedding 写回。两个子进程分别停在持久 `fenced` 和 `database-cleaned` 阶段，由父进程 SIGKILL 后重开真实数据库恢复。其他延迟 provider 和回调异常是注入故障，分别标明，不冒充远端服务中断。
 

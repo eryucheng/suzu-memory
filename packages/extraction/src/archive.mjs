@@ -1,3 +1,4 @@
+import { createExtractionEntityBinder } from './entity-bindings.mjs';
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,12 +12,9 @@ import {
   normalizeStateAnalysisTargetSpec,
 } from "@suzu-memory/core";
 import {
-  isRetentionReasonCompatible,
-} from "./prompt.mjs";
-import {
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
-import { buildExtractionParticipants, resolveExtractionParticipant, normalizeExtractionParticipantRoles, extractionParticipantNameKey } from './participant-identity.mjs';
+import { buildExtractionParticipants, resolveExtractionActor } from './participant-identity.mjs';
 import { createExtractionTimeValidator } from './temporal-evidence.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -60,26 +58,13 @@ function stableId(prefix, ...parts) {
 }
 
 function isoTimestamp(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
   const timestamp = new Date(value);
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : fallback;
 }
 
-function actorKeyFor(actorRole, actorName, agentId, identity = {}) {
-  const resolved = resolveExtractionParticipant(actorName, identity.participants);
-  if (resolved.status === 'known' && resolved.participant.actorRole === actorRole) return resolved.participant.actorKey;
-  if (resolved.status === 'ambiguous') return '';
-  if (identity.eventSourceIdentity && ['user', 'agent'].includes(actorRole)) return '';
-  const primaryUserId = clean(identity?.primaryUserId ?? "user");
-  const companionId = clean(identity?.companionId) || clean(agentId);
-  switch (actorRole) {
-    case "user": return primaryUserId;
-    case "agent": return companionId;
-    case "shared": return identity.eventSourceIdentity || !primaryUserId ? '' : `shared:${companionId}:${primaryUserId}`;
-    case "other": return clean(actorName) && identity.unresolvedActorScope
-      ? stableId('unresolved-person', agentId, identity.unresolvedActorScope, extractionParticipantNameKey(actorName)) : '';
-    case "world": return "";
-    default: return "";
-  }
+function actorKeyFor(actorRole, actorName, agentId, identity = {}, actorKey, status) {
+  return resolveExtractionActor({ role: actorRole, name: actorName, key: actorKey, status }, { ...identity, agentId }).key;
 }
 
 function actorIdentityKeys(agentId, identity = {}) {
@@ -95,15 +80,15 @@ function actorIdentityKeys(agentId, identity = {}) {
 function subjectKeyFor(candidate, agentId, identity) {
   if (candidate.subjectRole === 'shared' && identity?.eventSourceIdentity) {
     const actors = [...new Set(candidate.actorRoles.filter(actor => ['experiencer', 'participant'].includes(actor.role))
-      .map(actor => resolveExtractionParticipant(actor.actorName, identity.participants))
-      .filter(resolved => resolved.status === 'known')
-      .map(({ participant }) => `${participant.actorRole}:${encodeURIComponent(participant.actorKey)}`))].sort();
+      .map(actor => ({ role: actor.actorRole, key: actorKeyFor(actor.actorRole, actor.actorName, agentId, identity, actor.actorKey, actor.identityStatus) }))
+      .filter(actor => actor.key)
+      .map(actor => `${actor.role}:${encodeURIComponent(actor.key)}`))].sort();
     return actors.length >= 2 ? `shared:${actors.join('|')}` : '';
   }
-  return actorKeyFor(candidate.subjectRole, candidate.subjectName, agentId, identity);
+  return actorKeyFor(candidate.subjectRole, candidate.subjectName, agentId, identity, candidate.subjectKey, candidate.subjectIdentityStatus);
 }
 
-function requestTargetSpec(candidate, agentId, identity) {
+export function resolveExtractedCandidateStateTarget(candidate, agentId, identity) {
   const target = candidate.stateTarget || {};
   if (candidate.stateFamily === "identity") {
     return normalizeStateAnalysisTargetSpec("identity", {
@@ -114,8 +99,9 @@ function requestTargetSpec(candidate, agentId, identity) {
   if (candidate.stateFamily === "belief") {
     return normalizeStateAnalysisTargetSpec("belief", {
       objectRole: target.objectRole,
-      objectKey: actorKeyFor(target.objectRole, target.objectName, agentId, identity),
+      objectKey: actorKeyFor(target.objectRole, target.objectName, agentId, identity, target.objectKey, target.objectIdentityStatus),
       objectLabel: target.objectName,
+      ...(target.objectEntityId ? { objectEntityId: target.objectEntityId, objectKind: target.objectKind } : {}),
     }, { allowEmpty: false });
   }
   if (candidate.stateFamily === "relationship") {
@@ -125,18 +111,20 @@ function requestTargetSpec(candidate, agentId, identity) {
         target.counterpartRole,
         target.counterpartName,
         agentId,
-        identity,
+        identity, target.counterpartKey, target.counterpartIdentityStatus,
       ),
       counterpartLabel: target.counterpartName,
       direction: "holder_to_counterpart",
+      ...(target.counterpartEntityId ? { counterpartEntityId: target.counterpartEntityId, counterpartKind: target.counterpartKind } : {}),
       ...(target.relationshipDimension ? { relationshipDimension: target.relationshipDimension } : {}),
     }, { allowEmpty: false });
   }
   if (candidate.stateFamily === "affective_association") {
     return normalizeStateAnalysisTargetSpec("affective_association", {
       triggerRole: target.triggerRole,
-      triggerKey: actorKeyFor(target.triggerRole, target.triggerName, agentId, identity),
+      triggerKey: actorKeyFor(target.triggerRole, target.triggerName, agentId, identity, target.triggerKey, target.triggerIdentityStatus),
       triggerLabel: target.triggerName,
+      ...(target.triggerEntityId ? { triggerEntityId: target.triggerEntityId, triggerKind: target.triggerKind } : {}),
     }, { allowEmpty: false });
   }
   return {};
@@ -144,14 +132,15 @@ function requestTargetSpec(candidate, agentId, identity) {
 
 function structuredActorRoles(candidate, agentId, identity) {
   const roles = (Array.isArray(candidate.actorRoles) ? candidate.actorRoles : []).map((actor) => ({
+    ...actor,
     role: actor.role,
     actorRole: actor.actorRole,
-    actorKey: actorKeyFor(actor.actorRole, actor.actorName, agentId, identity),
+    actorKey: actorKeyFor(actor.actorRole, actor.actorName || actor.metadata?.actorName, agentId, identity, actor.actorKey, actor.identityStatus),
     isPrimary: false,
     confidence: actor.confidence,
     provenance: "suzu-memory-extraction-v1",
     metadata: { actorName: clean(actor.actorName),
-      ...(actor.actorRole === 'other' && resolveExtractionParticipant(actor.actorName, identity.participants).status === 'unknown'
+      ...(actor.identityStatus === 'unresolved'
         ? { identityStatus: 'unresolved', evidenceScope: clean(identity.unresolvedActorScope) } : {}) },
   }));
   const holderRole = candidate.kind === "belief_state"
@@ -166,6 +155,7 @@ function structuredActorRoles(candidate, agentId, identity) {
     ))) {
       roles.push({
         role: holderRole,
+        ...(candidate.subjectEntityRef ? { entityRef: candidate.subjectEntityRef, identityStatus: candidate.subjectIdentityStatus } : {}),
         actorRole: candidate.subjectRole,
         actorKey: subjectKey,
         isPrimary: true,
@@ -178,7 +168,7 @@ function structuredActorRoles(candidate, agentId, identity) {
   return roles;
 }
 
-/** Resolve extraction names once against the host's participant snapshot. */
+/** Resolve candidate identities against the captured host participants. */
 export function resolveExtractedCandidateIdentity(candidate, agentId, identity) {
   return { subjectKey: subjectKeyFor(candidate, agentId, identity),
     actorRoles: structuredActorRoles(candidate, agentId, identity) };
@@ -202,9 +192,9 @@ function extractionSourceEvidence(candidate, message, agentId, identity) {
     : authority === "direct_observation" ? 0.8 : 0.5, evidenceStrength: 1 };
 }
 
-function firstEvidenceTime(referenced, fallback) {
+function firstEvidenceKnownAt(referenced, fallback) {
   return referenced.reduce((earliest, item) => {
-    const timestamp = isoTimestamp(item.message.timestamp);
+    const timestamp = isoTimestamp(item.source.known_at);
     return timestamp && (!earliest || timestamp < earliest) ? timestamp : earliest;
   }, "") || fallback;
 }
@@ -216,26 +206,14 @@ function decisionForResult(result) {
   return result.memoryId ? "store" : "reject";
 }
 
-function sameNamedActor(candidate, actor, identity) {
-  if (actor.actorRole !== candidate.subjectRole) return false;
-  if (candidate.subjectRole !== "other") return true;
-  const subject = resolveExtractionParticipant(candidate.subjectName, identity.participants);
-  const holder = resolveExtractionParticipant(actor.actorName, identity.participants);
-  if (subject.status === 'known' && holder.status === 'known') {
-    return subject.participant.actorKey === holder.participant.actorKey
-      && subject.participant.actorRole === holder.participant.actorRole;
-  }
-  return subject.status === 'unknown' && holder.status === 'unknown'
-    && extractionParticipantNameKey(actor.actorName) === extractionParticipantNameKey(candidate.subjectName);
+function sameActor(candidate, actor) {
+  return actor.actorRole === candidate.subjectRole && actor.actorKey === candidate.subjectKey;
 }
 
 function evidenceAlignmentProblems(candidate, referencedMessages, identity = {}) {
   const problems = new Set();
   const hasUserEvidence = referencedMessages.some((message) => message.role === "user");
   const hasAgentEvidence = referencedMessages.some((message) => message.role === "assistant");
-  if (!isRetentionReasonCompatible(candidate.kind, candidate.retentionReason)) {
-    problems.add("retention-reason-kind-mismatch");
-  }
   if (candidate.subjectRole === "other" && !clean(candidate.subjectName)) {
     problems.add("other-memory-without-subject-name");
   }
@@ -251,19 +229,17 @@ function evidenceAlignmentProblems(candidate, referencedMessages, identity = {})
     ? "belief_holder"
     : candidate.kind === "preference" ? "preference_holder" : "";
   for (const actor of Array.isArray(candidate.actorRoles) ? candidate.actorRoles : []) {
-    if (holderRole && actor.role === holderRole && !sameNamedActor(candidate, actor, identity)) {
+    if (holderRole && actor.role === holderRole && !sameActor(candidate, actor)) {
       problems.add("holder-conflicts-with-subject");
     }
   }
   if (identity.eventSourceIdentity) {
-    const people = [[candidate.subjectName, candidate.subjectRole], ...candidate.actorRoles.map(actor => [actor.actorName, actor.actorRole]),
-      ...['object', 'counterpart', 'trigger'].map(prefix => [candidate.stateTarget?.[`${prefix}Name`], candidate.stateTarget?.[`${prefix}Role`]])];
-    for (const [name, role] of people) {
-      const resolved = resolveExtractionParticipant(name, identity.participants);
-      if (resolved.status === 'ambiguous') problems.add('ambiguous-participant-identity');
-      if (['user', 'agent'].includes(role) && (resolved.status !== 'known' || resolved.participant.actorRole !== role)) {
-        problems.add('participant-identity-mismatch');
-      }
+    const people = [[candidate.subjectKey, candidate.subjectRole, candidate.subjectIdentityStatus], ...candidate.actorRoles.map(actor => [actor.actorKey, actor.actorRole, actor.identityStatus]),
+      ...['object', 'counterpart', 'trigger'].map(prefix => [candidate.stateTarget?.[`${prefix}Key`], candidate.stateTarget?.[`${prefix}Role`], candidate.stateTarget?.[`${prefix}IdentityStatus`]])];
+    for (const [key, role, status] of people) {
+      if (!role || role === 'world' || role === 'shared') continue;
+      if (status === 'ambiguous') problems.add('ambiguous-participant-identity');
+      if (status === 'conflict' || ['user', 'agent'].includes(role) && !identity.participants.some(person => person.actorRole === role && person.actorKey === key)) problems.add('participant-identity-mismatch');
     }
     if (candidate.subjectRole === 'shared' && !subjectKeyFor(candidate, '', identity)) problems.add('shared-memory-needs-explicit-participants');
   }
@@ -320,7 +296,7 @@ function storeProvisionalEvidence({
     eventDate: generated.eventDate || null,
     eventStart: generated.eventStart || null,
     eventEnd: generated.eventEnd || null,
-    knownAt: firstEvidenceTime(referenced, recordedAt),
+    knownAt: firstEvidenceKnownAt(referenced, recordedAt),
     recordedAt,
     status: "archived",
     confidence: generated.confidence,
@@ -340,7 +316,6 @@ function storeProvisionalEvidence({
       ingestionDecisionId: decisionId,
       reviewReasonCodes: reasons,
       subjectName: generated.subjectName,
-      retentionReason: generated.retentionReason,
       sourceEvidenceMode: generated.evidenceMode,
       sourceRefs: generated.sourceRefs,
       extractionBatchId: batchId,
@@ -349,6 +324,7 @@ function storeProvisionalEvidence({
       generator: "suzu-memory-provisional-evidence-v2",
     },
   });
+  repository.linkMemoryEntities({ memoryId: memory.id, entityIds: generated.entityIds || [] });
   for (const item of referenced) {
     repository.linkSource(memory.id, item.source.id, "evidence", {
       ...extractionSourceEvidence(generated, item.message, agentId, identity),
@@ -388,11 +364,9 @@ export function fallbackStateAnalysisToProvisionalReview({
     return {
       source,
       memoryId,
-      memory: memoryId ? repository.getMemory(memoryId) : null,
       message: {
         role: source.metadata?.role,
         speakerIdentity: speaker ? { actorRole: speaker.actor_role, actorKey: speaker.actor_key } : null,
-        timestamp: source.occurred_at || source.known_at || source.recorded_at,
         worldId: source.world_id,
         worldFrame: source.world_frame,
         archiveWindowId: source.metadata?.archiveWindowId,
@@ -475,12 +449,12 @@ export function archiveLongTermEvidence({
   identity = { ...identity, participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
   if (messages.some(message => message.eventSource)) {
     identity = { ...identity, eventSourceIdentity: true };
-    generatedMemories = normalizeExtractionParticipantRoles({ memories: generatedMemories }, identity.participants).output.memories;
   }
   const sourceByRef = new Map();
   const messageMemories = [];
   const results = [];
   repository.transaction(() => {
+    const bindEntities = createExtractionEntityBinder(repository, agentId, generatedMemories, identity.participants, batchId);
     const keepResult = (candidateIndex, generated, result, referenced = []) => {
       const recorded = {
         candidateIndex,
@@ -501,6 +475,9 @@ export function archiveLongTermEvidence({
             identity,
           })
         : null;
+      for (const memoryId of new Set([...referenced.map(item => item.memoryId), result.memoryId, provisional?.id].filter(Boolean))) {
+        repository.linkMemoryEntities({ memoryId, entityIds: generated.entityIds || [] });
+      }
       const decision = repository.recordIngestionDecision({
         agentId,
         batchId,
@@ -511,7 +488,7 @@ export function archiveLongTermEvidence({
         candidate: recorded.candidate,
         sourceRefs: generated.sourceRefs,
         sourceIds: referenced.map((item) => item.source.id),
-        knownAt: firstEvidenceTime(referenced, null),
+        knownAt: firstEvidenceKnownAt(referenced, null),
         memoryId: recorded.memoryId || null,
         provisionalMemoryId: provisional?.id || null,
       });
@@ -560,6 +537,7 @@ export function archiveLongTermEvidence({
             ? message.sourceMetadata
             : {}),
           sourceLanguage: sourceLanguage(message.sourceLanguage),
+          causalExcerpt: message.causalExcerpt,
         },
       });
       const memoryId = stableId("mem", agentId, "utterance", message.id);
@@ -635,13 +613,29 @@ export function archiveLongTermEvidence({
     }
     for (const [position, rawCandidate] of generatedMemories.entries()) {
       const candidateIndex = candidateIndexOffset + position;
-      const generated = rawCandidate.kind === 'event'
+      let generated = rawCandidate.kind === 'event'
         ? { ...rawCandidate, canonicalKey: stableId('event', agentId, batchId, candidateIndex) } : rawCandidate;
       const referenced = generated.sourceRefs
         .map((reference) => sourceByRef.get(reference))
         .filter(Boolean);
+      const referencedWorlds = new Set(referenced.map(({ message }) => (
+        `${clean(message.worldFrame) || "unknown"}\u001f${clean(message.worldId) || "primary"}`
+      )));
+      if (referencedWorlds.size === 1) generated = { ...generated,
+        worldId: clean(referenced[0].message.worldId) || 'primary',
+        worldFrame: clean(referenced[0].message.worldFrame) || 'unknown' };
       identity = { ...identity, unresolvedActorScope: stableId('evidence', agentId,
         ...referenced.map(item => item.source.id).sort()) };
+      generated = { ...generated, subjectKey: subjectKeyFor(generated, agentId, identity),
+        subjectIdentityStatus: resolveExtractionActor({ role: generated.subjectRole, key: generated.subjectKey, name: generated.subjectName, status: generated.subjectIdentityStatus }, { ...identity, agentId }).status,
+        actorRoles: generated.actorRoles.map(actor => { const person = resolveExtractionActor({ role: actor.actorRole, key: actor.actorKey, name: actor.actorName, status: actor.identityStatus }, { ...identity, agentId });
+          return { ...actor, actorKey: person.key, identityStatus: person.status }; }),
+        ...(generated.stateTarget ? { stateTarget: { ...generated.stateTarget } } : {}) };
+      for (const prefix of ['object', 'counterpart', 'trigger']) {
+        if (!generated.stateTarget || !Object.hasOwn(generated.stateTarget, `${prefix}Role`)) continue;
+        const person = resolveExtractionActor({ role: generated.stateTarget[`${prefix}Role`], key: generated.stateTarget[`${prefix}Key`], name: generated.stateTarget[`${prefix}Name`], status: generated.stateTarget[`${prefix}IdentityStatus`] }, { ...identity, agentId });
+        generated.stateTarget[`${prefix}Key`] = person.key; generated.stateTarget[`${prefix}IdentityStatus`] = person.status;
+      }
       const missingRefs = generated.sourceRefs.filter((reference) => !sourceByRef.has(reference));
       if (missingRefs.length) {
         keepResult(candidateIndex, generated, {
@@ -670,9 +664,6 @@ export function archiveLongTermEvidence({
         }, referenced);
         continue;
       }
-      const referencedWorlds = new Set(referenced.map(({ message }) => (
-        `${clean(message.worldFrame) || "unknown"}\u001f${clean(message.worldId) || "primary"}`
-      )));
       if (referencedWorlds.size > 1) {
         keepResult(candidateIndex, generated, {
           status: "review",
@@ -680,6 +671,8 @@ export function archiveLongTermEvidence({
         }, referenced);
         continue;
       }
+      generated = bindEntities(generated, { reality: generated.reality,
+        world_id: generated.worldId, world_frame: generated.worldFrame });
       const alignmentProblems = evidenceAlignmentProblems(
         generated,
         referenced.map((item) => item.message),
@@ -709,7 +702,7 @@ export function archiveLongTermEvidence({
           }, referenced);
           continue;
         }
-        const targetSpec = requestTargetSpec(generated, agentId, identity);
+        const targetSpec = resolveExtractedCandidateStateTarget(generated, agentId, identity);
         if (generated.stateFamily === "relationship"
           && targetSpec.counterpartRole === generated.subjectRole
           && targetSpec.counterpartKey === subjectKey) {
@@ -735,8 +728,8 @@ export function archiveLongTermEvidence({
           sourceIds: referenced.map((item) => item.source.id),
           metadata: {
             candidateKind: generated.kind,
+            entityIds: generated.entityIds,
             subjectName: generated.subjectName,
-            retentionReason: generated.retentionReason,
             revisionAction: generated.revisionAction,
             temporalState: generated.temporalState,
             extractionBatchId: batchId,
@@ -764,15 +757,15 @@ export function archiveLongTermEvidence({
         subjectKey: subjectKeyFor(generated, agentId, identity),
         canonicalKey: generated.canonicalKey,
         reality: generated.reality,
-        worldId: clean(referenced[0]?.message?.worldId) || "primary",
-        worldFrame: clean(referenced[0]?.message?.worldFrame) || "unknown",
+        worldId: generated.worldId,
+        worldFrame: generated.worldFrame,
         evidenceMode: generated.evidenceMode,
         temporalState: generated.temporalState,
         revisionAction: generated.revisionAction,
         eventDate: generated.eventDate || null,
         eventStart: generated.eventStart || null,
         eventEnd: generated.eventEnd || null,
-        knownAt: firstEvidenceTime(referenced, recordedAt),
+        knownAt: firstEvidenceKnownAt(referenced, recordedAt),
         confidence: generated.confidence,
         importance: generated.importance,
         actorRoles: structuredActorRoles(generated, agentId, identity),
@@ -783,9 +776,9 @@ export function archiveLongTermEvidence({
           provenance: "suzu-memory-extraction-v1",
         })),
         metadata: {
+          entityIds: generated.entityIds,
           subjectName: generated.subjectName,
           ...sourceTimeMetadata(generated, referenced),
-          retentionReason: generated.retentionReason,
           sourceRefs: generated.sourceRefs,
           inputEventTypes: [...new Set(referenced.map((item) => clean(item.message.sourceKind))
             .filter(Boolean))],

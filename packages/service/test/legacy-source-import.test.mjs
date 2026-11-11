@@ -1,5 +1,5 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,10 +11,10 @@ const agentId = 'agent-import';
 const scope = { owner: 'suzu-lives-events', agentId, eventUpperBound: 10, clears: [] };
 
 function fixture() {
-  const memory = createMemoryService({
-    dataRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'memory-legacy-source-')),
+  const memory = closeAfterTests(createMemoryService({
+    dataRoot: createTestDirectory(path.join(os.tmpdir(), 'memory-legacy-source-')),
     agentId, defaults: { ingestion: { maximumEventCharacters: 64 } },
-  });
+  }));
   memory.initialize();
   const record = (id, commitSequence, text) => {
     memory.withRepository(repository => repository.upsertSource({ id, agentId,
@@ -120,6 +120,9 @@ test('experience evidence upgrades source coordinates once and retains graph pro
   const upgraded = f.inputs();
   assert.equal(f.memory.adoptExperienceSourceEvidence({ scope: current, resolveSource, consumedThroughExperienceSequence: 2 }).updated, 0);
   assert.deepEqual(f.inputs(), upgraded);
+  assert.equal(f.memory.appendEventSources({ scope: current,
+    events: [{ ...record.event, source: resolveSource(record.event.source) }] }).reused, 1,
+  'Upgrading provenance must preserve replay identity for the same public Event.');
 });
 
 test('conflicting experience identities roll back the source rewrite and leave the old scope usable', () => {

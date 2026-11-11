@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { databaseInfo, MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { databaseInfo, inputEventContentHash, MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
 const BACKUP_FORMAT = "suzu-memory-sqlite-backup-v1";
 
@@ -217,19 +217,58 @@ function snapshotDatabaseReadOnly(sourcePath, destinationPath) {
   }
 }
 
+const AGENT_IDENTITY_FIELDS = new Map([
+  ['agent_id', null], ['companion_id', null], ['companion_actor_key', null], ['recipient_agent_id', null],
+  ['actor_key', 'actor_role'], ['subject_key', 'subject_role'],
+  ['proposed_subject_key', 'proposed_subject_role'], ['actor_identity_key', 'actor_identity_role'],
+]);
+const COMPOSITE_IDENTITY_FIELDS = new Set(['relationship_key', 'canonical_key', 'target_scope_key', 'proposed_scope_key']);
+const identityField = key => key.replace(/[A-Z]/gu, letter => '_' + letter.toLowerCase());
+const agentRole = role => role === 'agent' || role === 'companion';
+const encodedAgentKey = value => encodeURIComponent(value.toLocaleLowerCase('en-US')).toLocaleLowerCase('en-US');
+
+function rewriteCompositeIdentity(value, source, target) {
+  return value.split('|').map(part => {
+    for (const prefix of ['agent:', 'actor:agent:']) {
+      const key = prefix === 'agent:' ? encodedAgentKey(source) : source;
+      if (part === prefix + key) return prefix + (prefix === 'agent:' ? encodedAgentKey(target) : target);
+    }
+    return part;
+  }).join('|');
+}
+
+function rewriteIdentityField(value, key, row, source, target) {
+  if (typeof value !== 'string') return value;
+  if (COMPOSITE_IDENTITY_FIELDS.has(key)) return rewriteCompositeIdentity(value, source, target);
+  if (!AGENT_IDENTITY_FIELDS.has(key)) return value;
+  const roleKey = AGENT_IDENTITY_FIELDS.get(key);
+  if (roleKey && row[roleKey] && !agentRole(row[roleKey])) return value;
+  return value === source ? target : value;
+}
+
 function rewriteJsonAgentIdentity(value, sourceAgentId, targetAgentId) {
-  if (typeof value === "string") {
-    if (value === sourceAgentId) return targetAgentId;
-    return value.replaceAll(`agent:${sourceAgentId}`, `agent:${targetAgentId}`);
-  }
   if (Array.isArray(value)) {
     return value.map((item) => rewriteJsonAgentIdentity(item, sourceAgentId, targetAgentId));
   }
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-      key,
-      rewriteJsonAgentIdentity(item, sourceAgentId, targetAgentId),
-    ]));
+    const fields = Object.fromEntries(Object.entries(value).map(([key, item]) => [identityField(key), item]));
+    const rewritten = Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      const field = identityField(key);
+      if (field === 'recipient_agent_ids' && Array.isArray(item)) {
+        return [key, item.map(id => id === sourceAgentId ? targetAgentId : id)];
+      }
+      const actorId = ['key', 'id'].includes(field) && agentRole(value.role || value.kind);
+      const rewritten = actorId && item === sourceAgentId ? targetAgentId
+        : rewriteIdentityField(item, field, fields, sourceAgentId, targetAgentId);
+      return [key, rewriteJsonAgentIdentity(rewritten, sourceAgentId, targetAgentId)];
+    }));
+    if (value.eventSource?.recipientAgentId === sourceAgentId) {
+      if (value.host?.sessionId === sourceAgentId) rewritten.host = { ...rewritten.host, sessionId: targetAgentId };
+      if (value.memoryWindow?.id === `events:${sourceAgentId}:${value.eventSource.spaceId}`) {
+        rewritten.memoryWindow = { ...rewritten.memoryWindow, id: `events:${targetAgentId}:${value.eventSource.spaceId}` };
+      }
+    }
+    return rewritten;
   }
   return value;
 }
@@ -241,8 +280,8 @@ function rewriteJsonColumns(database, table, columns, sourceAgentId, targetAgent
     const rows = database.prepare(`
       SELECT rowid AS row_id, ${quotedColumn} AS value
       FROM ${quotedTable}
-      WHERE instr(${quotedColumn}, ?) > 0
-    `).all(sourceAgentId);
+      WHERE instr(${quotedColumn}, ?) > 0 OR instr(${quotedColumn}, ?) > 0
+    `).all(sourceAgentId, encodedAgentKey(sourceAgentId));
     const update = database.prepare(`
       UPDATE ${quotedTable} SET ${quotedColumn} = ? WHERE rowid = ?
     `);
@@ -262,29 +301,23 @@ function rewriteJsonColumns(database, table, columns, sourceAgentId, targetAgent
   }
 }
 
-const AGENT_IDENTITY_COLUMNS = new Set([
-  "actor_key",
-  "subject_key",
-  "proposed_subject_key",
-  "relationship_key",
-  "canonical_key",
-  "target_scope_key",
-  "proposed_scope_key",
-  "source_locator",
-  "space_id",
-  "companion_id",
-]);
-
 function rewriteAgentIdentityColumns(database, table, columns, sourceAgentId, targetAgentId) {
   const quotedTable = sqlIdentifier(table);
   for (const column of columns) {
-    if (!AGENT_IDENTITY_COLUMNS.has(column.name)) continue;
+    if (column.name === 'agent_id') continue;
+    if (!AGENT_IDENTITY_FIELDS.has(column.name) && !COMPOSITE_IDENTITY_FIELDS.has(column.name)) continue;
     const quotedColumn = sqlIdentifier(column.name);
-    database.prepare(`
-      UPDATE ${quotedTable}
-      SET ${quotedColumn} = replace(${quotedColumn}, ?, ?)
-      WHERE instr(${quotedColumn}, ?) > 0
-    `).run(sourceAgentId, targetAgentId, sourceAgentId);
+    const role = AGENT_IDENTITY_FIELDS.get(column.name);
+    const roleColumn = columns.some(item => item.name === role) ? role : null;
+    const rows = database.prepare(`SELECT rowid AS row_id, ${quotedColumn} AS value
+      ${roleColumn ? ', ' + sqlIdentifier(roleColumn) : ''} FROM ${quotedTable}
+      WHERE instr(${quotedColumn}, ?) > 0 OR instr(${quotedColumn}, ?) > 0
+    `).all(sourceAgentId, encodedAgentKey(sourceAgentId));
+    const update = database.prepare(`UPDATE ${quotedTable} SET ${quotedColumn} = ? WHERE rowid = ?`);
+    for (const row of rows) {
+      const rewritten = rewriteIdentityField(row.value, column.name, row, sourceAgentId, targetAgentId);
+      if (rewritten !== row.value) update.run(rewritten, row.row_id);
+    }
   }
 }
 
@@ -298,6 +331,11 @@ function rebindAgentScope(database, { sourceAgentId, targetAgentId }) {
   }));
   database.exec("BEGIN IMMEDIATE");
   try {
+    const immutableTriggers = database.prepare(`SELECT name, sql FROM sqlite_master WHERE type='trigger'
+      AND name IN ('memory_input_events_erased_immutable', 'source_records_erased_immutable', 'memory_nodes_erased_immutable')`).all();
+    // The private staged copy changes ownership, including empty tombstones.
+    // Reinstall the same guards before this atomic migration can be committed.
+    for (const trigger of immutableTriggers) database.exec(`DROP TRIGGER ${sqlIdentifier(trigger.name)}`);
     // The database contains many composite foreign keys `(id, agent_id)`.
     // Deferring them lets every scoped table move in one atomic transaction.
     database.exec("PRAGMA defer_foreign_keys = ON");
@@ -315,6 +353,24 @@ function rebindAgentScope(database, { sourceAgentId, targetAgentId }) {
       rewriteAgentIdentityColumns(database, table, columns, source, target);
       rewriteJsonColumns(database, table, columns, source, target);
     }
+    const inputs = database.prepare('SELECT * FROM memory_input_events WHERE agent_id=?').all(target);
+    const updateInput = database.prepare('UPDATE memory_input_events SET input_hash=?, participants_json=? WHERE id=? AND agent_id=?');
+    for (const input of inputs) {
+      const metadata = JSON.parse(input.metadata_json);
+      if (metadata.eventSourceErased) continue;
+      const participants = JSON.parse(input.participants_json);
+      const original = metadata.eventSource?.topology?.participants?.find(item => item.kind === 'agent' && item.id === target);
+      for (const participant of participants) {
+        if (participant.role === 'companion' && participant.id === target && participant.name === source && original && !original.name) {
+          participant.name = target;
+        }
+      }
+      const hash = inputEventContentHash({ ...input, metadata, content: JSON.parse(input.content_json),
+        source: JSON.parse(input.source_json), participants });
+      const participantsJson = JSON.stringify(participants);
+      if (hash !== input.input_hash || participantsJson !== input.participants_json) updateInput.run(hash, participantsJson, input.id, target);
+    }
+    for (const trigger of immutableTriggers) database.exec(trigger.sql);
     const violations = database.prepare("PRAGMA foreign_key_check").all();
     if (violations.length) {
       const error = new Error("Imported database has invalid cross-table references.");

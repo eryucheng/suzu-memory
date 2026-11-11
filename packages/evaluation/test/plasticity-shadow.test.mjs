@@ -1,5 +1,5 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -30,9 +30,9 @@ const policy = Object.freeze({
 });
 
 function temporaryDatabase() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-plasticity-shadow-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-plasticity-shadow-"));
   const databasePath = path.join(root, "memory.db");
-  const database = openMemoryDatabase(databasePath);
+  const database = closeAfterTests(openMemoryDatabase(databasePath));
   return { databasePath, database, repository: new MemoryRepository(database) };
 }
 
@@ -129,7 +129,7 @@ test("runs an idempotent shadow window without changing retrieval behavior", () 
     ],
   );
 
-  const inspected = openMemoryDatabase(databasePath);
+  const inspected = closeAfterTests(openMemoryDatabase(databasePath));
   assert.equal(Number(inspected.prepare(`
     SELECT COUNT(*) AS count FROM memory_accessibility_state
   `).get().count), 0);
@@ -145,7 +145,7 @@ test("runs an idempotent shadow window without changing retrieval behavior", () 
   assert.equal(replay.wasInserted, false);
   assert.equal(replay.id, first.id);
 
-  const changed = openMemoryDatabase(databasePath);
+  const changed = closeAfterTests(openMemoryDatabase(databasePath));
   seedRetrieval(new MemoryRepository(changed), {
     traceId: "shadow-trace-2",
     feedbackId: "shadow-feedback-2",

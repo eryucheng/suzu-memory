@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 
 import {
   buildZh4oDatasetFromMoomSource,
@@ -66,11 +67,24 @@ test("ZH-4O source builder follows the official offset and retains post-hoc evid
   assert.deepEqual(built.dataset[0].qa[0].evidence, ["D1:2"]);
   assert.equal(built.dataset[0].qa[0].source.source_turn_index, 1);
 
-  const outputPath = path.join(directory, "derived.json");
-  const result = writeZh4oDatasetFromMoomSource({ sourceRoot, outputPath });
-  assert.equal(fs.existsSync(result.outputPath), true);
-  assert.equal(fs.existsSync(result.manifestPath), true);
-  const [normalized] = loadZh4oDataset(outputPath);
-  assert.deepEqual(normalized.questions[0].evidenceDialogueIds, ["D1:2"]);
-  assert.equal(normalized.questions[0].category, null);
+  for (const filename of ["derived.json", "derived-without-extension"]) {
+    const outputPath = path.join(directory, filename);
+    const result = writeZh4oDatasetFromMoomSource({ sourceRoot, outputPath });
+    assert.notEqual(result.outputPath, result.manifestPath);
+    assert.equal(fs.existsSync(result.manifestPath), true);
+    const [normalized] = loadZh4oDataset(outputPath);
+    assert.deepEqual(normalized.questions[0].evidenceDialogueIds, ["D1:2"]);
+    assert.equal(normalized.questions[0].category, null);
+    const dataset = fs.readFileSync(outputPath, "utf8");
+    assert.throws(() => writeZh4oDatasetFromMoomSource({ sourceRoot, outputPath, manifestPath: outputPath }),
+      /different output paths/u);
+    assert.equal(fs.readFileSync(outputPath, "utf8"), dataset, "A refused manifest collision leaves the dataset intact.");
+  }
+});
+
+test("evaluation public entry imports in Node eval without a script argv", () => {
+  const entry = import.meta.resolve("../src/index.mjs");
+  execFileSync(process.execPath, ["--input-type=module", "--eval",
+    "const api = await import(" + JSON.stringify(entry) + "); if (typeof api.loadZh4oDataset !== 'function') process.exit(3);"],
+  { windowsHide: true, stdio: "pipe", timeout: 10000 });
 });

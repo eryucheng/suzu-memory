@@ -1,3 +1,4 @@
+import { setTimeout as wait } from 'node:timers/promises';
 import {
   normalizeOpenAiCompatibleBaseUrl,
   openAiCompatibleEndpoint,
@@ -8,7 +9,7 @@ export const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 32_768;
 function clean(value) {
   return String(value ?? "").trim();
 }
-function httpEndpoint(baseUrl, type = "", endpoint = "") {
+export function openAiCompatibleChatEndpoint(baseUrl, type = "", endpoint = "") {
   const normalized = normalizeOpenAiCompatibleBaseUrl(baseUrl, type);
   if (clean(endpoint)) {
     return openAiCompatibleEndpoint(normalized, endpoint, type);
@@ -61,6 +62,10 @@ function intersectToolSchemas(base, refinement) {
       }
     } else if (key === "required") {
       merged.required = [...new Set([...(base.required || []), ...value])];
+    } else if (key === "type" && base.type) {
+      const types = [base.type].flat().filter(type => [value].flat().includes(type));
+      if (!types.length) return false;
+      merged.type = types.length === 1 ? types[0] : types;
     } else if (key === "enum" && base.enum) {
       merged.enum = base.enum.filter(item => value.some(candidate => JSON.stringify(candidate) === JSON.stringify(item)));
       if (!merged.enum.length) return false;
@@ -94,7 +99,14 @@ function intersectToolSchemas(base, refinement) {
 
 function strictToolSchema(schema) {
   if (!schema || typeof schema !== "object") return schema;
-  if (schema.anyOf && (schema.type === "object" || schema.properties)) {
+  if (Array.isArray(schema.type) && schema.type.some(type => type === 'object' || type === 'array')) {
+    const { type: types, ...base } = schema;
+    return { anyOf: types.flatMap(type => {
+      const branch = strictToolSchema({ ...base, type });
+      return branch.anyOf && Object.keys(branch).length === 1 ? branch.anyOf : [branch];
+    }) };
+  }
+  if (schema.anyOf && (schema.type || schema.properties)) {
     const { anyOf, ...base } = schema;
     const branches = anyOf.map(branch => intersectToolSchemas(base, branch)).filter(branch => branch !== false);
     if (!branches.length) throw new Error("严格结构化工具的 Schema 条件没有可满足的分支。");
@@ -104,6 +116,15 @@ function strictToolSchema(schema) {
   for (const key of ["properties", "$defs", "definitions"]) {
     if (schema[key]) result[key] = Object.fromEntries(Object.entries(schema[key])
       .map(([name, child]) => [name, strictToolSchema(child)]));
+  }
+  if (schema.type === 'object' && schema.properties) {
+    const required = new Set(schema.required || []);
+    result.properties = Object.fromEntries(Object.entries(result.properties).map(([key, child]) => [key,
+      required.has(key) || child.type === 'null'
+        || (Array.isArray(schema.properties[key].type) && schema.properties[key].type.includes('null'))
+        ? child : { anyOf: [child, { type: 'null' }] },
+    ]));
+    result.required = Object.keys(schema.properties);
   }
   if (schema.items) result.items = strictToolSchema(schema.items);
   if (schema.anyOf) result.anyOf = schema.anyOf.map(strictToolSchema);
@@ -192,12 +213,6 @@ function invalidEnvelopeMessage(response, bodyText, attempt, maximumAttempts) {
   return `记忆处理 API 返回的不是有效响应 JSON（${details.join("，")}）。`;
 }
 
-function wait(milliseconds) {
-  return milliseconds > 0
-    ? new Promise((resolve) => setTimeout(resolve, milliseconds))
-    : Promise.resolve();
-}
-
 function exhaustedTransportError(message, {
   attempt,
   maximumAttempts,
@@ -218,20 +233,22 @@ function exhaustedTransportError(message, {
  * extraction and specialist analysis. OpenAI-compatible endpoints use JSON or
  * strict tools; Anthropic-compatible endpoints use a forced tool call. Every
  * specialist still parses and validates the returned object against its own
- * fixed rules.
+ * fixed rules. Owners may supply modelInput/modelSchema for the wire and
+ * decodeOutput to restore the application contract.
  */
 export function createOpenAiCompatibleStructuredGenerator({
   connection = {},
   fetchImpl = globalThis.fetch,
   timeoutMs,
   maxOutputTokens = DEFAULT_GENERATION_MAX_OUTPUT_TOKENS,
+  getSignal,
 } = {}) {
   const apiKey = clean(connection.apiKey || connection.key);
   const model = clean(connection.model);
   const anthropicCompatible = clean(connection.type).toLowerCase() === "anthropic-compatible";
   const endpoint = anthropicCompatible
     ? anthropicMessagesEndpoint(connection.baseUrl)
-    : httpEndpoint(connection.baseUrl, connection.type, connection.endpoint);
+    : openAiCompatibleChatEndpoint(connection.baseUrl, connection.type, connection.endpoint);
   const outputMode = anthropicCompatible
     ? "anthropic-tool"
     : clean(connection.structuredOutputMode || "json-object").toLowerCase();
@@ -261,13 +278,15 @@ export function createOpenAiCompatibleStructuredGenerator({
     30_000,
   );
 
-  const generate = async function generate({
+  const buildPayload = ({
     input,
+    modelInput,
     systemPrompt,
-    schema = {},
+    schema: canonicalSchema = {},
+    modelSchema,
     schemaName = "memory-analysis-v1",
-  } = {}) {
-    const started = Date.now();
+  } = {}) => {
+    const schema = modelSchema ?? canonicalSchema;
     const selectedSchemaName = jsonName(schemaName);
     const schemaText = JSON.stringify(schema);
     const outputInstruction = outputMode === "strict-tool" || outputMode === "anthropic-tool"
@@ -282,7 +301,7 @@ export function createOpenAiCompatibleStructuredGenerator({
         model,
         max_tokens: outputLimit,
         system: `${clean(systemPrompt)}\n\n${outputInstruction}`,
-        messages: [{ role: "user", content: String(input ?? "") }],
+        messages: [{ role: "user", content: String(modelInput ?? input ?? "") }],
         temperature: 0,
         tools: [{
           name: selectedSchemaName,
@@ -299,7 +318,7 @@ export function createOpenAiCompatibleStructuredGenerator({
             role: "system",
             content: `${clean(systemPrompt)}\n\n${outputInstruction}`,
           },
-          { role: "user", content: String(input ?? "") },
+          { role: "user", content: String(modelInput ?? input ?? "") },
         ],
         temperature: 0,
         max_tokens: outputLimit,
@@ -321,9 +340,19 @@ export function createOpenAiCompatibleStructuredGenerator({
           response_format: { type: "json_object" },
         }),
       };
+    return { payload, selectedSchemaName };
+  };
+  const generate = async function generate({ signal, decodeOutput, ...request } = {}) {
+    const signals = [signal, getSignal?.()].filter(Boolean);
+    const operationSignal = signals.length ? AbortSignal.any(signals) : undefined;
+    operationSignal?.throwIfAborted();
+    const started = Date.now();
+    const { payload, selectedSchemaName } = buildPayload(request);
     for (let attempt = 1; attempt <= maximumTransportAttempts; attempt += 1) {
+      operationSignal?.throwIfAborted();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+      const requestSignal = operationSignal ? AbortSignal.any([operationSignal, controller.signal]) : controller.signal;
       let response;
       let envelope;
       let bodyText = "";
@@ -342,7 +371,7 @@ export function createOpenAiCompatibleStructuredGenerator({
             "User-Agent": "suzu-memory/0.1",
           },
           body: JSON.stringify(payload),
-          signal: controller.signal,
+          signal: requestSignal,
         });
         try {
           if (typeof response.text === "function") {
@@ -352,15 +381,16 @@ export function createOpenAiCompatibleStructuredGenerator({
             envelope = await response.json();
           }
         } catch (error) {
-          if (controller.signal.aborted) throw error;
+          if (requestSignal.aborted) throw error;
           // An unreadable body leaves no envelope and uses the validation below.
         }
       } catch (error) {
+        operationSignal?.throwIfAborted();
         const message = error?.name === "AbortError"
           ? `记忆处理 API 请求超过 ${requestTimeoutMs}ms。`
           : `无法连接记忆处理 API：${clean(error?.message) || "未知网络错误"}`;
         if (attempt < maximumTransportAttempts) {
-          await wait(transportRetryDelayMs * attempt);
+          await wait(transportRetryDelayMs * attempt, undefined, { signal: operationSignal });
           continue;
         }
         throw exhaustedTransportError(`${message}（已尝试 ${attempt} 次）`, {
@@ -372,6 +402,7 @@ export function createOpenAiCompatibleStructuredGenerator({
         clearTimeout(timer);
       }
 
+      operationSignal?.throwIfAborted();
       if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
         const message = invalidEnvelopeMessage(
           response,
@@ -381,7 +412,7 @@ export function createOpenAiCompatibleStructuredGenerator({
         );
         if (attempt < maximumTransportAttempts
           && (response.ok || retryableHttpStatus(response.status))) {
-          await wait(transportRetryDelayMs * attempt);
+          await wait(transportRetryDelayMs * attempt, undefined, { signal: operationSignal });
           continue;
         }
         throw exhaustedTransportError(message, {
@@ -400,7 +431,7 @@ export function createOpenAiCompatibleStructuredGenerator({
       if (!response.ok) {
         const message = providerMessage(envelope, response.status);
         if (attempt < maximumTransportAttempts && retryableHttpStatus(response.status)) {
-          await wait(transportRetryDelayMs * attempt);
+          await wait(transportRetryDelayMs * attempt, undefined, { signal: operationSignal });
           continue;
         }
         if (retryableHttpStatus(response.status)) {
@@ -442,9 +473,10 @@ export function createOpenAiCompatibleStructuredGenerator({
           error.diagnostics = { kind: "output-limit", finishReason, maxOutputTokens: outputLimit };
           throw error;
         }
-        return { ...responseInfo, output: parseJsonContent(anthropicCompatible
+        const output = parseJsonContent(anthropicCompatible
           ? anthropicToolContent(envelope, selectedSchemaName)
-          : completionContent(envelope, outputMode, selectedSchemaName)) };
+          : completionContent(envelope, outputMode, selectedSchemaName));
+        return { ...responseInfo, output: typeof decodeOutput === 'function' ? decodeOutput(output) : output };
       } catch (error) {
         Object.assign(error, responseInfo);
         throw error;
@@ -454,5 +486,6 @@ export function createOpenAiCompatibleStructuredGenerator({
   };
   generate.supportsCombinedStateAnalysis = true;
   generate.supportsCombinedConsolidation = true;
+  generate.measureRequest = request => JSON.stringify(buildPayload(request).payload).length;
   return generate;
 }

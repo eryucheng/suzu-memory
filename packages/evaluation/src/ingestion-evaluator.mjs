@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   buildLongTermExtractionInput,
   LONG_TERM_EXTRACTION_SCHEMA,
-  parseGeneratedLongTermExtraction,
+  normalizeGeneratedLongTermExtraction,
 } from "@suzu-memory/extraction";
 
 function clean(value) {
@@ -65,7 +65,6 @@ function normalizeMemoryExpectation(value, field) {
     reality: clean(value.reality),
     temporalState: clean(value.temporalState),
     revisionAction: clean(value.revisionAction),
-    retentionReason: clean(value.retentionReason),
     contentIncludes: stringArray(value.contentIncludes, `${field}.contentIncludes`),
     actorRoles: Array.isArray(value.actorRoles)
       ? value.actorRoles.map((item, index) => normalizeActorExpectation(item, `${field}.actorRoles[${index}]`))
@@ -192,7 +191,7 @@ export function createLongTermExtractionExecutor({ generate, systemPrompt }) {
       input: buildIngestionEvaluationInput(testCase),
       systemPrompt,
       schema: LONG_TERM_EXTRACTION_SCHEMA,
-      schemaName: "long-term-memory-extraction-v2",
+      schemaName: "long-term-memory-extraction-v4",
     });
     return generation?.output ?? generation;
   };
@@ -205,7 +204,6 @@ function matchesExpectation(memory, expectation) {
     "reality",
     "temporalState",
     "revisionAction",
-    "retentionReason",
   ]) {
     if (expectation[field] && clean(memory[field]) !== expectation[field]) return false;
   }
@@ -228,7 +226,6 @@ function memoryObservation(memory) {
     reality: memory.reality,
     temporalState: memory.temporalState,
     revisionAction: memory.revisionAction,
-    retentionReason: memory.retentionReason,
     eventDate: memory.eventDate,
     eventStart: memory.eventStart,
     eventEnd: memory.eventEnd,
@@ -241,7 +238,8 @@ function memoryObservation(memory) {
 
 export function evaluateIngestionResult(testCase, output, { includeContent = false } = {}) {
   const item = normalizedIngestionCase(testCase);
-  const parsed = parseGeneratedLongTermExtraction(output);
+  const context = buildLongTermExtractionInput({ memoryOwner: item.memoryOwner, userName: item.userName, messages: item.messages });
+  const parsed = normalizeGeneratedLongTermExtraction(output, context);
   const knownRefs = new Set(item.messages.map((message) => message.ref));
   const usedRefs = parsed.memories.flatMap((memory) => memory.sourceRefs);
   const unknownRefs = [...new Set(usedRefs.filter((ref) => !knownRefs.has(ref)))];

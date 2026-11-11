@@ -1,3 +1,4 @@
+import { commonMemoryWorld, memoryWorldScope, readStateAnalysisSemanticMemory } from '@suzu-memory/core';
 import { createHash } from "node:crypto";
 
 import { proposePreferenceState } from "@suzu-memory/core";
@@ -76,7 +77,14 @@ export function proposePreferenceStateFromEvaluation(repository, {
   const preview = evaluation.preview;
   const previewLevel = levelForPreview(preview, null, clean(evidenceReviewMode) || "bounded");
   const representationLayer = representationLayerForLevel(previewLevel);
+  const semantic = readStateAnalysisSemanticMemory(repository, { agent_id: normalizedAgentId, metadata });
+  const reviewedObservations = evaluation.observations || [];
+  const world = semantic ? memoryWorldScope(semantic) : reviewedObservations.length
+    ? commonMemoryWorld(reviewedObservations.map(item => item.world))
+    : commonMemoryWorld((evaluation.labels || []).map(item => repository.getMemory(item.memoryId)));
+  if (!world) return { status: 'blocked', reason: 'world-scope-required', proposal: null };
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId: normalizedAgentId,
     subjectRole: preview.subjectRole,
     subjectKey: preview.subjectKey,
@@ -133,6 +141,7 @@ export function proposePreferenceStateFromEvaluation(repository, {
     evidence: evidenceForProposal(evaluation.labels || [], preview),
     metadata: {
       ...metadata,
+      ...(reviewedObservations.length ? { observationIds: reviewedObservations.map(item => item.id) } : {}),
       evaluationStatus: evaluation.status,
       rejectedEvidenceCount: evaluation.rejected?.length || 0,
     },
@@ -173,7 +182,10 @@ function canonicalHash(value) {
 function assertCanonicalReviewStillCurrent(repository, review) {
   const snapshot = review.snapshot;
   const target = snapshot.target;
+  const world = target.world || commonMemoryWorld(snapshot.observations.map(item => item.memory), snapshot.currentState);
+  if (!world) throw new Error("Canonical preference review requires a fixed world scope.");
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId: snapshot.agentId,
     subjectRole: target.subjectRole,
     subjectKey: target.subjectKey,
@@ -186,6 +198,7 @@ function assertCanonicalReviewStillCurrent(repository, review) {
     throw new Error("Inferred preference state changed after canonical review; review it again.");
   }
   const currentObservations = repository.listStateEvidenceObservations(snapshot.agentId, {
+    world,
     stateFamily: "preference",
     subjectRole: target.subjectRole,
     subjectKey: target.subjectKey,

@@ -9,10 +9,12 @@ import {
   resolveReportedStateProposal,
   memoryRetrievalContextSourceHash,
   normalizeStateAnalysisTargetSpec,
+  modelCalendarFields,
 } from "@suzu-memory/core";
 import { syncMemoryEmbeddings } from '@suzu-memory/embedding-indexer';
+import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 import { fallbackStateAnalysisToProvisionalReview } from '@suzu-memory/extraction';
-import { runEmbeddingMaintenance } from '@suzu-memory/maintenance';
+import { autoAcceptReportedStateProposals, runEmbeddingMaintenance } from '@suzu-memory/maintenance';
 import { prepareStateMemoryCandidates } from '../src/state-memory-candidates.mjs';
 import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
@@ -31,6 +33,7 @@ function setupRequest({
   createdAt = "2026-07-11T02:01:00.000Z",
   stateFamily = "preference",
   targetSpec = {},
+  eventFields = {},
   content = `我一直很喜欢${targetLabel}，这个可以记住。`,
 } = {}) {
   const database = existingDatabase || openMemoryDatabase(":memory:");
@@ -120,11 +123,11 @@ function setupRequest({
       evidenceMode,
       stateFamily,
       temporalState: "current",
+      ...eventFields,
       confidence: 0.9,
       importance: 0.5,
       actorRoles: [],
       sourceRefs: [`message-preference-${suffix}`],
-      retentionReason: "durable_user_fact",
     },
     sourceRefs: [`message-preference-${suffix}`],
     sourceIds: [source.id],
@@ -133,9 +136,11 @@ function setupRequest({
   return { database, repository, source, memory, request };
 }
 
-for (const family of ['preference', 'goal']) test(`untrusted calendar times never enter ${family} analysis and survive state materialization as unknown`, async t => {
-  const f = setupRequest({ stateFamily: family, targetLabel: family === 'goal' ? '周六整理书单' : '解谜游戏',
-    content: family === 'goal' ? '我答应周六九点整理小说书单。' : '我一直很喜欢解谜游戏。' });
+for (const [family, explicitInterval] of [['preference', false], ['goal', false], ['goal', true]]) test(`untrusted calendar times never enter ${family} analysis while retaining explicit intervals: ${explicitInterval}`, async t => {
+  const f = setupRequest({ stateFamily: family, targetLabel: family === 'goal' ? '整理书单' : '解谜游戏',
+    eventFields: explicitInterval ? { eventDate: '2026-12-25', eventStart: '2026-12-25T01:00:00Z', eventEnd: '2026-12-26T01:00:00Z' } : {},
+    content: explicitInterval ? '我计划2026年12月25日至26日整理小说书单。'
+      : family === 'goal' ? '我答应周六九点整理小说书单。' : '我一直很喜欢解谜游戏。' });
   t.after(() => f.database.close());
   f.database.prepare("UPDATE source_records SET occurred_at=?, known_at=?, metadata_json=? WHERE id=?")
     .run('2000-01-02T12:00:00Z', '2000-01-02T12:00:00Z', JSON.stringify({ sourceTimeKnown: false }), f.source.id);
@@ -152,7 +157,14 @@ for (const family of ['preference', 'goal']) test(`untrusted calendar times neve
   assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
   assert.ok(calls.length > 0);
   const accepted = resolveReportedStateProposal(f.repository, { agentId: 'agent-test', proposalId: result.proposal.id, action: 'accept' });
-  assert.equal(accepted.memory.metadata.sourceTimeKnown, false);
+  const detail = f.repository.getMemoryDetail('agent-test', accepted.memory.id);
+  const calendar = modelCalendarFields(accepted.memory, ['knownAt', 'eventDate', 'eventStart', 'eventEnd'], detail.sources);
+  assert.equal(calendar.knownAt, null);
+  if (explicitInterval) {
+    assert.equal(calendar.eventDate, '2026-12-25');
+    assert.equal(calendar.eventStart, '2026-12-25T01:00:00Z');
+    assert.equal(calendar.eventEnd, '2026-12-26T01:00:00Z');
+  } else assert.equal(accepted.memory.metadata.sourceTimeKnown, false);
 });
 
 for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`early state embedding and candidate matching: ${scenario}`, async t => {
@@ -182,29 +194,44 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
   const second = setupRequest({ database: first.database, repository: first.repository, suffix: '2', stateFamily: 'goal',
     targetLabel: '取消书单安排', content: '我取消周六九点整理小说书单的安排，不是完成了。' });
   const calls = [];
+  const native = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture' },
+    fetchImpl: async (_url, { body }) => {
+      const { messages } = JSON.parse(body);
+      const input = messages[1].content;
+      const snapshot = JSON.parse(input.slice(input.indexOf('{')));
+      const evidence = snapshot.memories.find(memory => memory.content === second.memory.content);
+      assert.ok(evidence && evidence.id !== second.memory.id, 'The provider must receive a local memory reference.');
+      const source = snapshot.sourceRecords.find(row => row.content === second.source.content);
+      assert.ok(source && source.id !== second.source.id, 'The provider must receive a local source reference.');
+      assert.ok(evidence.sourceIds.includes(source.id));
+      const common = { memoryId: evidence.id, sourceIds: [source.id], confidence: 0.98, rationale: '原话明确取消同一约定。' };
+      let output;
+      if (snapshot.currentState) {
+        assert.equal(snapshot.currentState.content, old.content);
+        assert.notEqual(snapshot.currentState.id, old.id);
+        output = { analyses: [{ ...common, relation: 'cancels' }] };
+      } else {
+        const candidate = snapshot.stateCandidates.find(item => item.content === old.content);
+        assert.ok(candidate && candidate.id !== old.id);
+        output = { stateMatch: { resolution: scenario === 'ambiguous' ? 'ambiguous' : 'matched',
+          candidateId: scenario === 'ambiguous' ? '' : scenario === 'invalid' ? 'not-a-candidate' : candidate.id,
+          rationale: '比较具体约定。' }, analysis: { results: {
+          targetIntent: { analyses: [{ ...common, targetMatch: 'exact', goalText: '整理小说书单', intentionLevel: 'plan', specificity: 'actionable', peerRelations: [] }] },
+          holderResponsibility: { analyses: [{ ...common, holderMatch: 'yes', attribution: 'explicit_self_statement', responsibility: 'subject', agency: 'self_chosen', acceptsResponsibility: 'yes' }] },
+          lifecycle: { analyses: [{ ...common, lifecycle: 'cancelled', completionBasis: 'direct_cancellation', timeReference: '' }] },
+        } } };
+      }
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(output) } }] });
+    },
+  });
   const generator = Object.assign(async request => {
     assert.equal(embeddingCalls.length, 2, 'new semantic content must be embedded before the specialist');
     calls.push(request);
     assertMemoryTaskRequest(request);
-    const common = { memoryId: second.memory.id, sourceIds: [second.source.id], confidence: 0.98, rationale: '原话明确取消同一约定。' };
-    let output;
-    if (request.schemaName === 'memory-state-match-analysis-v1') {
-      const snapshot = JSON.parse(request.input.slice(request.input.indexOf('快照：\n') + '快照：\n'.length));
-      assert.ok(snapshot.stateCandidates.some(candidate => candidate.id === old.id));
-      output = { stateMatch: { resolution: scenario === 'ambiguous' ? 'ambiguous' : 'matched',
-        candidateId: scenario === 'ambiguous' ? '' : scenario === 'invalid' ? 'not-a-candidate' : old.id, rationale: '比较具体约定。' }, analysis: { results: {
-        targetIntent: { analyses: [{ ...common, targetMatch: 'exact', goalText: '整理小说书单', intentionLevel: 'plan', specificity: 'actionable', peerRelations: [] }] },
-        holderResponsibility: { analyses: [{ ...common, holderMatch: 'yes', attribution: 'explicit_self_statement', responsibility: 'subject', agency: 'self_chosen', acceptsResponsibility: 'yes' }] },
-        lifecycle: { analyses: [{ ...common, lifecycle: 'cancelled', completionBasis: 'direct_cancellation', timeReference: '' }] },
-      } } };
-    } else {
-      assert.equal(request.analyzerRole, 'current-relation');
-      const snapshot = JSON.parse(request.input.slice(request.input.indexOf('{')));
-      assert.equal(snapshot.currentState.id, old.id);
-      output = { analyses: [{ ...common, currentStatePresent: true, relation: 'cancels' }] };
-    }
-    validateMemoryTaskOutput(request, output);
-    return { output, model: 'test', metadata: { provider: 'test' } };
+    const generation = await native(request);
+    validateMemoryTaskOutput(request, generation.output);
+    return generation;
   }, { supportsCombinedStateAnalysis: true });
   const result = await processStateAnalysisRequest({ repository: second.repository, agentId: 'agent-test',
     requestId: second.request.id, generator, embeddingProvider });
@@ -261,7 +288,7 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
         assert.equal(snapshot.currentState.id, old.id);
         assert.equal(snapshot.currentState.statePhase, 'cancelled');
         output = { analyses: [{ memoryId: third.memory.id, sourceIds: [third.source.id], confidence: 0.98,
-          rationale: '直接恢复同一安排。', currentStatePresent: true, relation: 'resumes' }] };
+          rationale: '直接恢复同一安排。', relation: 'resumes' }] };
       }
       validateMemoryTaskOutput(request, output);
       return { output, model: 'test' };
@@ -399,8 +426,7 @@ function directGoalGenerator(fixture) {
       }] },
       "current-relation": { analyses: [{
         ...common,
-        currentStatePresent: false,
-        relation: "no_current_state",
+        relation: "unknown",
       }] },
     };
     return {
@@ -976,7 +1002,8 @@ test("output token exhaustion is recorded once and sent to review without automa
   const diagnostics = { maxOutputTokens: 65536, usage: { outputTokens: 65536, reasoningTokens: 64000 } };
   const generator = async () => {
     calls++;
-    throw Object.assign(new Error('Output protection reached'), { code: 'MAX_TOKENS', diagnostics });
+    throw Object.assign(new Error('Output protection reached'), { code: 'MAX_TOKENS', diagnostics,
+      usage: { prompt_tokens: 100, completion_tokens: 65536 }, model: 'fixture', requestId: 'truncated-state-request' });
   };
   generator.supportsCombinedStateAnalysis = true;
   const run = () => processPendingStateAnalysisRequests({ repository: fixture.repository,
@@ -990,6 +1017,10 @@ test("output token exhaustion is recorded once and sent to review without automa
   assert.equal(request.metadata.failureHistory[0].details.errorCode, 'MAX_TOKENS');
   assert.deepEqual(request.metadata.failureHistory[0].details.providerDiagnostics, diagnostics);
   assert.equal(fixture.repository.listPendingProvisionalMemories('agent-test')[0].content, fixture.source.content);
+  const runs = fixture.repository.listStateAnalysisRuns('agent-test', { limit: 100 });
+  assert.equal(runs.reduce((sum, row) => sum + Number(row.usage?.prompt_tokens || 0), 0), 100);
+  assert.equal(runs.reduce((sum, row) => sum + Number(row.usage?.completion_tokens || 0), 0), 65536);
+  assert.ok(runs.some(row => row.model === 'fixture' && row.request_id === 'truncated-state-request'));
   await run();
   assert.equal(calls, 1);
   fixture.database.close();
@@ -1137,14 +1168,85 @@ for (const content of ['我以前喜欢解谜游戏。', 'I used to like puzzle 
   });
 }
 
-test('direct expression stays usable when the unrelated behavior role fails', async t => {
+for (const failRole of ['behavior-conditions', 'sharing-affect']) test(`direct expression stays usable when the unrelated ${failRole} role fails`, async t => {
   const f = setupRequest();
   t.after(() => f.database.close());
   const result = await processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test',
-    requestId: f.request.id, generator: directPreferenceGenerator(f, { failRole: 'behavior-conditions' }) });
+    requestId: f.request.id, generator: directPreferenceGenerator(f, { failRole }) });
   assert.equal(result.status, 'proposal-pending');
   assert.equal(result.evaluation.status, 'partial');
   assert.equal(result.proposal.draft.preferenceClaim.polarity, 'positive');
+});
+
+test('a newer preference with a rejected essential judgment stays pending and retries only that judgment', async t => {
+  const first = setupRequest({ targetLabel: 'puzzle games', content: 'I like puzzle games.' });
+  t.after(() => first.database.close());
+  const later = setupRequest({ database: first.database, repository: first.repository, suffix: '2',
+    targetLabel: 'puzzle games', content: 'I now dislike puzzle games.' });
+  const laterAt = '2026-07-11T12:00:00.000Z';
+  first.database.prepare('UPDATE memory_nodes SET event_start=?,known_at=? WHERE id=?')
+    .run(laterAt, laterAt, later.memory.id);
+  first.database.prepare('UPDATE source_records SET occurred_at=?,known_at=? WHERE id=?')
+    .run(laterAt, laterAt, later.source.id);
+  const fixtures = [first, later];
+  const request = first.repository.recordStateAnalysisRequest({ agentId: 'agent-test',
+    batchId: 'combined-preference-evidence', candidateIndex: 0, stateFamily: 'preference',
+    subjectRole: 'user', subjectKey: 'user', canonicalKey: 'puzzle-games', targetLabel: 'puzzle games',
+    representationLayer: 'reported', evidenceMode: 'explicit',
+    memoryIds: fixtures.map(fixture => fixture.memory.id), sourceIds: fixtures.map(fixture => fixture.source.id),
+    metadata: { subjectName: 'User' } });
+  const original = first.repository.getIngestionDecisionByBatchCandidate('agent-test', first.request.batch_id,
+    first.request.candidate_index);
+  first.repository.recordIngestionDecision({ agentId: 'agent-test', batchId: request.batch_id, candidateIndex: 0,
+    decision: 'store', resultStatus: 'analysis_pending', candidate: { ...original.candidate,
+      content: later.source.content, canonicalKey: request.canonical_key, sourceRefs: ['M0001', 'M0002'] },
+    sourceRefs: ['M0001', 'M0002'], sourceIds: fixtures.map(fixture => fixture.source.id) });
+  const calls = [];
+  let rejectLaterTime = true;
+  const generator = async input => {
+    const snapshot = JSON.parse(input.input);
+    calls.push({ role: input.analyzerRole, memoryIds: snapshot.memories.map(memory => memory.id) });
+    const analyses = [];
+    for (const memory of snapshot.memories) {
+      const fixture = fixtures.find(fixture => fixture.memory.id === memory.id);
+      const generated = await directPreferenceGenerator({ ...fixture, request })(input);
+      for (const analysis of generated.output.analyses) {
+        if (fixture === later && input.analyzerRole === 'explicit-expression') analysis.expressionType = 'dislikes';
+        if (fixture === later && input.analyzerRole === 'time-scope') {
+          analysis.revisionCue = 'changed';
+          if (rejectLaterTime) analysis.sourceIds = [first.source.id];
+        }
+        analyses.push(analysis);
+      }
+    }
+    if (input.analyzerRole === 'time-scope') rejectLaterTime = false;
+    const output = { analyses };
+    validateMemoryTaskOutput(input, output);
+    return { output, model: 'fixture' };
+  };
+  const options = { repository: first.repository, agentId: 'agent-test', requestId: request.id, generator };
+  const pending = await processStateAnalysisRequest(options);
+  assert.equal(pending.status, 'retry-pending');
+  assert.equal(first.repository.getStateAnalysisRequest('agent-test', request.id).status, 'pending');
+  assert.equal(first.repository.listReportedStateProposals('agent-test').length, 0);
+  assert.deepEqual(pending.evaluation.runs.timeScope.metadata.retryMemoryIds, [later.memory.id]);
+  const savedRunIds = Object.values(pending.evaluation.runs).map(run => run.id);
+
+  const completed = await processStateAnalysisRequest(options);
+  assert.equal(completed.status, 'proposal-pending', JSON.stringify(completed));
+  assert.equal(completed.proposal.draft.preferenceClaim.polarity, 'negative');
+  assert.equal(first.repository.getStateAnalysisRequest('agent-test', request.id).status, 'completed');
+  assert.deepEqual(calls.filter(call => call.role === 'time-scope').map(call => call.memoryIds),
+    [[first.memory.id, later.memory.id], [later.memory.id]]);
+  assert.deepEqual(calls.filter(call => call.role !== 'time-scope').map(call => call.role).sort(),
+    ['behavior-conditions', 'explicit-expression', 'object-grounding', 'sharing-affect']);
+  for (const runId of savedRunIds) assert.ok(first.repository.getStateAnalysisRun('agent-test', runId));
+  const observations = first.repository.listStateEvidenceObservations('agent-test', {
+    stateFamily: 'preference', canonicalKey: completed.request.canonical_key });
+  assert.deepEqual(observations.map(observation => observation.memory_id).sort(),
+    [first.memory.id, later.memory.id].sort());
+  assert.equal(autoAcceptReportedStateProposals({ repository: first.repository, agentId: 'agent-test',
+    proposalIds: [completed.proposal.id] }).accepted.length, 1);
 });
 
 test('retries only a failed essential role and reuses the identical successful analyses', async t => {
@@ -1244,7 +1346,6 @@ for (const override of [false, true]) test(`public state analysis uses the confi
 
 test('all state analyzer requests satisfy strict provider object contracts', async () => {
   const { readdir } = await import('node:fs/promises');
-  const { createOpenAiCompatibleStructuredGenerator } = await import('@suzu-memory/providers');
   function assertStrictObjects(schema, location) {
     if (!schema || typeof schema !== 'object') return;
     if (schema.properties) {
@@ -1309,4 +1410,20 @@ test('related analysis groups structured snapshots independently of prompt white
     assert.equal(calls.length, 3, 'Distinct source material remains separate.');
   }
   assert.ok(checked.length > 0);
+});
+
+
+test('state matching uses a fixed entity ID across aliases and separates same-name objects', async t => {
+  const targetSpec = { triggerRole: 'world', triggerKey: '', triggerLabel: '巴黎', triggerEntityId: 'city-france', triggerKind: 'place' };
+  const f = setupRequest({ stateFamily: 'affective_association', targetSpec, targetLabel: '想到巴黎会安心', content: '想到巴黎这座城市，我就安心。' });
+  t.after(() => f.database.close());
+  for (const [id, entityId, label] of [['same-city', 'city-france', 'Paris'], ['another-city', 'city-texas', '巴黎']]) {
+    f.repository.upsertMemory({ id, agentId: 'agent-test', kind: 'belief_state', layer: 'semantic',
+      content: `${label} brings calm.`, title: label, subjectRole: 'user', subjectKey: 'user', stateFamily: 'affective_association',
+      representationLayer: 'reported', evidenceMode: 'explicit', reality: 'real', canonicalKey: id,
+      metadata: { stateTarget: { ...targetSpec, triggerEntityId: entityId, triggerLabel: label } } });
+  }
+  const context = await prepareStateMemoryCandidates({ repository: f.repository, request: f.request });
+  assert.ok(context.candidates.some(item => item.id === 'same-city'), 'The same ID remains eligible under a different label.');
+  assert.ok(!context.candidates.some(item => item.id === 'another-city'), 'A different ID remains separate despite an identical label.');
 });

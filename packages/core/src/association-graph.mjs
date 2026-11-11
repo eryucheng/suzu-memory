@@ -1,4 +1,4 @@
-import { isStatefulMemoryKind } from "./ontology.mjs";
+import { isStatefulMemoryKind, memoryWorldsCompatible, memoryWorldScope } from "./ontology.mjs";
 
 const DEFAULT_OPTIONS = Object.freeze({
   provenance: "association-builder-v1",
@@ -103,8 +103,7 @@ function eventTime(node) {
 }
 
 function sameWorld(left, right) {
-  return clean(left?.world_id) === clean(right?.world_id)
-    && clean(left?.world_frame) === clean(right?.world_frame);
+  return memoryWorldsCompatible(left, right);
 }
 
 function automaticThreadKey(node) {
@@ -117,7 +116,8 @@ function buildThreadAssociations(nodes, seedIds = null) {
   for (const node of nodes) {
     const canonicalKey = automaticThreadKey(node);
     if (!canonicalKey) continue;
-    const groupKey = `${clean(node.world_id)}\u001f${clean(node.world_frame)}\u001f${canonicalKey}`;
+    const world = memoryWorldScope(node);
+    const groupKey = JSON.stringify([world.reality, world.worldId, world.worldFrame, canonicalKey]);
     const members = groups.get(groupKey) || [];
     members.push(node);
     groups.set(groupKey, members);
@@ -578,20 +578,22 @@ export function updateAssociationGraph({
   let associations = [];
   let prunedAssociationEdges = 0;
   repository.transaction(() => {
-    repository.database.prepare(`
-      DELETE FROM memory_edges
-      WHERE id IN (
-        SELECT edge.id
-        FROM memory_edges AS edge
-        JOIN memory_nodes AS source
-          ON source.agent_id = edge.agent_id AND source.id = edge.from_memory_id
-        JOIN memory_nodes AS target
-          ON target.agent_id = edge.agent_id AND target.id = edge.to_memory_id
-        WHERE edge.agent_id = ?
-          AND edge.provenance = ?
-          AND (source.world_id <> target.world_id OR source.world_frame <> target.world_frame)
-      )
-    `).run(normalizedAgentId, options.provenance);
+    const existingWorldEdges = repository.database.prepare(`
+      SELECT edge.id, source.reality AS source_reality, source.world_id AS source_world_id,
+        source.world_frame AS source_world_frame, target.reality AS target_reality,
+        target.world_id AS target_world_id, target.world_frame AS target_world_frame
+      FROM memory_edges edge
+      JOIN memory_nodes source ON source.agent_id = edge.agent_id AND source.id = edge.from_memory_id
+      JOIN memory_nodes target ON target.agent_id = edge.agent_id AND target.id = edge.to_memory_id
+      WHERE edge.agent_id = ? AND edge.provenance = ?
+    `).all(normalizedAgentId, options.provenance);
+    const deleteWorldEdge = repository.database.prepare('DELETE FROM memory_edges WHERE id = ? AND agent_id = ?');
+    for (const edge of existingWorldEdges) {
+      if (!sameWorld({ reality: edge.source_reality, world_id: edge.source_world_id, world_frame: edge.source_world_frame },
+        { reality: edge.target_reality, world_id: edge.target_world_id, world_frame: edge.target_world_frame })) {
+        deleteWorldEdge.run(edge.id, normalizedAgentId);
+      }
+    }
     repository.database.prepare(`
       DELETE FROM memory_edges
       WHERE agent_id = ? AND provenance = ?

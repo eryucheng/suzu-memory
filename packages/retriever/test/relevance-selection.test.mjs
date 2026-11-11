@@ -301,6 +301,99 @@ for (const language of [
   }
 }
 
+for (const language of [
+  { name: 'English', query: 'When did Avery attend a workshop about ceramics?',
+    direct: 'Avery attended the ceramics workshop on Saturday.', broad: 'Avery enjoys ceramics and buys handmade bowls.',
+    specificConcept: 'ceramics workshop', broadConcept: 'ceramics',
+    labelQuery: 'animal shelter', label: 'volunteering at an animal shelter', alias: 'pet rescue',
+    implicit: 'Avery helped there every Sunday.' },
+  { name: 'Chinese', query: '小禾什么时候上的陶艺课？',
+    direct: '小禾周六参加了陶艺课程。', broad: '小禾喜欢陶艺，还买了许多手工碗。',
+    specificConcept: '陶艺课程', broadConcept: '陶艺',
+    labelQuery: '烹饪', label: '家常烹饪', alias: '做饭', implicit: '小禾每周末都会参加那项活动。' },
+]) {
+  test(`optional concept annotations do not displace the more relevant fact: ${language.name}`, async t => {
+    const { databasePath, repository } = fixture(t);
+    add(repository, 'direct', language.direct, { similarity: 0.82 });
+    add(repository, 'broad', language.broad, { similarity: 0.68 });
+    const before = await recall(databasePath, { maximumContextMemories: 1 }, language.query);
+    for (const [memoryId, name] of [['direct', language.specificConcept], ['broad', language.broadConcept]]) {
+      const entity = repository.upsertEntity({ agentId: 'relevance-agent', kind: 'concept', canonicalName: name });
+      repository.linkMemoryEntity({ memoryId, entityId: entity.id });
+    }
+    const result = await recall(databasePath, { maximumContextMemories: 1 }, language.query);
+    assert.deepEqual(result.records.map(record => record.memoryId), ['direct']);
+    for (const candidate of result.candidates) {
+      assert.equal(candidate.score, before.candidates.find(previous => previous.memoryId === candidate.memoryId).score,
+        'a concept already stated in the record adds no independent ranking evidence');
+    }
+  });
+
+  test(`concept names and aliases recall implicit records through indexed and short-term text matching: ${language.name}`, async t => {
+    const { databasePath, repository } = fixture(t);
+    add(repository, 'implicit', language.implicit, { similarity: 0.1 });
+    const concept = repository.upsertEntity({ agentId: 'relevance-agent', kind: 'concept', canonicalName: language.label, aliases: [language.alias] });
+    repository.linkMemoryEntity({ memoryId: 'implicit', entityId: concept.id });
+    for (const query of [language.labelQuery, language.alias]) {
+      const result = await recall(databasePath, { maximumContextMemories: 1, sqlPrefilterThreshold: 1 }, query);
+      assert.deepEqual(result.records.map(record => record.memoryId), ['implicit']);
+      assert.equal(repository.getMemory('implicit').content, language.implicit);
+      assert.ok(result.candidates[0].routeMatches.some(route => ['lexical', 'bm25'].includes(route.route) && route.contribution > 0));
+      assert.equal(result.candidates[0].routeMatches.find(route => route.route === 'entity')?.contribution || 0, 0);
+    }
+  });
+}
+
+for (const language of [
+  { name: 'English', person: 'Paris', alias: 'Paris Reed', cityAlias: 'City of Paris', query: 'What did Paris paint?',
+    aliasQuery: 'What did Paris Reed paint?', cityQuery: 'What is in the City of Paris?',
+    direct: 'Paris painted a watercolour seascape.', city: 'Paris has art shops and famous galleries.' },
+  { name: 'Chinese', person: '长安', alias: '画家长安', cityAlias: '长安城', query: '长安画了什么？',
+    aliasQuery: '画家长安画了什么？', cityQuery: '长安城有什么？',
+    direct: '长安昨天画了一幅海景水彩画。', city: '长安有很多美术馆和画廊。' },
+]) {
+  test(`a homonymous place cannot displace a person's direct fact, while unique aliases still resolve: ${language.name}`, async t => {
+    const { databasePath, repository } = fixture(t);
+    add(repository, 'person-fact', language.direct, { similarity: 0.8 });
+    add(repository, 'city-fact', language.city, { similarity: 0.7 });
+    for (const [memoryId, kind, alias] of [['person-fact', 'person', language.alias], ['city-fact', 'place', language.cityAlias]]) {
+      const entity = repository.upsertEntity({ agentId: 'relevance-agent', kind, canonicalName: language.person, aliases: [alias] });
+      repository.linkMemoryEntity({ memoryId, entityId: entity.id });
+    }
+    const ambiguous = await recall(databasePath, { maximumContextMemories: 1 }, language.query);
+    assert.deepEqual(ambiguous.records.map(record => record.memoryId), ['person-fact']);
+    assert.equal(ambiguous.matchedEntities.length, 2, 'both identities remain available as candidates');
+    assert.ok(ambiguous.candidates.every(candidate => candidate.routeMatches.find(route => route.route === 'entity').contribution === 0));
+    const namedPerson = await recall(databasePath, { maximumContextMemories: 1 }, language.aliasQuery);
+    assert.deepEqual(namedPerson.records.map(record => record.memoryId), ['person-fact']);
+    assert.equal(namedPerson.candidates.find(candidate => candidate.memoryId === 'city-fact').routeMatches
+      .find(route => route.route === 'entity').contribution, 0, 'a short name inside the full name is not a resolved city');
+    const namedPlace = await recall(databasePath, { maximumContextMemories: 1 }, language.cityQuery);
+    assert.deepEqual(namedPlace.records.map(record => record.memoryId), ['city-fact']);
+    assert.ok(namedPlace.candidates.find(candidate => candidate.memoryId === 'city-fact').routeMatches
+      .some(route => route.route === 'entity' && route.contribution > 0), 'a unique place alias retains identity evidence');
+  });
+}
+
+test('distinct works sharing a title keep both candidates and resolve a longer unique title', async t => {
+  const { databasePath, repository } = fixture(t);
+  for (const [id, content, alias] of [['portrait', 'The portrait uses blue and gold.', 'Dawn Portrait'],
+    ['landscape', 'The landscape uses green and grey.', 'Dawn Landscape']]) {
+    add(repository, id, content);
+    const entity = repository.upsertEntity({ agentId: 'relevance-agent', kind: 'work', canonicalName: 'Dawn', aliases: [alias] });
+    repository.linkMemoryEntity({ memoryId: id, entityId: entity.id });
+  }
+  const ambiguous = await recall(databasePath, { maximumContextMemories: 2 }, 'What colors are in Dawn?');
+  assert.deepEqual(new Set(ambiguous.records.map(record => record.memoryId)), new Set(['portrait', 'landscape']));
+  assert.ok(ambiguous.candidates.every(candidate => candidate.routeMatches.find(route => route.route === 'entity').contribution === 0));
+  const resolved = await recall(databasePath, { maximumContextMemories: 1 }, 'What colors are in Dawn Portrait?');
+  assert.deepEqual(resolved.records.map(record => record.memoryId), ['portrait']);
+  assert.ok(resolved.candidates.find(candidate => candidate.memoryId === 'portrait').routeMatches
+    .some(route => route.route === 'entity' && route.contribution > 0));
+  assert.equal(resolved.candidates.find(candidate => candidate.memoryId === 'landscape').routeMatches
+    .find(route => route.route === 'entity').contribution, 0);
+});
+
 for (const kind of ['event', 'utterance']) {
   test(`ordinary matching can fill its shared budget with five ${kind} records`, async t => {
     const { databasePath, repository } = fixture(t);
@@ -329,7 +422,6 @@ for (const kind of ['event', 'utterance']) {
     assert.ok(expansions.every(value => value.depth <= 1 && value.maximum <= 20 && value.returned <= 20));
     assert.equal(new Set(expansions.flatMap(value => value.ids)).size, expansions.length);
     if (kind === 'event') assert.equal(expansions.length, 0);
-    t.diagnostic(JSON.stringify({ kind, expansionCalls: expansions.length, returnedNodes: expansions.reduce((n, value) => n + value.returned, 0) }));
   });
 }
 
@@ -553,13 +645,6 @@ test('an unconnected weak text clue requires independent admission before it can
   assert.equal(connected.graph.convergedSeeds.connections[0].relation, 'timeline_next');
 });
 
-for (const [query, unrelated, relevant] of [
-  ["What are Avery's adoption plans?", "Avery likes abstract art.", "Avery is applying for adoption."],
-  ["小禾的领养计划是什么？", "小禾喜欢画抽象画。", "小禾已经向领养机构提交了申请。"],
-]) {
-
-}
-
 for (const language of [
   { name: 'English', query: 'What musical artist did Avery see?',
     statement: "It was Theo Reed. His songs were amazing. What have you been up to?",
@@ -682,7 +767,6 @@ for (const route of ['membership', 'direct']) {
     assert.deepEqual(result.nodes.map(node => node.id), ['first', 'distinct']);
     assert.equal(result.audit.coverageSourceRows, route === 'direct' ? 810 : 105);
     assert.equal(result.audit.coverageEdgeRows, route === 'membership' ? 210 : 0);
-    t.diagnostic(JSON.stringify({ route, ...result.audit }));
   });
 }
 

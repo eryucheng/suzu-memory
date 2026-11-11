@@ -289,7 +289,7 @@ test("semantic lane keeps retrieval context and structure prompts separate", asy
     if (schemaName === "memory_retrieval_context_critic_v1") {
       return { output: { approved: true, issues: [] }, usage: {} };
     }
-    if (schemaName === "memory-structure-proposals-v1") {
+    if (schemaName === "memory-structure-proposals-v2") {
       return { output: { proposals: [] }, usage: {} };
     }
     throw new Error(`unexpected schema ${schemaName}`);
@@ -309,7 +309,7 @@ test("semantic lane keeps retrieval context and structure prompts separate", asy
     "memory_retrieval_context_critic_v1",
     "memory_retrieval_context_proposal_v1",
     "memory_retrieval_context_critic_v1",
-    "memory-structure-proposals-v1",
+    "memory-structure-proposals-v2",
   ]);
   assert.ok(repository.getCurrentMemoryRetrievalContext("event-1"));
   assert.equal(repository.listMaintenanceTasks(AGENT_ID, {
@@ -348,7 +348,7 @@ test("pending topic and episode candidates immediately queue normal maintenance"
     retrievalContextGenerator: null,
     minimumStructureMemories: 2,
     structureGenerator: async ({ schemaName }) => {
-      assert.equal(schemaName, "memory-structure-proposals-v1");
+      assert.equal(schemaName, "memory-structure-proposals-v2");
       return {
         output: {
           proposals: [{

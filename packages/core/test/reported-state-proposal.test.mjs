@@ -1268,3 +1268,26 @@ test("repairs only derived reported world attributes with matching semantic prov
   database.exec(migration.sql);
   assert.equal(Number(database.prepare("SELECT total_changes() AS n").get().n), writes);
 });
+
+for (const action of ['accept', 'dismiss']) test(`a fictional goal completion and ${action} preserve the real goal`, t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const key = 'user:goal:world-publication';
+  const goal = (id, reality, worldId, worldFrame, day) => repository.upsertMemory({ id, agentId: 'agent-test', kind: 'plan', layer: 'prospective',
+    content: id, subjectRole: 'user', subjectKey: 'user', canonicalKey: key, representationLayer: 'reported', stateFamily: 'goal',
+    statePhase: 'active', temporalState: 'in_progress', evidenceMode: 'explicit', reality, worldId, worldFrame,
+    knownAt: `2026-08-${day}T08:00:00.000Z`, validFrom: `2026-08-${day}T08:00:00.000Z` });
+  const fictional = goal('fictional-goal', 'fictional', 'story', 'fictional', '01');
+  const real = goal('real-goal', 'real', 'room', 'physical', '02');
+  const evidence = addReportedBeliefObservation(repository, { id: `world-completion-${action}`, stateFamily: 'goal', canonicalKey: key,
+    occurredAt: '2026-08-05T08:00:00.000Z', signal: 'goal_completion' });
+  database.prepare("UPDATE memory_nodes SET reality='fictional',world_id='story',world_frame='fictional' WHERE id=?").run(evidence.memory_id);
+  const proposal = repository.recordReportedStateProposal({ agentId: 'agent-test', stateFamily: 'goal', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: key, action: 'complete', previousMemoryId: fictional.id, proposedState: null, reviewVersion: 'world-test', inputHash: `world-completion-${action}`,
+    selectedObservationId: evidence.id, consideredObservationIds: [evidence.id] });
+  materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id });
+  assert.equal(repository.getMemory(real.id).status, 'active');
+  resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: proposal.id, action });
+  assert.equal(repository.getMemory(real.id).status, 'active');
+  assert.equal(repository.getMemory(fictional.id).status, action === 'accept' ? 'superseded' : 'active');
+  assert.deepEqual([repository.getMemory(fictional.id).reality, repository.getMemory(fictional.id).world_id], ['fictional', 'story']);
+});

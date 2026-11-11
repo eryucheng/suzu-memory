@@ -29,8 +29,10 @@ function stableBatchId({ agentId, subjectRole, subjectKey, canonicalKey, current
   return `capability-analysis-${createHash("sha256").update(signature).digest("hex").slice(0, 24)}`;
 }
 
-function currentStateView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer) {
-  const current = repository.getCurrentCanonicalMemory({ agentId, subjectRole, subjectKey, canonicalKey,
+function currentStateView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer, world) {
+  if (!world) return null;
+  const current = repository.getCurrentCanonicalMemory({
+    ...world, agentId, subjectRole, subjectKey, canonicalKey,
     representationLayer, stateFamily: "capability" });
   if (!current) return null;
   if (!CAPABILITY_MEMORY_KINDS.has(current.kind)) {
@@ -82,9 +84,6 @@ function enforceAnalysisBoundary(role, analysis, snapshot) {
   assertSubjectBoundary(role, analysis, memory, snapshot.target);
   if (role === "time-current-relation") {
     const hasCurrent = Boolean(snapshot.currentState);
-    if (analysis.currentStatePresent !== hasCurrent) {
-      throw new Error("Capability current-state presence does not match the read-only snapshot.");
-    }
     if (hasCurrent && analysis.relation === "no_current_state") {
       throw new Error("Capability relation cannot omit an available current state.");
     }
@@ -293,12 +292,13 @@ export async function evaluateCapabilityEvidence({
     currentRepresentationLayer, memoryIds: normalizedMemoryIds });
   const baseSnapshot = buildPreferenceEvidenceSnapshot({ repository, agentId, subjectRole, subjectKey,
     canonicalKey, memoryIds: normalizedMemoryIds, ...snapshotOptions });
+  const world = baseSnapshot.world;
   const snapshot = {
     ...baseSnapshot, agentId: clean(agentId),
     target: { ...baseSnapshot.target, stateFamily: "capability", capabilityLabel: clean(capabilityLabel),
       currentRepresentationLayer: clean(currentRepresentationLayer) },
     currentState: currentStateView(repository, clean(agentId), baseSnapshot.target.subjectRole,
-      baseSnapshot.target.subjectKey, baseSnapshot.target.canonicalKey, clean(currentRepresentationLayer)),
+      baseSnapshot.target.subjectKey, baseSnapshot.target.canonicalKey, clean(currentRepresentationLayer), world),
     inputPolicy: { ...baseSnapshot.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
       modelCanChooseStateAction: false, oneResultCannotCreateStableCapability: true,

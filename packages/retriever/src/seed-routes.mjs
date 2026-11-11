@@ -1,5 +1,6 @@
-import { lexicalCoverage, lexicalScore, prepareLexicalQuery, recallCorePhrases } from "./query.mjs";
+import { lexicalCoverage, lexicalScore, prepareLexicalQuery } from "./query.mjs";
 import { utteranceStatements } from './query-text.mjs';
+import { conceptSearchText } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -74,9 +75,9 @@ function bm25Route(match, options) {
   };
 }
 
-function entityRoute(score) {
+function entityRoute(score, rankingScore = score) {
   if (!(Number(score) > 0)) return null;
-  const contribution = unit(score) * 0.35;
+  const contribution = unit(rankingScore) * 0.35;
   return {
     route: "entity",
     strength: "exact",
@@ -93,7 +94,7 @@ function priorContribution(node) {
 
 // Share base lexical scores only within one query and node snapshot. Route
 // admission, priors and adjustments are still calculated by each caller.
-export function createSeedLexicalScorer(preparedQuery, { includeQuestions = false } = {}) {
+export function createSeedLexicalScorer(preparedQuery, { includeQuestions = false, conceptLabels = new Map() } = {}) {
   const scores = new WeakMap();
   const prepare = node => {
     let entry = scores.get(node);
@@ -102,7 +103,8 @@ export function createSeedLexicalScorer(preparedQuery, { includeQuestions = fals
       const statements = node.kind === 'utterance' ? utteranceStatements(content) : null;
       const lexical = lexicalScore(
         preparedQuery,
-        [node.event_date || "", node.title || "", statements && !includeQuestions ? statements.text : content]
+        [node.event_date || "", node.title || "", statements && !includeQuestions ? statements.text : content,
+          conceptSearchText(`${node.title || ''}\n${content}`, conceptLabels.get(node.id))]
           .filter(Boolean).join("\n"),
       );
       entry = { lexical, statements };
@@ -114,8 +116,8 @@ export function createSeedLexicalScorer(preparedQuery, { includeQuestions = fals
     dialogue(node) {
       const entry = prepare(node);
       if (!entry.statements?.hasQuestion) return { hasQuestion: false };
-      entry.statementLexical ??= includeQuestions ? lexicalScore(preparedQuery,
-        [node.event_date || '', node.title || '', entry.statements.text].filter(Boolean).join('\n')) : entry.lexical;
+      entry.statementLexical ??= lexicalScore(preparedQuery,
+        [node.event_date || '', node.title || '', entry.statements.text].filter(Boolean).join('\n'));
       entry.questionLexical ??= lexicalScore(preparedQuery, entry.statements.questions);
       return { ...entry.statements, statementRelevance: lexicalCoverage(entry.statementLexical),
         questionRelevance: lexicalCoverage(entry.questionLexical) };
@@ -129,6 +131,7 @@ export function buildOrdinarySeedCandidates({
   bm25Scores = new Map(),
   vectorScores = new Map(),
   entityScores = new Map(),
+  entityRankingScores = entityScores,
   subjectOnlyEntityMemoryIds = new Set(),
   options,
   includeWeakLexical = false,
@@ -151,7 +154,7 @@ export function buildOrdinarySeedCandidates({
       lexicalRoute(lexical, options, bm25Scores.size > 0),
       bm25Route(bm25, options),
       vectorRoute(similarity, options),
-      entityRoute(entityScore),
+      entityRoute(entityScore, entityRankingScores.get(node.id) || 0),
     ].filter(Boolean);
     // A person's name identifies the search subject. It may admit a record,
     // but cannot replace a match to what is being asked about that person.

@@ -1,3 +1,4 @@
+import { commonMemoryWorld, memoryWorldScope } from '@suzu-memory/core';
 import { stateAnalysisBudgetError } from "./request-budget.mjs";
 import { createHash } from "node:crypto";
 
@@ -244,8 +245,15 @@ export function buildPreferenceEvidenceSnapshot({
   }
 
   unifyEpisodeContextGroups(memories);
+  const semantic = analysisRequest ? repository.getStateAnalysisRequestSemanticMemory(analysisRequest.agent_id, analysisRequest.id) : null;
+  if (semantic && (semantic.agent_id !== normalizedAgentId || semantic.status === 'deleted'
+    || semantic.metadata?.stateAnalysisDraft !== true || semantic.metadata?.stateAnalysisRequestId !== analysisRequest.id)) {
+    throw new Error('Preference snapshot semantic draft does not match its fixed request.');
+  }
+  const world = semantic ? memoryWorldScope(semantic) : commonMemoryWorld(memories);
   const snapshot = {
     schemaVersion: 1,
+    world,
     target: {
       subjectRole: normalizedSubjectRole,
       subjectKey: normalizedSubjectKey,

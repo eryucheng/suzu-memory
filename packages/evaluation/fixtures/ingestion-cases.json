@@ -17,7 +17,6 @@
           {
             "kind": "event",
             "subjectRole": "user",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["牛肉面"]
           }
         ],
@@ -40,7 +39,6 @@
           {
             "kind": "event",
             "subjectRole": "user",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["委屈"]
           }
         ],
@@ -63,7 +61,6 @@
           {
             "kind": "event",
             "subjectRole": "user",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["服务器故障"]
           }
         ],
@@ -86,7 +83,6 @@
           {
             "kind": "event",
             "subjectRole": "user",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["加班"]
           }
         ],
@@ -110,7 +106,6 @@
           {
             "kind": "event",
             "subjectRole": "user",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["姐姐", "吵"]
           }
         ],
@@ -133,7 +128,6 @@
           {
             "kind": "preference",
             "subjectRole": "user",
-            "retentionReason": "explicit_preference",
             "contentIncludes": ["科技展览"],
             "actorRoles": [
               { "role": "preference_holder", "actorRole": "user" }
@@ -169,7 +163,7 @@
         "minimumMemories": 1,
         "maximumMemories": 1,
         "required": [
-          { "kind": "fact", "subjectRole": "user", "retentionReason": "identity", "contentIncludes": ["围棋"] }
+          { "kind": "fact", "subjectRole": "user", "contentIncludes": ["围棋"] }
         ],
         "forbidden": [
           { "kind": "fact", "subjectRole": "agent", "contentIncludes": ["围棋"] }
@@ -192,7 +186,6 @@
             "kind": "event",
             "subjectRole": "shared",
             "reality": "roleplay",
-            "retentionReason": "episodic_event",
             "contentIncludes": ["月球基地"]
           }
         ],
@@ -212,7 +205,7 @@
         "minimumMemories": 1,
         "maximumMemories": 1,
         "required": [
-          { "kind": "open_loop", "subjectRole": "user", "temporalState": "in_progress", "retentionReason": "open_loop", "contentIncludes": ["检查"] }
+          { "kind": "open_loop", "subjectRole": "user", "temporalState": "in_progress", "contentIncludes": ["检查"] }
         ],
         "forbidden": [
           { "temporalState": "completed", "contentIncludes": ["检查"] }
@@ -231,7 +224,7 @@
         "minimumMemories": 1,
         "maximumMemories": 1,
         "required": [
-          { "kind": "commitment", "subjectRole": "shared", "temporalState": "planned", "retentionReason": "commitment", "contentIncludes": ["照片"] }
+          { "kind": "commitment", "subjectRole": "shared", "temporalState": "planned", "contentIncludes": ["照片"] }
         ]
       }
     }

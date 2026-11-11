@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -15,7 +16,7 @@ import { runMemoryCli } from "../src/index.mjs";
 import { runMemoryWorker } from "../src/worker.mjs";
 
 function temporaryDirectory() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-cli-"));
+  return createTestDirectory(path.join(os.tmpdir(), "suzu-memory-cli-"));
 }
 
 function outputSink() {
@@ -105,9 +106,9 @@ test("CLI loads portable Agent scope from a config file", async () => {
 
 test("CLI search, edit, delete and restore all reuse the shared Service", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({ dataRoot, agentId: "companion-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: "companion-test" }));
   service.initialize();
-  const database = openMemoryDatabase(service.paths.databasePath);
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
   try {
     new MemoryRepository(database).upsertMemory({
       id: "event-walk",
@@ -201,7 +202,7 @@ test("CLI ingests portable JSON events and lists the pending log", async () => {
 
 test("CLI can explicitly recover an interrupted processing batch", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({ dataRoot, agentId: "companion-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: "companion-test" }));
   service.appendEvent({
     protocolVersion: 1,
     eventId: "interrupted-event",
@@ -232,9 +233,9 @@ test("CLI can explicitly recover an interrupted processing batch", async () => {
 
 test("CLI backs up, inspects and restores one offline Agent database", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({ dataRoot, agentId: "companion-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: "companion-test" }));
   service.initialize();
-  const database = openMemoryDatabase(service.paths.databasePath);
+  const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
   try {
     new MemoryRepository(database).upsertMemory({
       id: "backup-event",
@@ -274,7 +275,7 @@ test("CLI backs up, inspects and restores one offline Agent database", async () 
 
 test("CLI lists and resolves high-level reviews through the shared Service", async () => {
   const dataRoot = temporaryDirectory();
-  const service = createMemoryService({ dataRoot, agentId: "companion-test" });
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: "companion-test" }));
   service.initialize();
   const proposal = service.withRepository((repository) => {
     for (const id of ["review-a", "review-b"]) {

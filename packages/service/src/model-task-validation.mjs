@@ -1,17 +1,20 @@
 import { isDeepStrictEqual } from 'node:util';
-import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, normalizeGeneratedExtractionRepair, parseGeneratedExtractionRepair,
-  normalizeGeneratedLongTermExtraction, parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
+import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair,
+  parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import * as analysis from '@suzu-memory/analysis';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA,
-  parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration, proposalSchemaForLimit } from '@suzu-memory/structurer';
+  MEMORY_STRUCTURE_SUMMARY_SCHEMA, parseStructureSummary,
+  parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration, proposalSchemaForLimit,
+  relationOutputSchema } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA,
   parseMemoryRetrievalContextProposal, parseMemoryRetrievalContextCritique } from '@suzu-memory/embedding-indexer';
 
 const tasks = new Map([
   ['memory-event-continuity-v2', [analysis.EVENT_CONTINUITY_SCHEMA, analysis.parseEventContinuity]],
-  ['long-term-memory-extraction-v2', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
-  ['long-term-memory-extraction-repair-v3', [LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair]],
-  ['memory-structure-proposals-v1', [MEMORY_STRUCTURE_OUTPUT_SCHEMA, parseStructureGeneration]],
+  ['long-term-memory-extraction-v4', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
+  ['long-term-memory-extraction-repair-v5', [LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair]],
+  ['memory-structure-proposals-v2', [MEMORY_STRUCTURE_OUTPUT_SCHEMA, parseStructureGeneration]],
+  ['memory-structure-summary-v1', [MEMORY_STRUCTURE_SUMMARY_SCHEMA, parseStructureSummary]],
   ['memory-relation-proposals-v1', [MEMORY_RELATION_OUTPUT_SCHEMA, parseRelationGeneration]],
   ['memory-subject-attribution-v1', [MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA, parseSubjectAttributionGeneration]],
   ['memory_retrieval_context_proposal_v1', [MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, parseMemoryRetrievalContextProposal]],
@@ -54,6 +57,12 @@ function declaredProposalSchema(template, declared) {
   return expected;
 }
 
+function declaredRelationSchema(declared) {
+  const template = relationOutputSchema(MEMORY_RELATION_OUTPUT_SCHEMA.properties.proposals.maxItems,
+    { excerpted: Object.hasOwn(declared?.properties || {}, 'needsFullEvidence') });
+  return declaredProposalSchema(template, declared);
+}
+
 // Only the keywords used by the registered owner contracts are supported.
 // This checks the declared wire shape before the existing domain parser (some
 // legacy parsers normalize values); it never accepts an unregistered task.
@@ -67,7 +76,7 @@ function validateWireShape(schema, value, path = 'output') {
   })) fail();
   const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
   const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-  if (!types.includes(type) && !(types.includes('integer') && Number.isInteger(value))) fail();
+  if (schema.type !== undefined && !types.includes(type) && !(types.includes('integer') && Number.isInteger(value))) fail();
   if (schema.enum && !schema.enum.some(item => isDeepStrictEqual(item, value))) fail();
   if (type === 'object') {
     if ((schema.required || []).some(key => !Object.hasOwn(value, key))) fail();
@@ -105,7 +114,8 @@ function resolveTaskParser(request) {
   const task = tasks.get(request?.schemaName);
   if (task) {
     if (task[1] === parseStructureGeneration || task[1] === parseRelationGeneration) {
-      const schema = declaredProposalSchema(task[0], request.schema);
+      const schema = task[1] === parseRelationGeneration ? declaredRelationSchema(request.schema)
+        : declaredProposalSchema(task[0], request.schema);
       return output => task[1](output, { maximumProposals: schema.properties.proposals.maxItems });
     }
     const specialist = definitions.find(item => item.definition.schemaName === request.schemaName);
@@ -116,7 +126,7 @@ function resolveTaskParser(request) {
   if (request?.schemaName === 'memory-consolidation-combined-v1') {
     const schemas = {
       structure: declaredProposalSchema(MEMORY_STRUCTURE_OUTPUT_SCHEMA, request.schema?.properties?.structure),
-      relations: declaredProposalSchema(MEMORY_RELATION_OUTPUT_SCHEMA, request.schema?.properties?.relations),
+      relations: declaredRelationSchema(request.schema?.properties?.relations),
     };
     if (!isDeepStrictEqual(request.schema, objectSchema(schemas))) {
       throw invalid('Combined consolidation requires exactly structure and relations.');
@@ -154,8 +164,6 @@ export function isMemoryStateAnalysisRequest(request) {
 
 export function validateMemoryTaskOutput(request, output) {
   const parse = resolveTaskParser(request);
-  if (parse === parseGeneratedLongTermExtraction) output = normalizeGeneratedLongTermExtraction(output);
-  if (parse === parseGeneratedExtractionRepair) output = normalizeGeneratedExtractionRepair(output);
   validateWireShape(request.schema, output);
   return parse(output);
 }

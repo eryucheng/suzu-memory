@@ -315,24 +315,6 @@ test("keeps a provider failure as audit only and writes no merged value evidence
   fixture.database.close();
 });
 
-test("rejects a current-state comparison that invents an absent value", async () => {
-  const fixture = setup();
-  const record = fixture.add({
-    id: "invented-current-value",
-    content: "用户明确说守信对自己很重要。",
-    sourceContent: "守信对我很重要。",
-  });
-  const result = await evaluate(fixture, record, analyzersFor(record, {
-    currentStatePresent: true,
-    relation: "supports",
-    scopeOverlap: "exact",
-  }));
-  assert.equal(result.status, "incomplete");
-  assert.deepEqual(result.failedRoles, ["currentRelation"]);
-  assert.deepEqual(result.observations, []);
-  fixture.database.close();
-});
-
 test("rejects a shared value holder instead of blending two people", async () => {
   const fixture = setup();
   const record = fixture.add({

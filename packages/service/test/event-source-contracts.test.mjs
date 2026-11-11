@@ -1,3 +1,4 @@
+import { retryCompanionExtractionRepair } from '../../ingestion/src/processing-stages.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,6 +12,7 @@ import { getEventSourceCleanup, openMemoryDatabase, MemoryRepository, SCHEMA_VER
 import { DatabaseSync } from 'node:sqlite';
 import { MIGRATIONS } from '../../core/src/schema.mjs';
 import { prepareEventContinuity, applyEventContinuity } from '@suzu-memory/analysis';
+import { readUsageEvents } from '@suzu-memory/usage-ledger';
 
 const owner = 'product-events';
 const timestamp = '2026-09-06T03:00:00.000Z';
@@ -92,7 +94,7 @@ test('public Event ingestion preserves actual other-Agent/Space identity, topolo
   assert.equal(utterance.subject_role, 'other');
   assert.equal(utterance.subject_key, 'agent-b');
   assert.equal(utterance.metadata.conversationTopology, 'space');
-  assert.deepEqual(validateMemoryExtractionOutput({ schemaName: 'long-term-memory-extraction-v2' }, { memories: [] }).memories, []);
+  assert.deepEqual(validateMemoryExtractionOutput({ schemaName: 'long-term-memory-extraction-v4' }, { memories: [] }).memories, []);
   assert.throws(() => memory.appendEventSources({ scope: scope(2), events: [source] }), { code: 'EVENT_SOURCE_FUTURE' });
   assert.throws(() => memory.appendEventSources({ scope: scope(), events: [{ ...source, source: { ...source.source, recipientAgentId: 'agent-b' } }] }), { code: 'EVENT_SOURCE_AGENT_CONFLICT' });
 });
@@ -274,6 +276,55 @@ test('event citation repair narrows both model bodies and scoped provenance to t
   assert.deepEqual(result.repair, { requested: 1, repaired: 1, sentToReview: 0 });
 });
 
+for (const invalidation of ['abort', 'clear']) test(`event continuity retains a completed receipt when its source guard rejects: ${invalidation}`, async t => {
+  const { memory } = fixture(t);
+  memory.appendEventSources({ scope: scope(2), events: [
+    event('receipt-plan', 1, '小明约好整理书单。'), event('receipt-finish', 2, '小明已整理完那份书单。'),
+  ] });
+  await archive(memory);
+  const sources = memory.withRepository(repository => repository.database.prepare('SELECT * FROM source_records').all());
+  for (const [id, content] of [['receipt-plan', '小明约好整理书单。'], ['receipt-finish', '小明已整理完那份书单。']]) {
+    const source = sources.find(row => row.content === content);
+    node(memory, id, content, [source.id]);
+  }
+  let start, release;
+  const started = new Promise(resolve => { start = resolve; });
+  const waiting = new Promise(resolve => { release = resolve; });
+  const controller = new AbortController();
+  let calls = 0;
+  const generator = async request => {
+    calls++;
+    start(); await waiting;
+    return { model: 'continuity-fixture', requestId: `completed-${invalidation}`,
+      usage: { inputTokens: 8, provider_echo: 'PRIVATE_RECEIPT_BODY' },
+      output: { matches: JSON.parse(request.input).events.map(({ memoryId }) => ({ memoryId,
+        resolution: 'new', candidateId: '', relation: '', memorySourceIds: [], candidateSourceIds: [], rationale: '另一件事。' })) } };
+  };
+  const embeddingProvider = Object.assign(async () => ({ model: 'test', vector: [1, 0] }), { model: 'test', dimensions: 2 });
+  const pending = memory.withRepository(async repository => {
+    const prepared = await prepareEventContinuity({ repository, agentId: memory.agentId,
+      memoryIds: ['receipt-finish'], generator, embeddingProvider });
+    return applyEventContinuity({ repository, agentId: memory.agentId, prepared, generator,
+      usageLedgerPath: memory.paths.usageLedgerPath });
+  }, { sourceScope: scope(2), signal: controller.signal });
+  const rejected = assert.rejects(pending, invalidation === 'abort'
+    ? { name: 'AbortError' } : { code: 'EVENT_SOURCE_EPOCH_CHANGED' });
+  await started;
+  if (invalidation === 'abort') controller.abort();
+  else memory.eraseEventSources({ id: 'clear-continuity-receipt',
+    scope: scope(2, [{ spaceId: 'direct-a', throughSequence: 2 }]) });
+  release();
+  await rejected;
+  assert.equal(calls, 1);
+  const { events: charges } = await readUsageEvents(memory.paths.usageLedgerPath);
+  assert.deepEqual(charges.map(charge => [charge.feature, charge.requestId, charge.usage.inputTokens]),
+    [['event-continuity', `completed-${invalidation}`, 8]]);
+  assert.ok(charges.every(charge => Object.keys(charge.metadata).length === 0));
+  assert.deepEqual(charges[0].usage, { inputTokens: 8 });
+  assert.ok(!fs.readFileSync(memory.paths.usageLedgerPath, 'utf8').includes('PRIVATE_RECEIPT_BODY'));
+  assert.ok(!memory.getMemory('receipt-finish')?.metadata?.eventContinuity);
+});
+
 test('committed fence rejects extraction and embedding late writes and lets newer Events proceed', async t => {
   const { memory } = fixture(t);
   memory.appendEventSources({ scope: scope(), events: [event('old', 1, 'LATE_ERASE_旧的雪山口令')] });
@@ -431,4 +482,35 @@ for (const stopPhase of ['fenced', 'database-cleaned']) test(`restart resumes re
   assert.equal(job.complete, true);
   assert.ok(!dump(restarted).includes('PROCESS_ERASE'));
   assert.ok(dump(restarted).includes('PROCESS_KEEP'));
+});
+
+test('review retries revalidate saved boundary context before sending it to a model', async t => {
+  const { memory } = fixture(t);
+  t.after(() => memory.close());
+  memory.appendEventSources({ scope: scope(), events: [
+    event('before-repair', 1, 'The dog is named Mochi.', 'old-context'),
+    event('core-repair', 2, 'I swam with that dog.'),
+    event('after-repair', 3, 'Then we went home.'),
+  ] });
+  const inputs = memory.withRepository(repository => repository.listInputEvents('agent-a', { statuses: ['pending'] }).items, { sourceScope: scope() });
+  const byText = text => inputs.find(input => input.content.text === text);
+  const result = await memory.processPendingEvents({ sourceScope: scope(), candidateEventIds: [byText('I swam with that dog.').id],
+    previousContextEvents: [byText('The dog is named Mochi.')], continuationGuidanceEvents: [byText('Then we went home.')],
+    generator: async request => ({ output: request.schemaName.endsWith('repair-v4')
+      ? { results: [{ candidateIndex: 0, status: 'pending', reason: 'Correction remains unresolved.' }] }
+      : { memories: [{ title: 'Swimming', content: 'Alice swam with Mochi.', classification: { category: 'event' },
+        subject: { name: 'Alice' }, actors: [], reality: 'real', evidenceMode: 'explicit', temporalState: 'historical',
+        time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'] }] } }),
+  });
+  const task = memory.withRepository(repository => repository.getMaintenanceTask('agent-a', result.generationDiagnostics.failureReviewTaskId), { sourceScope: scope() });
+  assert.equal(task.payload.extractionRepair.contextWindows[0].previousContextMessages[0].text, 'The dog is named Mochi.');
+  const freshScope = scope(20, [{ spaceId: 'old-context', throughSequence: 1 }]);
+  memory.eraseEventSources({ id: 'clear-old-repair-context', scope: freshScope });
+  let calls = 0;
+  await assert.rejects(memory.withRepository(repository => retryCompanionExtractionRepair({ repository, agentId: 'agent-a', task,
+    identity: memory.companionIdentity(), completedAt: timestamp, generator: async () => {
+      calls++;
+      return { output: { results: [{ candidateIndex: 0, status: 'pending', reason: 'Still unresolved.' }] } };
+    } }), { sourceScope: freshScope }), { code: 'EVENT_SOURCE_MATERIAL_INELIGIBLE' });
+  assert.equal(calls, 0);
 });

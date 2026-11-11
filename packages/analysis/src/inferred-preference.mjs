@@ -1,4 +1,5 @@
-import { materializePreferenceStateProposal, proposePreferenceState, resolvePreferenceStateProposal } from '@suzu-memory/core';
+import { materializePreferenceStateProposal, proposePreferenceState, resolvePreferenceStateProposal,
+  commonMemoryWorld, memoryWorldScope, memoryWorldsCompatible } from '@suzu-memory/core';
 import { simulatePreferenceFormation } from './preference-simulator.mjs';
 import { stateAnalysisBudgetError } from './request-budget.mjs';
 
@@ -30,7 +31,12 @@ export function accumulateInferredPreference({ repository, request, policy = DEF
 }
 
 function accumulate(repository, request, policy) {
+  const semantic = repository.getStateAnalysisRequestSemanticMemory(request.agent_id, request.id);
+  const world = semantic ? memoryWorldScope(semantic)
+    : commonMemoryWorld(request.memoryIds.map(id => repository.getMemory(id)));
+  if (!world) return { status: 'review-required', reason: 'preference-world-scope-needs-resolution', proposal: null };
   const observations = repository.listStateEvidenceObservations(request.agent_id, {
+    world,
     stateFamily: 'preference', subjectRole: request.subject_role, subjectKey: request.subject_key,
     canonicalKey: request.canonical_key, lifecycles: ['current'], limit: 1000,
   });
@@ -60,7 +66,7 @@ function accumulate(repository, request, policy) {
   const preview = simulatePreferenceFormation({ subjectRole: request.subject_role, subjectKey: request.subject_key,
     canonicalKey: request.canonical_key, evidence, policy, timeZone: repository.timeZone });
   let proposedLevel = LEVELS[preview.status];
-  const current = repository.getCurrentCanonicalMemory({ agentId: request.agent_id, subjectRole: request.subject_role,
+  const current = repository.getCurrentCanonicalMemory({ ...world, agentId: request.agent_id, subjectRole: request.subject_role,
     subjectKey: request.subject_key, canonicalKey: request.canonical_key, stateFamily: 'preference', representationLayer: 'inferred' });
   if (['conflicting-evidence', 'behavioral-opposition'].includes(preview.status)) {
     proposedLevel = current?.metadata?.preferenceStateLevel || 'no_conclusion';
@@ -83,12 +89,18 @@ function accumulate(repository, request, policy) {
       distinctSupportContexts: preview.distinctSupportContexts, choiceEvidenceCount: preview.choiceEvidenceCount },
     rationale: preview.reasons.join('; '), provenance: 'accumulated-preference-evidence-v1',
     metadata: { accumulatedPreference: true, observationIds: selected.map(item => item.id),
-      observationHashes },
+      observationHashes, ...(semantic ? { stateAnalysisRequestId: request.id, semanticMemoryId: semantic.id,
+        semanticMemorySnapshot: { title: semantic.title, content: semantic.content } } : {}) },
   });
   const pending = repository.listPreferenceStateProposals(request.agent_id, { canonicalKey: request.canonical_key, reviewStates: ['pending'], limit: 500 });
   for (const previous of pending) {
-    if (previous.id !== proposal.id && previous.metadata?.accumulatedPreference
-      && previous.subject_role === request.subject_role && previous.subject_key === request.subject_key) {
+    if (previous.id === proposal.id || !previous.metadata?.accumulatedPreference
+      || previous.subject_role !== request.subject_role || previous.subject_key !== request.subject_key) continue;
+    const previousObservations = (previous.metadata?.observationIds || []).map(id => repository.getStateEvidenceObservation(request.agent_id, id));
+    const previousWorld = previousObservations.length && previousObservations.every(Boolean)
+      ? commonMemoryWorld(previousObservations.map(item => item.world))
+      : commonMemoryWorld(previous.evidence.map(item => repository.getMemory(item.memoryId)));
+    if (previousWorld && memoryWorldsCompatible(world, previousWorld, { allowRealSpaces: true })) {
       resolvePreferenceStateProposal(repository, { agentId: request.agent_id, proposalId: previous.id,
         action: 'dismiss', resolvedBy: 'preference-accumulation', note: 'Replaced by an updated evidence accumulation.' });
     }

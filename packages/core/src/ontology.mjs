@@ -60,15 +60,30 @@ export const WORLD_FRAMES = values([
   "unknown",
 ]);
 
+export function memoryWorldScope(memory) {
+  if (!memory) return {};
+  return {
+    reality: memory.reality || memory.metadata?.reality || (['fictional', 'hypothetical', 'dream'].includes(memory.world_frame ?? memory.worldFrame)
+      ? memory.world_frame ?? memory.worldFrame : 'real'),
+    worldId: memory.world_id ?? memory.worldId ?? 'primary',
+    worldFrame: memory.world_frame ?? memory.worldFrame ?? 'unknown',
+  };
+}
+
+// No arbitrary first-world choice: a mixed set needs a fixed caller scope.
+export function commonMemoryWorld(memories, anchor = null) {
+  const nodes = memories.filter(Boolean);
+  const world = anchor || nodes[0];
+  return world && nodes.every(node => memoryWorldsCompatible(world, node, { allowRealSpaces: true }))
+    ? memoryWorldScope(world) : null;
+}
+
 export function memoryWorldsCompatible(left, right, { allowRealSpaces = false } = {}) {
-  const reality = memory => memory.reality || memory.metadata?.reality || (['fictional', 'hypothetical', 'dream'].includes(memory.world_frame ?? memory.worldFrame)
-    ? memory.world_frame ?? memory.worldFrame : 'real');
-  if (reality(left) !== reality(right)) return false;
-  const frame = memory => memory.world_frame ?? memory.worldFrame ?? 'unknown';
-  const world = memory => memory.world_id ?? memory.worldId ?? 'primary';
+  const leftWorld = memoryWorldScope(left), rightWorld = memoryWorldScope(right);
+  if (leftWorld.reality !== rightWorld.reality) return false;
   const ordinary = new Set(['physical', 'relational', 'unknown']);
-  return (allowRealSpaces && reality(left) === 'real' && ordinary.has(frame(left)) && ordinary.has(frame(right)))
-    || (world(left) === world(right) && frame(left) === frame(right));
+  return (allowRealSpaces && leftWorld.reality === 'real' && ordinary.has(leftWorld.worldFrame) && ordinary.has(rightWorld.worldFrame))
+    || (leftWorld.worldId === rightWorld.worldId && leftWorld.worldFrame === rightWorld.worldFrame);
 }
 
 export const EVIDENCE_MODES = values([

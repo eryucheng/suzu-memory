@@ -319,7 +319,7 @@ function requestSnapshotOptions(request, snapshotOptions) {
   };
 }
 
-function validatePreflight(request, snapshot) {
+function validatePreflight(repository, request, snapshot) {
   const visibleMemoryIds = exactSet(snapshot.memories.map((memory) => memory.id));
   const visibleSourceIds = exactSet(snapshot.sourceRecords.map((source) => source.id));
   if (!sameMembers(visibleMemoryIds, exactSet(request.memoryIds))) {
@@ -335,14 +335,14 @@ function validatePreflight(request, snapshot) {
     && !memory.actorRoles.some(role => ["subject", "speaker", "participant"].includes(role.role)
       && role.actorRole === request.subject_role && role.actorKey === request.subject_key)
   ))) {
-    // A third-party target is an extraction hypothesis, not the utterance's speaker.
-    // Resolve its name with the same host identities and evidence scope as extraction.
-    const name = clean(request.metadata?.subjectName);
-    const identity = resolveExtractedCandidateIdentity({
-      subjectRole: request.subject_role, subjectName: name, actorRoles: [],
-    }, request.agent_id, request.metadata?.actorIdentity || {});
-    if (!name || identity.subjectKey !== request.subject_key) {
-      return "request-subject-identity-mismatch";
+    // The request must still point at the captured extraction identity.
+    const decision = repository.getIngestionDecisionByBatchCandidate(request.agent_id, request.batch_id, request.candidate_index);
+    const candidate = decision?.candidate;
+    if (!candidate) return 'request-subject-identity-mismatch';
+    const identity = resolveExtractedCandidateIdentity(candidate, request.agent_id,
+      candidate.metadata?.actorIdentity || request.metadata?.actorIdentity || {});
+    if (candidate.subjectRole !== request.subject_role || !identity.subjectKey || identity.subjectKey !== request.subject_key) {
+      return 'request-subject-identity-mismatch';
     }
   }
   return "";
@@ -456,7 +456,7 @@ async function processStateAnalysisRequestInternal({
     memoryIds: request.memoryIds,
     ...boundedSnapshotOptions,
   });
-  const boundaryProblem = validatePreflight(request, preflight);
+  const boundaryProblem = validatePreflight(repository, request, preflight);
   if (boundaryProblem) return fallbackRequest(repository, request, boundaryProblem);
   const evidenceOnly = request.representation_layer === "inferred" && request.state_family !== "preference";
   const stateContext = evidenceOnly ? null

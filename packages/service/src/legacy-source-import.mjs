@@ -1,5 +1,5 @@
 import { appendMemoryEventSources } from './event-source-ingestion.mjs';
-import { normalizeEventSource, normalizeEventSourceScope, observeEventSourceScope, recordEventSourceConsumption, sourceHash } from '@suzu-memory/core';
+import { inputEventContentHash, normalizeEventSource, normalizeEventSourceScope, observeEventSourceScope, recordEventSourceConsumption, sourceHash } from '@suzu-memory/core';
 
 /** Offline provenance upgrade. Body, graph identities, extraction status and
  * historical model materials remain fixed; only Host source coordinates change. */
@@ -20,9 +20,8 @@ export function adoptExperienceSourceEvidence(memory, { scope: value, resolveSou
       }
       metadata.eventSource = source;
       metadata.eventSourceMigration = { version: 1, originalInputHash: row.input_hash };
-      const hash = sourceHash({ protocolVersion: row.protocol_version, eventType: row.event_type, actor: { role: row.actor_role, key: row.actor_key },
-        participants: JSON.parse(row.participants_json), world: { id: row.world_id, frame: row.world_frame }, occurredAt: row.occurred_at,
-        knownAt: row.known_at, content: JSON.parse(row.content_json), source: JSON.parse(row.source_json), metadata });
+      const hash = inputEventContentHash({ ...row, metadata, participants: JSON.parse(row.participants_json),
+        content: JSON.parse(row.content_json), source: JSON.parse(row.source_json) });
       repository.database.prepare('UPDATE memory_input_events SET metadata_json=?,input_hash=? WHERE id=? AND agent_id=?')
         .run(JSON.stringify(metadata), hash, row.id, memory.agentId); updated++;
     }

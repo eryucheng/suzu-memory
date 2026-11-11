@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,11 +11,11 @@ import { openMemoryDatabase } from "@suzu-memory/core";
 import { runMemoryEvaluationCli } from "../src/index.mjs";
 
 test("CLI enables the bound embedding route only when explicitly requested and reports its cost", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-evaluation-cli-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-memory-evaluation-cli-"));
   const databasePath = path.join(root, "memory.db");
   const casesPath = path.join(root, "cases.json");
   const dataRoot = path.join(root, "data");
-  openMemoryDatabase(databasePath).close();
+  closeAfterTests(openMemoryDatabase(databasePath)).close();
   fs.writeFileSync(casesPath, JSON.stringify({
     version: 1,
     cases: [{

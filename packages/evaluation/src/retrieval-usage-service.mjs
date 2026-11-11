@@ -124,6 +124,7 @@ export async function processRetrievalUsageRequest({
     callStatus = "completed";
   } catch (error) {
     callStatus = generation ? "rejected" : "failed";
+    generation ||= error;
     errorMessage = clean(error?.message) || "retrieval-usage-analysis-failed";
   }
   const warning = await appendUsage({

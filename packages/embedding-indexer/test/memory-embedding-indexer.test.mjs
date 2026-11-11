@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -5,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { MemoryRepository, openMemoryDatabase, withEventSourceExecution } from "@suzu-memory/core";
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 
 import {
   assessMemoryRetrievalContextNeed,
@@ -33,8 +35,8 @@ test('English retrieval context recognizes discourse references and negation wit
 });
 
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-indexer-"));
-  const database = openMemoryDatabase(path.join(root, "memory.db"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-memory-indexer-"));
+  const database = closeAfterTests(openMemoryDatabase(path.join(root, "memory.db")));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "relationship-state",
@@ -377,6 +379,37 @@ for (const [beforeDimensions, afterDimensions] of [[2, 3], [3, 2]]) {
   });
 }
 
+test('selected maintenance reads only selected bodies and reusable vectors from a large library', async t => {
+  const { repository, database } = fixture();
+  t.after(() => database.close());
+  repository.transaction(() => {
+    for (let index = 0; index < 401; index++) {
+      const memory = repository.upsertMemory({ id: `unrelated-${index}`, agentId: 'agent-test', kind: 'fact',
+        layer: 'semantic', content: `An independently recorded observation number ${index}.` });
+      repository.upsertEmbedding({ memoryId: memory.id, model: 'scoped', vector: [1, 0],
+        contentHash: memoryEmbeddingContentHash(memory) });
+    }
+  });
+  const original = repository.getMemory('unrelated-0');
+  repository.upsertMemory({ id: 'selected-copy', agentId: 'agent-test', kind: 'fact', layer: 'semantic', content: original.content });
+  const bodyReads = [], vectorReads = [];
+  const list = repository.listMemories.bind(repository), vectors = repository.readEmbeddingRows.bind(repository);
+  repository.listMemories = (...args) => { const page = list(...args); bodyReads.push(...page.items.map(row => row.id)); return page; };
+  repository.readEmbeddingRows = (...args) => { const rows = vectors(...args); vectorReads.push(...rows.map(row => row.memory_id)); return rows; };
+  const indexed = await syncMemoryEmbeddings({ repository, agentId: 'agent-test', memoryIds: ['selected-copy'],
+    embeddingProvider: Object.assign(async () => { throw new Error('Same content must reuse its stored vector.'); }, { model: 'scoped', dimensions: 2 }) });
+  assert.equal(indexed.copied, 1);
+  assert.deepEqual(bodyReads, ['selected-copy']);
+  assert.deepEqual(vectorReads, ['unrelated-0']);
+  assert.equal(repository.listEmbeddings('agent-test', 'scoped', { memoryIds: [] }).length, 0);
+  assert.equal(repository.listMemories('agent-test', { memoryIds: [] }).total, 0);
+  bodyReads.length = 0;
+  const skipped = await generateMemoryRetrievalContexts({ repository, agentId: 'agent-test', memoryIds: ['selected-copy'],
+    proposer: async () => { throw new Error('Self-contained text needs no context model.'); }, critic: async () => { throw new Error('No critic needed.'); } });
+  assert.equal(skipped.skipped, 1);
+  assert.deepEqual(bodyReads, ['selected-copy']);
+});
+
 test("copies only dimension-compatible same-content vectors instead of reusing an incompatible node vector", async t => {
   const { database, repository } = fixture();
   t.after(() => database.close());
@@ -541,17 +574,76 @@ test("records API usage and leaves existing vectors intact when a rebuild fails"
   database.close();
 });
 
-test("does not write a batch when vector dimensions are inconsistent", async () => {
-  const { database, repository } = fixture();
+test("does not write an inconsistent batch but records its API usage", async () => {
+  const { root, database, repository } = fixture();
+  const ledgerPath = path.join(root, 'failed-vector-usage.jsonl');
   const provider = fakeProvider({ dimensions: 4 });
   const result = await syncMemoryEmbeddings({
     repository,
     agentId: "agent-test",
     embeddingProvider: provider,
     dimensions: 3,
+    ledgerPath,
   });
   assert.equal(result.status, "error");
   assert.equal(repository.listEmbeddings("agent-test", provider.model).length, 0);
+  assert.ok(fs.existsSync(ledgerPath), 'A charged response must leave a usage receipt even when its vectors cannot be stored.');
+  const events = fs.readFileSync(ledgerPath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].usage.prompt_tokens, 30);
+  database.close();
+});
+
+test('charges each embedding response once across retry, rejection, and recovery', async () => {
+  const { root, database, repository } = fixture();
+  const ledgerPath = path.join(root, 'retried-vector-usage.jsonl');
+  let calls = 0;
+  const provider = Object.assign(async () => { throw new Error('Expected a batch request'); }, {
+    model: 'embedding-test', dimensions: 2,
+    embedMany: async texts => {
+      const receipt = { model: 'embedding-test', usage: { prompt_tokens: 11, total_tokens: 11 },
+        requestId: `charged-${++calls}` };
+      if (calls <= 2) throw Object.assign(new Error(calls === 1 ? 'HTTP 503: retry' : 'Invalid vector response'), receipt);
+      return { ...receipt, vectors: texts.map(() => [1, 0]) };
+    },
+  });
+  const options = { repository, agentId: 'agent-test', embeddingProvider: provider, ledgerPath, retryDelayMs: 1 };
+  const failed = await syncMemoryEmbeddings(options);
+  assert.equal(failed.status, 'error');
+  assert.equal(repository.listEmbeddings('agent-test', provider.model).length, 0);
+  const recovered = await syncMemoryEmbeddings(options);
+  assert.equal(recovered.status, 'ready');
+  assert.equal(recovered.added, 3);
+  const events = fs.readFileSync(ledgerPath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse);
+  assert.deepEqual(events.map(event => event.requestId), ['charged-1', 'charged-2', 'charged-3']);
+  assert.equal(events.reduce((sum, event) => sum + event.usage.prompt_tokens, 0), 33);
+  database.close();
+});
+
+test('cancelling embedding maintenance interrupts retry backoff and preserves its pending work', async () => {
+  const { database, repository } = fixture();
+  const controller = new AbortController();
+  let calls = 0, started;
+  const firstRequest = new Promise(resolve => { started = resolve; });
+  const provider = Object.assign(async () => {
+    calls++;
+    started();
+    throw new Error('HTTP 503: temporary failure');
+  }, { model: 'embedding-test', dimensions: 2 });
+  const work = withEventSourceExecution(repository, () => syncMemoryEmbeddings({
+    repository, agentId: 'agent-test', embeddingProvider: provider, retryDelayMs: 4000,
+  }), { signal: controller.signal });
+  const rejected = assert.rejects(work, { name: 'AbortError' });
+  await firstRequest;
+  await new Promise(resolve => setTimeout(resolve, 40));
+  const cancelledAt = performance.now();
+  controller.abort();
+  await rejected;
+  assert.ok(performance.now() - cancelledAt < 1000, 'Cancellation must not wait for the four-second retry delay.');
+  assert.equal(calls, 1);
+  assert.equal(repository.listEmbeddings('agent-test', provider.model).length, 0);
+  const retry = await syncMemoryEmbeddings({ repository, agentId: 'agent-test', embeddingProvider: fakeProvider() });
+  assert.equal(retry.added, 3);
   database.close();
 });
 
@@ -617,6 +709,38 @@ test("stores critic-approved retrieval context separately and sends it to FTS an
   assert.equal(replay.pending, 0);
   assert.equal(generator.calls.length, 1);
   database.close();
+});
+
+for (const failure of ['proposal', 'critic', 'persistence']) test(`retrieval context retains each receipt across ${failure} failure and recovery`, async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  repository.upsertMemory({ id: 'context-receipt', agentId: 'agent-test', kind: 'fact', layer: 'semantic',
+    content: '用户不再接受原来的安排。', subjectRole: 'user', subjectKey: 'user', reality: 'real' });
+  const charges = [];
+  let calls = 0;
+  let failed = false;
+  const store = repository.upsertMemoryRetrievalContext.bind(repository);
+  if (failure === 'persistence') repository.upsertMemoryRetrievalContext = (...args) => {
+    if (!failed) { failed = true; throw new Error('context storage failure'); }
+    return store(...args);
+  };
+  const generator = async request => {
+    const stage = request.analyzerRole.endsWith('proposer') ? 'proposal' : 'critic';
+    const receipt = { model: 'fixture', requestId: `context-${++calls}`, usage: { prompt_tokens: 7 } };
+    if (stage === failure && !failed) { failed = true; throw Object.assign(new Error('context provider failure'), receipt); }
+    return { ...receipt, output: stage === 'proposal'
+      ? { context: '这条记忆说明用户不再接受先前安排。', queryTerms: ['安排', '不再接受'] }
+      : { approved: true, issues: [] } };
+  };
+  const run = () => withUsageRecorder(charge => charges.push(charge), () => generateMemoryRetrievalContexts({
+    repository, agentId: 'agent-test', memoryIds: ['context-receipt'], proposer: generator, critic: generator,
+    ledgerPath: 'context-owner-unused.jsonl' }));
+  assert.equal((await run()).failed, 1);
+  assert.equal(charges.length, failure === 'proposal' ? 1 : 2);
+  assert.equal((await run()).added, 1);
+  assert.equal(charges.length, calls);
+  assert.equal(new Set(charges.map(charge => charge.requestId)).size, charges.length);
+  assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), calls * 7);
 });
 
 test("skips self-contained memories without calling either context model", async () => {

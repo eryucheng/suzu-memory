@@ -461,7 +461,3 @@ export const REWARD_CREDIT_HOLDOUT_V1 = Object.freeze({
   description: "84条完全原创、完全虚构、覆盖六类陪伴记忆表面的奖励归因留出案例。",
   cases: Object.freeze(cases),
 });
-
-export function loadRewardCreditHoldoutV1() {
-  return REWARD_CREDIT_HOLDOUT_V1;
-}

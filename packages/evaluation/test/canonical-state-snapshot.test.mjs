@@ -304,3 +304,19 @@ test("reviews complete long evidence and current state within the aggregate budg
   assert.equal(snapshot.observations[0].sources[0].content, content);
   assert.throws(() => build(fixture.repository, { maxSnapshotChars: 20_000 }), /complete 20000-character budget/);
 });
+
+
+test("complete review preserves pure fictional evidence and requires scope only for incompatible groups", t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const a = addObservation(repository, { id: 'fiction-one' });
+  const b = addObservation(repository, { id: 'fiction-two' });
+  for (const item of [a,b]) database.prepare("UPDATE memory_nodes SET reality='fictional',world_id='story-a',world_frame='fictional' WHERE id=?").run(item.memory.id);
+  assert.equal(build(repository).status, 'ready');
+  const real = addObservation(repository, { id: 'ordinary-real' });
+  assert.equal(build(repository).status, 'blocked');
+  const selected = build(repository, { world: { reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' } });
+  assert.equal(selected.status, 'ready');
+  assert.deepEqual(selected.snapshot.observations.map(item => item.memoryId).sort(), [a.memory.id,b.memory.id].sort());
+  database.prepare("UPDATE memory_nodes SET world_id='another-room',world_frame='physical' WHERE id=?").run(real.memory.id);
+  assert.equal(build(repository, { world: { reality: 'real', worldId: 'relationship', worldFrame: 'relational' } }).snapshot.observations.length, 1);
+});

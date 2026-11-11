@@ -12,9 +12,8 @@ function normalizeVector(input) {
   let norm = 0;
   for (const value of vector) norm += value * value;
   norm = Math.sqrt(norm);
-  if (norm > 0) {
-    for (let index = 0; index < vector.length; index += 1) vector[index] /= norm;
-  }
+  if (!norm) throw new Error("Embedding API 返回了零向量。");
+  for (let index = 0; index < vector.length; index += 1) vector[index] /= norm;
   return vector;
 }
 
@@ -52,6 +51,7 @@ export function createOpenAiCompatibleEmbeddingProvider({
     if (!secret) throw new Error("Embedding API Key 未配置。");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs)));
+    let receipt;
     try {
       const response = await fetchImplementation(
         actual.url,
@@ -73,21 +73,31 @@ export function createOpenAiCompatibleEmbeddingProvider({
       } catch {
         throw new Error(`Embedding API 返回非 JSON（HTTP ${response.status}）。`);
       }
+      receipt = {
+        model: parsed?.model || fixed.model,
+        usage: parsed?.usage || {},
+        requestId: response.headers.get("x-request-id") || parsed?.request_id || "",
+        metadata: { provider: "openai-compatible" },
+      };
       if (!response.ok) {
         throw new Error(`Embedding API 请求失败（HTTP ${response.status}）：${parsed?.error?.message || raw}`);
       }
       const data = Array.isArray(parsed?.data) ? [...parsed.data] : [];
-      data.sort((left, right) => Number(left?.index || 0) - Number(right?.index || 0));
       if (data.length !== texts.length) {
         throw new Error(`Embedding API 应返回 ${texts.length} 个向量，实际返回 ${data.length} 个。`);
       }
+      const indices = new Set(data.map(item => item?.index));
+      if (indices.size !== texts.length || [...indices].some(index => !Number.isInteger(index) || index < 0 || index >= texts.length)) {
+        throw new Error("Embedding API 返回的 index 未完整对应输入文本。");
+      }
+      data.sort((left, right) => left.index - right.index);
       return {
+        ...receipt,
         vectors: data.map((item) => normalizeVector(item?.embedding)),
-        model: parsed.model || fixed.model,
-        usage: parsed.usage || {},
-        requestId: response.headers.get("x-request-id") || parsed.request_id || "",
-        metadata: { provider: "openai-compatible" },
       };
+    } catch (error) {
+      if (receipt) Object.assign(error, receipt);
+      throw error;
     } finally {
       clearTimeout(timer);
     }

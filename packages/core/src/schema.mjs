@@ -1,8 +1,9 @@
 import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
-import { backfillSearchRows } from './search-index.mjs';
+import { backfillSearchRows, backfillConceptSearchRows } from './search-index.mjs';
 import { memoryWorldsCompatible } from './ontology.mjs';
+import { entityNameKeys } from './entity-identity.mjs';
 import { structureKnownAt } from './structure-policy.mjs';
-export const SCHEMA_VERSION = 48;
+export const SCHEMA_VERSION = 51;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2402,6 +2403,52 @@ export const MIGRATIONS = Object.freeze([
           update.run(knownAt, repairedAt, container.id);
         }
       }
+    },
+  },
+  {
+    version: 49, name: 'entity-identities-and-name-candidates', foreignKeysOff: true,
+    apply(database) {
+      database.exec(`
+        CREATE TABLE entities_by_id (
+          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, kind TEXT NOT NULL,
+          canonical_name TEXT NOT NULL, aliases_json TEXT NOT NULL DEFAULT '[]',
+          metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO entities_by_id SELECT * FROM entities;
+        DROP TABLE entities;
+        ALTER TABLE entities_by_id RENAME TO entities;
+        CREATE UNIQUE INDEX entities_id_agent ON entities(id, agent_id);
+        CREATE TABLE entity_names (
+          entity_id TEXT NOT NULL, agent_id TEXT NOT NULL, kind TEXT NOT NULL, name_key TEXT NOT NULL,
+          PRIMARY KEY(entity_id, name_key),
+          FOREIGN KEY(entity_id, agent_id) REFERENCES entities(id, agent_id) ON DELETE CASCADE
+        ) STRICT;
+        CREATE INDEX entity_names_lookup ON entity_names(agent_id, name_key, kind, entity_id);
+      `);
+      const insert = database.prepare('INSERT INTO entity_names(entity_id, agent_id, kind, name_key) VALUES (?, ?, ?, ?)');
+      for (const row of database.prepare('SELECT * FROM entities').all()) {
+        for (const key of entityNameKeys({ ...row, aliases: JSON.parse(row.aliases_json) })) insert.run(row.id, row.agent_id, row.kind, key);
+      }
+    },
+  },
+
+  {
+    version: 50, name: 'embedding-content-reuse-lookup',
+    apply(database) {
+      database.exec('CREATE INDEX memory_embeddings_content_reuse ON memory_embeddings(model, content_hash, memory_id)');
+    },
+  },
+  {
+    version: 51, name: 'concept-label-search-text',
+    apply(database) {
+      backfillConceptSearchRows(database);
+      for (const operation of ['INSERT', 'UPDATE', 'DELETE']) database.exec(`
+        CREATE TRIGGER retrieval_revision_memory_entities_${operation.toLowerCase()} AFTER ${operation} ON memory_entities
+        BEGIN UPDATE memory_meta SET value=lower(hex(randomblob(16))) WHERE key='retrieval-revision'; END;
+      `);
+      database.exec(`CREATE TRIGGER retrieval_revision_concept_names AFTER UPDATE OF canonical_name,aliases_json ON entities
+        WHEN NEW.kind='concept' AND (OLD.canonical_name<>NEW.canonical_name OR OLD.aliases_json<>NEW.aliases_json)
+        BEGIN UPDATE memory_meta SET value=lower(hex(randomblob(16))) WHERE key='retrieval-revision'; END;`);
     },
   },
 ]);

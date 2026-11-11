@@ -10,7 +10,8 @@ const slots = new Set();
 const MAX_WORKERS = 2;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 function available() { for (const wake of [...slots]) wake(); }
-const errorValue = error => ({ name: error.name, message: error.message, code: error.code });
+const errorValue = error => ({ name: error.name, message: error.message, code: error.code,
+  model: error.model, usage: error.usage, requestId: error.requestId, metadata: error.metadata });
 let nextId = 0;
 
 async function stop(pool) {

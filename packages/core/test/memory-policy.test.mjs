@@ -618,3 +618,32 @@ test("keeps an invalid correction pending and can later dismiss it", () => {
   assert.equal(dismissed.decision.resolution_note, "证据不足，不进入长期记忆。");
   database.close();
 });
+
+
+test("canonical duplicate reinforcement respects reality and preserves the original compatible world", t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const real = applyMemoryCandidate(repository, explicitFact({ worldId: 'room-a', worldFrame: 'physical' }));
+  const fictional = applyMemoryCandidate(repository, explicitFact({ reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' }));
+  const otherStory = applyMemoryCandidate(repository, explicitFact({ reality: 'fictional', worldId: 'story-b', worldFrame: 'fictional' }));
+  assert.equal(fictional.status, 'created'); assert.equal(otherStory.status, 'created');
+  assert.notEqual(real.memory.id, fictional.memory.id);
+  const repeated = applyMemoryCandidate(repository, explicitFact({ reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' }));
+  assert.equal(repeated.status, 'reinforced'); assert.equal(repeated.memory.id, fictional.memory.id);
+  assert.deepEqual([repeated.memory.reality, repeated.memory.world_id, repeated.memory.world_frame], ['fictional', 'story-a', 'fictional']);
+  const ordinary = applyMemoryCandidate(repository, explicitFact({ worldId: 'relationship-b', worldFrame: 'relational' }));
+  assert.equal(ordinary.status, 'reinforced'); assert.equal(ordinary.memory.id, real.memory.id);
+  assert.deepEqual([ordinary.memory.world_id, ordinary.memory.world_frame], ['room-a', 'physical']);
+});
+
+test("canonical current selection applies world compatibility before LIMIT and keeps ordinary real spaces compatible", t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const target = { agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user', canonicalKey: 'world-current', representationLayer: 'inferred', stateFamily: 'preference' };
+  const add = (id, reality, worldId, worldFrame, day) => repository.upsertMemory({ ...target, id, kind: 'derived_hypothesis', layer: 'semantic', content: id,
+    reality, worldId, worldFrame, statePhase: 'active', temporalState: 'current', validFrom: `2026-07-${day}T00:00:00.000Z` });
+  add('real-old', 'real', 'room-a', 'physical', '01');
+  add('fiction-new', 'fictional', 'story-a', 'fictional', '02');
+  add('fiction-other', 'fictional', 'story-b', 'fictional', '03');
+  assert.equal(repository.getCurrentCanonicalMemory({ ...target, reality: 'real', worldId: 'room-b', worldFrame: 'relational' }).id, 'real-old');
+  assert.equal(repository.getCurrentCanonicalMemory({ ...target, reality: 'fictional', worldId: 'story-a', worldFrame: 'fictional' }).id, 'fiction-new');
+  assert.equal(repository.getCurrentCanonicalMemory({ ...target, reality: 'hypothetical', worldId: 'story-a', worldFrame: 'fictional' }), null);
+});

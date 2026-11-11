@@ -137,7 +137,7 @@ export function reviewReportedSelfConceptState({
     ...snapshotOptions,
     currentRepresentationLayer: "reported",
   });
-  if (baseResult.status === "skipped") return { ...baseResult, representationLayer: "reported", ...flags() };
+  if (baseResult.status !== "ready") return { ...baseResult, representationLayer: "reported", ...flags() };
   const snapshot = baseResult.snapshot;
   const candidates = snapshot.observations
     .map((observation) => candidateFromObservation(observation, Boolean(snapshot.currentState)))

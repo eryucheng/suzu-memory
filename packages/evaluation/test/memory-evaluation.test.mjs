@@ -1,3 +1,5 @@
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -35,7 +37,6 @@ function extractionCandidate(overrides = {}) {
     evidenceMode: "explicit",
     temporalState: "timeless",
     revisionAction: "add",
-    retentionReason: "identity",
     eventDate: "",
     eventStart: "",
     eventEnd: "",
@@ -64,7 +65,6 @@ function extractionCandidate(overrides = {}) {
 function publicIngestionOutput(caseId) {
   const episodicEvent = (overrides = {}) => extractionCandidate({
     kind: "event",
-    retentionReason: "episodic_event",
     temporalState: "historical",
     eventDate: "2026-07-01",
     eventStart: "2026-07-01T04:00:00.000Z",
@@ -117,7 +117,6 @@ function publicIngestionOutput(caseId) {
           confidence: 1,
         }],
         canonicalKey: "user:preference:technology-exhibition",
-        retentionReason: "explicit_preference",
       })],
     },
     "agent-guess-is-not-user-fact": { memories: [] },
@@ -152,7 +151,6 @@ function publicIngestionOutput(caseId) {
           confidence: 1,
         }],
         temporalState: "in_progress",
-        retentionReason: "open_loop",
         eventDate: "2026-07-06",
         eventStart: "2026-07-06T04:00:00.000Z",
       })],
@@ -169,17 +167,16 @@ function publicIngestionOutput(caseId) {
           { role: "participant", actorRole: "agent", actorName: "Suzu", confidence: 1 },
         ],
         temporalState: "planned",
-        retentionReason: "commitment",
         sourceRefs: ["M0001", "M0002"],
       })],
     },
   };
-  return outputs[caseId];
+  return extractionModelFixture(outputs[caseId]);
 }
 
 test("evaluates the current retriever with source ownership and private context omitted", async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-evaluation-"));
-  const databasePath = path.join(root, "memory.db"), database = openMemoryDatabase(databasePath);
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-memory-evaluation-"));
+  const databasePath = path.join(root, "memory.db"), database = closeAfterTests(openMemoryDatabase(databasePath));
   t.after(() => { database.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const repository = new MemoryRepository(database);
   repository.upsertMemory({ id: "event-museum", agentId: "agent-test", kind: "event", layer: "episodic",
@@ -427,7 +424,7 @@ test("records a failed expectation as baseline data instead of throwing", async 
 });
 
 test("writes private reports atomically and only includes context when requested", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-report-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-memory-report-"));
   const report = await runMemoryEvaluation({
     cases: [{
       id: "local-detail",
@@ -470,15 +467,14 @@ test("detects a user preference fabricated from an Agent guess", () => {
     "ingestion-cases.json",
   ));
   const item = loaded.cases.find((entry) => entry.id === "agent-guess-is-not-user-fact");
-  const result = evaluateIngestionResult(item, {
+  const result = evaluateIngestionResult(item, extractionModelFixture({
     memories: [extractionCandidate({
       kind: "preference",
       title: "喜欢科幻",
       content: "用户喜欢科幻。",
-      retentionReason: "explicit_preference",
       sourceRefs: ["M0002"],
     })],
-  });
+  }));
   assert.equal(result.passed, false);
   assert.deepEqual(
     result.assertions.filter((assertion) => !assertion.passed).map((assertion) => assertion.rule),
@@ -512,7 +508,7 @@ test("long-term extraction executor uses the production schema contract", async 
     messages: [{ ref: "M0001", role: "user", text: "今天下雨。", timestamp: "2026-08-01" }],
     expect: { maximumMemories: 0 },
   });
-  assert.equal(request.schemaName, "long-term-memory-extraction-v2");
+  assert.equal(request.schemaName, "long-term-memory-extraction-v4");
   assert.deepEqual(request.schema.required, ["memories"]);
   assert.equal(request.systemPrompt, "只输出结构化记忆。");
   assert.match(request.input, /\[M0001\]/u);

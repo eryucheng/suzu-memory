@@ -273,6 +273,14 @@ node examples/basic-host/basic-host.mjs --config ./suzu-memory.local.json
 
 示例写入一段虚构对话，执行记忆维护，再查询相关经历。输出包括导入、维护和检索结果，完整调用见[基础示例](examples/basic-host/basic-host.mjs)。
 
+### 接入题库评测
+
+提供统一的题库运行器，复用原配置建库、按历史时点只读答题，支持并发、断点续跑、三组对照和实时进度窗口。记忆组默认必须检索后作答。题库转换格式与评分器接入见[评测接口](docs/benchmark.md)。
+
+```sh
+node packages/evaluation/src/benchmark-cli.mjs --dataset ./examples/benchmark/dataset.json --config ./suzu-memory.local.json --output ./runtime/benchmark-example --open-progress
+```
+
 ### 在聊天应用中接入
 
 聊天类宿主可以使用适配器，在每轮对话前后各调用一次：

@@ -12,6 +12,7 @@ export {
   DEFAULT_RETRIEVAL_OPTIONS,
 } from "./retriever.mjs";
 export { retrieveMemories, closeRetrievalWorker, closeRetrievalWorkers } from './worker-dispatch.mjs';
+export { fitRecallRecords } from './context-renderer.mjs';
 
 export {
   collectBm25SeedScores,

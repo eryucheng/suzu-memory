@@ -1,3 +1,4 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -18,7 +19,7 @@ import {
 } from "../src/index.mjs";
 
 test('an empty memory graph starts with its owning Agent only, including legacy identity roots', () => {
-  const database = openMemoryDatabase(':memory:');
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
   const repository = new MemoryRepository(database);
   ensureCompanionRelationshipStructure({ repository, agentId: 'owner', companionName: 'Suzu',
     primaryUserId: 'human', primaryUserName: '小夏' });
@@ -33,7 +34,7 @@ test('an empty memory graph starts with its owning Agent only, including legacy 
 });
 
 test('centering the owner keeps the layout version and every other cached position', t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-owner-position-'));
+  const root = createTestDirectory(path.join(os.tmpdir(), 'suzu-owner-position-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const cachePath = path.join(root, 'layout.json');
   const positions = { 'topology:agent': { x: .7, y: .2, z: -.1 }, event: { x: -.5, y: .2, z: .3 }, topic: { x: .4, y: -.3, z: .1 } };
@@ -50,7 +51,7 @@ test('centering the owner keeps the layout version and every other cached positi
 });
 
 test('people connect to the owner and their own memories; shared events remain single nodes', () => {
-  const database = openMemoryDatabase(':memory:');
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
   const repository = new MemoryRepository(database);
   const agentId = 'owner';
   ensureCompanionRelationshipStructure({ repository, agentId, companionName: 'Suzu', createPrimaryRelationship: false });
@@ -89,10 +90,10 @@ test('people connect to the owner and their own memories; shared events remain s
 });
 
 test('confirmed identity aliases share one stable person node, including aliases of the owner', t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-person-alias-'));
+  const root = createTestDirectory(path.join(os.tmpdir(), 'suzu-person-alias-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const cachePath = path.join(root, 'layout.json');
-  const database = openMemoryDatabase(':memory:');
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
   const agentId = 'owner';
@@ -123,7 +124,7 @@ test('confirmed identity aliases share one stable person node, including aliases
 });
 
 test('multiple roles retain their edges but count one memory per person', t => {
-  const database = openMemoryDatabase(':memory:');
+  const database = closeAfterTests(openMemoryDatabase(':memory:'));
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
   repository.upsertMemory({ id: 'event', agentId: 'owner', kind: 'event', layer: 'episodic', content: '一起观察日食',
@@ -145,9 +146,9 @@ test('multiple roles retain their edges but count one memory per person', t => {
 });
 
 test("builds a stable structured-memory brain snapshot without raw utterances", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-brain-layout-"));
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-brain-layout-"));
   const cachePath = path.join(root, "brain-layout.json");
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "event-a",
@@ -234,8 +235,8 @@ test("builds a stable structured-memory brain snapshot without raw utterances", 
 });
 
 test("renders formal big neurons, state nodes, overlapping memberships, and all real edge families", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-brain-semantics-"));
-  const database = openMemoryDatabase(":memory:");
+  const root = createTestDirectory(path.join(os.tmpdir(), "suzu-brain-semantics-"));
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const event = repository.upsertMemory({
     id: "event-museum",
@@ -344,7 +345,7 @@ test("renders formal big neurons, state nodes, overlapping memberships, and all 
 });
 
 test("connects each person by identity and only uses recorded relationship memberships", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const identity = ensureCompanionRelationshipStructure({
     repository,

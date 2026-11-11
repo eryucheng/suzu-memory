@@ -1,5 +1,7 @@
+import { memoryWorldScope, commonMemoryWorld } from './ontology.mjs';
 import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 import { createHash } from "node:crypto";
+import { readStateAnalysisSemanticMemory } from './reported-state-policy.mjs';
 
 import {
   NON_STATE_SCOPE_KEY,
@@ -106,8 +108,7 @@ function directionForEvidence(item) {
   return "neutral";
 }
 
-function preferenceEvidenceSnapshot(repository, { agentId, memoryId, sourceIds }) {
-  const detail = repository.getMemoryDetail(agentId, memoryId);
+function preferenceEvidenceSnapshot(detail, { memoryId, sourceIds }) {
   if (!detail?.memory) throw new Error(`Preference proposal evidence ${memoryId} is unavailable.`);
   const sources = new Map(detail.sources.map((source) => [source.id, source]));
   if (sourceIds.some((sourceId) => !sources.has(sourceId))) {
@@ -180,8 +181,7 @@ function normalizeEvidence(repository, { agentId, subjectRole, subjectKey, evide
     if (!evidenceGroupId || !signal || !sourceIds.length) {
       throw new Error(`Preference proposal evidence ${memoryId} requires a group, signal, and direct sources.`);
     }
-    const evidenceSnapshotHash = preferenceEvidenceSnapshot(repository, {
-      agentId,
+    const evidenceSnapshotHash = preferenceEvidenceSnapshot(repository.getMemoryDetail(agentId, memoryId), {
       memoryId,
       sourceIds,
     });
@@ -328,7 +328,16 @@ export function proposePreferenceState(repository, input = {}) {
   if (representationLayer === "established") {
     throw new Error("Established preference requires the dedicated cross-layer promotion policy.");
   }
+  const evidence = normalizeEvidence(repository, {
+    agentId,
+    subjectRole,
+    subjectKey,
+    evidence: input.evidence,
+  });
+  if (!evidence.length) throw new Error("Preference state proposal requires evidence.");
+  const world = preferenceProposalWorld(repository, { agent_id: agentId, subject_role: subjectRole, subject_key: subjectKey, canonical_key: canonicalKey, metadata: object(input.metadata), evidence });
   const current = repository.getCurrentCanonicalMemory({
+    ...world,
     agentId,
     subjectRole,
     subjectKey,
@@ -341,13 +350,6 @@ export function proposePreferenceState(repository, input = {}) {
   if (requestedPreviousMemoryId && requestedPreviousMemoryId !== current?.id) {
     throw new Error("Preference state proposal does not target the current canonical state.");
   }
-  const evidence = normalizeEvidence(repository, {
-    agentId,
-    subjectRole,
-    subjectKey,
-    evidence: input.evidence,
-  });
-  if (!evidence.length) throw new Error("Preference state proposal requires evidence.");
   const currentLevel = inferredLevel(current);
   const transition = transitionFor({
     currentLevel,
@@ -434,8 +436,33 @@ export function proposePreferenceState(repository, input = {}) {
   });
 }
 
+function preferenceProposalWorld(repository, proposal) {
+  const semantic = readStateAnalysisSemanticMemory(repository, proposal);
+  if (semantic) return memoryWorldScope(semantic);
+  const observationIds = cleanStringList([
+    ...(proposal.metadata?.observationIds || []),
+    ...(proposal.metadata?.canonicalReview?.observationSnapshots || []).map(item => item.id),
+    ...proposal.evidence.map(item => item.label?.observationId || item.observationId),
+  ]);
+  if (observationIds.length) {
+    const observations = observationIds.map(id => repository.getStateEvidenceObservation(proposal.agent_id, id));
+    if (observations.some(item => !item || item.state_family !== 'preference' || item.subject_role !== proposal.subject_role
+      || item.subject_key !== proposal.subject_key || item.canonical_key !== proposal.canonical_key)) {
+      throw new Error('Preference proposal observation escaped its fixed target.');
+    }
+    const world = commonMemoryWorld(observations.map(item => item.world));
+    if (!world) throw new Error('Preference proposal observations cross incompatible worlds.');
+    return world;
+  }
+  const memories = proposal.evidence.map(item => repository.getMemory(item.memoryId));
+  const world = commonMemoryWorld(memories, semantic);
+  if (!world) throw new Error('Preference proposal evidence crosses incompatible worlds.');
+  return world;
+}
+
 function currentStateForProposal(repository, proposal) {
   const current = repository.getCurrentCanonicalMemory({
+    ...preferenceProposalWorld(repository, proposal),
     agentId: proposal.agent_id,
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
@@ -469,7 +496,9 @@ function validateCanonicalReviewSnapshot(repository, proposal) {
     ))) {
     throw new Error("Canonical preference review snapshot is incomplete; review it again.");
   }
+  const world = preferenceProposalWorld(repository, proposal);
   const currentObservations = repository.listStateEvidenceObservations(proposal.agent_id, {
+    world,
     stateFamily: "preference",
     subjectRole: proposal.subject_role,
     subjectKey: proposal.subject_key,
@@ -504,9 +533,10 @@ function validateCanonicalReviewSnapshot(repository, proposal) {
 
 function attachEvidence(repository, proposal, targetMemory, { pending = false } = {}) {
   const provenance = pending ? "pending-preference-state-proposal-v1" : "accepted-preference-state-proposal-v1";
+  const entityIds = new Set();
   for (const item of proposal.evidence) {
-    const currentSnapshotHash = preferenceEvidenceSnapshot(repository, {
-      agentId: proposal.agent_id,
+    const evidenceDetail = repository.getMemoryDetail(proposal.agent_id, item.memoryId);
+    const currentSnapshotHash = preferenceEvidenceSnapshot(evidenceDetail, {
       memoryId: item.memoryId,
       sourceIds: item.sourceIds,
     });
@@ -515,7 +545,7 @@ function attachEvidence(repository, proposal, targetMemory, { pending = false } 
     }
     if (item.direction === "neutral" || item.memoryId === targetMemory.id) continue;
     const relation = item.direction === "support" ? "supported_by" : "challenged_by";
-    const evidenceDetail = repository.getMemoryDetail(proposal.agent_id, item.memoryId);
+    for (const entity of evidenceDetail.entities) entityIds.add(entity.id);
     const sources = new Map((evidenceDetail?.sources || []).map((source) => [source.id, source]));
     for (const sourceId of item.sourceIds) {
       const source = sources.get(sourceId);
@@ -549,6 +579,7 @@ function attachEvidence(repository, proposal, targetMemory, { pending = false } 
       },
     });
   }
+  repository.linkMemoryEntities({ memoryId: targetMemory.id, entityIds: [...entityIds] });
 }
 
 function provisionalPreferenceId(proposal) {
@@ -563,14 +594,13 @@ export function materializePreferenceStateProposal(repository, { agentId, propos
   const existing = repository.getMemory(provisionalPreferenceId(proposal));
   if (existing) return { status: "existing", proposal, memory: existing };
   return repository.transaction(() => {
-    const first = repository.getMemory(proposal.evidence[0]?.memoryId);
+    const world = preferenceProposalWorld(repository, proposal);
     const memory = repository.upsertMemory({
       id: provisionalPreferenceId(proposal), agentId: proposal.agent_id,
       kind: proposal.proposed_kind, layer: "provisional", status: "archived",
       title: proposal.title, content: proposal.content,
       subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
-      canonicalKey: proposal.canonical_key, reality: "real", evidenceMode: "inferred",
-      worldId: first?.world_id, worldFrame: first?.world_frame,
+      canonicalKey: proposal.canonical_key, ...world, evidenceMode: "inferred",
       representationLayer: "inferred", stateFamily: "preference", stateScopeKey: proposal.state_scope_key,
       statePhase: "active", temporalState: "current", knownAt: proposal.known_at,
       validFrom: proposal.valid_from, confidence: Math.min(0.65, proposal.confidence), importance: 0.6,
@@ -696,7 +726,7 @@ export function resolvePreferenceStateProposal(repository, {
       subjectRole: proposal.subject_role,
       subjectKey: proposal.subject_key,
       canonicalKey: proposal.canonical_key,
-      reality: "real",
+      ...preferenceProposalWorld(repository, proposal),
       evidenceMode: DIRECT_LEVELS.has(proposal.proposed_level) ? "explicit" : "inferred",
       representationLayer: proposal.representation_layer,
       stateFamily: "preference",

@@ -68,11 +68,10 @@ test('cleanup keeps SQL and JSON references in their table namespace across live
   assert.equal(job.complete, true);
   assert.equal(job.result.backups, 1);
   const retainedTraceIds = [sharedId, 'source-namespace-trace', 'literal-id-trace'];
-  for (const [label, file] of [['live', memory.paths.databasePath], ['backup', backup.databasePath]]) {
+  for (const file of [memory.paths.databasePath, backup.databasePath]) {
     const database = openMemoryDatabase(file, { readOnly: true });
     try {
       const after = read(database);
-      t.diagnostic(JSON.stringify({ label, before, after }));
       assert.deepEqual(after.traces, before.traces.filter(row => retainedTraceIds.includes(row.id)));
       assert.deepEqual(after.feedback, before.feedback.filter(row => row.id === sharedId));
       assert.deepEqual(after.analyses, before.analyses.filter(row => row.id === 'erased-trace'));

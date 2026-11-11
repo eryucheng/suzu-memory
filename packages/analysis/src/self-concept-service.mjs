@@ -17,8 +17,10 @@ function stableBatchId({ agentId, subjectRole, subjectKey, canonicalKey, current
     clean(currentRepresentationLayer), uniqueStrings(memoryIds).sort().join("\u001f")].join("\u001e");
   return `self-concept-analysis-${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
 }
-function currentStateView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer) {
-  const current = repository.getCurrentCanonicalMemory({ agentId, subjectRole, subjectKey, canonicalKey,
+function currentStateView(repository, agentId, subjectRole, subjectKey, canonicalKey, representationLayer, world) {
+  if (!world) return null;
+  const current = repository.getCurrentCanonicalMemory({
+    ...world, agentId, subjectRole, subjectKey, canonicalKey,
     representationLayer, stateFamily: "self_concept" });
   if (!current) return null;
   if (!SELF_CONCEPT_MEMORY_KINDS.has(current.kind)) throw new Error("Self-concept canonicalKey currently resolves to a non-self-concept-compatible memory kind.");
@@ -47,7 +49,6 @@ function enforceBoundary(role, analysis, snapshot) {
   }
   if (role === "current-relation") {
     const hasCurrent = Boolean(snapshot.currentState);
-    if (analysis.currentStatePresent !== hasCurrent) throw new Error("Self-concept current-state presence does not match the read-only snapshot.");
     if (hasCurrent && analysis.relation === "no_current_state") throw new Error("Self-concept relation cannot omit an available current state.");
     if (!hasCurrent && analysis.relation !== "no_current_state") throw new Error("Self-concept relation invented a current state.");
   }
@@ -186,11 +187,12 @@ export async function evaluateSelfConceptEvidence({
     currentRepresentationLayer, memoryIds: normalizedMemoryIds });
   const baseSnapshot = buildPreferenceEvidenceSnapshot({ repository, agentId, subjectRole, subjectKey, canonicalKey,
     memoryIds: normalizedMemoryIds, ...snapshotOptions });
+  const world = baseSnapshot.world;
   const snapshot = { ...baseSnapshot, agentId: clean(agentId),
     target: { ...baseSnapshot.target, stateFamily: "self_concept", selfConceptLabel: clean(selfConceptLabel),
       currentRepresentationLayer: clean(currentRepresentationLayer) },
     currentState: currentStateView(repository, clean(agentId), baseSnapshot.target.subjectRole,
-      baseSnapshot.target.subjectKey, baseSnapshot.target.canonicalKey, clean(currentRepresentationLayer)),
+      baseSnapshot.target.subjectKey, baseSnapshot.target.canonicalKey, clean(currentRepresentationLayer), world),
     inputPolicy: { ...baseSnapshot.inputPolicy, currentStateIsReadOnly: true,
       currentStateLayerIsFixedByCaller: Boolean(clean(currentRepresentationLayer)),
       modelCanChooseStateAction: false, modelSummaryCannotBecomeSubjectSelfConcept: true } };

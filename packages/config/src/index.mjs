@@ -6,7 +6,7 @@ import {
   createOpenAiCompatibleStructuredGenerator,
   DEFAULT_GENERATION_MAX_OUTPUT_TOKENS,
 } from "@suzu-memory/providers";
-import { WORLD_FRAMES } from "@suzu-memory/core";
+import { WORLD_FRAMES, currentEventSourceExecution } from "@suzu-memory/core";
 import { createMemoryService } from "@suzu-memory/service";
 import { DEFAULT_LENGTH_ARCHIVE_POLICY } from "@suzu-memory/ingestion";
 
@@ -263,8 +263,7 @@ export function createProvidersFromMemoryConfig(config, {
   const interventionConfig = config.providers.intervention;
   const embeddingConfig = config.providers.embedding;
   let resolvedGenerator = null;
-  const generator = generationConfig ? async (request) => {
-    resolvedGenerator ||= createOpenAiCompatibleStructuredGenerator({
+  const resolveGenerator = () => resolvedGenerator ||= createOpenAiCompatibleStructuredGenerator({
       connection: {
         ...generationConfig,
         apiKey: secret(generationConfig, environment, "Generation"),
@@ -272,12 +271,13 @@ export function createProvidersFromMemoryConfig(config, {
       fetchImpl,
       timeoutMs: generationConfig.timeoutMs,
       maxOutputTokens: generationConfig.maxOutputTokens,
+      getSignal: () => currentEventSourceExecution()?.signal,
     });
-    return resolvedGenerator(request);
-  } : null;
+  const generator = generationConfig ? async request => resolveGenerator()(request) : null;
   if (generator) {
     generator.supportsCombinedStateAnalysis = true;
     generator.supportsCombinedConsolidation = true;
+    generator.measureRequest = request => resolveGenerator().measureRequest(request);
   }
   let resolvedInterventionGenerator = null;
   const interventionGenerator = interventionConfig === generationConfig
@@ -291,6 +291,7 @@ export function createProvidersFromMemoryConfig(config, {
         fetchImpl,
         timeoutMs: interventionConfig.timeoutMs,
         maxOutputTokens: interventionConfig.maxOutputTokens,
+        getSignal: () => currentEventSourceExecution()?.signal,
       });
       return resolvedInterventionGenerator(request);
     } : null;

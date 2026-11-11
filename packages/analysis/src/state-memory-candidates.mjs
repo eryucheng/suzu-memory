@@ -1,3 +1,4 @@
+import { memoryWorldScope } from '@suzu-memory/core';
 import { createHash } from 'node:crypto';
 import { readReportedStateDraft, executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible, modelCalendarFields } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
@@ -22,6 +23,7 @@ function similarity(left, right) {
 }
 
 function storedTarget(memory, earlierRequest = null) {
+  if (memory.metadata?.stateTarget && Object.keys(memory.metadata.stateTarget).length) return memory.metadata.stateTarget;
   const stored = readReportedStateDraft(memory);
   if (earlierRequest) return earlierRequest.targetSpec;
   if (stored?.identityClaim) return { identityField: stored.identityClaim.identityField };
@@ -34,14 +36,19 @@ function storedTarget(memory, earlierRequest = null) {
 
 function targetCompatible(request, targetSpec) {
   if (!targetSpec) return true;
+  const prefix = { belief: 'object', relationship: 'counterpart', affective_association: 'trigger' }[request.state_family];
+  if (prefix && targetSpec[`${prefix}EntityId`] && request.targetSpec[`${prefix}EntityId`]
+    && targetSpec[`${prefix}EntityId`] !== request.targetSpec[`${prefix}EntityId`]) return false;
   if (request.state_family === 'identity') return targetSpec.identityField === request.targetSpec.identityField;
   if (request.state_family === 'relationship') return targetSpec.counterpartRole === request.targetSpec.counterpartRole
     && targetSpec.counterpartKey === request.targetSpec.counterpartKey
     && (!targetSpec.relationshipDimension || !request.targetSpec.relationshipDimension
       || targetSpec.relationshipDimension === request.targetSpec.relationshipDimension);
+  const sameEntity = prefix && targetSpec[`${prefix}EntityId`]
+    && targetSpec[`${prefix}EntityId`] === request.targetSpec[`${prefix}EntityId`];
   if (request.state_family === 'affective_association') return targetSpec.triggerRole === request.targetSpec.triggerRole
     && targetSpec.triggerKey === request.targetSpec.triggerKey
-    && (targetSpec.triggerRole !== 'world' || String(targetSpec.triggerLabel).normalize('NFKC').toLowerCase()
+    && (sameEntity || targetSpec.triggerRole !== 'world' || String(targetSpec.triggerLabel).normalize('NFKC').toLowerCase()
       === String(request.targetSpec.triggerLabel).normalize('NFKC').toLowerCase());
   return true;
 }
@@ -109,7 +116,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     ...ranked.slice(0, 2),
   ].map(item => [item.memory.id, item])).values()];
   const candidates = selected.map(({ memory, earlierRequest, targetSpec }) => ({ ...candidateView(repository, memory),
-    ...(targetSpec ? { targetSpec } : {}),
+    ...(targetSpec ? { targetSpec: Object.fromEntries(Object.entries(targetSpec).filter(([key]) => !key.endsWith('EntityId'))) } : {}),
     canonicalKey: earlierRequest?.canonical_key || memory.canonical_key }));
   const validityById = new Map(selected.map(({ memory }) => [memory.id, memory.valid_to]));
   // A persisted binding belongs to this request across retries. Only a successful
@@ -144,7 +151,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
       }
       context.selected = selected;
       if (selected && !selected.evidenceOnly) {
-        const latest = repository.getCurrentCanonicalMemory({ agentId: request.agent_id,
+        const latest = repository.getCurrentCanonicalMemory({ ...memoryWorldScope(draft), agentId: request.agent_id,
           subjectRole: request.subject_role, subjectKey: request.subject_key, canonicalKey: selected.canonicalKey,
           representationLayer: request.representation_layer, stateFamily: request.state_family,
           includePending: true, includeHistorical: true });

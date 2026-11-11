@@ -88,7 +88,7 @@ function reportedState(candidate, snapshot, propositionTarget) {
   };
 }
 
-function reviewResult(snapshot, reason, details = {}) {
+function reviewResult(reason, details = {}) {
   return {
     status: "review_required",
     reason,
@@ -134,7 +134,7 @@ export function reviewReportedBeliefState({
     ...snapshotOptions,
     currentRepresentationLayer: "reported",
   });
-  if (baseResult.status === "skipped") {
+  if (baseResult.status !== "ready") {
     return {
       ...baseResult,
       representationLayer: "reported",
@@ -172,7 +172,7 @@ export function reviewReportedBeliefState({
     const reason = selection.reason === "simultaneous-direct-state-conflict"
       ? "simultaneous-direct-belief-conflict"
       : "multiple-unresolved-direct-beliefs-without-change-cue";
-    return reviewResult(snapshot, reason, {
+    return reviewResult(reason, {
       snapshot,
       selectedObservationId: selection.selected?.observation.id || "",
       consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),
@@ -181,7 +181,7 @@ export function reviewReportedBeliefState({
   const selected = selection.selected;
   const action = snapshot.currentState ? actionAgainstCurrent(selected) : "create";
   if (action === "review_required") {
-    return reviewResult(snapshot, "latest-direct-belief-does-not-prove-a-safe-transition", {
+    return reviewResult("latest-direct-belief-does-not-prove-a-safe-transition", {
       snapshot,
       selectedObservationId: selected.observation.id,
       consideredObservationIds: selection.ordered.map((candidate) => candidate.observation.id),

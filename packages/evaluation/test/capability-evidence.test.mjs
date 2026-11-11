@@ -234,18 +234,6 @@ test("keeps a provider failure as audit only and writes no merged capability evi
   fixture.database.close();
 });
 
-test("rejects a current-state comparison that invents an absent capability", async () => {
-  const fixture = setup();
-  const record = fixture.add({ id: "invented-current-capability", content: "用户说自己会写脚本。",
-    sourceContent: "我会写这种脚本。" });
-  const result = await evaluate(fixture, record, analyzersFor(record, {
-    currentStatePresent: true, relation: "supports", scopeOverlap: "exact",
-  }));
-  assert.equal(result.status, "incomplete");
-  assert.deepEqual(result.failedRoles, ["timeCurrentRelation"]);
-  fixture.database.close();
-});
-
 test("compares a reported capability only against the reported current layer", async () => {
   const fixture = setup({ withCurrent: true, currentRepresentationLayer: "established" });
   const record = fixture.add({ id: "reported-layer-capability", content: "用户说自己会写脚本。",

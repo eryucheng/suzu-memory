@@ -482,7 +482,3 @@ export const REWARD_CREDIT_MINI_V1 = Object.freeze({
   description: "140条完全原创、完全虚构、可回放的陪伴型长期记忆奖励归因候选案例。",
   cases: Object.freeze(cases),
 });
-
-export function loadRewardCreditMiniV1() {
-  return REWARD_CREDIT_MINI_V1;
-}

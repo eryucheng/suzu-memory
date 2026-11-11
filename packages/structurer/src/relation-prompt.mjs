@@ -1,4 +1,4 @@
-import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit } from './prompt.mjs';
+import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit, proposalSchemaForLimit } from './prompt.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -37,11 +37,23 @@ export const MEMORY_RELATION_OUTPUT_SCHEMA = Object.freeze({
   },
 });
 
-export function buildRelationGenerationInput(snapshot) {
+export function relationOutputSchema(maximumProposals, { excerpted = false } = {}) {
+  const schema = proposalSchemaForLimit(MEMORY_RELATION_OUTPUT_SCHEMA, maximumProposals);
+  if (!excerpted) return schema;
+  return { ...schema, required: [...schema.required, 'needsFullEvidence'],
+    properties: { ...schema.properties, needsFullEvidence: { type: 'boolean' } } };
+}
+
+export function buildRelationGenerationInput(snapshot, { excerpted = false } = {}) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Memory relation generation requires a snapshot object.");
   }
-  return JSON.stringify(Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sourceMaterial')), null, 2);
+  const { memories, retrospectiveContext } = snapshot;
+  const sourceRecords = snapshot.sourceRecords.map(source => {
+    const range = excerpted && snapshot.sourceExcerpts?.get(source.id);
+    return range ? { ...source, content: source.content.slice(range.start, range.end), excerpt: true } : source;
+  });
+  return JSON.stringify({ memories, sourceRecords, retrospectiveContext });
 }
 
 export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS } = {}) {
@@ -66,6 +78,7 @@ export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXI
     throw new Error(`Memory relation generator returned more than ${limit} proposals.`);
   }
   return {
+    ...(Object.hasOwn(parsed, 'needsFullEvidence') ? { needsFullEvidence: parsed.needsFullEvidence } : {}),
     proposals: parsed.proposals.map((proposal, index) => {
       if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
         throw new Error(`Relation proposal ${index} must be an object.`);

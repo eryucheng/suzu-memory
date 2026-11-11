@@ -34,6 +34,7 @@ export function queueCounterpartRelationshipRequests(repository, request, evalua
   const existing = repository.listStateAnalysisRequests(request.agent_id, {
     stateFamily: 'relationship', batchId: request.batch_id, limit: 500,
   });
+  const original = repository.getIngestionDecisionByBatchCandidate(request.agent_id, request.batch_id, request.candidate_index)?.candidate;
   return repository.transaction(() => [...groups].flatMap(([key, group]) => {
     const sourceIds = [...group.sourceIds].sort();
     const subject = snapshot.counterpart;
@@ -58,21 +59,26 @@ export function queueCounterpartRelationshipRequests(repository, request, evalua
       canonicalKey, targetLabel, targetSpec, representationLayer: 'reported', evidenceMode: 'explicit',
       memoryIds: group.memories.map(memory => memory.id), sourceIds,
       metadata: { actorIdentity: request.metadata?.actorIdentity, sourceLanguage: request.metadata?.sourceLanguage,
+        entityIds: request.metadata?.entityIds || original?.entityIds || [],
         archiveWindowId: request.metadata?.archiveWindowId, subjectName: subject.label,
-        candidateKind: 'relationship', retentionReason: 'relationship', revisionAction: 'add', temporalState: 'unknown',
+        candidateKind: 'relationship', revisionAction: 'add', temporalState: 'unknown',
         extractionBatchId: batchId, generator: 'suzu-memory-relationship-direction-v1', reverseOfRequestId: request.id },
       createdAt: request.created_at,
     });
     if (result.wasInserted) repository.recordIngestionDecision({
       agentId: request.agent_id, batchId, candidateIndex: 0, decision: 'store', resultStatus: 'analysis_pending',
       candidate: { kind: 'relationship', stateFamily: 'relationship', title: targetLabel, content,
-        subjectRole: subject.subjectRole, subjectName: subject.label, canonicalKey,
+        subjectRole: subject.subjectRole, subjectName: subject.label, subjectKey: subject.subjectKey, canonicalKey,
         stateLabel: targetLabel, stateTarget: { counterpartRole: targetSpec.counterpartRole,
-          counterpartName: targetSpec.counterpartLabel, relationshipDimension: targetSpec.relationshipDimension },
-        reality: 'real', evidenceMode: 'explicit', temporalState: 'unknown', revisionAction: 'add',
-        retentionReason: 'relationship', actorRoles: [], sourceRefs: sourceIds, confidence: group.grounding.confidence,
+          counterpartName: targetSpec.counterpartLabel, counterpartKey: targetSpec.counterpartKey,
+          relationshipDimension: targetSpec.relationshipDimension },
+        reality: original?.reality || 'unknown', evidenceMode: 'explicit', temporalState: 'unknown', revisionAction: 'add',
+        entityIds: request.metadata?.entityIds || original?.entityIds || [],
+        metadata: { actorIdentity: request.metadata?.actorIdentity },
+        actorRoles: [], sourceRefs: sourceIds, confidence: group.grounding.confidence,
         importance: 0.5 },
-      sourceRefs: sourceIds, sourceIds, knownAt: group.memories[0].knownAt,
+      sourceRefs: sourceIds, sourceIds, knownAt: sources.map(source => Date.parse(source.knownAt))
+        .filter(Number.isFinite).sort((a, b) => a - b).map(time => new Date(time).toISOString())[0] || null,
     });
     return [result];
   }));

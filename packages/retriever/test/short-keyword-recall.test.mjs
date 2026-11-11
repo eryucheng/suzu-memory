@@ -116,14 +116,12 @@ test('returns the other participant’s pet statement with its original attribut
 
 test('spaced naming questions retain both statements for the reader', async () => {
   const perspective = { queryPerspective: { speakerRole: 'agent', speakerKey: agentId, addresseeRole: 'user', addresseeKey: 'user' } };
-  for (const [query, expectedId, excludedId] of [
-    ['我的猫 叫什么名字', 'agent-cat', 'cat'],
-    ['你的猫叫 什么名字', 'cat', 'agent-cat'],
-  ]) {
-    const result = await recall(query, undefined, perspective);
+  for (const query of ['我的猫 叫什么名字', '你的猫叫 什么名字']) {
+    const result = await recall(query, { maximumContextMemories: 2, maximumContextChars: 4000 }, perspective);
     assert.equal(result.status, 'ready', query);
-    assert.ok(result.candidates.some(candidate => candidate.memoryId === expectedId));
-    assert.ok(result.candidates.some(candidate => candidate.memoryId === excludedId));
+    assert.deepEqual(new Set(result.records.map(record => record.memoryId)), new Set(['cat', 'agent-cat']));
+    assert.match(result.context, /用户养的猫是橘猫，小名是小橘。/u);
+    assert.match(result.context, /助手养的猫是黑猫，小名是大白。/u);
   }
 });
 

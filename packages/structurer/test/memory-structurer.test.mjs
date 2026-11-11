@@ -1,19 +1,25 @@
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
 import { readUsageEvents } from "@suzu-memory/usage-ledger";
+import { syncMemoryEmbeddings } from '@suzu-memory/embedding-indexer';
+import { runSemanticTaskMaintenance } from '@suzu-memory/maintenance';
 import {
   MemoryRepository,
   openMemoryDatabase,
+  proposeMemoryStructure,
+  resolveMemoryStructureProposal,
 } from "@suzu-memory/core";
 
 import {
   buildRelationSnapshot,
+  buildRelationGenerationInput,
   buildStructureSnapshot,
+  buildStructureGenerationInput,
   planMemoryConsolidation,
   processPlannedConsolidationRuns,
   proposeSubjectAttributionForMemory,
@@ -21,10 +27,128 @@ import {
   proposeRelationsForBatch,
   proposeStructuresForBatch,
   runMemoryConsolidation,
+  prepareStructureGeneration,
+  runBudgetedMemoryParts,
 } from "../src/index.mjs";
 
+test('attachment repair sends surviving evidence and completes the superseded background task', async t => {
+  const { database, repository, topic } = fixture();
+  t.after(() => database.close());
+  for (const [id, content] of [['retained', 'They shared space news.'], ['incoming', 'They watched a rocket launch.']]) {
+    repository.upsertMemory({ id, agentId: 'agent-test', kind: 'event', layer: 'episodic', content });
+  }
+  const attach = (id, content) => proposeMemoryStructure(repository, { agentId: 'agent-test', operation: 'attach',
+    kind: 'topic', targetMemoryId: topic.id, memberIds: [id], content });
+  const removed = attach('batch-dinner', 'Museum visits and dinner.');
+  const retained = attach('retained', 'Museum visits, dinner and space news.');
+  resolveMemoryStructureProposal(repository, { agentId: 'agent-test', proposalId: retained.id, action: 'accept' });
+  resolveMemoryStructureProposal(repository, { agentId: 'agent-test', proposalId: removed.id, action: 'dismiss' });
+  const repair = repository.listMaintenanceTasks('agent-test', { taskTypes: ['structure-summary'], statuses: ['pending'] })[0];
+  assert.ok(repair);
+  const noOp = await proposeStructuresForBatch({ repository, agentId: 'agent-test', memoryIds: ['retained', 'incoming'],
+    nearbyContainerIds: [topic.id], generator: async request => {
+      assert.notEqual(request.schemaName, 'memory-structure-summary-v1', 'An unchanged membership must not trigger a paid summary.');
+      return { output: { proposals: [{ operation: 'attach', targetMemoryId: topic.id,
+        memberIds: ['retained'], content: 'An update without any new evidence.' }] } };
+    } });
+  assert.equal(noOp.rejected.length, 1);
+  assert.match(noOp.rejected[0].error, /at least one new member/);
+  const result = await proposeStructuresForBatch({ repository, agentId: 'agent-test', memoryIds: ['incoming'],
+    nearbyContainerIds: [topic.id], generator: async request => {
+      if (request.schemaName === 'memory-structure-summary-v1') {
+        assertMemoryTaskRequest(request);
+        const input = JSON.parse(request.input);
+        assert.ok(input.members.some(memory => memory.content === 'They shared space news.'));
+        assert.ok(input.members.some(memory => memory.content === 'They watched a rocket launch.'));
+        assert.ok(!input.members.some(memory => memory.content === repository.getMemory('batch-dinner').content));
+        return { output: { title: 'Exploring space', content: 'They explore space through museum visits, news and launches.' } };
+      }
+      return { output: { proposals: [{ operation: 'attach', targetMemoryId: topic.id, kind: 'topic',
+        memberIds: ['incoming'], content: 'An incomplete update based on the safe older summary.' }] } };
+    } });
+  assert.deepEqual(result.rejected, []);
+  assert.equal(repository.getMemory(topic.id).content, 'They explore space through museum visits, news and launches.');
+  await runSemanticTaskMaintenance({ repository, agentId: 'agent-test',
+    structureGenerator: async () => { throw new Error('Superseded work must not generate.'); } });
+  assert.equal(repository.getMaintenanceTask('agent-test', repair.id).status, 'completed');
+  assert.equal(repository.getMemory(topic.id).content, 'They explore space through museum visits, news and launches.');
+});
+
+test('failed combined-attachment summary is billed and retry preserves one complete membership update', async t => {
+  const { database, repository, topic } = fixture(); t.after(() => database.close());
+  repository.upsertMemory({ id: 'later', agentId: 'agent-test', kind: 'event', layer: 'episodic', content: 'They discussed a rocket launch.' });
+  const usageLedgerPath = path.join(createTestDirectory(path.join(os.tmpdir(), 'suzu-summary-usage-')), 'usage.jsonl');
+  let summaryAttempts = 0;
+  const generator = async request => {
+    if (request.schemaName === 'memory-structure-summary-v1') {
+      summaryAttempts++;
+      if (summaryAttempts === 1) throw Object.assign(new Error('Summary connection failed after a paid response.'), {
+        model: 'fixture', usage: { prompt_tokens: 57, completion_tokens: 9 }, requestId: 'failed-summary',
+      });
+      return { output: { title: 'Exploring space', content: 'They share an interest in space through museum visits and rocket launches.' },
+        model: 'fixture', usage: { prompt_tokens: 59, completion_tokens: 11 }, requestId: 'successful-summary' };
+    }
+    return { output: { proposals: ['batch-dinner', 'later'].map(id => ({ operation: 'attach', targetMemoryId: topic.id,
+      content: 'Shared space activities.', memberIds: [id] })) }, model: 'fixture',
+      usage: { prompt_tokens: 12, completion_tokens: 8 }, requestId: `grouping-${summaryAttempts}` };
+  };
+  const args = { repository, agentId: 'agent-test', memoryIds: ['batch-dinner', 'later'], nearbyContainerIds: [topic.id], generator, usageLedgerPath };
+  assert.equal((await proposeStructuresForBatch(args)).status, 'partial-failure');
+  assert.deepEqual(repository.listTopicMembers({ agentId: 'agent-test', topicId: topic.id }).map(row => row.id), ['batch-museum']);
+  const first = await readUsageEvents(usageLedgerPath);
+  assert.equal(first.events.length, 2);
+  assert.equal(first.events.filter(row => row.requestId === 'failed-summary').length, 1);
+  assert.equal(first.events.reduce((sum, row) => sum + row.usage.prompt_tokens, 0), 69);
+  const result = await proposeStructuresForBatch(args);
+  assert.equal(result.status, 'proposed'); assert.equal(result.proposed.length, 1);
+  assert.deepEqual(repository.listTopicMembers({ agentId: 'agent-test', topicId: topic.id }).map(row => row.id).sort(), ['batch-dinner', 'batch-museum', 'later']);
+  assert.match(repository.getMemory(topic.id).content, /rocket launches/);
+  assert.equal((await readUsageEvents(usageLedgerPath)).events.length, 4);
+});
+
+test('one batch updates a shared container from all new members, or keeps rejected work pending', async t => {
+  const { database, repository, topic } = fixture();
+  t.after(() => database.close());
+  repository.upsertMemory({ id: 'later', agentId: 'agent-test', kind: 'event', layer: 'episodic', content: 'They discussed the space exhibit again.' });
+  const members = ['batch-dinner', 'later'];
+  const overall = 'Their shared exploration of space includes museum visits and later conversations.';
+  const generator = async request => {
+    if (request.schemaName === 'memory-structure-summary-v1') {
+      const input = JSON.parse(request.input);
+      assert.ok(input.members.some(memory => memory.content === 'They discussed the space exhibit again.'));
+      assert.ok(input.members.some(memory => memory.content === repository.getMemory('batch-dinner').content));
+      assert.ok(input.members.every(memory => !Object.hasOwn(memory, 'id') && !Object.hasOwn(memory, 'subjectKey')));
+      return { output: { title: 'Exploring space', content: overall } };
+    }
+    return { output: { proposals: members.map(id => ({ operation: 'attach', targetMemoryId: topic.id,
+      kind: 'topic', title: '', content: repository.getMemory(id).content, memberIds: [id] })) } };
+  };
+  const args = { repository, agentId: 'agent-test', memoryIds: members, nearbyContainerIds: [topic.id], generator };
+  const parts = [{ id: 'shared-target', memoryIds: members, status: 'pending' }];
+  await runBudgetedMemoryParts({ parts, prepare: () => prepareStructureGeneration(args),
+    execute: (_part, preparedGeneration) => proposeStructuresForBatch({ ...args, preparedGeneration }), checkpoint() {} });
+  assert.equal(parts[0].status, 'completed');
+  assert.deepEqual(parts[0].result.rejected, []);
+  assert.equal(repository.getMemory(topic.id).content, overall);
+  assert.ok(members.every(id => repository.listTopicMembers({ agentId: 'agent-test', topicId: topic.id }).some(memory => memory.id === id)));
+
+  repository.upsertMemory({ id: 'unwritten', agentId: 'agent-test', kind: 'event', layer: 'episodic', content: 'A later space visit.' });
+  const staleArgs = { ...args, memoryIds: ['unwritten'] };
+  const pending = [{ id: 'stale-update', memoryIds: ['unwritten'], status: 'pending' }];
+  await assert.rejects(runBudgetedMemoryParts({ parts: pending, prepare: () => prepareStructureGeneration(staleArgs),
+    execute: (_part, preparedGeneration) => proposeStructuresForBatch({ ...staleArgs, preparedGeneration,
+      generator: async () => {
+        repository.editMemoryManually({ agentId: 'agent-test', memoryId: topic.id, patch: { content: 'Manual revision.' } });
+        return { output: { proposals: [{ operation: 'attach', kind: 'topic', targetMemoryId: topic.id,
+          memberIds: ['unwritten'], content: 'Stale update.' }] } };
+      } }), checkpoint() {} }),
+  { code: 'MEMORY_STRUCTURE_PARTIAL_FAILURE' });
+  assert.equal(pending[0].status, 'pending');
+  assert.equal(repository.getMemory(topic.id).content, 'Manual revision.');
+});
+
 function fixture() {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content, eventStart] of [
     ["batch-museum", "用户去了科技馆并参观航天展。", "2026-07-11T03:00:00.000Z"],
@@ -69,8 +193,118 @@ function fixture() {
   return { database, repository, topic };
 }
 
+test('structure generation groups undated evidence and evidence with only one known date in either language', async () => {
+  for (const language of ['zh', 'en']) for (const timed of [false, true]) for (const kind of ['episode', 'topic']) {
+    const database = closeAfterTests(openMemoryDatabase(':memory:'));
+    try {
+      const repository = new MemoryRepository(database);
+      const ids = ['first', 'second'];
+      for (const [index, id] of ids.entries()) repository.upsertMemory({id, agentId: 'grouping', kind: 'event', layer: 'episodic',
+        content: language === 'zh' ? ['林准备了旅行装备。', '林预订了这次旅行的营地。'][index]
+          : ['Lin packed for a hiking trip.', 'Lin booked the campsite for that trip.'][index],
+        knownAt: '2026-11-01T08:00:00Z', eventDate: timed && !index ? '2026-10-20' : null });
+      let calls = 0;
+      const result = await proposeStructuresForBatch({repository, agentId: 'grouping', memoryIds: ids,
+        generator: async request => {
+          calls++;
+          assertMemoryTaskRequest(request);
+          const output = {proposals: [{operation: 'create', kind, title: 'Trip',
+            content: language === 'zh' ? '林为徒步旅行准备装备并预订营地。' : 'Lin prepared equipment and booked a campsite for the hiking trip.',
+            subjectRole: 'unknown', subjectKey: '',
+            memberIds: ids, actorRoles: [], confidence: 0.9, rationale: 'The records describe the same trip.'}]};
+          validateMemoryTaskOutput(request, output);
+          return {output};
+        }});
+      assert.equal(calls, 1);
+      assert.equal(result.proposed.length, 1, JSON.stringify(result.rejected));
+      const saved = repository.getMemory(result.proposed[0].result_memory_id);
+      assert.equal(saved.event_date, kind === 'episode' && timed ? '2026-10-20' : null);
+      assert.equal(saved.event_start, null);
+    } finally { database.close(); }
+  }
+});
+
+test('attachment uses the same structure call to refresh its summary and rejects a stale generated update', async t => {
+  const {database, repository, topic} = fixture();
+  t.after(() => database.close());
+  const next = '参观航天展并在晚餐中交流，是两人共同探索航天的经历。';
+  let calls = 0;
+  const generate = async request => {
+    calls++;
+    const input = JSON.parse(request.input);
+    assert.equal(input.candidateContainers[0].content, topic.content);
+    const output = {proposals: [{operation: 'attach', targetMemoryId: topic.id, title: '', content: next,
+      memberIds: ['batch-dinner'], confidence: 0.9, rationale: 'Shared space exploration.'}]};
+    validateMemoryTaskOutput(request, output);
+    return {output};
+  };
+  const result = await proposeStructuresForBatch({repository, agentId: 'agent-test', memoryIds: ['batch-dinner'],
+    nearbyContainerIds: [topic.id], generator: generate});
+  assert.equal(calls, 1);
+  assert.equal(result.proposed.length, 1, JSON.stringify(result.rejected));
+  assert.equal(repository.getMemory(topic.id).content, next);
+  const embedded = [];
+  const embeddingProvider = Object.assign(async text => {
+    embedded.push(text);
+    return {model:'fixture',vector:[1,0]};
+  }, {model:'fixture',dimensions:2});
+  const indexing = {repository,agentId:'agent-test',embeddingProvider,memoryIds:[topic.id]};
+  await syncMemoryEmbeddings(indexing);
+  assert.equal(embedded.length,1);
+  assert.ok(embedded[0].includes(next));
+  assert.ok(!embedded[0].includes(topic.content));
+  assert.equal(repository.listEmbeddings('agent-test','fixture').length,1);
+  await syncMemoryEmbeddings(indexing);
+  assert.equal(embedded.length,1,'Unchanged summary reuses its stored vector.');
+  repository.upsertMemory({id: 'new-member', agentId: 'agent-test', kind: 'event', layer: 'episodic', content: '后来又分享了航天新闻。'});
+  const stale = await proposeStructuresForBatch({repository, agentId: 'agent-test', memoryIds: ['new-member'],
+    nearbyContainerIds: [topic.id], generator: async () => {
+      repository.editMemoryManually({agentId: 'agent-test', memoryId: topic.id, patch: {content: '用户修订的主题概述。'}});
+      return {output: {proposals: [{operation: 'attach', targetMemoryId: topic.id, kind: 'topic', title: '', content: '过时的生成结果。',
+        subjectRole: 'unknown', subjectKey: '', memberIds: ['new-member'], actorRoles: [], confidence: 0.9, rationale: 'stale'}]}};
+    }});
+  assert.equal(stale.proposed.length, 0);
+  assert.match(stale.rejected[0].error, /changed after generation/);
+  assert.equal(repository.getMemory(topic.id).content, '用户修订的主题概述。');
+  assert.equal(repository.listTopicMembers({agentId: 'agent-test', topicId: topic.id}).length, 2);
+});
+
+test('organization requests keep semantic material and leave local bookkeeping in their snapshots', t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  for (const [build, render] of [[buildStructureSnapshot, buildStructureGenerationInput],
+    [buildRelationSnapshot, buildRelationGenerationInput]]) {
+    const snapshot = build({ repository, agentId: 'agent-test', batchId: 'local-audit-batch',
+      memoryIds: ['batch-museum', 'batch-dinner'] });
+    const original = JSON.stringify(snapshot);
+    const material = JSON.parse(render(snapshot));
+    for (const key of ['schemaVersion', 'batchId', 'inputPolicy', 'omitted', 'sourceMaterial']) {
+      assert.equal(Object.hasOwn(material, key), false, key);
+    }
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (['schemaVersion', 'batchId', 'inputPolicy', 'omitted', 'sourceMaterial'].includes(key)) continue;
+      if (key === 'candidateContainers') {
+        for (const container of value) {
+          const modelContainer = material.candidateContainers.find(item => item.id === container.id);
+          assert.equal(modelContainer.content, container.content);
+          assert.equal(modelContainer.memberCount, container.memberIds.length);
+          for (const memory of material.memories) {
+            assert.equal(modelContainer.memberIds.includes(memory.id), container.memberIds.includes(memory.id));
+            assert.equal(modelContainer.addableMemberIds.includes(memory.id), !container.memberIds.includes(memory.id));
+          }
+        }
+        continue;
+      }
+      assert.deepEqual(material[key === 'currentMemories' ? 'memories' : key], value, key);
+    }
+    assert.ok(snapshot.inputPolicy);
+    assert.equal(snapshot.batchId, 'local-audit-batch');
+    assert.equal(JSON.stringify(snapshot), original);
+  }
+});
+
 function subjectAttributionFixture() {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -108,7 +342,7 @@ function subjectAttributionFixture() {
 
 test("creates only a pending bounded subject attribution proposal", async () => {
   const { database, repository, source, memory, allowedActors } = subjectAttributionFixture();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-subject-attribution-"));
+  const directory = createTestDirectory(path.join(os.tmpdir(), "suzu-subject-attribution-"));
   const ledgerPath = path.join(directory, "cost-ledger", "events.jsonl");
   let received = null;
   const result = await proposeSubjectAttributionForMemory({
@@ -147,8 +381,12 @@ test("creates only a pending bounded subject attribution proposal", async () => 
   assert.equal(result.proposal.review_state, "pending");
   assert.equal(repository.getMemory(memory.id).subject_role, "unknown");
   assert.equal(received.schemaName, "memory-subject-attribution-v1");
-  assert.match(received.systemPrompt, /speaker.*发话者/u);
-  assert.match(received.systemPrompt, /按正文确定经历者/u);
+  const sent = JSON.parse(received.input);
+  assert.equal(sent.memory.content, memory.content);
+  assert.deepEqual(sent.sources.map(({ id, speaker, content }) => ({ id, speaker, content })),
+    [{ id: source.id, speaker: 'User', content: source.content }]);
+  assert.deepEqual(new Set(sent.allowedActors.map(({ role, key, name }) => JSON.stringify({ role, key, name }))),
+    new Set(allowedActors.map(({ role, key, name }) => JSON.stringify({ role, key, name }))));
   assert.doesNotMatch(received.input, /private\/conversation/u);
   const ledger = await readUsageEvents(ledgerPath);
   assert.equal(ledger.events.length, 1);
@@ -278,7 +516,7 @@ test("builds a bounded proposal snapshot without raw evidence or metadata", () =
 
 test("records only pending create and attach proposals with metered fake generation", async () => {
   const { database, repository, topic } = fixture();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-structurer-"));
+  const directory = createTestDirectory(path.join(os.tmpdir(), "suzu-structurer-"));
   const ledgerPath = path.join(directory, "cost-ledger", "events.jsonl");
   let received = null;
   const generator = async (request) => {
@@ -291,7 +529,7 @@ test("records only pending create and attach proposals with metered fake generat
             targetMemoryId: topic.id,
             kind: "topic",
             title: "",
-            content: "",
+            content: "围绕航天展览、参观及同行讨论形成的兴趣主题。",
             subjectRole: "unknown",
             subjectKey: "",
             eventDate: null,
@@ -384,7 +622,7 @@ test("records only pending create and attach proposals with metered fake generat
     agentId: "agent-test",
     topicId: topic.id,
   }).length, 2);
-  assert.equal(received.schemaName, "memory-structure-proposals-v1");
+  assert.equal(received.schemaName, "memory-structure-proposals-v2");
   assert.equal(received.schema.type, "object");
   assert.doesNotMatch(received.input, /绝不能发送/u);
 
@@ -425,7 +663,7 @@ test("does not write proposals when generation fails", async () => {
 });
 
 function relationFixture() {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const directSource = repository.upsertSource({
     agentId: "agent-test",
@@ -476,9 +714,9 @@ test('structure and relation budgets reach the model and validator without fixed
           calls += 1;
           assertMemoryTaskRequest(request);
           assert.equal(request.schema.properties.proposals.maxItems, maximumProposals);
-          const proposal = kind === 'structure' ? { operation: 'create', targetMemoryId: '', kind: 'topic', title: 'Museum visit',
+          const proposal = kind === 'structure' ? { operation: 'create', kind: 'topic', title: 'Museum visit',
             content: 'A visit to the museum and dinner afterwards.', subjectRole: 'unknown', subjectKey: '',
-            eventDate: null, eventStart: null, eventEnd: null, memberIds: memoryIds, actorRoles: [], confidence: 0.9, rationale: 'A shared subject.' }
+            memberIds: memoryIds, actorRoles: [], confidence: 0.9, rationale: 'A shared subject.' }
             : { relation: 'causes', fromMemoryId: memoryIds[0], toMemoryId: memoryIds[1], evidenceSourceIds: [f.directSource.id], confidence: 0.9, rationale: 'The speaker explicitly describes the cause.' };
           const proposals = Array.from({ length: maximumProposals }, () => proposal);
           assert.equal(validateMemoryTaskOutput(request, { proposals }).proposals.length, maximumProposals);
@@ -517,7 +755,7 @@ test("builds a bounded causal snapshot with source evidence but no paths or meta
 
 test("turns generated causes into pending proposals without writing graph edges", async () => {
   const { database, repository, directSource, unrelatedSource } = relationFixture();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-relation-structurer-"));
+  const directory = createTestDirectory(path.join(os.tmpdir(), "suzu-relation-structurer-"));
   const ledgerPath = path.join(directory, "usage.jsonl");
   let received;
   const generator = async (request) => {
@@ -614,7 +852,7 @@ test("allows the relation generator to abstain without creating forced memories"
 });
 
 test("plans bounded retrospective consolidation without changing the memory graph", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const [id, content, agentId = "agent-test", kind = "event"] of [
     ["new-trigger", "用户刚明确说自己一直喜欢航天。"],
@@ -703,7 +941,7 @@ test("plans bounded retrospective consolidation without changing the memory grap
 });
 
 test("records an empty consolidation plan without calling a generator or inventing links", async () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   repository.upsertMemory({
     id: "isolated-trigger",
@@ -739,7 +977,7 @@ test("records an empty consolidation plan without calling a generator or inventi
 });
 
 test("honors an explicit zero consolidation candidate limit", () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const id of ["zero-trigger", "zero-neighbor"]) {
     repository.upsertMemory({
@@ -771,7 +1009,7 @@ test("honors an explicit zero consolidation candidate limit", () => {
 });
 
 function consolidationFixture() {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const sharedSource = repository.upsertSource({
     agentId: "agent-test",
@@ -862,7 +1100,7 @@ function retrospectiveStructureOutput() {
   };
 }
 
-test("runs retrospective consolidation as reviewable new-old proposals without changing the graph", async () => {
+test("retrospective consolidation materializes reviewable groups and leaves causal links pending", async () => {
   const { database, repository, plan, sharedSource } = consolidationFixture();
   const beforeNodes = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count);
   const beforeEdges = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count);
@@ -1150,7 +1388,7 @@ test("routes a consolidation lease crash on the final attempt to human review", 
 });
 
 test("processes a bounded planned batch, retries failures, and keeps later runs moving", async () => {
-  const database = openMemoryDatabase(":memory:");
+  const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   for (const id of ["fail-trigger", "fail-history", "ok-trigger", "ok-history"]) {
     repository.upsertMemory({

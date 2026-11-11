@@ -1,3 +1,4 @@
+import { ENTITY_KINDS } from './entity-identity.mjs';
 const SIMPLE_TARGET_FAMILIES = new Set([
   "preference",
   "habit",
@@ -37,6 +38,17 @@ function exactKeys(value, expected) {
   return keys.length === allowed.length && keys.every((key, index) => key === allowed[index]);
 }
 
+function entityFields(source, prefix) {
+  const id = source[`${prefix}EntityId`], kind = source[`${prefix}Kind`];
+  if (id === undefined && kind === undefined) return {};
+  if (!clean(id) || !ENTITY_KINDS.includes(kind)) throw new Error('State target entity identity is incomplete.');
+  return { [`${prefix}EntityId`]: clean(id), [`${prefix}Kind`]: kind };
+}
+
+function entityKeys(source, prefix) {
+  return [`${prefix}EntityId`, `${prefix}Kind`].filter(key => Object.hasOwn(source, key));
+}
+
 function invalid(stateFamily) {
   throw new Error(`State analysis targetSpec is invalid for ${stateFamily || "(empty)"}.`);
 }
@@ -64,7 +76,7 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
     return { identityField, fieldCardinality };
   }
   if (family === "belief") {
-    if (!exactKeys(source, ["objectRole", "objectKey", "objectLabel"])) return invalid(family);
+    if (!exactKeys(source, ["objectRole", "objectKey", "objectLabel", ...entityKeys(source, "object")])) return invalid(family);
     const objectRole = clean(source.objectRole);
     const objectKey = clean(source.objectKey);
     const objectLabel = clean(source.objectLabel);
@@ -72,11 +84,11 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
       return invalid(family);
     }
     if (objectRole === "world" && objectKey) return invalid(family);
-    return { objectRole, objectKey, objectLabel };
+    return { objectRole, objectKey, objectLabel, ...entityFields(source, "object") };
   }
   if (family === "relationship") {
     if (!exactKeys(source, [
-      "counterpartRole", "counterpartKey", "counterpartLabel", "direction",
+      "counterpartRole", "counterpartKey", "counterpartLabel", "direction", ...entityKeys(source, "counterpart"),
       ...(Object.hasOwn(source, "relationshipDimension") ? ["relationshipDimension"] : []),
     ])) return invalid(family);
     const counterpartRole = clean(source.counterpartRole);
@@ -87,17 +99,17 @@ export function normalizeStateAnalysisTargetSpec(stateFamily, value, { allowEmpt
       || direction !== "holder_to_counterpart") return invalid(family);
     const relationshipDimension = clean(source.relationshipDimension);
     if (Object.hasOwn(source, "relationshipDimension") && !RELATIONSHIP_DIMENSIONS.includes(relationshipDimension)) return invalid(family);
-    return { counterpartRole, counterpartKey, counterpartLabel, direction,
+    return { counterpartRole, counterpartKey, counterpartLabel, direction, ...entityFields(source, "counterpart"),
       ...(relationshipDimension ? { relationshipDimension } : {}) };
   }
   if (family === "affective_association") {
-    if (!exactKeys(source, ["triggerRole", "triggerKey", "triggerLabel"])) return invalid(family);
+    if (!exactKeys(source, ["triggerRole", "triggerKey", "triggerLabel", ...entityKeys(source, "trigger")])) return invalid(family);
     const triggerRole = clean(source.triggerRole);
     const triggerKey = clean(source.triggerKey);
     const triggerLabel = clean(source.triggerLabel);
     if (!OBJECT_ROLES.has(triggerRole) || !triggerLabel
       || (triggerRole === "world" ? triggerKey : !triggerKey)) return invalid(family);
-    return { triggerRole, triggerKey, triggerLabel };
+    return { triggerRole, triggerKey, triggerLabel, ...entityFields(source, "trigger") };
   }
   return invalid(family);
 }

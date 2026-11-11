@@ -28,6 +28,12 @@ export function createExtractionTimeValidator(messages = [], timeZone = DEFAULT_
     return parsedSources.get(ref);
   };
   return candidate => {
+    if (candidate.eventDate && candidate.eventStart
+      && candidate.eventDate !== dateKeyInTimeZone(candidate.eventStart, timeZone)) {
+      throw Object.assign(new Error('Temporal conflict: the event date and start time identify different days in ' + timeZone + '.'), {
+        code: 'MEMORY_EXTRACTION_TIME_CONFLICT',
+      });
+    }
     const sources = (candidate.sourceRefs || []).map(sourceFor);
     const dated = sources.filter(source => source.claims.length);
     const anchors = [...new Map(sources.filter(source => source.day).map(source => [source.day, source.anchor])).values()];

@@ -1,8 +1,9 @@
+import { normalizedEntityName, entityNameKey, entityNameKeys } from './entity-identity.mjs';
 import { retirePendingMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
-import { readReportedStateDraft } from "./reported-state-policy.mjs";
+import { stateAnalysisSemanticMemoryMatches, readStateAnalysisSemanticMemory, readReportedStateDraft } from "./reported-state-policy.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from './calendar-time.mjs';
-import { normalizedSearchDocument, removeSearchRows } from './search-index.mjs';
+import { normalizedSearchDocument, removeSearchRows, memoryConceptLabels, conceptSearchText, withSearchTransaction } from './search-index.mjs';
 import { cachedEmbeddingRows } from './embedding-cache.mjs';
 import { eventContinuityFingerprint, invalidateEventContinuity } from './event-continuity-policy.mjs';
 import { guardSourceEpoch, advanceEventSourceEpoch } from './event-source-state.mjs';
@@ -23,6 +24,7 @@ import {
   TEMPORAL_STATES,
   WORLD_FRAMES,
   memoryWorldsCompatible,
+  memoryWorldScope,
   isMemoryKindAllowedForStateFamily,
   isReportedStateActionAllowedForFamily,
   isStatefulMemoryKind,
@@ -62,6 +64,14 @@ function canonicalJson(value, fallback) {
 
 function canonicalHash(value) {
   return createHash("sha256").update(canonicalJson(value, {})).digest("hex");
+}
+
+export function inputEventContentHash(event) {
+  const { suzuMemoryProcessing: _processing, eventSourceMigration: _migration, ...metadata } = event.metadata || {};
+  return canonicalHash({ protocolVersion: Number(event.protocol_version), eventType: event.event_type,
+    actor: { role: event.actor_role, key: event.actor_key }, participants: event.participants,
+    world: { id: event.world_id, frame: event.world_frame }, occurredAt: event.occurred_at,
+    knownAt: event.known_at, content: event.content, source: event.source, metadata });
 }
 
 function parseJson(value, fallback) {
@@ -317,14 +327,6 @@ function normalizeRetrievalContext(row) {
   };
 }
 
-function normalizedEntityName(value) {
-  return String(value ?? "").normalize("NFKC").trim().replace(/\s+/gu, " ");
-}
-
-function entityNameKey(value) {
-  return normalizedEntityName(value).toLocaleLowerCase("zh-CN");
-}
-
 function normalizeIngestionDecision(row) {
   if (!row) return null;
   return {
@@ -536,10 +538,39 @@ function normalizeStateAnalysisRun(row, memoryIds = [], sourceIds = []) {
   };
 }
 
+// Both observation getters and list filters resolve the same fixed semantic provenance.
+// Legacy family observations record the request on their analyzer runs instead of payload.
+function stateEvidenceWorldRows() {
+  return `SELECT observation.*,
+    COALESCE(semantic.reality, evidence.reality) AS evidence_world_reality,
+    COALESCE(semantic.world_id, evidence.world_id) AS evidence_world_id,
+    COALESCE(semantic.world_frame, evidence.world_frame) AS evidence_world_frame
+  FROM memory_state_evidence_observations observation
+  JOIN memory_nodes evidence ON evidence.agent_id = observation.agent_id AND evidence.id = observation.memory_id
+  LEFT JOIN memory_state_analysis_requests request
+    ON request.agent_id = observation.agent_id AND request.id = COALESCE(
+      NULLIF(json_extract(observation.payload_json, '$.analysisRequest.id'), ''),
+      (SELECT CASE WHEN COUNT(DISTINCT json_extract(run.metadata_json, '$.stateAnalysisRequestId')) = 1
+        THEN MIN(json_extract(run.metadata_json, '$.stateAnalysisRequestId')) END
+       FROM memory_state_observation_runs link JOIN memory_state_analysis_runs run
+         ON run.agent_id = link.agent_id AND run.id = link.analysis_run_id
+       WHERE link.observation_id = observation.id
+         AND COALESCE(json_extract(run.metadata_json, '$.stateAnalysisRequestId'), '') <> ''))
+    AND request.state_family = observation.state_family AND request.subject_role = observation.subject_role
+    AND request.subject_key = observation.subject_key AND request.canonical_key = observation.canonical_key
+    AND EXISTS (SELECT 1 FROM memory_state_analysis_request_memories member
+      WHERE member.agent_id = request.agent_id AND member.request_id = request.id AND member.memory_id = observation.memory_id)
+  LEFT JOIN memory_nodes semantic
+    ON semantic.agent_id = request.agent_id AND semantic.id = json_extract(request.metadata_json, '$.semanticMemoryId')
+    AND state_analysis_semantic_matches(semantic.agent_id, semantic.status, semantic.metadata_json, request.agent_id, request.id)`;
+}
+
 function normalizeStateEvidenceObservation(row, sourceIds = [], analysisRunIds = []) {
   if (!row) return null;
+  const { evidence_world_reality, evidence_world_id, evidence_world_frame, ...stored } = row;
   return {
-    ...row,
+    ...stored,
+    world: { reality: evidence_world_reality, worldId: evidence_world_id, worldFrame: evidence_world_frame },
     sourceIds,
     analysisRunIds,
     supersedesObservationId: clean(row.supersedes_observation_id),
@@ -791,24 +822,37 @@ function nodeSnapshot(node) {
 export class MemoryRepository {
   constructor(database, { timeZone = DEFAULT_MEMORY_TIME_ZONE } = {}) {
     this.timeZone = timeZone;
+    // Restricted read adapters can wrap a connection whose functions are already registered.
+    if (typeof database.function === 'function') {
+      database.function('state_analysis_semantic_matches', { deterministic: true },
+        (agentId, status, metadata, requestedAgentId, requestId) => Number(stateAnalysisSemanticMemoryMatches(
+          { agent_id: agentId, status, metadata: parseJson(metadata, {}) }, { agentId: requestedAgentId, requestId },
+        )));
+      database.function('memory_worlds_compatible', { deterministic: true },
+        (reality, worldId, worldFrame, targetReality, targetWorldId, targetWorldFrame) => Number(memoryWorldsCompatible(
+          { reality, worldId, worldFrame }, { reality: targetReality, worldId: targetWorldId, worldFrame: targetWorldFrame },
+          { allowRealSpaces: true },
+        )));
+    }
     this.sourceEpoch = guardSourceEpoch(database, () => currentEventSourceExecution()?.signal?.throwIfAborted());
     this.database = this.sourceEpoch.database;
     this.transactionDepth = 0;
   }
 
-  transaction(callback) {
+  transaction(callback, { rollbackWhen = null } = {}) {
     const depth = this.transactionDepth;
     const sourceEpoch = this.sourceEpoch.checkpoint();
     const savepoint = `memory_nested_${depth}`;
     this.database.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
     this.transactionDepth += 1;
+    const declined = {};
+    let result;
     try {
-      const result = callback();
-      this.transactionDepth -= 1;
+      result = callback();
+      if (rollbackWhen?.(result)) throw declined;
       this.database.exec(depth === 0 ? "COMMIT" : `RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error) {
-      this.transactionDepth -= 1;
       if (depth === 0) {
         this.database.exec("ROLLBACK");
       } else {
@@ -816,7 +860,10 @@ export class MemoryRepository {
         this.database.exec(`RELEASE SAVEPOINT ${savepoint}`);
       }
       this.sourceEpoch.restore(sourceEpoch);
+      if (error === declined) return result;
       throw error;
+    } finally {
+      this.transactionDepth = depth;
     }
   }
 
@@ -970,19 +1017,10 @@ export class MemoryRepository {
       .every((value) => Number.isFinite(value.getTime()))) {
       throw new Error("Input event timestamps are invalid.");
     }
-    const semanticPayload = {
-      protocolVersion: Number(protocolVersion),
-      eventType: normalizedEventType,
-      actor: { role: normalizedActorRole, key: normalizedActorKey },
-      participants: normalizedParticipants,
-      world: { id: normalizedWorldId, frame: normalizedWorldFrame },
-      occurredAt: normalizedOccurredAt.toISOString(),
-      knownAt: normalizedKnownAt.toISOString(),
-      content: normalizedContent,
-      source: normalizedSource,
-      metadata: normalizedMetadata,
-    };
-    const inputHash = canonicalHash(semanticPayload);
+    const inputHash = inputEventContentHash({ protocol_version: protocolVersion, event_type: normalizedEventType,
+      actor_role: normalizedActorRole, actor_key: normalizedActorKey, participants: normalizedParticipants,
+      world_id: normalizedWorldId, world_frame: normalizedWorldFrame, occurred_at: normalizedOccurredAt.toISOString(),
+      known_at: normalizedKnownAt.toISOString(), content: normalizedContent, source: normalizedSource, metadata: normalizedMetadata });
     const existing = this.getInputEventByExternalId(normalizedAgentId, normalizedExternalId);
     if (existing) {
       if (existing.input_hash !== inputHash) {
@@ -1522,7 +1560,6 @@ export class MemoryRepository {
       const quarantineGroup = (group, code, message, details = {}) => {
         const ids = [...new Set(group.events.map((event) => clean(event.id)).filter(Boolean))];
         if (!ids.length) return null;
-        const placeholders = ids.map(() => "?").join(", ");
         const quarantine = {
           code,
           message,
@@ -2785,9 +2822,6 @@ export class MemoryRepository {
     const normalizedDate = clean(eventDate);
     const normalizedStart = clean(eventStart);
     const normalizedEnd = clean(eventEnd);
-    if (!normalizedDate && !normalizedStart) {
-      throw new Error("Episode requires eventDate or eventStart.");
-    }
     if (normalizedDate && !validIsoDate(normalizedDate)) {
       throw new Error("Episode eventDate must be a valid YYYY-MM-DD date.");
     }
@@ -3640,9 +3674,11 @@ export class MemoryRepository {
         representationLayer: request.representation_layer, evidenceMode: request.evidence_mode,
         reality: candidate.reality, worldId: evidence.world_id, worldFrame: evidence.world_frame,
         eventDate: candidate.eventDate || null, eventStart: candidate.eventStart || null,
-        knownAt: evidence.known_at, recordedAt: request.created_at,
-        metadata: { stateAnalysisDraft: true, stateAnalysisRequestId: request.id },
+        eventEnd: candidate.eventEnd || null,
+        knownAt: decision.known_at || evidence.known_at, recordedAt: request.created_at,
+        metadata: { stateAnalysisDraft: true, stateAnalysisRequestId: request.id, stateTarget: request.targetSpec },
       });
+      this.linkMemoryEntities({ memoryId: id, entityIds: request.metadata?.entityIds || [] });
       for (const sourceId of request.sourceIds) this.linkSource(id, sourceId, 'evidence', {
         authority: 'model_inference', provenance: 'state-analysis-semantic-memory-v1',
       });
@@ -3829,6 +3865,15 @@ export class MemoryRepository {
       });
       return { ...this.getStateAnalysisRequest(normalizedAgentId, requestId), wasInserted: true };
     });
+  }
+
+  getStateAnalysisRequestSemanticMemory(agentId, requestId) {
+    return normalizeNode(this.database.prepare(`SELECT semantic.* FROM memory_state_analysis_requests request
+      JOIN memory_nodes semantic ON semantic.agent_id = request.agent_id
+        AND semantic.id = json_extract(request.metadata_json, '$.semanticMemoryId')
+      WHERE request.agent_id = ? AND request.id = ?
+        AND state_analysis_semantic_matches(semantic.agent_id, semantic.status, semantic.metadata_json, request.agent_id, request.id)
+    `).get(clean(agentId), clean(requestId)));
   }
 
   getStateAnalysisRequest(agentId, requestId) {
@@ -4510,7 +4555,7 @@ export class MemoryRepository {
     const normalizedAgentId = clean(agentId);
     const normalizedObservationId = clean(observationId);
     const row = this.database.prepare(`
-      SELECT * FROM memory_state_evidence_observations WHERE agent_id = ? AND id = ?
+      SELECT * FROM (${stateEvidenceWorldRows()}) WHERE agent_id = ? AND id = ?
     `).get(normalizedAgentId, normalizedObservationId);
     if (!row) return null;
     const sourceIds = this.database.prepare(`
@@ -4530,6 +4575,7 @@ export class MemoryRepository {
     subjectKey = "",
     canonicalKey = "",
     memoryId = "",
+    world = null,
     qualifications = [],
     lifecycles = ["current"],
     limit = 200,
@@ -4570,13 +4616,18 @@ export class MemoryRepository {
       clauses.push(`lifecycle IN (${normalizedLifecycles.map(() => "?").join(", ")})`);
       parameters.push(...normalizedLifecycles);
     }
+    if (world) {
+      const scope = memoryWorldScope(world);
+      clauses.push('memory_worlds_compatible(evidence_world_reality, evidence_world_id, evidence_world_frame, ?, ?, ?)');
+      parameters.push(scope.reality, scope.worldId, scope.worldFrame);
+    }
     const sourceView = executionEventSourceView(this, normalizedAgentId);
     if (sourceView) {
       clauses.push('id IN (SELECT value FROM json_each(?))');
       parameters.push(JSON.stringify([...sourceView.observationIds]));
     }
     const rows = this.database.prepare(`
-      SELECT id FROM memory_state_evidence_observations
+      SELECT id FROM (${stateEvidenceWorldRows()})
       WHERE ${clauses.join(" AND ")}
       ORDER BY observed_at DESC, created_at DESC, id DESC LIMIT ?
     `).all(...parameters, Math.min(1000, Math.max(1, Math.trunc(Number(limit) || 200))));
@@ -4800,6 +4851,12 @@ export class MemoryRepository {
       reportedStateEvidenceSnapshot: evidenceSnapshot,
     });
 
+    const worldMemory = readStateAnalysisSemanticMemory(this, { agent_id: normalizedAgentId, metadata: proposalMetadata })
+      || this.getStateEvidenceObservation(normalizedAgentId, selected.id).world;
+    if (!metadata?.semanticMemoryId && observations.filter(item => item.evidenceRole === 'selected' || item.evidenceRole === 'contributing')
+      .some(item => !memoryWorldsCompatible(worldMemory, this.getStateEvidenceObservation(normalizedAgentId, item.id).world, { allowRealSpaces: true }))) {
+      throw new Error('Reported state contributing evidence crosses incompatible worlds.');
+    }
     const normalizedCreatedAt = new Date(createdAt).toISOString();
     const proposalHash = createHash("sha256").update(canonicalJson({
       agentId: normalizedAgentId,
@@ -4837,6 +4894,7 @@ export class MemoryRepository {
       WHERE proposal.agent_id = ? AND proposal.proposal_hash = ? AND memory.layer = 'provisional'
       LIMIT 1`).get(normalizedAgentId, proposalHash);
     const currentState = this.getCurrentCanonicalMemory({
+      ...memoryWorldScope(worldMemory),
       agentId: normalizedAgentId, subjectRole: normalizedSubjectRole, subjectKey: normalizedSubjectKey,
       canonicalKey: normalizedCanonicalKey, representationLayer: "reported", stateFamily: normalizedFamily,
       stateScopeKey: normalizedTargetScopeKey, includePending: true, excludeMemoryId: ownPendingState?.id,
@@ -5456,6 +5514,7 @@ export class MemoryRepository {
       throw new Error("State promotion source must be the exact active inferred state.");
     }
     const established = this.getCurrentCanonicalMemory({
+      ...memoryWorldScope(source),
       agentId: normalizedAgentId,
       subjectRole: normalizedSubjectRole,
       subjectKey: normalizedSubjectKey,
@@ -6446,6 +6505,22 @@ export class MemoryRepository {
     return row ? Number(row.candidate_index) + 1 : 0;
   }
 
+  listIngestionEntityBindings({ agentId, batchId, entityScopes }) {
+    const scopes = cleanStringList(entityScopes);
+    if (!clean(batchId) || !scopes.length) return [];
+    return this.database.prepare(`WITH scoped AS (
+      SELECT CASE WHEN json_type(resolved_candidate_json, '$.entityBindings') = 'object'
+        THEN resolved_candidate_json ELSE candidate_json END AS candidate
+      FROM memory_ingestion_decisions WHERE agent_id = ? AND batch_id = ?
+    ) SELECT DISTINCT entity.*, json_extract(scoped.candidate, '$.entityBindingScope') AS binding_scope,
+        reference.key AS binding_ref
+      FROM scoped JOIN json_each(scoped.candidate, '$.entityBindings') reference
+      JOIN entities entity ON entity.id = reference.value AND entity.agent_id = ?
+      WHERE json_extract(scoped.candidate, '$.entityScope') IN (SELECT value FROM json_each(?))
+      ORDER BY binding_scope, binding_ref, entity.id`).all(clean(agentId), clean(batchId), clean(agentId), JSON.stringify(scopes))
+      .map(row => ({ scope: row.binding_scope, ref: row.binding_ref, entity: normalizeEntity(row) }));
+  }
+
   listIngestionDecisions(agentId, {
     batchId = "",
     reviewState = "",
@@ -6536,12 +6611,14 @@ export class MemoryRepository {
     return this.getIngestionDecision(normalizedAgentId, normalizedDecisionId);
   }
 
-  listPendingProvisionalMemories(agentId, { limit = 500 } = {}) {
+  listPendingProvisionalMemories(agentId, { limit = 500, memoryIds = null } = {}) {
     const normalizedAgentId = clean(agentId);
     if (!normalizedAgentId) {
       throw new Error("listPendingProvisionalMemories requires agentId.");
     }
     const maximum = Math.min(5_000, Math.max(1, Math.trunc(Number(limit) || 500)));
+    const selected = memoryIds == null ? null : JSON.stringify([...new Set(memoryIds.map(clean).filter(Boolean))]);
+    const selection = selected == null ? '' : ' AND memory.id IN (SELECT value FROM json_each(?))';
     return this.database.prepare(`
       SELECT memory.*,
              decision.id AS provisional_decision_id,
@@ -6556,6 +6633,7 @@ export class MemoryRepository {
         AND decision.review_state = 'pending'
         AND memory.layer = 'provisional'
         AND memory.status <> 'deleted'
+        ${selection}
       UNION ALL
       SELECT memory.*, proposal.id AS provisional_decision_id,
              '[]' AS provisional_reason_codes_json, proposal.created_at AS provisional_created_at
@@ -6564,6 +6642,7 @@ export class MemoryRepository {
         AND json_extract(memory.metadata_json, '$.reportedStateProposalId') = proposal.id
       WHERE proposal.agent_id = ? AND proposal.review_state = 'pending'
         AND memory.layer = 'provisional' AND memory.status <> 'deleted'
+        ${selection}
       UNION ALL
       SELECT memory.*, proposal.id AS provisional_decision_id,
              '[]' AS provisional_reason_codes_json, proposal.created_at AS provisional_created_at
@@ -6572,9 +6651,10 @@ export class MemoryRepository {
         AND json_extract(memory.metadata_json, '$.preferenceProposalId') = proposal.id
       WHERE proposal.agent_id = ? AND proposal.review_state = 'pending'
         AND memory.layer = 'provisional' AND memory.status <> 'deleted'
+        ${selection}
       ORDER BY provisional_created_at DESC, provisional_decision_id ASC
       LIMIT ?
-    `).all(normalizedAgentId, normalizedAgentId, normalizedAgentId, maximum).map((row) => ({
+    `).all(...Array.from({ length: 3 }, () => selected == null ? [normalizedAgentId] : [normalizedAgentId, selected]).flat(), maximum).map((row) => ({
       ...normalizeNode(row),
       provisionalDecisionId: clean(row.provisional_decision_id),
       provisionalReasonCodes: parseJson(row.provisional_reason_codes_json, []),
@@ -9531,6 +9611,7 @@ export class MemoryRepository {
         throw new Error("Only a current structured affective state can be enabled for activation.");
       }
       const current = this.getCurrentCanonicalMemory({
+      ...memoryWorldScope(memory),
         agentId: normalizedAgentId,
         subjectRole: memory.subject_role,
         subjectKey: memory.subject_key,
@@ -9649,6 +9730,7 @@ export class MemoryRepository {
     query = "",
     statuses = ["active"],
     kinds = [],
+    memoryIds = null,
     limit = 50,
     offset = 0,
   } = {}) {
@@ -9664,6 +9746,10 @@ export class MemoryRepository {
     const skip = Math.max(0, Math.trunc(Number(offset) || 0));
     const clauses = ["agent_id = ?"];
     const parameters = [normalizedAgentId];
+    if (memoryIds != null) {
+      clauses.push('id IN (SELECT value FROM json_each(?))');
+      parameters.push(JSON.stringify([...new Set(memoryIds.map(clean).filter(Boolean))]));
+    }
     if (normalizedStatuses.length) {
       clauses.push(`status IN (${normalizedStatuses.map(() => "?").join(", ")})`);
       parameters.push(...normalizedStatuses);
@@ -9855,6 +9941,25 @@ export class MemoryRepository {
     return { ...after, eventContinuityInvalidatedMemoryIds: invalidatedMemoryIds };
   }
 
+  updateStructureSummary({ agentId, memoryId, title, content, proposalId = '', actor = 'memory-structurer', reason = '' }) {
+    const before = this.getMemory(memoryId);
+    if (!before || before.agent_id !== clean(agentId) || !['episode', 'topic'].includes(before.kind)
+      || before.status !== 'active' || !clean(content)) throw new Error('Structure summary requires an active container and nonempty content.');
+    const metadata = { ...before.metadata };
+      metadata.structureSummaryHash = createHash('sha256').update(JSON.stringify([clean(title), clean(content)])).digest('hex');
+    if (proposalId) metadata.structureSummaryProposalId = proposalId;
+    else delete metadata.structureSummaryProposalId;
+    return this.transaction(() => {
+      this.database.prepare(`UPDATE memory_nodes SET title = ?, content = ?, metadata_json = ?, updated_at = ?
+        WHERE agent_id = ? AND id = ?`).run(clean(title), clean(content), json(metadata, {}), nowIso(), before.agent_id, before.id);
+      this.database.prepare('DELETE FROM memory_embeddings WHERE memory_id = ?').run(before.id);
+      this.syncSearch(before.id);
+      const after = this.getMemory(before.id);
+      this.recordMutation({ agentId: before.agent_id, memoryId: before.id, action: 'edit', actor, reason, before, after });
+      return after;
+    });
+  }
+
   updateMemoryMetadata({
     agentId,
     memoryId,
@@ -9940,12 +10045,16 @@ export class MemoryRepository {
     subjectRole,
     subjectKey,
     canonicalKey,
+    reality = "",
+    worldId = "",
+    worldFrame = "",
     representationLayer = "",
     stateFamily = "",
     stateScopeKey = "",
     statuses = ["active"],
   }) {
     const normalizedStatuses = [...new Set(statuses.map(clean).filter(Boolean))];
+    const world = reality || worldId || worldFrame ? memoryWorldScope({ reality, worldId: worldId || undefined, worldFrame: worldFrame || undefined }) : null;
     const normalizedRepresentationLayer = clean(representationLayer);
     const normalizedStateFamily = clean(stateFamily);
     const normalizedStateScopeKey = clean(stateScopeKey)
@@ -9962,6 +10071,7 @@ export class MemoryRepository {
       throw new Error("Canonical memory stateScopeKey is invalid.");
     }
     if (!normalizedStatuses.length) return [];
+    const worldFilter = world ? "AND memory_worlds_compatible(reality, world_id, world_frame, ?, ?, ?)" : "";
     const representationFilter = normalizedRepresentationLayer ? "AND representation_layer = ?" : "";
     const stateFamilyFilter = normalizedStateFamily ? "AND state_family = ?" : "";
     const stateScopeFilter = normalizedStateScopeKey ? "AND state_scope_key = ?" : "";
@@ -9971,6 +10081,7 @@ export class MemoryRepository {
         AND subject_role = ?
         AND subject_key = ?
         AND canonical_key = ?
+        ${worldFilter}
         ${representationFilter}
         ${stateFamilyFilter}
         ${stateScopeFilter}
@@ -9981,6 +10092,7 @@ export class MemoryRepository {
       subjectRole,
       subjectKey,
       canonicalKey,
+      ...(world ? [world.reality, world.worldId, world.worldFrame] : []),
       ...(normalizedRepresentationLayer ? [normalizedRepresentationLayer] : []),
       ...(normalizedStateFamily ? [normalizedStateFamily] : []),
       ...(normalizedStateScopeKey ? [normalizedStateScopeKey] : []),
@@ -10011,15 +10123,23 @@ export class MemoryRepository {
     `).get(clean(agentId), clean(entityId)));
   }
 
-  findEntityByName({ agentId, kind, name }) {
-    const key = entityNameKey(name);
-    if (!key) return null;
-    const matches = this.listEntities(agentId, { kind }).filter((entity) => (
-      [entity.canonical_name, ...entity.aliases].some((label) => entityNameKey(label) === key)
-    ));
-    if (matches.length > 1) {
-      throw new Error(`Entity name is ambiguous for this Agent: ${normalizedEntityName(name)}`);
-    }
+  findEntitiesByNames({ agentId, names, kind = '' }) {
+    const keys = [...new Set(names.map(entityNameKey).filter(Boolean))];
+    if (!keys.length) return [];
+    return this.database.prepare(`SELECT DISTINCT entity.* FROM entity_names name
+      JOIN entities entity ON entity.id = name.entity_id AND entity.agent_id = name.agent_id
+      WHERE name.agent_id = ? AND name.name_key IN (SELECT value FROM json_each(?))
+        ${kind ? 'AND name.kind = ?' : ''} ORDER BY entity.id`)
+      .all(clean(agentId), JSON.stringify(keys), ...(kind ? [clean(kind)] : [])).map(normalizeEntity);
+  }
+
+  findEntitiesByName({ agentId, kind = '', name }) {
+    return this.findEntitiesByNames({ agentId, kind, names: [name] });
+  }
+
+  findEntityByName(options) {
+    const matches = this.findEntitiesByName(options);
+    if (matches.length > 1) throw new Error(`Entity name is ambiguous for this Agent: ${normalizedEntityName(options.name)}`);
     return matches[0] || null;
   }
 
@@ -10037,94 +10157,92 @@ export class MemoryRepository {
     if (!normalizedAgentId || !normalizedKind || !normalizedCanonicalName) {
       throw new Error("Entity requires agentId, kind, and canonicalName.");
     }
-    const requestedId = clean(id);
-    const byId = requestedId ? this.getEntity(normalizedAgentId, requestedId) : null;
-    const byName = this.findEntityByName({
-      agentId: normalizedAgentId,
-      kind: normalizedKind,
-      name: normalizedCanonicalName,
-    });
-    if (byId && byName && byId.id !== byName.id) {
-      throw new Error("Entity id and canonical name resolve to different existing entities.");
-    }
-    const existing = byId || byName;
-    const normalizedAliases = (Array.isArray(aliases) ? aliases : [])
-      .map(normalizedEntityName)
-      .filter(Boolean);
-    for (const alias of normalizedAliases) {
-      const conflict = this.findEntityByName({
-        agentId: normalizedAgentId,
-        kind: normalizedKind,
-        name: alias,
-      });
-      if (conflict && conflict.id !== existing?.id) {
-        throw new Error(`Entity alias already belongs to another entity: ${alias}`);
+    return this.transaction(() => {
+      const entityId = clean(id) || `entity-${randomUUID()}`;
+      const existing = this.getEntity(normalizedAgentId, entityId);
+      if (!existing && this.database.prepare('SELECT 1 FROM entities WHERE id = ?').get(entityId)) {
+        throw new Error('Entity id belongs to another Agent.');
       }
-    }
-    const entityId = existing?.id || requestedId || stableId(
-      "entity",
-      normalizedAgentId,
-      normalizedKind,
-      entityNameKey(normalizedCanonicalName),
-    );
-    const storedCanonicalName = existing?.canonical_name || normalizedCanonicalName;
-    const canonicalKey = entityNameKey(storedCanonicalName);
-    const mergedAliases = [
-      ...(existing?.aliases || []),
-      ...(existing && entityNameKey(normalizedCanonicalName) !== canonicalKey
-        ? [normalizedCanonicalName]
-        : []),
-      ...normalizedAliases,
-    ].filter((alias, index, values) => (
-      entityNameKey(alias) !== canonicalKey
-      && values.findIndex((candidate) => entityNameKey(candidate) === entityNameKey(alias)) === index
-    ));
-    const timestamp = nowIso();
-    this.database.prepare(`
-      INSERT INTO entities (
-        id, agent_id, kind, canonical_name, aliases_json,
-        metadata_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        kind = excluded.kind,
-        canonical_name = excluded.canonical_name,
-        aliases_json = excluded.aliases_json,
-        metadata_json = excluded.metadata_json,
-        updated_at = excluded.updated_at
-    `).run(
-      entityId,
-      normalizedAgentId,
-      normalizedKind,
-      storedCanonicalName,
-      json(mergedAliases, []),
-      json({ ...(existing?.metadata || {}), ...metadata }, {}),
-      existing?.created_at || timestamp,
-      timestamp,
-    );
-    return this.getEntity(normalizedAgentId, entityId);
+      if (existing && existing.kind !== normalizedKind) throw new Error('An existing entity cannot change its kind.');
+      const storedCanonicalName = normalizedCanonicalName;
+      const canonicalKey = entityNameKey(storedCanonicalName);
+      const mergedAliases = [...(existing?.aliases || []),
+        ...(existing && entityNameKey(existing.canonical_name) !== canonicalKey ? [existing.canonical_name] : []),
+        ...(Array.isArray(aliases) ? aliases : [])].map(normalizedEntityName).filter((alias, index, values) =>
+          alias && entityNameKey(alias) !== canonicalKey && values.findIndex(value => entityNameKey(value) === entityNameKey(alias)) === index);
+      const timestamp = nowIso();
+      this.database.prepare(`
+        INSERT INTO entities (
+          id, agent_id, kind, canonical_name, aliases_json,
+          metadata_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          kind = excluded.kind,
+          canonical_name = excluded.canonical_name,
+          aliases_json = excluded.aliases_json,
+          metadata_json = excluded.metadata_json,
+          updated_at = excluded.updated_at
+      `).run(
+        entityId,
+        normalizedAgentId,
+        normalizedKind,
+        storedCanonicalName,
+        json(mergedAliases, []),
+        json({ ...(existing?.metadata || {}), ...metadata }, {}),
+        existing?.created_at || timestamp,
+        timestamp,
+      );
+      this.database.prepare('DELETE FROM entity_names WHERE entity_id = ?').run(entityId);
+      const indexName = this.database.prepare('INSERT INTO entity_names(entity_id, agent_id, kind, name_key) VALUES (?, ?, ?, ?)');
+      for (const key of entityNameKeys({ canonicalName: storedCanonicalName, aliases: mergedAliases })) indexName.run(entityId, normalizedAgentId, normalizedKind, key);
+      if (existing?.kind === 'concept' && (existing.canonical_name !== storedCanonicalName
+        || JSON.stringify(existing.aliases) !== JSON.stringify(mergedAliases))) {
+        const linked = this.database.prepare('SELECT DISTINCT memory_id FROM memory_entities WHERE entity_id=?').all(entityId);
+        for (const row of linked) this.syncSearch(row.memory_id);
+      }
+      return this.getEntity(normalizedAgentId, entityId);
+    });
+  }
+
+  linkMemoryEntities({ memoryId, entityIds, role = "about" }) {
+    const ids = cleanStringList(entityIds);
+    if (!ids.length) return [];
+    return this.transaction(() => {
+      const memory = this.getMemory(memoryId);
+      if (!memory) throw new Error("Memory entity link requires an existing memory.");
+      const entities = this.database.prepare(`SELECT id, kind FROM entities WHERE agent_id = ?
+        AND id IN (SELECT value FROM json_each(?))`).all(memory.agent_id, JSON.stringify(ids));
+      if (entities.length !== ids.length) throw new Error("Memory entity link requires entities from the same Agent.");
+      const insert = this.database.prepare(`INSERT INTO memory_entities (memory_id, entity_id, role, created_at)
+        VALUES (?, ?, ?, ?) ON CONFLICT(memory_id, entity_id, role) DO NOTHING`);
+      const timestamp = nowIso(), normalizedRole = clean(role) || 'about';
+      let conceptChanged = false;
+      for (const entity of entities) {
+        const changed = insert.run(memory.id, entity.id, normalizedRole, timestamp);
+        if (changed.changes && entity.kind === 'concept') conceptChanged = true;
+      }
+      if (conceptChanged) this.syncSearch(memory.id);
+      return this.listMemoryEntities(memory.id).filter(entity => ids.includes(entity.id) && entity.link_role === normalizedRole);
+    });
   }
 
   linkMemoryEntity({ memoryId, entityId, role = "about" }) {
-    const memory = this.getMemory(memoryId);
-    if (!memory) throw new Error("Memory entity link requires an existing memory.");
-    const entity = this.getEntity(memory.agent_id, entityId);
-    if (!entity) throw new Error("Memory entity link requires an entity from the same Agent.");
-    const normalizedRole = clean(role) || "about";
-    this.database.prepare(`
-      INSERT INTO memory_entities (memory_id, entity_id, role, created_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(memory_id, entity_id, role) DO NOTHING
-    `).run(memory.id, entity.id, normalizedRole, nowIso());
-    return this.listMemoryEntities(memory.id).find((item) => (
-      item.id === entity.id && item.link_role === normalizedRole
-    ));
+    return this.linkMemoryEntities({ memoryId, entityIds: [entityId], role })[0];
   }
 
   unlinkMemoryEntity({ memoryId, entityId, role = "about" }) {
-    return Number(this.database.prepare(`
-      DELETE FROM memory_entities
-      WHERE memory_id = ? AND entity_id = ? AND role = ?
-    `).run(clean(memoryId), clean(entityId), clean(role) || "about").changes || 0);
+    return withSearchTransaction(this.database, () => {
+      const entity = this.database.prepare('SELECT kind FROM entities WHERE id=?').get(clean(entityId));
+      const changed = Number(this.database.prepare(`DELETE FROM memory_entities
+        WHERE memory_id = ? AND entity_id = ? AND role = ?`)
+        .run(clean(memoryId), clean(entityId), clean(role) || 'about').changes || 0);
+      if (changed && entity?.kind === 'concept') this.syncSearch(clean(memoryId));
+      return changed;
+    });
+  }
+
+  listMemoryConceptLabels({ agentId, memoryIds }) {
+    return memoryConceptLabels(this.database, clean(agentId), cleanStringList(memoryIds));
   }
 
   listMemoryEntities(memoryId) {
@@ -10153,6 +10271,30 @@ export class MemoryRepository {
       clean(entityId),
       ...normalizedStatuses,
     ).map(normalizeNode);
+  }
+
+  listEntityMemoryReferences({ agentId, entityIds, statuses = ['active'], eligibleMemoryIds = null }) {
+    const ids = cleanStringList(entityIds), states = cleanStringList(statuses);
+    const eligible = eligibleMemoryIds === null ? null : cleanStringList([...eligibleMemoryIds]);
+    if (!ids.length || !states.length || (eligible && !eligible.length)) return [];
+    const scope = eligible === null ? '' : 'AND memory.id IN (SELECT value FROM json_each(?))';
+    const parameters = [clean(agentId), JSON.stringify(states), ...(eligible === null ? [] : [JSON.stringify(eligible)])];
+    // Keep actor lookup anchored at the requested binding, so the role index
+    // uses actor_role/actor_key instead of visiting every role of the Agent.
+    return this.database.prepare(`WITH requested AS (SELECT value AS id FROM json_each(?)),
+      eligible AS (SELECT memory.id FROM memory_nodes memory
+        WHERE memory.agent_id=? AND memory.status IN (SELECT value FROM json_each(?)) ${scope})
+      SELECT link.entity_id AS entityId, link.memory_id AS memoryId, 'direct' AS source
+      FROM requested JOIN memory_entities link ON link.entity_id=requested.id
+      JOIN entities entity ON entity.id=link.entity_id AND entity.agent_id=?
+      JOIN eligible ON eligible.id=link.memory_id
+      UNION
+      SELECT binding.entity_id AS entityId, role.memory_id AS memoryId, 'actor' AS source
+      FROM requested CROSS JOIN actor_entity_bindings binding ON binding.entity_id=requested.id AND binding.agent_id=?
+      CROSS JOIN memory_actor_roles role ON role.agent_id=binding.agent_id
+        AND role.actor_role=binding.actor_role AND role.actor_key=binding.actor_key
+      JOIN eligible ON eligible.id=role.memory_id
+      ORDER BY entityId, memoryId, source`).all(JSON.stringify(ids), ...parameters, clean(agentId), clean(agentId));
   }
 
   getActorEntityBinding({ agentId, actorRole, actorKey }) {
@@ -10271,28 +10413,20 @@ export class MemoryRepository {
     if (bound) {
       const entity = this.getEntity(normalizedAgentId, bound.entity_id);
       if (!entity) throw new Error("Actor entity binding points to a missing entity.");
-      const canonicalKey = entityNameKey(entity.canonical_name);
-      const desiredAliases = [
-        ...entity.aliases,
-        ...(entityNameKey(normalizedDisplayName) === canonicalKey ? [] : [normalizedDisplayName]),
-        ...(Array.isArray(aliases) ? aliases : []),
-      ].map(normalizedEntityName).filter((alias, index, values) => (
-        alias && entityNameKey(alias) !== canonicalKey
-        && (!this.findEntityByName({ agentId: normalizedAgentId, kind: entity.kind, name: alias })
-          || this.findEntityByName({ agentId: normalizedAgentId, kind: entity.kind, name: alias }).id === entity.id)
-        && values.findIndex((candidate) => (
-          entityNameKey(candidate) === entityNameKey(alias)
-        )) === index
-      ));
+      const canonicalKey = entityNameKey(normalizedDisplayName);
+      const desiredAliases = [...entity.aliases,
+        ...(entityNameKey(entity.canonical_name) !== canonicalKey ? [entity.canonical_name] : []),
+        ...(Array.isArray(aliases) ? aliases : [])].map(normalizedEntityName).filter((alias, index, values) =>
+          alias && entityNameKey(alias) !== canonicalKey && values.findIndex(value => entityNameKey(value) === entityNameKey(alias)) === index);
       const desiredEntityMetadata = { ...entity.metadata, ...metadata };
-      const updated = canonicalJson(entity.aliases, []) === canonicalJson(desiredAliases, [])
+      const updated = entity.canonical_name === normalizedDisplayName && canonicalJson(entity.aliases, []) === canonicalJson(desiredAliases, [])
         && canonicalJson(entity.metadata, {}) === canonicalJson(desiredEntityMetadata, {})
         ? entity
         : this.upsertEntity({
           id: entity.id,
           agentId: normalizedAgentId,
           kind: entity.kind,
-          canonicalName: entity.canonical_name,
+          canonicalName: normalizedDisplayName,
           aliases: desiredAliases,
           metadata: desiredEntityMetadata,
         });
@@ -10307,20 +10441,11 @@ export class MemoryRepository {
       });
       return { entity: updated, binding, wasCreated: false };
     }
-    const entityKind = normalizedActorRole === 'agent' ? 'agent' : 'person';
-    const sameName = this.findEntityByName({ agentId: normalizedAgentId, kind: entityKind, name: normalizedDisplayName });
-    const identityName = sameName ? `${normalizedDisplayName} [${normalizedActorRole}:${normalizedActorKey}]` : normalizedDisplayName;
     const entity = this.upsertEntity({
-      id: stableId("actor-entity", normalizedAgentId, normalizedActorRole, normalizedActorKey),
-      agentId: normalizedAgentId,
-      kind: normalizedActorRole === "agent" ? "agent" : "person",
-      canonicalName: identityName,
-      aliases: (Array.isArray(aliases) ? aliases : []).filter(alias => !this.findEntityByName({ agentId: normalizedAgentId, kind: entityKind, name: alias })),
-      metadata: {
-        actorRole: normalizedActorRole,
-        actorKey: normalizedActorKey,
-        ...metadata,
-      },
+      id: stableId('actor-entity', normalizedAgentId, normalizedActorRole, normalizedActorKey),
+      agentId: normalizedAgentId, kind: normalizedActorRole === 'agent' ? 'agent' : 'person',
+      canonicalName: normalizedDisplayName, aliases,
+      metadata: { actorRole: normalizedActorRole, actorKey: normalizedActorKey, ...metadata },
     });
     const binding = this.bindActorEntity({
       agentId: normalizedAgentId,
@@ -10723,6 +10848,7 @@ export class MemoryRepository {
     representationLayer = "",
     stateFamily = "",
     stateScopeKey = ROOT_STATE_SCOPE_KEY,
+    reality = "",
     worldId = "",
     worldFrame = "",
     includePending = false,
@@ -10732,8 +10858,7 @@ export class MemoryRepository {
     const normalizedRepresentationLayer = clean(representationLayer);
     const normalizedStateFamily = clean(stateFamily);
     const normalizedStateScopeKey = clean(stateScopeKey) || ROOT_STATE_SCOPE_KEY;
-    const normalizedWorldId = clean(worldId);
-    const normalizedWorldFrame = clean(worldFrame);
+    const world = reality || worldId || worldFrame ? memoryWorldScope({ reality, worldId: worldId || undefined, worldFrame: worldFrame || undefined }) : null;
     if (normalizedRepresentationLayer && !REPRESENTATION_LAYERS.includes(normalizedRepresentationLayer)) {
       throw new Error("Current canonical memory representationLayer is invalid.");
     }
@@ -10746,8 +10871,7 @@ export class MemoryRepository {
     }
     const representationFilter = normalizedRepresentationLayer ? "AND representation_layer = ?" : "";
     const stateFamilyFilter = normalizedStateFamily ? "AND state_family = ?" : "";
-    const worldIdFilter = normalizedWorldId ? "AND world_id = ?" : "";
-    const worldFrameFilter = normalizedWorldFrame ? "AND world_frame = ?" : "";
+    const worldFilter = world ? "AND memory_worlds_compatible(reality, world_id, world_frame, ?, ?, ?)" : "";
     const current = normalizeNode(this.database.prepare(`
       SELECT * FROM memory_nodes
       WHERE agent_id = ?
@@ -10756,8 +10880,7 @@ export class MemoryRepository {
         AND canonical_key = ?
         ${representationFilter}
         ${stateFamilyFilter}
-        ${worldIdFilter}
-        ${worldFrameFilter}
+        ${worldFilter}
         AND state_scope_key = ?
         AND id <> ?
         AND (status = 'active' ${includePending ? `OR (
@@ -10780,8 +10903,7 @@ export class MemoryRepository {
       canonicalKey,
       ...(normalizedRepresentationLayer ? [normalizedRepresentationLayer] : []),
       ...(normalizedStateFamily ? [normalizedStateFamily] : []),
-      ...(normalizedWorldId ? [normalizedWorldId] : []),
-      ...(normalizedWorldFrame ? [normalizedWorldFrame] : []),
+      ...(world ? [world.reality, world.worldId, world.worldFrame] : []),
       normalizedStateScopeKey,
       clean(excludeMemoryId),
     ));
@@ -10797,11 +10919,15 @@ export class MemoryRepository {
     subjectRole,
     subjectKey,
     canonicalKey,
+    reality = "",
+    worldId = "",
+    worldFrame = "",
     representationLayer = "",
     stateFamily = "",
     stateScopeKey = ROOT_STATE_SCOPE_KEY,
     includeDeleted = false,
   }) {
+    const world = reality || worldId || worldFrame ? memoryWorldScope({ reality, worldId: worldId || undefined, worldFrame: worldFrame || undefined }) : null;
     const normalizedRepresentationLayer = clean(representationLayer);
     const normalizedStateFamily = clean(stateFamily);
     const normalizedStateScopeKey = clean(stateScopeKey) || ROOT_STATE_SCOPE_KEY;
@@ -10816,6 +10942,7 @@ export class MemoryRepository {
       throw new Error("Canonical history stateScopeKey is invalid.");
     }
     const statusFilter = includeDeleted ? "" : "AND status <> 'deleted'";
+    const worldFilter = world ? "AND memory_worlds_compatible(reality, world_id, world_frame, ?, ?, ?)" : "";
     const representationFilter = normalizedRepresentationLayer ? "AND representation_layer = ?" : "";
     const stateFamilyFilter = normalizedStateFamily ? "AND state_family = ?" : "";
     return this.database.prepare(`
@@ -10824,6 +10951,7 @@ export class MemoryRepository {
         AND subject_role = ?
         AND subject_key = ?
         AND canonical_key = ?
+        ${worldFilter}
         ${representationFilter}
         ${stateFamilyFilter}
         AND state_scope_key = ?
@@ -10835,6 +10963,7 @@ export class MemoryRepository {
       subjectRole,
       subjectKey,
       canonicalKey,
+      ...(world ? [world.reality, world.worldId, world.worldFrame] : []),
       ...(normalizedRepresentationLayer ? [normalizedRepresentationLayer] : []),
       ...(normalizedStateFamily ? [normalizedStateFamily] : []),
       normalizedStateScopeKey,
@@ -10875,7 +11004,7 @@ export class MemoryRepository {
       root.canonical_key,
       root.representation_layer,
       root.state_family,
-    ).map(normalizeNode);
+    ).map(normalizeNode).filter(memory => memoryWorldsCompatible(root, memory, { allowRealSpaces: true }));
   }
 
   bindEventContinuity({ agentId, memoryId, resolution, candidateId = '', relation = '', contentHash, rationale, candidateIds = [], evidenceSourceIds = [], provenance = 'event-continuity-v1' }) {
@@ -11038,7 +11167,8 @@ export class MemoryRepository {
     // A later transition or manual edit owns the state now; never overwrite it.
     if (memory.metadata?.reportedStateTransitionId !== proposalId
       || ["status", "state_phase", "temporal_state", "valid_to"].some(key => memory[key] !== applied[key])) return null;
-    const current = this.getCurrentCanonicalMemory({ agentId, subjectRole: memory.subject_role,
+    const current = this.getCurrentCanonicalMemory({
+      ...memoryWorldScope(memory), agentId, subjectRole: memory.subject_role,
       subjectKey: memory.subject_key, canonicalKey: memory.canonical_key,
       representationLayer: "reported", stateFamily: memory.state_family, stateScopeKey: memory.state_scope_key,
       includePending: true, excludeMemoryId: memory.id });
@@ -11250,26 +11380,34 @@ export class MemoryRepository {
 
   listEmbeddings(agentId, model, {
     includeArchived = false,
+    memoryIds = null,
+    contentHashes = [],
     cache = false,
     cacheMaxBytes,
   } = {}) {
-    const read = () => this.readEmbeddingRows(agentId, model, { includeArchived });
-    return cache ? cachedEmbeddingRows(this.database, JSON.stringify([agentId, model, includeArchived]), read,
+    const selected = memoryIds == null ? null : [...new Set(memoryIds.map(clean).filter(Boolean))].sort();
+    const hashes = [...new Set(contentHashes.map(clean).filter(Boolean))].sort();
+    const read = () => this.readEmbeddingRows(agentId, model, { includeArchived, memoryIds: selected, contentHashes: hashes });
+    return cache ? cachedEmbeddingRows(this.database, JSON.stringify([agentId, model, includeArchived, selected, hashes]), read,
       { maximumBytes: cacheMaxBytes }) : read();
   }
 
-  readEmbeddingRows(agentId, model, { includeArchived }) {
+  readEmbeddingRows(agentId, model, { includeArchived, memoryIds = null, contentHashes = [] }) {
     const statusClause = includeArchived
       ? "node.status <> 'deleted'"
       : "node.status = 'active'";
+    const selection = memoryIds == null ? '' : ` AND embedding.memory_id IN (
+      SELECT value FROM json_each(?)
+      UNION SELECT memory_id FROM memory_embeddings WHERE model = ? AND content_hash IN (SELECT value FROM json_each(?))
+    )`;
     return this.database.prepare(`
       SELECT embedding.memory_id, embedding.model, embedding.dimensions,
              embedding.content_hash, embedding.vector, embedding.source_memory_ids_json, node.kind,
              node.layer, node.importance, node.recorded_at
       FROM memory_embeddings AS embedding
       JOIN memory_nodes AS node ON node.id = embedding.memory_id
-      WHERE node.agent_id = ? AND embedding.model = ? AND ${statusClause}
-    `).all(agentId, model).map((row) => ({
+      WHERE node.agent_id = ? AND embedding.model = ? AND ${statusClause}${selection}
+    `).all(agentId, model, ...(memoryIds == null ? [] : [JSON.stringify(memoryIds), model, JSON.stringify(contentHashes)])).map((row) => ({
       ...row,
       vector: new Float32Array(
         row.vector.buffer.slice(
@@ -11420,36 +11558,43 @@ export class MemoryRepository {
 
   syncSearch(memoryId) {
     // SAVEPOINT also nests inside a transaction opened directly by a host.
-    this.database.exec('SAVEPOINT memory_search_sync');
-    try {
-      const result = this.syncSearchEntry(memoryId);
-      this.database.exec('RELEASE memory_search_sync');
-      return result;
-    } catch (error) {
-      this.database.exec('ROLLBACK TO memory_search_sync');
-      this.database.exec('RELEASE memory_search_sync');
-      throw error;
-    }
+    return withSearchTransaction(this.database, () => this.syncSearchEntry(memoryId));
   }
 
   syncSearchEntry(memoryId) {
     const memory = this.getMemory(memoryId);
     if (!memory) return;
-    removeSearchRows(this.database, memoryId);
-    if (memory.status === "deleted") return;
+    if (memory.status === 'deleted') { removeSearchRows(this.database, memoryId); return; }
     const retrievalContext = this.getCurrentMemoryRetrievalContext(memoryId);
-    const indexedContent = [
+    const content = [
       memory.content,
       retrievalContext?.context_text,
       ...(retrievalContext?.queryTerms || []),
     ].map(clean).filter(Boolean).join("\n");
+    const labels = this.listMemoryConceptLabels({ agentId: memory.agent_id, memoryIds: [memory.id] }).get(memory.id);
+    const conceptText = conceptSearchText(`${memory.title}\n${content}`, labels);
+    const indexedContent = [content, conceptText].filter(Boolean).join('\n');
+    const lexicalText = normalizedSearchDocument(`${memory.title}\n${memory.content}\n${conceptSearchText(`${memory.title}\n${memory.content}`, labels)}`);
+    const indexedRows = Boolean(this.database.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_fts_rows'").get());
+    if (indexedRows) {
+      const current = this.database.prepare(`SELECT fts.rowid, fts.memory_id, fts.agent_id, fts.title, fts.content, search.lexical_text
+        FROM memory_fts_rows search LEFT JOIN memory_fts fts ON fts.rowid=search.fts_rowid
+        WHERE search.memory_id=? LIMIT 2`).all(memory.id);
+      if (current.length === 1 && current[0].memory_id === memory.id && current[0].agent_id === memory.agent_id
+        && current[0].title === memory.title && current[0].content === indexedContent) {
+        if (current[0].lexical_text !== lexicalText) this.database.prepare('UPDATE memory_fts_rows SET lexical_text=? WHERE fts_rowid=?')
+          .run(lexicalText, current[0].rowid);
+        return;
+      }
+    }
+    removeSearchRows(this.database, memoryId);
     const inserted = this.database.prepare(`
       INSERT INTO memory_fts (memory_id, agent_id, title, content)
       VALUES (?, ?, ?, ?)
     `).run(memory.id, memory.agent_id, memory.title, indexedContent);
-    if (this.database.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_fts_rows'").get()) {
+    if (indexedRows) {
       this.database.prepare(`INSERT INTO memory_fts_rows(fts_rowid,memory_id,agent_id,lexical_text) VALUES(?,?,?,?)`)
-        .run(inserted.lastInsertRowid, memory.id, memory.agent_id, normalizedSearchDocument(`${memory.title}\n${memory.content}`));
+        .run(inserted.lastInsertRowid, memory.id, memory.agent_id, lexicalText);
     }
   }
 

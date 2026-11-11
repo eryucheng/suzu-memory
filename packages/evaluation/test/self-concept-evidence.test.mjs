@@ -181,18 +181,6 @@ test("keeps a provider failure as audit only and writes no merged self-concept e
   fixture.database.close();
 });
 
-test("rejects a current-state comparison that invents an absent self-concept", async () => {
-  const fixture = setup();
-  const record = fixture.add({ id: "invented-current", content: "用户定义自己的角色。",
-    sourceContent: "我一直把自己看成照顾者。" });
-  const result = await evaluate(fixture, record, analyzersFor(record, {
-    currentStatePresent: true, relation: "supports", scopeOverlap: "exact",
-  }));
-  assert.equal(result.status, "incomplete");
-  assert.deepEqual(result.failedRoles, ["currentRelation"]);
-  fixture.database.close();
-});
-
 test("compares a reported self-concept only against the reported current layer", async () => {
   const fixture = setup({ withCurrent: true, currentRepresentationLayer: "established" });
   const record = fixture.add({ id: "reported-layer-self-concept", content: "用户定义自己的角色。",
