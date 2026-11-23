@@ -5,7 +5,7 @@ import { archiveLongTermEvidence, buildLongTermExtractionInput } from '@suzu-mem
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 import { processStateAnalysisRequest } from '../src/index.mjs';
 
-function fixture(t, texts, { independentReverse = false, sameTime = false, sameName = false, reality = 'real', worldId = 'primary', worldFrame = 'unknown' } = {}) {
+function fixture(t, texts, { independentReverse = false, sameTime = false, sameName = false, reality = 'real', worldId = 'primary', worldFrame = 'unknown', sourceLanguage } = {}) {
   const database = openMemoryDatabase(':memory:');
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
@@ -13,7 +13,7 @@ function fixture(t, texts, { independentReverse = false, sameTime = false, sameN
   if (sameName) identity.companionName = identity.primaryUserName = 'Echo';
   const built = buildLongTermExtractionInput({ identity, memoryOwner: 'Melanie', userName: 'Caroline',
     messages: texts.map(([role, text, knownAt], i) => ({ id: `message-${i}`, role,
-      speaker: role === 'user' ? identity.primaryUserName : identity.companionName, text, worldId, worldFrame,
+      speaker: role === 'user' ? identity.primaryUserName : identity.companionName, text, worldId, worldFrame, sourceLanguage,
       ...(knownAt ? { knownAt } : {}),
       timestamp: `2026-10-20T10:0${sameTime ? 0 : i}:00.000Z` })) });
   const candidate = { kind: 'relationship', stateFamily: 'relationship', title: 'Support',
@@ -79,6 +79,19 @@ function generatorFor({ comparison = 'supports', outsideEvidence = false,
 const process = (f, generator, requestId = f.request.id) => processStateAnalysisRequest({
   repository: f.repository, agentId: 'melanie', requestId, generator });
 
+test('state analysis reuses the archive window language without serializing a language tag per source', async t => {
+  const f = fixture(t, [['user', 'I support you, as I wrote on the card “有需要我会一直支持你”。']], { sourceLanguage: 'en' });
+  const source = f.repository.getSource(f.request.sourceIds[0]);
+  assert.equal(source.metadata.outputLanguage, 'en');
+  const { generator, calls } = generatorFor();
+  await process(f, generator);
+  assert.ok(calls.length > 0);
+  for (const call of calls) {
+    assert.match(call.systemPrompt, /^【输出语言：沿用直接证据的语言，语种不清时用English】\n/u);
+    assert.doesNotMatch(call.modelInput ?? call.input, /"(?:sourceLanguage|outputLanguage)"/u);
+  }
+});
+
 test('derived reverse relationships retain fixed same-name identities, entity links and fictional scope', async t => {
   const f = fixture(t, [['user', 'I will support you.'],
     ['assistant', 'I support you too.', '2026-10-20T12:00:00Z'],
@@ -114,6 +127,11 @@ for (const texts of [
   const result = await process(f, generator);
   assert.equal(result.status, 'proposal-pending', JSON.stringify(result));
   assert.equal(calls.length, 2, 'one combined evidence call and one bounded peer comparison');
+  const language = /\p{Script=Han}/u.test(texts[0][1]) ? '中文' : 'English';
+  for (const { systemPrompt } of calls) {
+    assert.ok(systemPrompt.startsWith(`【输出语言：沿用直接证据的语言，语种不清时用${language}】\n\n`));
+    assert.equal(systemPrompt.match(/【输出语言：/gu)?.length, 1);
+  }
   assert.equal(result.proposal.draft.relationshipView.sharedConfirmation, 'unconfirmed');
   assert.equal(result.review.automaticRuntimePermissionChangeAllowed, false);
   assert.equal(result.evaluation.observations.filter(o => o.qualification === 'qualified').length, 2);

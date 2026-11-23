@@ -135,6 +135,84 @@ function invocationOptions(snapshot, generator) {
     } };
 }
 
+for (const missingRole of [false, true]) test(`compact specialists retain independent evidence, confidence and failure boundaries: missing role ${missingRole}`, async () => {
+  const snapshot = { memories: [{ id: 'memory-a', content: 'I like swimming and swim every weekend.', sourceIds: ['source-a','source-b'] }],
+    sourceRecords: [{ id: 'source-a', content: 'I like swimming.' }, { id: 'source-b', content: 'I swim every weekend.' }] };
+  const definitions = Object.fromEntries(['objectGrounding','explicitExpression'].map(key => [key, analysis.PREFERENCE_SPECIALIST_ANALYZERS[key]]));
+  let calls = 0;
+  const generator = Object.assign(async request => {
+    calls++;
+    const wire = JSON.parse(request.modelInput), memory = wire.memories[0];
+    const properties = request.modelSchema.properties.analyses.items.properties;
+    assert.ok(properties.sourceIds && properties.rationale && properties.judgments);
+    assert.equal(properties.judgments.properties.objectGrounding.anyOf[1].properties.memoryId, undefined);
+    const judgments = {
+      objectGrounding: { targetMatch: 'exact', matchedLabel: 'swimming', confidence: 0.81, sourceIds: [memory.sourceIds[0]], note: 'The first statement names the activity.' },
+      explicitExpression: { expressionType: 'likes', directness: 'explicit_self_statement', confidence: 0.93, sourceIds: null, note: '' },
+    };
+    if (missingRole) delete judgments.objectGrounding;
+    return { output: request.decodeOutput({ analyses: [{ memoryId: memory.id, sourceIds: memory.sourceIds,
+      rationale: 'The user describes a preference and a recurring activity.', judgments }] }), usage: { prompt_tokens: 100, completion_tokens: 20 } };
+  }, { supportsCombinedStateAnalysis: true });
+  const batch = createRelatedAnalyzerBatch({ definitions, generator, request: { id: 'compact-evidence', processorVersion: 'fixture' } });
+  const [grounding, expression] = await Promise.all(Object.entries(definitions).map(([key, definition]) => invokeEvidenceAnalyzer({
+    ...invocationOptions(snapshot, batch[key]), definition,
+  })));
+  assert.equal(calls, 1);
+  assert.equal(expression.status, 'completed', expression.error);
+  assert.deepEqual(expression.analyses[0].sourceIds, ['source-a','source-b']);
+  assert.equal(expression.analyses[0].confidence, 0.93);
+  assert.equal(expression.analyses[0].rationale, 'The user describes a preference and a recurring activity.');
+  if (missingRole) {
+    assert.ok(['failed','rejected'].includes(grounding.status));
+    assert.deepEqual(grounding.retryMemoryIds, ['memory-a']);
+  } else {
+    assert.equal(grounding.status, 'completed', grounding.error);
+    assert.deepEqual(grounding.analyses[0].sourceIds, ['source-a']);
+    assert.equal(grounding.analyses[0].confidence, 0.81);
+    assert.equal(grounding.analyses[0].rationale, 'The user describes a preference and a recurring activity.\nThe first statement names the activity.');
+  }
+  assert.equal([grounding, expression].reduce((sum, result) => sum + (result.generation.usage?.prompt_tokens || 0), 0), 100);
+});
+
+test('model projection shares only identical owned source content and restores evidence references', async () => {
+  const text = '他说："我喜欢游泳。"\nThe full source includes a second line.';
+  const snapshot = { target: { subjectRole: 'other', subjectKey: 'person-a', canonicalKey: 'swimming' },
+    memories: [
+      { id: 'verbatim-memory', content: text, sourceIds: ['source-a'], subjectRole: 'other', subjectKey: 'person-a',
+        actorRoles: [{ role: 'speaker', actorRole: 'user', actorKey: 'user' }], evidenceGroupId: 'group-a', contextId: 'day:2026-08-04' },
+      { id: 'summarized-memory', title: 'r1', content: 'A separate summary of the statement.', sourceIds: ['source-a'] },
+      { id: 'separate-memory', content: 'Another source has this text.', sourceIds: ['source-a'] },
+    ], sourceRecords: [{ id: 'source-a', speaker: 'User', content: text },
+      { id: 'source-b', speaker: 'Another person', content: 'Another source has this text.' }] };
+  const before = structuredClone(snapshot);
+  let calls = 0;
+  const result = await invokeEvidenceAnalyzer(invocationOptions(snapshot, async request => {
+    calls++;
+    const wire = JSON.parse(request.modelInput);
+    assert.equal(request.modelInput, JSON.stringify(wire), 'Model input uses compact serialization.');
+    assert.match(request.systemPrompt, /contentSourceId/);
+    assert.equal(wire.memories[0].contentSourceId, wire.sourceRecords[0].id);
+    assert.equal(Object.hasOwn(wire.memories[0], 'content'), false);
+    assert.equal(wire.memories[1].content, snapshot.memories[1].content);
+    assert.equal(Object.hasOwn(wire.memories[1], 'contentSourceId'), false);
+    assert.equal(Object.hasOwn(wire.memories[2], 'contentSourceId'), false, 'Equal text in an unrelated source cannot become this memory\'s citation.');
+    assert.equal(Object.hasOwn(wire.target, 'canonicalKey'), false);
+    const restored = request.decodeOutput(wire);
+    for (const memory of restored.memories) if (memory.contentSourceId) {
+      memory.content = restored.sourceRecords.find(source => source.id === memory.contentSourceId).content;
+      delete memory.contentSourceId;
+    }
+    assert.deepEqual(restored, { ...before, target: { subjectRole: 'other', subjectKey: 'person-a' } });
+    assert.deepEqual(JSON.parse(request.input), before);
+    return { output: request.decodeOutput({ analyses: wire.memories.map(memory => item(memory, cases[0].fields)) }) };
+  }));
+  assert.equal(calls, 1);
+  assert.equal(result.status, 'completed', result.error);
+  assert.deepEqual(result.analyses.map(value => value.memoryId), before.memories.map(memory => memory.id));
+  assert.deepEqual(snapshot, before, 'Model projection must not mutate canonical evidence.');
+});
+
 test('a retry merges eighty accepted judgments with the remaining judgment and then reuses the complete result', async () => {
   const snapshot = { memories: memories(81), sourceRecords: memories(81).map(memory => ({ id: memory.sourceIds[0], content: memory.content })) };
   let calls = 0;

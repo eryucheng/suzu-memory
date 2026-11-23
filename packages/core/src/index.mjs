@@ -1,5 +1,9 @@
-export { ENTITY_KINDS, normalizedEntityName, entityNameKey, entityNameKeys } from './entity-identity.mjs';
+export { ENTITY_KINDS, normalizedEntityName, entityNameKey, entityNameKeys, entityLabelKey, entityLabelOccurs } from './entity-identity.mjs';
+export { withRepositoryWriteGuard } from './repository-execution.mjs';
+export { readMemoryInput, isCurrentEvidenceSource, reportedStateEvidenceAvailable } from './memory-input.mjs';
 export { withModelReferences } from './model-references.mjs';
+export { OrganizationCandidateError, OrganizationInputChangedError } from './organization-error.mjs';
+export { readOrganizationInput, selectOrganizationInput, organizationInputIsCurrent, assertOrganizationInputCurrent } from './organization-input.mjs';
 export { locateCausalExcerpt, readCausalExcerpt } from './causal-evidence.mjs';
 export { conceptSearchText } from './search-index.mjs';
 export { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES, memoryMaintenanceTaskPayload, enqueueMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
@@ -12,9 +16,18 @@ export { assertEventSourceScope, observeEventSourceScope, eventSourceState, reco
   beginEventSourceCleanup, getEventSourceCleanup, advanceEventSourceCleanup } from './event-source-state.mjs';
 export { eventContinuityFingerprint, recordEventContinuityReview, resolveEventContinuityReview, invalidateEventContinuity } from './event-continuity-policy.mjs';
 export { isRepeatedReportedStateTransition } from './reported-state-policy.mjs';
+export { runImmediateMemoryMaintenance } from './immediate-maintenance.mjs';
+export { reconcileReportedStateEvidence } from './reported-state-evidence.mjs';
+export {
+  applyAutomaticReportedState,
+  assessReportedStateAutoAcceptance,
+  autoAcceptReportedStateProposals,
+  recoverPendingAutomaticReportedStates,
+} from './automatic-reported-state.mjs';
 export {
   databaseInfo,
   openMemoryDatabase,
+  sqliteFilePath,
 } from "./database.mjs";
 
 export {
@@ -95,20 +108,32 @@ export {
   materializePendingMemoryStructureProposals,
   proposeMemoryStructure,
   resolveMemoryStructureProposal,
+  validateStructureMembership,
 } from "./structure-policy.mjs";
 
 export {
+  MEMORY_EXPLANATORY_RELATIONS,
   proposeMemoryRelation,
+  materializeMemoryRelationProposal,
+  relationProposalOwnsEdge,
   resolveMemoryRelationProposal,
   revokeMemoryRelationProposal,
 } from "./relation-policy.mjs";
+export { materializePendingMemoryRelationProposals } from './relation-recovery.mjs';
+export { expectedStructureSummary, structureSummaryMatches, structureSummaryNeedsRefresh,
+  unavailableStructureSummaryIds } from './structure-provenance.mjs';
 
 export {
   PREFERENCE_STATE_LEVELS,
+  PreferenceStateValidationError,
   materializePreferenceStateProposal,
+  appliedPreferenceStateMemory,
+  preferenceEvidenceSnapshot,
+  invalidatePreferenceStateEvidence,
   proposePreferenceState,
   resolvePreferenceStateProposal,
 } from "./preference-state-policy.mjs";
+export { materializePreferenceEvidenceMemory, preferenceEvidenceKind } from './preference-evidence-memory.mjs';
 
 export {
   PREFERENCE_ESTABLISHED_PROMOTION_POLICY_FIELDS,
@@ -120,9 +145,17 @@ export {
 export {
   readReportedStateDraft,
   readStateAnalysisSemanticMemory,
+  applyReportedStateProposal,
+  appliedReportedStateMemory,
+  withdrawableReportedStateMemory,
+  recoverAutomaticallyReviewedStates,
   resolveReportedStateProposal,
   materializeReportedStateProposal,
   materializePendingReportedStateProposals,
+  isReportedPreferenceReinforcement,
+  appliedReportedPreferenceMemory,
+  suspendedReportedPreferenceMemory,
+  withdrawnReportedPreferenceSources,
 } from "./reported-state-policy.mjs";
 
 export {

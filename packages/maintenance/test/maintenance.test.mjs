@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { processPlannedConsolidationRuns } from '@suzu-memory/structurer';
 
 import {
-  autoAcceptReportedStateProposals,
   inspectMaintenance,
   MAINTENANCE_TASK_TYPES,
   runEmbeddingMaintenance,
@@ -329,6 +329,34 @@ test("semantic lane keeps retrieval context and structure prompts separate", asy
   database.close();
 });
 
+test('automatic maintenance plans and completes same-batch causal work after initial grouping', async t => {
+  const { database, repository } = fixture(); t.after(() => database.close());
+  const source = repository.upsertSource({ agentId: AGENT_ID, sourceKind: 'conversation', externalId: 'first-outing',
+    content: 'Because the museum was closed, we cancelled our visit.' });
+  for (const [id, content] of [['closed', 'The museum was closed.'], ['cancelled', 'We cancelled the visit.']]) {
+    seedMemory(repository, id, content); repository.linkSource(id, source.id);
+  }
+  runImmediateMemoryMaintenance({ repository, agentId: AGENT_ID, batchId: 'first-outing', memoryIds: ['closed', 'cancelled'],
+    followUpTaskTypes: [MAINTENANCE_TASK_TYPES.structureProposal], planConsolidation: false });
+  const calls = [];
+  const generator = async request => {
+    calls.push(request.schemaName);
+    return { output: { proposals: request.schemaName === 'memory-relation-proposals-v2' ? [{ relation: 'causes',
+      fromMemoryId: 'closed', toMemoryId: 'cancelled', evidenceSourceIds: [source.id], confidence: 0.9,
+      rationale: 'The closure explicitly caused the cancellation.' }] : [] } };
+  };
+  const grouped = await runSemanticTaskMaintenance({ repository, agentId: AGENT_ID, structureGenerator: generator,
+    retrievalContextGenerator: null, minimumStructureMemories: 2 });
+  assert.equal(grouped.status, 'completed');
+  const args = { repository, agentId: AGENT_ID, generator, maximumRuns: 10, minimumTriggerMemories: 2 };
+  const organized = await processPlannedConsolidationRuns(args);
+  assert.equal(organized.selected, 1); assert.equal(organized.results[0].relationProposalCount, 1);
+  assert.deepEqual(calls, ['memory-structure-proposals-v2', 'memory-relation-proposals-v2']);
+  assert.equal(repository.listRelationProposals(AGENT_ID)[0].review_state, 'pending');
+  assert.ok(repository.getEdge(AGENT_ID, repository.listRelationProposals(AGENT_ID)[0].result_edge_id));
+  assert.equal((await processPlannedConsolidationRuns(args)).selected, 0);
+});
+
 test("pending topic and episode candidates immediately queue normal maintenance", async () => {
   const { database, repository } = fixture();
   seedMemory(repository, "event-1", "我们一起整理了新的记忆结构。");
@@ -538,7 +566,7 @@ test("a local restart immediately requeues interrupted maintenance work", () => 
 });
 
 for (const [subjectRole, subjectKey] of [["user", "human-a"], ["agent", AGENT_ID], ["other", "agent-b"], ["other", "human-b"]])
-test(`semantic maintenance accepts a request-bound self report from ${subjectRole}:${subjectKey}`, async () => {
+test(`semantic maintenance applies a request-bound self report from ${subjectRole}:${subjectKey} before review`, async () => {
   const { database, repository } = fixture();
   const source = repository.upsertSource({
     agentId: AGENT_ID,
@@ -625,47 +653,25 @@ test(`semantic maintenance accepts a request-bound self report from ${subjectRol
     retrievalContextGenerator: null,
   });
   assert.equal(result.stateAnalysis.results[0].status, "proposal-pending");
-  assert.equal(result.automaticStateAcceptance.accepted.length, 1);
+  assert.equal(result.automaticStateAcceptance.accepted.length, 0);
   assert.equal(result.automaticStateAcceptance.deferred.length, 0);
   const state = repository.listMemories(AGENT_ID, { kinds: ["preference"] });
   assert.equal(state.total, 1);
   assert.equal(state.items[0].representation_layer, "reported");
   assert.equal(state.items[0].subject_role, subjectRole);
   assert.equal(state.items[0].subject_key, subjectKey);
-  assert.equal(repository.listReportedStateProposals(AGENT_ID, {
+  const pending = repository.listReportedStateProposals(AGENT_ID, {
     reviewStates: ["pending"],
-  }).length, 0);
+  });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].resultMemoryId, state.items[0].id);
+  assert.equal(pending[0].resolved_by, "");
   assert.deepEqual(
     repository.listMaintenanceTasks(AGENT_ID, { statuses: ["pending"] })
       .map((task) => task.task_type).sort(),
     ["memory-embedding", "structure-proposal"],
   );
 
-  const reviewed = result.stateAnalysis.results[0].proposal;
-  const transition = repository.recordReportedStateProposal({
-    agentId: AGENT_ID,
-    batchId: "explicit-transition-batch",
-    stateFamily: reviewed.state_family,
-    subjectRole: reviewed.subject_role,
-    subjectKey: reviewed.subject_key,
-    canonicalKey: reviewed.canonical_key,
-    action: "supersede",
-    previousMemoryId: state.items[0].id,
-    proposedState: reviewed.draft,
-    reviewVersion: reviewed.review_version,
-    inputHash: "explicit-transition-review-input",
-    selectedObservationId: reviewed.selectedObservationId,
-    consideredObservationIds: reviewed.consideredObservationIds,
-    metadata: { stateAnalysisRequestId: reviewed.metadata.stateAnalysisRequestId },
-  });
-  const deferred = autoAcceptReportedStateProposals({
-    repository,
-    agentId: AGENT_ID,
-    proposalIds: [transition.id],
-  });
-  assert.equal(deferred.accepted.length, 0);
-  assert.equal(deferred.deferred[0].reason, "state-transition-requires-review");
-  assert.equal(repository.getReportedStateProposal(AGENT_ID, transition.id).review_state, "pending");
   database.close();
 });
 

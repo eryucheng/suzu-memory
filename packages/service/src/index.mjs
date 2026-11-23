@@ -4,7 +4,7 @@ export { createMemorySearchSession, MEMORY_SEARCH_TOOL } from './search-session.
 import path from "node:path";
 import { appendMemoryEventSources } from './event-source-ingestion.mjs';
 import { adoptLegacySourceEvidence, adoptExperienceSourceEvidence } from './legacy-source-import.mjs';
-import { eraseMemoryEventSources, recoverMemoryEventSourceCleanups } from './event-source-cleanup.mjs';
+import { eraseMemoryEventSources, recoverMemoryEventSourceCleanups, clearReconciledPreferenceTargets } from './event-source-cleanup.mjs';
 export { validateMemoryExtractionOutput } from './event-source-ingestion.mjs';
 export { assertMemoryTaskRequest, validateMemoryTaskOutput, isMemoryStateAnalysisRequest } from './model-task-validation.mjs';
 
@@ -22,6 +22,12 @@ import {
   ensureCompanionRelationshipStructure,
   enqueueMemoryMaintenanceTasks,
   materializePendingMemoryStructureProposals,
+  materializePendingMemoryRelationProposals,
+  materializePendingReportedStateProposals,
+  recoverAutomaticallyReviewedStates,
+  recoverPendingAutomaticReportedStates,
+  reconcileReportedStateEvidence,
+  appliedReportedStateMemory,
   MemoryRepository,
   openMemoryDatabase,
   rebuildAssociationGraph,
@@ -61,6 +67,7 @@ import {
   stableAgentId,
 } from "@suzu-memory/runtime";
 import { processPlannedConsolidationRuns } from "@suzu-memory/structurer";
+import { reconcileInferredPreferences } from '@suzu-memory/analysis';
 import { createBrainSnapshot } from "@suzu-memory/visualization";
 import {
   createDatabaseBackup,
@@ -312,6 +319,21 @@ export class MemoryService {
         worldId: this.defaults.defaultWorldId,
         worldFrame: this.defaults.defaultWorldFrame,
       });
+      const pendingReportedPreferences = this.readOnly || this.initialized ? null
+        : materializePendingReportedStateProposals(repository, { agentId: this.agentId, stateFamily: 'preference' });
+      let inferredPreferenceReconciliation = null;
+      if (!this.readOnly && !this.initialized) {
+        repository.recoverInvalidatedSourceDerivatives(this.agentId);
+        repository.recoverInputExtractionRetries(this.agentId);
+        recoverAutomaticallyReviewedStates(repository, this.agentId);
+        repository.transaction(() => reconcileReportedStateEvidence(repository, { agentId: this.agentId, recover: true }));
+        recoverPendingAutomaticReportedStates(repository, this.agentId);
+        repository.normalizePreferenceAnalysisSources(this.agentId);
+        const results = reconcileInferredPreferences({ repository, agentId: this.agentId });
+        const failed = results.flatMap(result => result.failure ? [result.failure] : []);
+        clearReconciledPreferenceTargets(repository, this.agentId, failed);
+        inferredPreferenceReconciliation = { failed };
+      }
       if (!this.readOnly && !this.initialized) {
         const pending = repository.listPendingProvisionalMemories(this.agentId, { limit: 5_000 })
           .filter(memory => memory.metadata?.reportedStateProposalId || memory.metadata?.preferenceProposalId);
@@ -323,6 +345,8 @@ export class MemoryService {
         repository,
         { agentId: this.agentId },
       );
+      const pendingRelationMaterialization = this.readOnly || this.initialized ? null
+        : materializePendingMemoryRelationProposals(repository, { agentId: this.agentId });
       const memories = repository.listMemories(this.agentId, {
         statuses: [],
         limit: 1,
@@ -334,9 +358,22 @@ export class MemoryService {
         databasePath: this.paths.databasePath,
         usageLedgerPath: this.paths.usageLedgerPath,
         memoryCount: memories.total,
+        inferredPreferenceReconciliation,
+        pendingReportedPreferences: pendingReportedPreferences && {
+          materialized: pendingReportedPreferences.materialized.length,
+          failed: pendingReportedPreferences.failed,
+        },
+        pendingRelationMaterialization: pendingRelationMaterialization && {
+          materialized: pendingRelationMaterialization.materialized.length,
+          covered: pendingRelationMaterialization.covered.length,
+          requeued: pendingRelationMaterialization.requeued.length,
+          retired: pendingRelationMaterialization.retired.length,
+          failed: pendingRelationMaterialization.failed,
+        },
         pendingStructureMaterialization: pendingStructureMaterialization && {
           materialized: pendingStructureMaterialization.materialized.length,
           alreadyMaterialized: pendingStructureMaterialization.skipped.length,
+          retired: pendingStructureMaterialization.retired.length,
           failed: pendingStructureMaterialization.failed,
         },
         identityStructure: identityStructure && {
@@ -528,6 +565,10 @@ export class MemoryService {
     }));
   }
 
+  listEventSourceInputs(options = {}) {
+    return this.withRepository(repository => repository.listEventSourceInputs(this.agentId, options), { readOnly: true });
+  }
+
   listInputEvents(options = {}) {
     return this.withRepository(
       (repository) => repository.listInputEvents(this.agentId, options),
@@ -574,6 +615,7 @@ export class MemoryService {
         force: Boolean(force),
         recoveredAt,
       }),
+      stateAnalysis: repository.recoverStateAnalysisRequests(this.agentId, { force: Boolean(force), recoveredAt }),
     }));
   }
 
@@ -589,7 +631,7 @@ export class MemoryService {
       throw new Error("Long-term extraction retry requires a generation provider.");
     }
     const executionTime = validDate(now, "long-term extraction retry now");
-    const task = this.withRepository((repository) => {
+    const { task, progress: initialProgress } = this.withRepository(repository => repository.transaction(() => {
       const current = repository.getMaintenanceTask(this.agentId, normalizedTaskId);
       if (!current || current.task_type !== "long-term-extraction"
         || current.status !== "failed" || current.review_state !== "pending") {
@@ -601,37 +643,41 @@ export class MemoryService {
           .filter(Boolean),
       )];
       const view = executionEventSourceView(repository, this.agentId);
-      if (view && eventIds.some(id => !view.inputIds.has(id))) {
+      if (view && !current.payload.extractionRepair && eventIds.some(id =>
+        repository.getInputEvent(this.agentId, id)?.lifecycle === 'active' && !view.inputIds.has(id))) {
         throw Object.assign(new Error('Extraction review sources await an eligible scope.'), { code: 'EVENT_SOURCE_TASK_DEFERRED' });
       }
       if (!eventIds.length) {
         throw new Error("Long-term extraction failure has no recoverable source events.");
       }
-      if (!current.payload.extractionRepair) repository.requeueArchivedInputEventsForHumanRetry({
+      if (current.payload.extractionRepair) return { task: current };
+      return repository.requeueArchivedInputEventsForHumanRetry({
         agentId: this.agentId,
         eventIds,
         retryTaskId: current.id,
+        originalBatchId: current.payload.batchId,
+        reviewedBy: actor,
         reason: clean(reason),
         retriedAt: executionTime.toISOString(),
       });
-      return current;
-    });
+    }));
     if (task.payload.extractionRepair) {
       const result = await this.withRepository(repository => retryCompanionExtractionRepair({
         repository, agentId: this.agentId, task, generator, identity: this.companionIdentity(),
-        completedAt: executionTime.toISOString(), executionTime, usageLedgerPath: this.paths.usageLedgerPath,
+        completedAt: executionTime.toISOString(), usageLedgerPath: this.paths.usageLedgerPath,
         reviewedBy: clean(actor) || 'human', reviewNote: reason,
       }));
       const remaining = result.failureReviewTask;
-      return { status: remaining ? 'retry-degraded' : 'retried', result,
+      return { status: remaining ? 'retry-degraded' : result.status === 'source-invalidated' ? 'source-invalidated' : 'retried', result,
         reviewTask: remaining || this.withRepository(repository => repository.getMaintenanceTask(this.agentId, task.id), { readOnly: true }) };
     }
     let result = null;
     let latestError = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const candidateEventIds = initialProgress.remainingEventIds;
+    for (let attempt = 0; candidateEventIds.length && attempt < 3; attempt += 1) {
       try {
         result = await this.processPendingEvents({
-          candidateEventIds: task.payload.eventIds,
+          candidateEventIds,
           generator,
           now: executionTime,
         });
@@ -641,27 +687,14 @@ export class MemoryService {
         latestError = error;
       }
     }
-    if (!result) throw latestError || new Error("Long-term extraction retry did not produce a result.");
-    if (result.status !== "processed" || result.generationDiagnostics?.degraded) {
-      return {
-        status: "retry-degraded",
-        result,
-        reviewTask: this.withRepository((repository) => (
-          repository.getMaintenanceTask(this.agentId, normalizedTaskId)
-        ), { readOnly: true }),
-      };
-    }
-    return this.withRepository((repository) => ({
-      status: "retried",
-      result,
-      reviewTask: repository.reviewMaintenanceTaskFailure({
-        agentId: this.agentId,
-        taskId: normalizedTaskId,
-        action: "accept",
-        reviewedBy: clean(actor) || "human",
-        note: clean(reason) || "Human requested a successful long-term extraction retry.",
-        reviewedAt: executionTime.toISOString(),
-      }),
+    if (!result && latestError) throw latestError;
+    return this.withRepository(repository => repository.transaction(() => {
+      const { task: reviewTask, progress } = repository.settleInputExtractionRetry(
+        this.agentId, normalizedTaskId, executionTime.toISOString());
+      const status = reviewTask?.review_state === 'accepted' ? 'retried'
+        : !progress || progress.withdrawn === progress.total ? 'source-invalidated'
+          : progress.remainingEventIds.length ? 'retry-partial' : 'retry-degraded';
+      return { status, result, reviewTask, progress };
     }));
   }
 
@@ -799,10 +832,10 @@ export class MemoryService {
           if (!['processed', 'quarantined'].includes(result.status)) break;
         }
       }
-      if (chunkPolicy?.maximumCoreCharacters != null && inputBatches.at(-1)?.status === 'waiting'
-        && !inputBatches.some(batch => ['processed', 'quarantined'].includes(batch.status))) {
-        return { status: 'waiting', inputBatches, failures, tasks: [] };
-      }
+      const inputWaiting = chunkPolicy?.maximumCoreCharacters != null && inputBatches.at(-1)?.status === 'waiting'
+        && !inputBatches.some(batch => ['processed', 'quarantined'].includes(batch.status));
+      // Waiting for a new archive batch must not suspend durable work from
+      // earlier batches. Empty queues already avoid generation at their owners.
       let semantic;
       try {
         semantic = await this.withRepository((repository) => runSemanticMemoryMaintenance({
@@ -833,7 +866,7 @@ export class MemoryService {
         failures,
         status: failures.length || semantic.status === "failed"
           ? "completed-with-failures"
-          : semantic.status || "completed",
+          : inputWaiting && semantic.status === 'completed' ? 'waiting' : semantic.status || "completed",
       };
     }, { sourceScope, signal });
   }
@@ -1222,6 +1255,8 @@ export class MemoryService {
         resolvedBy: clean(actor) || "human",
         note: clean(reason),
       };
+      const priorReported = normalizedType === 'reported-state' ? repository.getReportedStateProposal(this.agentId, id) : null;
+      const confirmedExistingReported = normalizedAction === 'accept' && priorReported && appliedReportedStateMemory(repository, priorReported);
       const resolution = normalizedType === "reported-state"
         ? resolveReportedStateProposal(repository, common)
         : normalizedType === "preference-state"
@@ -1229,13 +1264,19 @@ export class MemoryService {
         : normalizedType === "structure"
           ? resolveMemoryStructureProposal(repository, common)
           : resolveMemoryRelationProposal(repository, common);
+      const confirmedPreference = normalizedAction === "accept" && (normalizedType === 'preference-state'
+        || normalizedType === "reported-state" && resolution.proposal.state_family === 'preference');
+      const confirmedStructure = normalizedAction === 'accept' && normalizedType === 'structure';
       let maintenance = {
         status: "not-required",
+        queued: [],
         reason: normalizedAction === "dismiss"
           ? "proposal-dismissed"
-          : "relation-edge-is-immediately-queryable",
+          : confirmedPreference ? "reported-preference-already-applied"
+            : confirmedStructure ? 'structure-already-applied'
+              : confirmedExistingReported ? 'reported-state-already-applied' : "relation-edge-is-immediately-queryable",
       };
-      if (normalizedAction === "accept" && resolution.memory?.id) {
+      if (normalizedAction === "accept" && resolution.memory?.id && !confirmedPreference && !confirmedStructure && !confirmedExistingReported) {
         maintenance = runImmediateMemoryMaintenance({
           repository,
           agentId: this.agentId,
@@ -1298,6 +1339,7 @@ export class MemoryService {
       throw new Error("editMemory requires a patch object.");
     }
     return this.withRepository((repository) => repository.transaction(() => {
+      const preferenceTargets = repository.getInferredPreferenceTargets({ agentId: this.agentId, memoryIds: [id] });
       const edited = repository.editMemoryManually({
         agentId: this.agentId,
         memoryId: id,
@@ -1305,8 +1347,11 @@ export class MemoryService {
         actor: clean(actor) || "human",
         reason: clean(reason),
       });
+      const results = reconcileInferredPreferences({ repository, agentId: this.agentId, targets: preferenceTargets });
+      const failed = results.flatMap(result => result.failure ? [result.failure] : []);
       return {
         ...edited,
+        ...(failed.length && { inferredPreferenceReconciliation: { failed } }),
         maintenance: runImmediateMemoryMaintenance({
           repository,
           agentId: this.agentId,
@@ -1322,6 +1367,7 @@ export class MemoryService {
     const id = clean(memoryId);
     if (!id) throw new Error("setMemoryDeleted requires memoryId.");
     return this.withRepository((repository) => repository.transaction(() => {
+      const preferenceTargets = repository.getInferredPreferenceTargets({ agentId: this.agentId, memoryIds: [id] });
       const changed = repository.setMemoryDeleted({
         agentId: this.agentId,
         memoryId: id,
@@ -1329,8 +1375,11 @@ export class MemoryService {
         actor: clean(actor) || "human",
         reason: clean(reason),
       });
+      const results = reconcileInferredPreferences({ repository, agentId: this.agentId, targets: preferenceTargets });
+      const failed = results.flatMap(result => result.failure ? [result.failure] : []);
       return {
         ...changed,
+        ...(failed.length && { inferredPreferenceReconciliation: { failed } }),
         maintenance: runImmediateMemoryMaintenance({
           repository,
           agentId: this.agentId,
@@ -1550,6 +1599,7 @@ export class MemoryService {
     snapshotOptions = {},
     reviewVersion = "",
     preferencePolicy,
+    firstStageBatchOptions,
     sourceScope = null,
     signal = null,
   } = {}) {
@@ -1563,6 +1613,7 @@ export class MemoryService {
       snapshotOptions,
       reviewVersion,
       preferencePolicy,
+      firstStageBatchOptions,
     }), { sourceScope, signal });
   }
 

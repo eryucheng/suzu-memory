@@ -130,6 +130,7 @@ function proposedState(candidate, snapshot) {
       agency: candidate.holder.agency,
       lifecycle: candidate.lifecycle.lifecycle,
       timeReference: clean(candidate.lifecycle.timeReference),
+      ...(candidate.lifecycle.deadlineDate ? { deadlineDate: candidate.lifecycle.deadlineDate } : {}),
       holderStatementStatus: "directly-reported",
       sharedConfirmation: candidate.holder.responsibility === "shared" ? "unconfirmed" : "not-applicable",
       executionStatus: "unverified",

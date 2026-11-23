@@ -40,7 +40,7 @@ export async function processPlannedConsolidationRuns({
     limit,
   }).filter(run => run.triggerIds.length >= minimumTriggerMemories
     || run.structureProposalIds.length || run.relationProposalIds.length
-    || run.metadata?.accumulatedStructureBatchId || run.metadata?.organizationProgress);
+    || run.metadata?.accumulatedStructureBatchId || run.metadata?.organizationProgress || run.metadata?.replannedFrom);
   const results = [];
   for (const run of selected) {
     try {
@@ -59,6 +59,7 @@ export async function processPlannedConsolidationRuns({
         status: result.status,
         structureProposalCount: result.run.structureProposalIds.length,
         relationProposalCount: result.run.relationProposalIds.length,
+        ...(result.replacementRun ? { replacementRunId: result.replacementRun.id } : {}),
         error: clean(result.error),
       });
     } catch (error) {

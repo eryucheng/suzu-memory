@@ -208,10 +208,13 @@ test('structure generation groups undated evidence and evidence with only one kn
         generator: async request => {
           calls++;
           assertMemoryTaskRequest(request);
-          const output = {proposals: [{operation: 'create', kind, title: 'Trip',
+          const material = JSON.parse(request.modelInput);
+          assert.equal(request.modelSchema.properties.attachments.type, 'null');
+          const output = request.decodeOutput({ creations: [{ kind, title: 'Trip',
             content: language === 'zh' ? '林为徒步旅行准备装备并预订营地。' : 'Lin prepared equipment and booked a campsite for the hiking trip.',
             subjectRole: 'unknown', subjectKey: '',
-            memberIds: ids, actorRoles: [], confidence: 0.9, rationale: 'The records describe the same trip.'}]};
+            firstMemberId: material.memories[0].id, secondMemberId: material.memories[1].id, additionalMemberIds: [],
+            actorRoles: [], confidence: 0.9, rationale: 'The records describe the same trip.' }], attachments: null });
           validateMemoryTaskOutput(request, output);
           return {output};
         }});
@@ -264,7 +267,7 @@ test('attachment uses the same structure call to refresh its summary and rejects
         subjectRole: 'unknown', subjectKey: '', memberIds: ['new-member'], actorRoles: [], confidence: 0.9, rationale: 'stale'}]}};
     }});
   assert.equal(stale.proposed.length, 0);
-  assert.match(stale.rejected[0].error, /changed after generation/);
+  assert.equal(stale.rejected[0].category, 'stale-input');
   assert.equal(repository.getMemory(topic.id).content, '用户修订的主题概述。');
   assert.equal(repository.listTopicMembers({agentId: 'agent-test', topicId: topic.id}).length, 2);
 });
@@ -512,6 +515,22 @@ test("builds a bounded proposal snapshot without raw evidence or metadata", () =
     memoryIds: ["missing-memory"],
   }), /must exist for the same Agent/u);
   database.close();
+});
+
+test('conflicting primary subjects are rejected before persistence without retrying valid siblings', async t => {
+  const { database, repository } = fixture(); t.after(() => database.close());
+  const valid = { operation: 'create', kind: 'episode', title: 'Museum visit and dinner', content: 'The pair visited the museum and ate dinner.',
+    memberIds: ['batch-museum', 'batch-dinner'], subjectRole: 'shared', subjectKey: 'agent-test:user', actorRoles: [],
+    confidence: 0.9, rationale: 'The same outing.' };
+  const conflicting = { ...valid, actorRoles: [{ role: 'subject', actorRole: 'user', actorKey: 'user', isPrimary: true, confidence: 1 }] };
+  assert.throws(() => proposeMemoryStructure(repository, { ...conflicting, agentId: 'agent-test' }),
+    { code: 'MEMORY_STRUCTURE_INVALID_SUBJECT' });
+  const report = await proposeStructuresForBatch({ repository, agentId: 'agent-test', memoryIds: valid.memberIds,
+    generator: async () => ({ output: { proposals: [conflicting, valid] } }) });
+  assert.equal(report.status, 'proposed'); assert.equal(report.proposed.length, 1);
+  assert.equal(report.rejected.length, 1); assert.ok(!report.rejected[0].retryable);
+  assert.doesNotMatch(report.rejected[0].error, /UNIQUE constraint/);
+  assert.equal(repository.listStructureProposals('agent-test').length, 1);
 });
 
 test("records only pending create and attach proposals with metered fake generation", async () => {
@@ -817,8 +836,8 @@ test("turns generated causes into pending proposals without writing graph edges"
     fromMemoryId: "relation-rain",
     toMemoryId: "relation-cancel",
     relation: "causes",
-  }), null);
-  assert.equal(received.schemaName, "memory-relation-proposals-v1");
+  }).id, result.proposed[0].result_edge_id);
+  assert.equal(received.schemaName, "memory-relation-proposals-v2");
   assert.equal(received.schema.type, "object");
   assert.match(received.input, /因为突然下大雨/u);
   const ledger = await readUsageEvents(ledgerPath);
@@ -1153,14 +1172,14 @@ test("retrospective consolidation materializes reviewable groups and leaves caus
   assert.equal(repository.listStructureProposals("agent-test")[0].review_state, "pending");
   assert.equal(repository.listRelationProposals("agent-test")[0].review_state, "pending");
   assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), beforeNodes + 1);
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges + 2);
+  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_edges").get().count), beforeEdges + 3);
   assert.equal(repository.listMemories("agent-test", { kinds: ["episode"] }).total, 1);
   assert.equal(repository.findEdge({
     agentId: "agent-test",
     fromMemoryId: "old-heavy-rain",
     toMemoryId: "new-cancel",
     relation: "causes",
-  }), null);
+  }).id, result.relations.proposed[0].result_edge_id);
 
   let rerunCalls = 0;
   const rerun = await runMemoryConsolidation({
@@ -1182,7 +1201,7 @@ test("combines retrospective structure and relation generation into one provider
   const calls = [];
   const generator = async (request) => {
     calls.push(request);
-    assert.equal(request.schemaName, "memory-consolidation-combined-v1");
+    assert.equal(request.schemaName, "memory-consolidation-combined-v2");
     assert.deepEqual(request.combinedOutputs, ["structure", "relations"]);
     assert.equal(request.schema.properties.structure.properties.proposals.maxItems, 31);
     assert.equal(request.schema.properties.relations.properties.proposals.maxItems, 43);

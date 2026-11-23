@@ -31,6 +31,7 @@ export function buildRelationSnapshot({
   maxSourceContentChars = Infinity,
   maxSnapshotChars = 48_000,
   retrospective = null,
+  relationContext = null,
 } = {}) {
   if (!repository) throw new Error("Relation snapshot requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -98,12 +99,25 @@ export function buildRelationSnapshot({
     const triggerMemoryIds = uniqueStrings(retrospective.triggerMemoryIds);
     const historicalMemoryIds = uniqueStrings(retrospective.historicalMemoryIds);
     const currentIds = new Set(memories.map((memory) => memory.id));
-    if (!triggerMemoryIds.length || !historicalMemoryIds.length
+    if (!triggerMemoryIds.length || (!historicalMemoryIds.length && !retrospective.includeTriggerPairs)
       || [...triggerMemoryIds, ...historicalMemoryIds].some((id) => !currentIds.has(id))
       || triggerMemoryIds.some((id) => historicalMemoryIds.includes(id))) {
       throw new Error("Retrospective relation context must partition snapshot memories into trigger and historical IDs.");
     }
-    retrospectiveContext = { triggerMemoryIds, historicalMemoryIds };
+    retrospectiveContext = { triggerMemoryIds, historicalMemoryIds,
+      ...(retrospective.includeTriggerPairs ? { includeTriggerPairs: true } : {}) };
+  }
+  let selectedRelations = null;
+  if (relationContext) {
+    const anchorMemoryIds = uniqueStrings(relationContext.anchorMemoryIds);
+    const candidateMemoryIds = uniqueStrings(relationContext.candidateMemoryIds);
+    const available = new Set(memories.map(memory => memory.id));
+    if (!anchorMemoryIds.length || typeof relationContext.includeAnchorPairs !== 'boolean'
+      || [...anchorMemoryIds, ...candidateMemoryIds].some(id => !available.has(id))
+      || anchorMemoryIds.some(id => candidateMemoryIds.includes(id))) {
+      throw new Error('Relation context requires disjoint available anchor and candidate memories.');
+    }
+    selectedRelations = { anchorMemoryIds, candidateMemoryIds, includeAnchorPairs: relationContext.includeAnchorPairs };
   }
   const snapshot = {
     schemaVersion: 1,
@@ -111,6 +125,7 @@ export function buildRelationSnapshot({
     memories,
     sourceRecords: [...sourceRecords.values()],
     retrospectiveContext,
+    ...(selectedRelations ? { relationContext: selectedRelations } : {}),
     inputPolicy: {
       candidateEndpointsAreBounded: true,
       sourceIdsMustAlreadySupportAnEndpoint: true,

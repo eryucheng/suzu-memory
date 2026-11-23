@@ -1,14 +1,16 @@
-import { repairExtractionCandidates } from './extraction-repair.mjs';
+import { repairExtractionCandidates, requestExtractionOutput, selectCurrentRepairCandidates } from './extraction-repair.mjs';
 import {
-  archiveLongTermEvidence,
-  buildLongTermExtractionInput,
+  archiveRepairedLongTermEvidence,
+  readArchivedExtractionEvidence,
+  archiveValidatedLongTermEvidence,
+  buildLongTermExtractionRequest,
   DIRECT_USER_AGENT_DM_TOPOLOGY,
   loadLongTermExtractionSystemPrompt,
-  LONG_TERM_EXTRACTION_SCHEMA,
-  normalizeGeneratedLongTermExtraction, extractionEntityScope,
+  inspectGeneratedLongTermExtraction,
+  normalizeGeneratedLongTermExtraction, extractionEntityScope, extractionEntityDeclarationsFor,
 } from "@suzu-memory/extraction";
 import { ensureCompanionRelationshipStructure, locateCausalExcerpt } from "@suzu-memory/core";
-import { currentEventSourceExecution, eventSourceMaterial, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { currentEventSourceExecution, eventSourceMaterial, assertEventSourceExecutionCurrent, executionEventSourceView } from '@suzu-memory/core';
 import { runImmediateMemoryMaintenance } from "@suzu-memory/maintenance";
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 
@@ -26,18 +28,6 @@ function combinedNumericUsage(...records) {
   return usage;
 }
 
-function looseExtractionObject(output) {
-  if (output && typeof output === "object" && !Array.isArray(output)) return output;
-  if (typeof output !== "string") return null;
-  const text = output.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
 function annotateCausalSources(messages, excerpts) {
   if (!Array.isArray(excerpts) || !excerpts.length) return messages;
   const byRef = new Map();
@@ -50,31 +40,6 @@ function annotateCausalSources(messages, excerpts) {
     const causalExcerpt = hint && locateCausalExcerpt(message.text, hint);
     return causalExcerpt ? { ...message, causalExcerpt } : message;
   });
-}
-
-function retainValidExtractionCandidates(output, context) {
-  const parsed = looseExtractionObject(output);
-  if (!parsed || !Array.isArray(parsed.memories)) return null;
-  // A malformed shared table cannot be salvaged by validating rows in isolation.
-  try { normalizeGeneratedLongTermExtraction({ entities: parsed.entities, memories: [] }, context); } catch { return null; }
-  const memories = [];
-  const rejected = [];
-  const invalidCandidates = [];
-  parsed.memories.forEach((candidate, index) => {
-    try {
-      memories.push(normalizeGeneratedLongTermExtraction({ ...(parsed.entities ? { entities: parsed.entities } : {}), memories: [candidate] }, context).memories[0]);
-    } catch (error) {
-      rejected.push({ index, reason: clean(error?.message).slice(0, 500) });
-      invalidCandidates.push(candidate);
-    }
-  });
-  return {
-    output: { memories },
-    rejected,
-    invalidCandidates,
-    originalCount: parsed.memories.length,
-    entities: parsed.entities,
-  };
 }
 
 function companionEventFragment(event) {
@@ -288,6 +253,7 @@ export function buildCompanionExtractionRequest({
   previousContextEvents = [],
   continuationGuidanceEvents = [],
   archiveWindows = [],
+  outputLanguage,
   identity,
   systemPrompt = "",
   timeZone,
@@ -299,27 +265,31 @@ export function buildCompanionExtractionRequest({
   const continuationGuidanceMessages = semanticWindows.length
     ? []
     : companionMessagesFromEvents(continuationGuidanceEvents, identity);
-  const built = buildLongTermExtractionInput({
+  return buildLongTermExtractionRequest({
     messages: semanticWindows.length ? [] : companionMessagesFromEvents(events, identity),
     previousContextMessages,
     continuationGuidanceMessages,
     archiveWindows: semanticWindows,
+    outputLanguage,
     memoryOwner: identity.companionName,
     userName: identity.primaryUserName,
     identity,
     timeZone,
-  });
-  return { built, request: {
-    input: built.input,
     systemPrompt: clean(systemPrompt) || loadLongTermExtractionSystemPrompt(),
-    schema: LONG_TERM_EXTRACTION_SCHEMA,
-    schemaName: "long-term-memory-extraction-v4",
-  } };
+  });
+}
+
+export function measureCompanionExtractionRequest(options) {
+  // English has the longest language label and fallback speaker labels.
+  // Measure the request envelope before classifying the selected window.
+  const { request } = buildCompanionExtractionRequest({ ...options, outputLanguage: 'en' });
+  return (request.modelInput ?? request.input).length + request.systemPrompt.length
+    + JSON.stringify(request.modelSchema ?? request.schema).length + 100;
 }
 
 export async function generateCompanionEventBatch({ events, previousContextEvents = [],
   continuationGuidanceEvents = [], archiveWindows = [], identity, generator,
-  memoriesOverride = null, systemPrompt = '', timeZone }) {
+  memoriesOverride = null, systemPrompt = '', timeZone, sourceIsCurrent, contextIsCurrent }) {
   const { built, request: generationRequest } = buildCompanionExtractionRequest({ events,
     previousContextEvents, continuationGuidanceEvents, archiveWindows, identity, systemPrompt, timeZone });
   const timeContext = built;
@@ -346,40 +316,42 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     throw new Error("Processing pending events requires a generation provider.");
   }
   const execution = currentEventSourceExecution();
+  const scopedMaterial = (messages) => eventSourceMaterial(execution.repository,
+    identity.agentId || identity.companionId, [], [], messages.flatMap(messageInputIds));
   if (execution?.sourceScope) {
     // built contains precisely the messages serialized by the existing input
     // builder, including archive-window context and fragmented input IDs.
     const messages = [...built.messages, ...built.previousContextMessages, ...built.continuationGuidanceMessages];
-    const ids = messages.flatMap(message => message.inputEventIds || [message.inputEventId]).filter(Boolean);
-    generationRequest.sourceMaterial = eventSourceMaterial(execution.repository, identity.agentId || identity.companionId, [], [], ids);
+    generationRequest.sourceMaterial = scopedMaterial(messages);
   }
-  const generation = await generator(generationRequest);
+  const { generation, decodeError } = await requestExtractionOutput(generator, generationRequest);
   assertEventSourceExecutionCurrent();
-  const messages = annotateCausalSources(built.messages, looseExtractionObject(generation.output)?.causalExcerpts);
-  let parsedOutput;
-  try {
-    parsedOutput = normalizeGeneratedLongTermExtraction(generation.output, timeContext);
-  } catch (validationError) {
-    const salvage = retainValidExtractionCandidates(generation.output, timeContext);
+  const inspected = decodeError ? { validationError: decodeError }
+    : inspectGeneratedLongTermExtraction(generation.output, timeContext);
+  const messages = annotateCausalSources(built.messages, inspected.causalExcerpts);
+  const { validationError, failures = [] } = inspected;
+  let parsedOutput = inspected.output;
+  if (validationError) {
     const initialRequestId = generation.requestId;
-    const valid = salvage?.output.memories || [];
+    const currentRefs = sourceIsCurrent ? new Set(messages.filter(sourceIsCurrent).map(message => message.memoryRef)) : null;
+    const valid = (parsedOutput?.memories || []).filter(memory => !currentRefs || memory.sourceRefs.every(ref => currentRefs.has(ref)));
+    const established = new Map(valid.flatMap(memory => memory.entityMentions || []).map(entity => [entity.ref, entity]));
     let repair = { memories: [], recoveredCount: 0, rejected: [], failures: [], returnedCount: 0, generations: [], state: null };
-    const candidates = salvage ? salvage.invalidCandidates.map((candidate, index) => ({
-      index: salvage.rejected[index].index, candidate, reason: salvage.rejected[index].reason,
-    })) : [{ index: 0, candidate: null, rawOutput: generation.output, reason: clean(validationError.message) }];
+    const candidates = parsedOutput ? failures.map(({ candidate, index, error }) => {
+      const entities = extractionEntityDeclarationsFor([candidate], inspected.entities, established);
+      return { index, evidenceSourceRefs: candidate?.sourceRefs,
+        draft: { memories: [candidate], ...(Array.isArray(entities) && !entities.length ? {} : { entities }) }, reason: clean(error.message).slice(0, 500) };
+    }) : [{ index: 0, draft: { rawOutput: generation.output }, reason: clean(validationError.message) }];
     if (candidates.length) {
-      try {
-        repair = await repairExtractionCandidates({
-          state: { candidates, entityScope: extractionEntityScope(built.messages), ...(salvage?.entities ? { entities: salvage.entities } : {}), messages, participants: built.participants, timeZone: built.timeZone,
-            contextWindows: built.archiveWindows.filter(window => window.previousContextMessages.length || window.continuationGuidanceMessages.length)
-              .map(({ id, label, previousContextMessages, continuationGuidanceMessages }) => ({ id, label, previousContextMessages, continuationGuidanceMessages })) }, generator,
-          sourceMaterial: generationRequest.sourceMaterial,
-        });
-      } catch (error) {
-        error.usage = combinedNumericUsage(generation.usage, ...(error.repairGenerations || []).map(item => item.usage));
-        error.metadata = { ...generation.metadata, ...error.metadata, initialRequestId };
-        throw error;
-      }
+      repair = await repairExtractionCandidates({
+        state: { candidates, entityScope: extractionEntityScope(built.messages), entities: [...established.values()], messages, participants: built.participants, timeZone: built.timeZone,
+          contextWindows: built.archiveWindows.filter(window => window.previousContextMessages.length || window.continuationGuidanceMessages.length)
+            .map(({ id, label, previousContextMessages, continuationGuidanceMessages }) => ({ id, label, previousContextMessages, continuationGuidanceMessages })) }, generator,
+        sourceIsCurrent, contextIsCurrent,
+        sourceMaterial: generationRequest.sourceMaterial ? ({ messages: selected, contextWindows }) =>
+          scopedMaterial([...selected, ...contextWindows.flatMap(window => [...window.previousContextMessages,
+            ...window.continuationGuidanceMessages])]) : undefined,
+      });
     }
     parsedOutput = { memories: [...valid, ...repair.memories] };
     const last = repair.generations.at(-1);
@@ -389,10 +361,10 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
       ...(last || {}), output: parsedOutput, usage, durationMs,
       metadata: {
         ...(last?.metadata || generation.metadata || {}),
-        repaired: Boolean(repair.generations.length && !repair.state),
+        repaired: Boolean((repair.recoveredCount || repair.generations.length) && !repair.state),
         salvaged: Boolean(valid.length),
         salvageSource: valid.length && repair.memories.length ? 'initial+repair' : repair.memories.length ? 'repair' : valid.length ? 'initial' : '',
-        initialCandidateCount: salvage?.originalCount ?? null,
+        initialCandidateCount: inspected.originalCount ?? null,
         initialValidCandidateCount: valid.length,
         initialInvalidCandidateCount: candidates.length,
         repairCandidateCount: repair.returnedCount,
@@ -404,7 +376,9 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
         unresolvedCandidateCount: repair.state?.candidates.length || 0,
         candidateValidationIncomplete: Boolean(repair.state),
         extractionRepair: repair.state,
-        rejectedCandidates: [...(salvage?.rejected || []).map(item => ({ ...item, stage: 'initial' })), ...repair.failures],
+        rejectedCandidates: [...failures.map(({ index, error }) => ({
+          index, reason: clean(error.message).slice(0, 500), stage: 'initial',
+        })), ...repair.failures],
         initialSchemaName: generationRequest.schemaName,
         initialRequestId,
         initialValidationError: clean(validationError.message),
@@ -431,6 +405,7 @@ export async function generateCompanionEventBatch({ events, previousContextEvent
     previousContextMessages: built.previousContextMessages,
     continuationGuidanceMessages: built.continuationGuidanceMessages,
     input: built.input,
+    modelInput: generationRequest.modelInput,
     generation: {
       ...generation,
       output: parsedOutput,
@@ -451,8 +426,9 @@ export function extractionRepairFailure(generation) {
 function recordExtractionFailure({ repository, agentId, batchId, generated, archive, terminalFailure, completedAt, parentTaskId }) {
   if (!terminalFailure) return null;
   const sourceMessages = generated.generation.metadata?.extractionRepair?.messages || generated.messages;
-  const sourceMessageIds = new Set(sourceMessages.map(message => message.id));
-  const memoryIds = archive.utteranceMemoryIds.filter((_, index) => sourceMessageIds.has(generated.messages[index].id));
+  const archivedById = new Map(archive.utteranceMemoryIds.map((id, index) => [generated.messages[index].id, id]));
+  const memoryIds = [...new Set(sourceMessages.map(message => archivedById.get(message.id)
+    || readArchivedExtractionEvidence(repository, agentId, message)?.memoryId).filter(Boolean))];
   const eventIds = [...new Set(sourceMessages
     .flatMap(message => message.inputEventIds || [message.inputEventId]).map(clean).filter(Boolean))];
   const attempts = Math.max(1, Math.trunc(Number(terminalFailure.attempts) || 1));
@@ -470,56 +446,172 @@ function recordExtractionFailure({ repository, agentId, batchId, generated, arch
   });
 }
 
-export async function retryCompanionExtractionRepair({ repository, agentId, task, generator, identity,
-  completedAt, usageLedgerPath, executionTime, reviewedBy = 'human', reviewNote = '' }) {
-  const state = task.payload.extractionRepair;
-  const assertSourcesAvailable = () => {
-    if (task.payload.eventIds.some(id => {
-      const event = repository.getInputEvent(agentId, id);
-      return !event || event.status !== 'archived' || event.lifecycle !== 'active';
-    })) {
-      throw new Error('Only active archived input events can be retried from human review.');
+const messageInputIds = message => (message.inputEventIds || [message.inputEventId]).filter(Boolean);
+
+export const isExtractionRetryInput = event => Boolean(event.metadata?.suzuMemoryProcessing?.retryRequestedBy);
+const hasArchivedInput = event => event.status === 'archived' || isExtractionRetryInput(event);
+
+function currentContextMessage(repository, agentId, message, view, events) {
+  const ids = messageInputIds(message);
+  if (!ids.length || (view && ids.some(id => !view.inputIds.has(id)))) return false;
+  const rows = ids.map(id => events ? events.get(id) : repository.getInputEvent(agentId, id));
+  return rows.every(event => event?.lifecycle === 'active' && event.processing_disposition !== 'quarantined')
+    && clean(rows.map(event => event.content?.text).join('')) === clean(message.text)
+    && (!rows.some(hasArchivedInput) || Boolean(readArchivedExtractionEvidence(repository, agentId, message)));
+}
+
+export function readExtractionContext(repository, agentId, identity) {
+  const view = executionEventSourceView(repository, agentId);
+  const contextIds = new Set();
+  const select = rows => {
+    const stored = new Map();
+    const refreshed = rows.flatMap(row => {
+      const event = (row.id && repository.getInputEvent(agentId, row.id))
+        || repository.getInputEventByExternalId(agentId, row.external_id || row.eventId || row.id);
+      if (view && !view.inputIds.has(event?.id)) return [];
+      if (!event) return [row];
+      stored.set(event.id, event);
+      return [event];
+    });
+    const unavailable = new Set();
+    for (const message of companionMessagesFromEvents(refreshed, identity)) {
+      const ids = messageInputIds(message);
+      if (ids.some(id => stored.has(id))) {
+        if (!currentContextMessage(repository, agentId, message, view, stored)) {
+          ids.forEach(id => unavailable.add(id));
+        } else ids.forEach(id => contextIds.add(id));
+      }
     }
+    return refreshed.filter(row => !unavailable.has(row.id || row.eventId));
   };
-  assertSourcesAvailable();
+  const contextIsCurrent = message => {
+    const ids = messageInputIds(message);
+    return !ids.some(id => contextIds.has(id)) || currentContextMessage(repository, agentId, message, view);
+  };
+  return { select, contextIsCurrent };
+}
+
+export function currentArchivedInputEvents(repository, agentId, events, identity) {
+  const archived = events.filter(isExtractionRetryInput);
+  if (!archived.length) return events;
+  const unavailable = new Set(companionMessagesFromEvents(archived, identity)
+    .filter(message => !readArchivedExtractionEvidence(repository, agentId, message)).flatMap(messageInputIds));
+  return unavailable.size ? events.filter(event => !unavailable.has(event.id)) : events;
+}
+
+function refreshRetryEvidence(repository, agentId, generated, retryInputIds, withdrawn) {
+  const archivedEvidence = new Map();
+  if (!retryInputIds.size) return { generated, archivedEvidence };
+  const messages = generated.messages.filter(message => {
+    const ids = messageInputIds(message);
+    if (!ids.some(id => retryInputIds.has(id))) return true;
+    const stored = readArchivedExtractionEvidence(repository, agentId, message);
+    if (stored) archivedEvidence.set(message.id, stored);
+    else for (const id of ids) withdrawn.add(id);
+    return Boolean(stored);
+  });
+  if (messages.length === generated.messages.length) return { generated, archivedEvidence };
+  const scoped = new Set(messages.map(message => message.memoryRef));
+  const generation = generated.generation;
+  const metadata = { ...generation.metadata };
+  if (metadata.extractionRepair) {
+    const state = metadata.extractionRepair;
+    const { available, rejected } = selectCurrentRepairCandidates(state, { evidence: scoped, scoped });
+    metadata.extractionRepair = available.length ? { ...state, messages, candidates: available } : null;
+    metadata.unresolvedCandidateCount = available.length;
+    metadata.candidateValidationIncomplete = Boolean(available.length);
+    metadata.repairRejectedCandidates = [...(metadata.repairRejectedCandidates || []), ...rejected];
+  }
+  const memories = generation.output.memories.filter(memory => memory.sourceRefs.every(ref => scoped.has(ref)));
+  metadata.finalCandidateCount = memories.length;
+  return { archivedEvidence, generated: { ...generated, messages, generation: { ...generation, metadata,
+    output: { ...generation.output, memories } } } };
+}
+
+function readRepairSources(repository, agentId, state) {
+  const view = executionEventSourceView(repository, agentId);
+  const evidence = new Map(), scoped = new Set();
+  for (const message of state.messages) {
+    const item = readArchivedExtractionEvidence(repository, agentId, message);
+    if (!item) continue;
+    evidence.set(message.memoryRef, item);
+    if (!view || view.memoryIds.has(item.memoryId)) scoped.add(message.memoryRef);
+  }
+  return { evidence, scoped, view };
+}
+
+export async function retryCompanionExtractionRepair({ repository, agentId, task, generator, identity,
+  completedAt, usageLedgerPath, reviewedBy = 'human', reviewNote = '' }) {
   const execution = currentEventSourceExecution();
-  const contextMessages = (state.contextWindows || []).flatMap(window => [
-    ...window.previousContextMessages, ...window.continuationGuidanceMessages,
-  ]);
-  const materialInputIds = [...new Set([...task.payload.eventIds,
-    ...contextMessages.flatMap(message => message.inputEventIds || [message.inputEventId]).filter(Boolean)])];
-  const sourceMaterial = execution?.sourceScope ? eventSourceMaterial(repository, agentId, [], [], materialInputIds) : undefined;
-  const usageWarnings = [];
-  const repair = await repairExtractionCandidates({ state, sourceMaterial,
-    generator: recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
-      agentId, batchId: task.payload.batchId, warnings: usageWarnings }) });
-  const generation = { output: { memories: repair.memories },
-    metadata: { ...repair.generations.at(-1)?.metadata, extractionRepair: repair.state, repairAttempts: repair.generations.length,
-      repairRejectedCandidates: repair.rejected, repairRejectedCandidateCount: repair.rejected.length,
-      unresolvedCandidateCount: repair.state?.candidates.length || 0, candidateValidationIncomplete: Boolean(repair.state) } };
-  const failure = extractionRepairFailure(generation);
-  const result = repository.transaction(() => {
-    assertSourcesAvailable();
+  const assertTaskPending = () => {
     const current = repository.getMaintenanceTask(agentId, task.id);
-    if (current?.status !== 'failed' || current.review_state !== 'pending') throw new Error('Extraction repair review is no longer pending.');
-    const archive = archiveLongTermEvidence({ repository, agentId, messages: state.messages,
-      timeZone: state.timeZone,
+    if (!current && execution?.sourceScope) throw Object.assign(new Error('Extraction review was removed with its source.'),
+      { code: 'EVENT_SOURCE_MATERIAL_INELIGIBLE' });
+    if (current?.status !== 'failed' || current.review_state !== 'pending'
+      || current.updated_at !== task.updated_at) throw new Error('Extraction repair review is no longer pending.');
+  };
+  assertTaskPending();
+  const state = task.payload.extractionRepair;
+  const sources = readRepairSources(repository, agentId, state);
+  const { available, deferred, rejected } = selectCurrentRepairCandidates(state, sources);
+  if (!available.length && deferred.length && !rejected.length) throw Object.assign(
+    new Error('Extraction review sources await an eligible scope.'), { code: 'EVENT_SOURCE_TASK_DEFERRED' });
+  const eligibleContext = message => currentContextMessage(repository, agentId, message, sources.view);
+  const messages = state.messages.filter(message => sources.scoped.has(message.memoryRef));
+  const contextWindows = (state.contextWindows || []).map(window => ({ ...window,
+    previousContextMessages: window.previousContextMessages.filter(eligibleContext),
+    continuationGuidanceMessages: window.continuationGuidanceMessages.filter(eligibleContext),
+  }));
+  const sourceMaterial = execution?.sourceScope ? ({ messages: selectedMessages, contextWindows: selectedWindows }) =>
+    eventSourceMaterial(repository, agentId, [], [], [...selectedMessages, ...selectedWindows.flatMap(window => [
+      ...window.previousContextMessages, ...window.continuationGuidanceMessages,
+    ])].flatMap(messageInputIds)) : undefined;
+  const usageWarnings = [];
+  const repair = await repairExtractionCandidates({ state: { ...state, candidates: available, messages, contextWindows }, sourceMaterial,
+    resumeSavedDrafts: true,
+    sourceIsCurrent: message => Boolean(readArchivedExtractionEvidence(repository, agentId, message)),
+    contextIsCurrent: eligibleContext,
+    generator: recordingCompanionEventGenerator({ generator, usageLedgerPath,
+      agentId, batchId: task.payload.batchId, warnings: usageWarnings }) });
+  const result = repository.transaction(() => {
+    assertEventSourceExecutionCurrent();
+    assertTaskPending();
+    const latest = readRepairSources(repository, agentId, state);
+    const ready = repair.memories.filter(memory => memory.sourceRefs.every(ref => latest.scoped.has(ref)));
+    const pending = selectCurrentRepairCandidates({ ...state, candidates: [...(repair.state?.candidates || []), ...deferred] }, latest);
+    const candidates = [...pending.available, ...pending.deferred];
+    const extractionRepair = candidates.length ? { ...state, ...repair.state, candidates,
+      messages: (pending.deferred.length ? state.messages : repair.state.messages)
+        .filter(message => latest.evidence.has(message.memoryRef)),
+      contextWindows: pending.deferred.length ? state.contextWindows : repair.state.contextWindows || [],
+    } : null;
+    const repairRejectedCandidates = [...rejected, ...repair.rejected, ...pending.rejected];
+    const generation = { output: { memories: ready }, metadata: { ...repair.generations.at(-1)?.metadata,
+      extractionRepair, repairAttempts: repair.generations.length, repairRejectedCandidates,
+      repairRejectedCandidateCount: repairRejectedCandidates.length + repair.memories.length - ready.length,
+      rejectedCandidates: repair.failures, unresolvedCandidateCount: candidates.length, candidateValidationIncomplete: Boolean(extractionRepair),
+    } };
+    const failure = extractionRepairFailure(generation);
+    const archivedMessages = state.messages.filter(message => latest.scoped.has(message.memoryRef));
+    const archive = archiveRepairedLongTermEvidence({ repository, agentId, messages: archivedMessages,
       generatedMemories: generation.output.memories,
       candidateIndexOffset: repository.getNextIngestionCandidateIndex(agentId, task.payload.batchId), batchId: task.payload.batchId,
-      conversationTopology: state.messages.some(message => message.eventSource) ? '' : DIRECT_USER_AGENT_DM_TOPOLOGY,
       recordedAt: completedAt, identity: { ...identity, participants: state.participants } });
     const failureReviewTask = recordExtractionFailure({ repository, agentId, batchId: task.payload.batchId,
-      generated: { messages: state.messages, generation }, archive, terminalFailure: failure, completedAt, parentTaskId: task.id });
+      generated: { messages: archivedMessages, generation }, archive, terminalFailure: failure, completedAt, parentTaskId: task.id });
+    const sourceInvalidated = !ready.length && !candidates.length
+      && (rejected.length || pending.rejected.length || repair.sourceInvalidated || repair.memories.length > ready.length);
     const memoryIds = [...new Set(archive.candidateResults.flatMap(item => [item.memoryId, item.provisionalMemoryId]).filter(Boolean))];
     const postProcessing = runCompanionEventPostProcessing({ repository, agentId,
-      batchId: task.payload.batchId, memoryIds, embeddingMemoryIds: [...new Set([...memoryIds, ...archive.utteranceMemoryIds])],
+      batchId: task.payload.batchId, memoryIds,
       requiredFollowUpEnqueue: true });
     const note = [clean(reviewNote) || 'Extraction candidate repair was retried.',
-      ...repair.rejected.map(item => 'Candidate ' + item.index + ' rejected: ' + item.reason)].join('\n');
+      ...repairRejectedCandidates.map(item => 'Candidate ' + item.index + ' rejected: ' + item.reason),
+      ...(repair.memories.length > ready.length ? ['Original sources changed before archiving some repaired memories.'] : [])].join('\n');
     if (!failureReviewTask || failureReviewTask.id !== task.id) repository.reviewMaintenanceTaskFailure({
-      agentId, taskId: task.id, action: 'accept', reviewedBy, note, reviewedAt: completedAt,
+      agentId, taskId: task.id, action: sourceInvalidated ? 'dismiss' : 'accept', reviewedBy, note, reviewedAt: completedAt,
     });
-    return { status: 'processed', ...archive, failureReviewTask, postProcessing,
+    return { status: sourceInvalidated ? 'source-invalidated' : 'processed', ...archive, failureReviewTask, postProcessing,
       generationDiagnostics: { ...generation.metadata, degraded: Boolean(failure) } };
   });
   result.warnings = [...(result.postProcessing.warnings || []), ...usageWarnings];
@@ -535,12 +627,21 @@ export function archiveCompanionEventBatch({
   completedAt,
   terminalFailure = null,
   identity = {},
+  retryInputIds = new Set(),
+  retryWithdrawnEventIds = [],
 }) {
   let archive;
   let failureReviewTask = null;
   let postProcessing;
   repository.transaction(() => {
     repository.assertInputBatchLease(agentId, batchId, leaseOwner);
+    const withdrawn = new Set(retryWithdrawnEventIds);
+    const current = refreshRetryEvidence(repository, agentId, generated, retryInputIds, withdrawn);
+    generated = current.generated;
+    if (!generated.messages.length) terminalFailure = null;
+    else if (terminalFailure?.errorCode === 'MEMORY_EXTRACTION_REPAIR_INCOMPLETE') {
+      terminalFailure = extractionRepairFailure(generated.generation);
+    }
     ensureCompanionRelationshipStructure({
       createPrimaryRelationship: Boolean(identity.primaryUserId) && !generated.messages.some(message => message.eventSource),
       repository,
@@ -554,12 +655,13 @@ export function archiveCompanionEventBatch({
       worldFrame: identity.defaultWorldFrame,
       provenance: "suzu-memory-ingestion-identity",
     });
-    archive = archiveLongTermEvidence({
+    archive = archiveValidatedLongTermEvidence({
       repository,
       agentId,
       sourceLocator: "",
       sourceKind: "input-event",
       messages: generated.messages,
+      archivedEvidence: current.archivedEvidence,
       timeZone: generated.timeZone,
       generatedMemories: generated.generation.output.memories,
       batchId,
@@ -573,7 +675,7 @@ export function archiveCompanionEventBatch({
       .filter(Boolean))];
     const embeddingMemoryIds = [...new Set([
       ...memoryIds,
-      ...(archive.utteranceMemoryIds || []),
+      ...archive.utteranceMemoryIds.filter((id, index) => !current.archivedEvidence.has(generated.messages[index].id)),
     ])];
     postProcessing = runCompanionEventPostProcessing({
       repository,
@@ -588,8 +690,9 @@ export function archiveCompanionEventBatch({
       leaseOwner,
       output: {
         messagesArchived: archive.messagesArchived,
-        inputCharacters: generated.input.length,
+        inputCharacters: (generated.modelInput ?? generated.input).length,
         degraded: Boolean(terminalFailure),
+        ...(withdrawn.size ? { retryWithdrawnEventIds: [...withdrawn] } : {}),
         candidateValidationIncomplete: Boolean(generated.generation.metadata?.candidateValidationIncomplete),
         unresolvedCandidateCount: generated.generation.metadata?.unresolvedCandidateCount || 0,
         repairRejectedCandidates: generated.generation.metadata?.repairRejectedCandidates || [],
@@ -607,7 +710,7 @@ export function archiveCompanionEventBatch({
       completedAt,
     });
   });
-  return { ...archive, failureReviewTask, postProcessing };
+  return { ...archive, failureReviewTask, postProcessing, terminalFailure, generated };
 }
 
 export function runCompanionEventPostProcessing({
@@ -644,7 +747,7 @@ export function runCompanionEventPostProcessing({
   };
 }
 
-export function recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
+export function recordingCompanionEventGenerator({ generator, usageLedgerPath,
   agentId, batchId, warnings }) {
   if (typeof generator !== 'function') return generator;
   // Forward function properties and methods, including non-enumerable provider
@@ -652,6 +755,7 @@ export function recordingCompanionEventGenerator({ generator, usageLedgerPath, e
   // validate sources, repair output, or persist a batch.
   return new Proxy(generator, {
     async apply(target, receiver, args) {
+      const requestedAt = new Date().toISOString();
       let generation;
       let failed = false;
       try {
@@ -663,7 +767,7 @@ export function recordingCompanionEventGenerator({ generator, usageLedgerPath, e
         throw error;
       } finally {
         const warning = await recordCompanionEventGenerationUsage({
-          usageLedgerPath, executionTime, agentId, batchId,
+          usageLedgerPath, requestedAt, agentId, batchId,
           generation: failed ? { model: generation?.model, requestId: generation?.requestId,
             usage: generation?.usage, durationMs: generation?.durationMs,
             metadata: { ...generation?.metadata, failed: true, errorCode: generation?.code || '' } } : generation,
@@ -676,7 +780,7 @@ export function recordingCompanionEventGenerator({ generator, usageLedgerPath, e
 
 async function recordCompanionEventGenerationUsage({
   usageLedgerPath,
-  executionTime,
+  requestedAt,
   agentId,
   batchId,
   generation,
@@ -685,7 +789,7 @@ async function recordCompanionEventGenerationUsage({
     || !Object.keys(generation.usage).length) return "";
   try {
     await appendUsageEvent(usageLedgerPath, {
-      timestamp: executionTime.toISOString(),
+      timestamp: requestedAt,
       agentId,
       provider: generation.metadata?.provider || "",
       model: generation.model,

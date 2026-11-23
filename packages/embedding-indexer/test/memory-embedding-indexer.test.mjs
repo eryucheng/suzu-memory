@@ -743,6 +743,26 @@ for (const failure of ['proposal', 'critic', 'persistence']) test(`retrieval con
   assert.equal(charges.reduce((sum, charge) => sum + charge.usage.prompt_tokens, 0), calls * 7);
 });
 
+test('cancelling context generation stops the critic and retains the completed proposal receipt', async t => {
+  const { database, repository } = fixture();
+  t.after(() => database.close());
+  const controller = new AbortController(), entered = Promise.withResolvers(), release = Promise.withResolvers(), charges = [];
+  const original = fakeContextGenerators();
+  let criticCalls = 0;
+  const pending = withUsageRecorder(charge => charges.push(charge), () => withEventSourceExecution(repository,
+    () => generateMemoryRetrievalContexts({ repository, agentId: 'agent-test', memoryIds: ['relationship-state'],
+      ledgerPath: path.join(os.tmpdir(), 'unused-context-ledger.jsonl'),
+      proposer: async request => { entered.resolve(); await release.promise; return original(request); },
+      critic: async request => { criticCalls++; return original(request); } }), { signal: controller.signal }));
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await entered.promise;
+  controller.abort(); release.resolve(); await rejected;
+  assert.equal(criticCalls, 0);
+  assert.equal(charges.length, 1);
+  assert.equal(charges[0].requestId, 'proposal-request');
+  assert.equal(repository.getCurrentMemoryRetrievalContext('relationship-state'), null);
+});
+
 test("skips self-contained memories without calling either context model", async () => {
   const { database, repository } = fixture();
   repository.upsertMemory({
@@ -777,7 +797,7 @@ test("skips self-contained memories without calling either context model", async
   database.close();
 });
 
-test("does not store a rejected retrieval context", async () => {
+test("generates and reviews a retrieval context using the same facts before rejecting it", async () => {
   const { database, repository } = fixture();
   const generator = fakeContextGenerators({ approved: false });
   const generated = await generateMemoryRetrievalContexts({
@@ -789,6 +809,18 @@ test("does not store a rejected retrieval context", async () => {
   });
   assert.equal(generated.added, 0);
   assert.equal(generated.rejected, 1);
+  assert.equal(generated.criticCalls, 1);
+  const [proposal, critique] = generator.calls.map(call => JSON.parse(call.input));
+  assert.deepEqual(critique.source, proposal.source);
+  assert.equal(proposal.source.title, "科技馆之行");
+  assert.equal(proposal.source.content, "用户周六去了科技馆。");
+  assert.equal(proposal.source.subjectRole, "user");
+  assert.equal(proposal.source.eventDate, "2026-07-11");
+  assert.equal(proposal.source.reality, "real");
+  for (const field of ["schemaVersion", "memoryId", "subjectKey", "canonicalKey", "stateScopeKey", "layer", "status"]) {
+    assert.equal(Object.hasOwn(proposal.source, field), false, field);
+  }
+  assert.equal(Object.hasOwn(critique, "riskReasons"), false);
   assert.equal(repository.getCurrentMemoryRetrievalContext("museum-event"), null);
   assert.equal(repository.listMemoryRetrievalContexts({
     agentId: "agent-test",

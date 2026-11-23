@@ -19,7 +19,7 @@ export function readMemoryBenchmarkPreparation(memory) {
     return row ? { total: row.total, completed: row.completed, blocked: row.blocked } : null;
   }, { readOnly: true }) : null;
   return { observedAt: new Date().toISOString(), ...status.work,
-    ...(consolidation ? { operation: 'memory-consolidation-combined-v1' } : {}),
+    ...(consolidation ? { operation: 'memory-consolidation-combined-v2' } : {}),
     pending: { inputEvents, ...status.work.pending }, consolidation };
 }
 

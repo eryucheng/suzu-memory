@@ -1,5 +1,8 @@
 export {
   archiveLongTermEvidence,
+  archiveRepairedLongTermEvidence,
+  archiveValidatedLongTermEvidence,
+  readArchivedExtractionEvidence,
   fallbackStateAnalysisToProvisionalReview,
   loadLongTermExtractionSystemPrompt,
   resolveExtractedCandidateIdentity,
@@ -8,12 +11,20 @@ export {
 
 export {
   LONG_TERM_EXTRACTION_SCHEMA,
+  LONG_TERM_EXTRACTION_MODEL_SCHEMA,
   EXTRACTION_ENTITY_SCHEMA,
   extractionEntityScope,
   parseExtractionEntities,
+  extractionEntityReferences,
+  extractionEntityDeclarationsFor,
   assignMemoryRefs,
   buildLongTermExtractionInput,
+  buildLongTermExtractionRequest,
   detectExtractionLanguage,
+  normalizeExtractionLanguage,
+  extractionContextLanguage,
+  extractionOutputLanguage,
+  inspectGeneratedLongTermExtraction,
   normalizeGeneratedLongTermExtraction,
   parseGeneratedLongTermExtraction,
 } from "./prompt.mjs";
@@ -25,7 +36,7 @@ export {
 
 export { buildExtractionParticipants, resolveExtractionParticipant, resolveExtractionSpeaker, resolveExtractionActor } from './participant-identity.mjs';
 
-export { LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair } from './repair.mjs';
-export { createExtractionTimeValidator } from './temporal-evidence.mjs';
+export { LONG_TERM_EXTRACTION_REPAIR_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_MODEL_SCHEMA, parseGeneratedExtractionRepair, parseExtractionRepairResultEnvelope } from './repair.mjs';
+export { collectCalendarEvidence } from './temporal-evidence.mjs';
 
 export { createExtractionEntityBinder } from './entity-bindings.mjs';

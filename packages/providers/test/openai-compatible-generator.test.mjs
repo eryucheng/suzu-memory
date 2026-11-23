@@ -169,7 +169,7 @@ test("DashScope saved base URL uses its OpenAI-compatible text endpoint", async 
   assert.equal(requestedUrl, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
 });
 
-test("strict tool mode sends the supplied schema to the configured endpoint and parses arguments", async () => {
+test("strict tool mode uses a fixed result tool across schema versions", async () => {
   let request = null;
   const schema = {
     type: "object",
@@ -196,7 +196,7 @@ test("strict tool mode sends the supplied schema to the configured endpoint and 
             tool_calls: [{
               type: "function",
               function: {
-                name: "memory-goal-v1",
+                name: "return_result",
                 arguments: '{"analyses":[]}',
               },
             }],
@@ -206,35 +206,57 @@ test("strict tool mode sends the supplied schema to the configured endpoint and 
       });
     },
   });
-  const result = await generate({
-    input: "evidence",
-    systemPrompt: "analyze",
-    schemaName: "memory-goal-v1",
-    schema,
+  for (const schemaName of ["memory-goal-v1", "memory-goal-v2"]) {
+    const result = await generate({ input: "evidence", systemPrompt: "analyze", schemaName, schema });
+    assert.equal(request.url, "https://api.deepseek.com/beta/chat/completions");
+    assert.equal(request.body.response_format, undefined);
+    assert.deepEqual(request.body.thinking, { type: "disabled" });
+    assert.equal(request.body.messages[0].content, "analyze\n\n按提供的 JSON Schema 返回结果。");
+    assert.equal(request.body.tools[0].function.name, "return_result");
+    assert.equal(request.body.tools[0].function.strict, true);
+    assert.deepEqual(request.body.tools[0].function.parameters, schema);
+    assert.deepEqual(request.body.tool_choice, {
+      type: "function",
+      function: { name: "return_result" },
+    });
+    assert.deepEqual(result.output, { analyses: [] });
+    assert.equal(result.metadata.responseFormat, "strict-tool");
+    assert.equal(result.metadata.schemaName, schemaName);
+  }
+});
+
+test("Anthropic-compatible generation reads the fixed result tool input", async () => {
+  let request;
+  const schema = { type: "object", properties: { choice: { type: "string" } },
+    required: ["choice"], additionalProperties: false };
+  const generate = createOpenAiCompatibleStructuredGenerator({
+    connection: { type: "anthropic-compatible", baseUrl: "https://api.example.test", model: "fixture", apiKey: "secret" },
+    fetchImpl: async (url, options) => {
+      request = { url, body: JSON.parse(options.body) };
+      return response({ stop_reason: "tool_use", content: [
+        { type: "tool_use", name: "return_result", input: { choice: "A" } },
+      ] });
+    },
   });
-  assert.equal(request.url, "https://api.deepseek.com/beta/chat/completions");
-  assert.equal(request.body.response_format, undefined);
-  assert.deepEqual(request.body.thinking, { type: "disabled" });
-  assert.equal(request.body.tools[0].function.name, "memory-goal-v1");
-  assert.equal(request.body.tools[0].function.strict, true);
-  assert.deepEqual(request.body.tools[0].function.parameters, schema);
-  assert.deepEqual(request.body.tool_choice, {
-    type: "function",
-    function: { name: "memory-goal-v1" },
-  });
-  assert.deepEqual(result.output, { analyses: [] });
-  assert.equal(result.metadata.responseFormat, "strict-tool");
+  const result = await generate({ input: "option", systemPrompt: "choose", schemaName: "answer-v2", schema });
+  assert.equal(request.url, "https://api.example.test/v1/messages");
+  assert.equal(request.body.system, "choose\n\n按提供的 JSON Schema 返回结果。");
+  assert.deepEqual(request.body.tool_choice, { type: "tool", name: "return_result" });
+  assert.equal(request.body.tools[0].name, "return_result");
+  assert.deepEqual(request.body.tools[0].input_schema, schema);
+  assert.deepEqual(result.output, { choice: "A" });
+  assert.equal(result.metadata.schemaName, "answer-v2");
 });
 
 test("strict tools expand conditional objects without requiring forbidden fields or mutating the owner schema", async () => {
   const schema = { type: 'object', additionalProperties: false, required: ['memories'], properties: {
-    entities: { type: ['array', 'null'], items: { type: 'string' } },
+    entities: { type: ['array', 'null'], description: 'Known entities.', items: { type: 'string' }, minItems: 1 },
     time: { type: ['object', 'null'], anyOf: [{ type: 'null' }, {
       type: 'object', additionalProperties: false, required: [],
       properties: { date: { type: ['string', 'null'] } },
     }] },
     memories: { type: 'array', items: {
-      type: 'object', additionalProperties: false, required: ['family', 'content'],
+      type: 'object', description: 'An extracted memory.', additionalProperties: false, required: ['family', 'content'],
       properties: { family: { type: 'string', enum: ['identity', 'event'] },
         content: { type: 'string', minLength: 1 }, target: { type: 'object', description: 'Conditional target.' } },
       anyOf: [
@@ -252,7 +274,7 @@ test("strict tools expand conditional objects without requiring forbidden fields
       fetchImpl: async (_url, options) => {
         requests.push(JSON.parse(options.body));
         return response({ choices: [{ message: { content: '{"memories":[]}', tool_calls: [{
-          function: { name: 'conditional', arguments: '{"memories":[]}' },
+          function: { name: 'return_result', arguments: '{"memories":[]}' },
         }] } }] });
       },
     });
@@ -261,8 +283,11 @@ test("strict tools expand conditional objects without requiring forbidden fields
   const [identity, event] = requests[0].tools[0].function.parameters.properties.memories.items.anyOf;
   const parameters = requests[0].tools[0].function.parameters;
   assert.ok(Array.isArray(parameters.properties.entities.anyOf), 'Strict providers require anyOf for nullable arrays.');
-  assert.deepEqual(parameters.properties.entities.anyOf[0], { type: 'array', items: { type: 'string' } });
-  assert.equal(parameters.properties.entities.anyOf[1].type, 'null');
+  assert.equal(parameters.properties.entities.description, 'Known entities.');
+  assert.deepEqual(parameters.properties.entities.anyOf[0], { type: 'array', items: { type: 'string' }, minItems: 1 });
+  assert.deepEqual(parameters.properties.entities.anyOf[1], { type: 'null' });
+  assert.equal(parameters.properties.memories.items.description, 'An extracted memory.');
+  assert.equal(Object.hasOwn(identity, 'description') || Object.hasOwn(event, 'description'), false);
   const time = parameters.properties.time.anyOf[0];
   assert.equal(time.type, 'object');
   assert.deepEqual(time.required, ['date']);

@@ -8,6 +8,7 @@ import { runImmediateMemoryMaintenance, runSemanticMemoryMaintenance, runSemanti
   maintenanceWorkStatus } from "../src/index.mjs";
 import { planMemoryConsolidation } from "@suzu-memory/structurer";
 import { claimAccumulatedStructureTasks } from "../src/structure-batching.mjs";
+import { retrieveMemories } from '../../retriever/src/index.mjs';
 
 test('dismissal sends only surviving evidence for summary repair, retries failures and preserves manual edits', async t => {
   const { repository, seed } = fixture(t);
@@ -94,7 +95,7 @@ function fixture(t, databasePath = ":memory:") {
   const calls = [];
   const generator = async request => {
     calls.push(request);
-    return { output: request.schemaName === "memory-consolidation-combined-v1"
+    return { output: request.schemaName === "memory-consolidation-combined-v2"
       ? { structure: { proposals: [] }, relations: { proposals: [] } } : { proposals: [] } };
   };
   generator.supportsCombinedConsolidation = true;
@@ -108,6 +109,67 @@ function fixture(t, databasePath = ":memory:") {
   }
   return { database, repository, calls, generator, seed, run };
 }
+
+test('organization refreshes approved derived summaries through their parents while retaining human rewrites', async t => {
+  const databasePath = path.join(createTestDirectory(path.join(os.tmpdir(), 'summary-refresh-')), 'memory.db');
+  const { repository, seed } = fixture(t, databasePath);
+  const members = [seed(1, { content: 'Lin took a hiking trip.' }), seed(2, { content: 'Lin visited a museum.' })];
+  const create = (kind, memberIds, content) => {
+    const proposal = proposeMemoryStructure(repository, { agentId: 'owner', kind, memberIds, content });
+    resolveMemoryStructureProposal(repository, { agentId: 'owner', proposalId: proposal.id, action: 'accept' });
+    return repository.getMemory(proposal.result_memory_id);
+  };
+  const episode = create('episode', members.map(memory => memory.id), 'A hiking trip and a museum visit.');
+  const topic = create('topic', [episode.id, members[1].id], 'Lin enjoys hiking and museums.');
+  const manual = create('topic', members.map(memory => memory.id), 'Automatically proposed overview.');
+  repository.editMemoryManually({ agentId: 'owner', memoryId: manual.id, patch: { content: 'My own interpretation of these events.' } });
+  repository.editMemoryManually({ agentId: 'owner', memoryId: members[0].id, patch: { content: 'Correction: Lin went swimming, not hiking.' } });
+  const search = () => retrieveMemories({ databasePath, agentId: 'owner', query: 'Lin went swimming and visited a museum',
+    anchorMemoryIds: [episode.id, topic.id, members[0].id], now: new Date('2026-09-21T08:00:00.000Z') });
+  const duringRefresh = await search();
+  assert.ok(duringRefresh.graph.selectedMemoryIds.includes(members[0].id));
+  assert.ok(!duringRefresh.graph.selectedMemoryIds.includes(episode.id));
+  assert.ok(!duringRefresh.graph.selectedMemoryIds.includes(topic.id));
+  let calls = 0;
+  const generator = async request => {
+    if (request.schemaName !== 'memory-structure-summary-v1') return { output: { proposals: [] } };
+    calls++;
+    assert.match(request.input, /swimming/);
+    return { output: { title: 'Updated activities', content: 'Lin went swimming and visited a museum.' } };
+  };
+  const run = () => runSemanticTaskMaintenance({ repository, agentId: 'owner', structureGenerator: generator });
+  await run(); await run();
+  assert.equal(repository.getMemory(episode.id).content, 'Lin went swimming and visited a museum.');
+  assert.equal(repository.getMemory(topic.id).content, 'Lin went swimming and visited a museum.');
+  assert.equal(repository.getMemory(manual.id).content, 'My own interpretation of these events.');
+  assert.ok((await search()).graph.selectedMemoryIds.some(id => id === episode.id || id === topic.id));
+  assert.ok([episode, topic, manual].every(memory => repository.getStructureProposal('owner', memory.metadata.structureProposalId).review_state === 'accepted'));
+  const settledCalls = calls; await run(); assert.equal(calls, settledCalls);
+
+  for (const memory of members) repository.setMemoryDeleted({ agentId: 'owner', memoryId: memory.id });
+  const empty = await run();
+  assert.ok(empty.tasksSentToReview > 0, 'An approved container with no remaining evidence needs review, not invented text.');
+  assert.equal(calls, settledCalls, 'No model call can reconstruct a summary from zero evidence.');
+  await run(); assert.equal(calls, settledCalls);
+});
+
+test('withdrawing a structure keeps valid surviving evidence recallable while its fuller summary is queued', async t => {
+  const databasePath = path.join(createTestDirectory(path.join(os.tmpdir(), 'surviving-summary-')), 'memory.db');
+  const { repository, seed } = fixture(t, databasePath);
+  const initial = [seed(1, { content: 'Lin took a hiking trip.' }), seed(2, { content: 'Lin visited a museum.' })];
+  const survivors = [seed(3, { content: 'Lin bought some clay.' }), seed(4, { content: 'Lin made a clay sculpture.' })];
+  const proposal = proposeMemoryStructure(repository, { agentId: 'owner', kind: 'topic',
+    memberIds: initial.map(memory => memory.id), content: 'A hiking trip and a museum visit.' });
+  const topicId = proposal.result_memory_id;
+  for (const member of survivors) repository.linkMemoryToTopic({ agentId: 'owner', topicId, memoryId: member.id, provenance: 'human' });
+  const withdrawn = resolveMemoryStructureProposal(repository, { agentId: 'owner', proposalId: proposal.id, action: 'dismiss' });
+  assert.ok(survivors.some(member => member.content === withdrawn.memory.content));
+  assert.ok(repository.listMaintenanceTasks('owner', { taskTypes: ['structure-summary'], statuses: ['pending'] })
+    .some(task => task.payload.memoryIds.includes(topicId)));
+  const recall = await retrieveMemories({ databasePath, agentId: 'owner', query: 'Lin clay sculpture', anchorMemoryIds: [topicId],
+    now: new Date('2026-09-21T08:00:00.000Z') });
+  assert.ok(recall.graph.selectedMemoryIds.includes(topicId));
+});
 
 test("nineteen memories wait without generation or attempts, the twentieth is grouped once", async t => {
   const f = fixture(t);
@@ -132,6 +194,42 @@ test("nineteen memories wait without generation or attempts, the twentieth is gr
   f.seed(39);
   await f.run();
   assert.equal(f.calls.length, 2);
+});
+
+for (const failure of ['planning', 'handoff']) test(`capable providers transfer accumulated memories atomically and recover failed ${failure}`, async t => {
+  const f = fixture(t), members = [f.seed(1), f.seed(2)];
+  const calls = [];
+  const generator = Object.assign(async request => {
+    calls.push(request.schemaName);
+    if (request.schemaName === 'memory-structure-memberships-v1') return { output: { proposals: [{ operation: 'create', kind: 'episode',
+      title: 'Shared experience', memberIds: members.map(memory => memory.id), subjectRole: 'agent', subjectKey: 'owner', actorRoles: [], confidence: 0.9, rationale: 'Same outing.' }] } };
+    assert.equal(request.schemaName, 'memory-structure-summary-v1');
+    return { output: { title: 'Shared experience', content: 'Two stages of the same outing.' } };
+  }, { supportsPlannedOrganization: true, supportsCombinedConsolidation: true });
+  const record = f.repository.recordConsolidationRun.bind(f.repository);
+  const finish = f.repository.finishMaintenanceTask.bind(f.repository);
+  if (failure === 'planning') f.repository.recordConsolidationRun = () => { throw new Error('Planning storage unavailable.'); };
+  else {
+    let finished = 0;
+    f.repository.finishMaintenanceTask = input => {
+      if (input.result?.structureBatch && ++finished === 2) throw new Error('Handoff storage unavailable.');
+      return finish(input);
+    };
+  }
+  const options = { repository: f.repository, agentId: 'owner', structureGenerator: generator, minimumStructureMemories: 2 };
+  const first = await runSemanticTaskMaintenance(options);
+  assert.equal(first.tasksRetried, 2);
+  assert.equal(calls.length, 0);
+  assert.ok(f.repository.listMaintenanceTasks('owner', { taskTypes: ['structure-proposal'] }).every(task => task.status === 'pending' && !task.lease_owner));
+  assert.ok(f.repository.listMaintenanceTasks('owner', { taskTypes: ['structure-proposal'] }).every(task => !task.result.structureBatch.organizationRunId));
+  f.repository.recordConsolidationRun = record;
+  f.repository.finishMaintenanceTask = finish;
+  const report = await runSemanticMemoryMaintenance(options);
+  assert.equal(report.status, 'completed');
+  assert.deepEqual(calls, ['memory-structure-memberships-v1','memory-structure-summary-v1']);
+  assert.equal(f.repository.listStructureProposals('owner').length, 1);
+  await runSemanticMemoryMaintenance(options);
+  assert.equal(calls.length, 2, 'Completed queue handoff and organization are not repeated.');
 });
 
 test('maintenance inspection shares the structure threshold without claiming or modifying tasks', async t => {
@@ -224,7 +322,7 @@ test("an accumulated batch uses at most one local call plus one combined old-net
       relation: "associated_with", weight: 0.9, confidence: 0.9 });
   }
   await f.run();
-  assert.deepEqual(f.calls.map(call => call.schemaName), ["memory-structure-proposals-v2", "memory-consolidation-combined-v1"]);
+  assert.deepEqual(f.calls.map(call => call.schemaName), ["memory-structure-proposals-v2", "memory-consolidation-combined-v2"]);
   await f.run();
   assert.equal(f.calls.length, 2);
 });
@@ -277,6 +375,36 @@ test("interrupted batches retain membership before the first provider call", asy
   const snapshot = JSON.parse(f.calls[0].input);
   assert.equal(snapshot.memories.length, 20);
   assert.equal(snapshot.memories.some(memory => memory.id === "owner-primary-20"), false);
+});
+
+test('organization refreshes frozen batch coverage after a member changes or is deleted', async t => {
+  const f = fixture(t), calls = [];
+  for (const world of ['a', 'b']) for (let i = 0; i < 10; i++) f.seed(i, { world });
+  const generator = async request => {
+    calls.push(JSON.parse(request.input));
+    if (calls.length === 2) throw new Error('Temporary failure after the first world completed.');
+    return { output: { proposals: [] } };
+  };
+  const run = () => runSemanticTaskMaintenance({ repository: f.repository, agentId: 'owner', structureGenerator: generator });
+  assert.equal((await run()).status, 'partial-failure');
+  assert.equal(calls.length, 2);
+  f.repository.editMemoryManually({ agentId: 'owner', memoryId: 'owner-a-0', patch: { content: 'Corrected first world.' } });
+  f.repository.setMemoryDeleted({ agentId: 'owner', memoryId: 'owner-a-1' });
+  const deletedTask = f.repository.listMaintenanceTasks('owner', { taskTypes: ['structure-proposal'] })
+    .find(task => task.payload.memoryIds.includes('owner-a-1'));
+  assert.equal(deletedTask.status, 'pending', 'A shared batch owns the task until the batch settles.');
+  // Also recover persisted state left by the former per-memory retirement path.
+  f.database.prepare("UPDATE memory_maintenance_tasks SET status = 'completed', result_json = ? WHERE id = ?")
+    .run(JSON.stringify({ status: 'skipped', reason: 'memory-deleted', memoryId: 'owner-a-1' }), deletedTask.id);
+  const resumed = await run();
+  assert.equal(resumed.status, 'completed');
+  assert.equal(calls.length, 4, 'Changed input must rebuild the frozen coverage rather than treating old success as current.');
+  const current = calls.slice(2).flatMap(input => input.memories);
+  assert.equal(current.find(memory => memory.id === 'owner-a-0').content, 'Corrected first world.');
+  assert.equal(current.some(memory => memory.id === 'owner-a-1'), false);
+  assert.equal(new Set(current.map(memory => memory.id)).size, 19);
+  await run();
+  assert.equal(calls.length, 4, 'Settled current input should not be generated again.');
 });
 
 test("oversized batches split complete memories and retry only unfinished parts", async t => {

@@ -4,13 +4,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
-import { proposeMemoryRelation } from "@suzu-memory/core";
+import { proposeMemoryRelation, readOrganizationInput, selectOrganizationInput, assertOrganizationInputCurrent,
+  organizationInputIsCurrent, OrganizationInputChangedError, OrganizationCandidateError } from "@suzu-memory/core";
+import { organizationRejection } from './rejection.mjs';
 
 import { enforceRelationCandidatePolicy } from "./relation-candidate-policy.mjs";
 import {
   buildRelationGenerationInput,
   relationOutputSchema,
   parseRelationGeneration,
+  withRelationModelOutput,
 } from "./relation-prompt.mjs";
 import { buildRelationSnapshot } from "./relation-snapshot.mjs";
 import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit } from './prompt.mjs';
@@ -18,7 +21,8 @@ import { withGenerationReferences, assertGenerationRequestBudget, RELATION_REQUE
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "relation-system-prompt.md");
-const EXCERPT_INSTRUCTIONS = '标有 excerpt 的 sourceRecords 保留了原话中的因果片段。结合 memories 判断因果时，先检查片段是否足以核实两端事件、因果方向及必要条件。涉及未给出的上下文、跨轮指代或条件时，返回 needsFullEvidence: true 和空 proposals，获取完整原话后再判断；证据充足时返回 needsFullEvidence: false 并给出提案。';
+const EXCERPT_INSTRUCTIONS = 'excerpt 标记的来源是原话摘录。需要完整原话时填写 needsFullEvidence。';
+const SELECTION_INSTRUCTIONS = '关系的 anchorMemoryId 和 relatedMemoryId 只选 selectionScope.relations 对应列表中的 ID。';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -62,6 +66,7 @@ export function prepareRelationGeneration({
   repository, agentId, batchId, memoryIds,
   snapshotOptions = {}, systemPromptPath = DEFAULT_PROMPT_PATH, generator, maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
   maximumRequestCharacters = RELATION_REQUEST_CHARACTERS,
+  useSourceExcerpts = true, selectionInBody = false, deferEvidenceChoice = false,
 }) {
   const limit = proposalCountLimit(maximumProposals);
   if (limit === 0) return { snapshot: null, request: null, reason: 'proposal-budget-zero' };
@@ -73,26 +78,32 @@ export function prepareRelationGeneration({
     maxSnapshotChars: Infinity, ...snapshotOptions,
   });
   if (snapshot.memories.length < 2 || !snapshot.sourceRecords.length) return { snapshot, request: null, reason: snapshot.memories.length < 2 ? "fewer-than-two-eligible-memories" : "no-source-evidence" };
+  const scope = snapshot.relationContext;
+  if (scope && !scope.candidateMemoryIds.length && (!scope.includeAnchorPairs || scope.anchorMemoryIds.length < 2)) {
+    return { snapshot, request: null, reason: 'no-selected-relation-pairs' };
+  }
   const systemPrompt = fs.readFileSync(path.resolve(systemPromptPath), "utf8").trim();
-  const buildRequest = excerpted => withGenerationReferences({
+  const buildRequest = excerpted => withGenerationReferences(withRelationModelOutput({
     input: buildRelationGenerationInput(snapshot, { excerpted }),
-    systemPrompt: excerpted ? `${systemPrompt}\n\n${EXCERPT_INSTRUCTIONS}` : systemPrompt,
+    systemPrompt: [systemPrompt, ...(excerpted ? [EXCERPT_INSTRUCTIONS] : []),
+      ...(selectionInBody ? [SELECTION_INSTRUCTIONS] : [])].join('\n\n'),
     schema: relationOutputSchema(limit, { excerpted }),
-    schemaName: "memory-relation-proposals-v1",
+    schemaName: "memory-relation-proposals-v2",
     ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
-  });
+  }), { selectionInBody });
   const fullRequest = buildRequest(false);
-  assertGenerationRequestBudget(fullRequest, maximumRequestCharacters, generator);
-  if (snapshot.sourceExcerpts?.size) {
+  const inputVersion = readOrganizationInput(repository, agentId, snapshot.memories.map(memory => memory.id));
+  if (useSourceExcerpts && snapshot.sourceExcerpts?.size) {
     const request = buildRequest(true);
     const requestSize = value => generator?.measureRequest ? generator.measureRequest(value)
       : value.modelInput.length + value.systemPrompt.length + JSON.stringify(value.schema).length;
-    if (requestSize(request) < requestSize(fullRequest)) {
+    if (deferEvidenceChoice || requestSize(request) < requestSize(fullRequest)) {
       assertGenerationRequestBudget(request, maximumRequestCharacters, generator);
-      return { snapshot, request, fullRequest };
+      return { snapshot, request, fullRequest, inputVersion };
     }
   }
-  return { snapshot, request: fullRequest };
+  assertGenerationRequestBudget(fullRequest, maximumRequestCharacters, generator);
+  return { snapshot, request: fullRequest, inputVersion };
 }
 
 export async function proposeRelationsForBatch({
@@ -108,6 +119,7 @@ export async function proposeRelationsForBatch({
   candidatePolicy = {},
   maximumProposals = DEFAULT_MAXIMUM_PROPOSALS,
   maximumRequestCharacters = RELATION_REQUEST_CHARACTERS,
+  useSourceExcerpts = true,
   preparedGeneration = null,
 } = {}) {
   if (!repository) throw new Error("Memory relation structurer requires a repository.");
@@ -123,15 +135,16 @@ export async function proposeRelationsForBatch({
   const limit = proposalCountLimit(maximumProposals);
   const prepared = (limit > 0 ? preparedGeneration : null) || prepareRelationGeneration({
     repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
-    snapshotOptions, systemPromptPath, generator, maximumProposals: limit, maximumRequestCharacters,
+    snapshotOptions, systemPromptPath, generator, maximumProposals: limit, maximumRequestCharacters, useSourceExcerpts,
   });
-  const { snapshot, request, fullRequest } = prepared;
+  const { snapshot, request, fullRequest, inputVersion } = prepared;
   if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
     snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
   if (request.schema.properties.proposals.maxItems !== limit) throw new Error('Prepared relation request does not match maximumProposals.');
   const warnings = [];
   let usageRecorded = false;
   const generate = async (provider, input) => {
+    assertOrganizationInputCurrent(repository, normalizedAgentId, inputVersion);
     provider.assertRequestBudget?.(input);
     let result;
     try { result = await provider(input); }
@@ -147,17 +160,31 @@ export async function proposeRelationsForBatch({
   let generation = await generate(generator, request);
   let parsed = parseRelationGeneration(generation?.output, { maximumProposals });
   if (fullRequest && parsed.needsFullEvidence !== false) {
-    generation = await generate(fullEvidenceGenerator, fullRequest);
-    parsed = parseRelationGeneration(generation?.output, { maximumProposals });
+    try {
+      // Budget the evidence actually requested. A larger fallback can be split by
+      // the consolidation owner without repeating its completed structure work.
+      assertGenerationRequestBudget(fullRequest, maximumRequestCharacters, fullEvidenceGenerator);
+      generation = await generate(fullEvidenceGenerator, fullRequest);
+      parsed = parseRelationGeneration(generation?.output, { maximumProposals });
+    } catch (error) {
+      error.requiresFullEvidence = true;
+      throw error;
+    }
   }
   const proposed = [];
   const duplicates = [];
   const rejected = [];
   for (const [index, candidate] of parsed.proposals.entries()) {
+    let guardedCandidate;
     try {
-      const guardedCandidate = enforceRelationCandidatePolicy(candidate, snapshot, candidatePolicy);
+      if (candidate instanceof OrganizationCandidateError) throw candidate;
+      guardedCandidate = enforceRelationCandidatePolicy(candidate, snapshot, candidatePolicy);
+    }
+    catch (error) { rejected.push(organizationRejection(error, { index, candidate, inputVersion, generation })); continue; }
+    try {
       const proposal = proposeMemoryRelation(repository, {
         ...guardedCandidate,
+        expectedInput: selectOrganizationInput(inputVersion, [guardedCandidate.fromMemoryId, guardedCandidate.toMemoryId]),
         agentId: normalizedAgentId,
         batchId: normalizedBatchId,
         provenance: "memory-relation-structurer-v1",
@@ -169,11 +196,16 @@ export async function proposeRelationsForBatch({
       });
       (proposal.wasInserted ? proposed : duplicates).push(proposal);
     } catch (error) {
-      rejected.push({ index, error: error.message });
+      rejected.push(organizationRejection(error, { index, candidate, inputVersion, generation }));
     }
   }
+  if (!organizationInputIsCurrent(repository, normalizedAgentId, inputVersion)
+    && !rejected.some(item => item.category === 'stale-input')) {
+    rejected.push(organizationRejection(new OrganizationInputChangedError(), { index: null, inputVersion, generation }));
+  }
   return {
-    status: parsed.proposals.length === limit ? 'capacity-reached'
+    status: rejected.some(item => item.retryable) ? 'partial-failure'
+      : parsed.proposals.length === limit ? 'capacity-reached'
       : proposed.length ? "proposed" : duplicates.length ? "duplicates-only" : "no-valid-proposals",
     batchId: normalizedBatchId,
     snapshot,

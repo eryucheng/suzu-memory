@@ -1,4 +1,4 @@
-import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, memoryWorldsCompatible } from '@suzu-memory/core';
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, memoryWorldsCompatible, OrganizationCandidateError } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -10,7 +10,7 @@ function datePart(value, timeZone) {
   return dateKeyInTimeZone(text, timeZone);
 }
 
-function deriveEpisodeBoundary(members, timeZone) {
+export function deriveEpisodeBoundary(members, timeZone) {
   const dates = members.flatMap((memory) => [
     datePart(memory.eventDate, timeZone),
     datePart(memory.eventStart, timeZone),
@@ -43,6 +43,8 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
   requiredTriggerMemoryIds = [],
   requiredHistoricalMemoryIds = [],
   requireRetrospectiveParticipation = false,
+  includeTriggerPairs = false,
+  requireSummary = true,
 } = {}) {
   const currentById = new Map(snapshot.currentMemories.map((memory) => [memory.id, memory]));
   const containerById = new Map(snapshot.candidateContainers.map((memory) => [memory.id, memory]));
@@ -50,11 +52,11 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
     (Array.isArray(candidate.memberIds) ? candidate.memberIds : []).map(clean).filter(Boolean),
   )];
   if (!memberIds.length || memberIds.some((id) => !currentById.has(id))) {
-    throw new Error("Every structure member must come from currentMemories in this bounded snapshot.");
+    throw new OrganizationCandidateError("Every structure member must come from currentMemories in this bounded snapshot.");
   }
   const scopedMembers = memberIds.map(id => currentById.get(id));
   if (scopedMembers.some(memory => !memoryWorldsCompatible(scopedMembers[0], memory))) {
-    throw new Error("Structure members must share their reality and world scope.");
+    throw new OrganizationCandidateError("Structure members must share their reality and world scope.");
   }
   const operation = clean(candidate.operation);
   const kind = clean(candidate.kind);
@@ -67,38 +69,37 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
     const historicalIds = new Set(
       (Array.isArray(requiredHistoricalMemoryIds) ? requiredHistoricalMemoryIds : []).map(clean).filter(Boolean),
     );
-    if (!triggerIds.size || !historicalIds.size) {
+    if (!triggerIds.size || (!includeTriggerPairs && !historicalIds.size)) {
       throw new Error("Retrospective structure policy requires trigger and historical partitions.");
     }
     if (![...triggerIds].some((id) => members.has(id))) {
-      throw new Error("Retrospective structure proposal must include a trigger memory.");
+      throw new OrganizationCandidateError("Retrospective structure proposal must include a trigger memory.");
     }
-    if (value.operation === "create" && ![...historicalIds].some((id) => members.has(id))) {
-      throw new Error("Retrospective structure creation must include a historical memory.");
+    if (value.operation === "create" && !includeTriggerPairs && ![...historicalIds].some((id) => members.has(id))) {
+      throw new OrganizationCandidateError("Retrospective structure creation must include a historical memory.");
     }
     return value;
   };
   if (operation === "attach") {
     const target = containerById.get(clean(candidate.targetMemoryId));
     if (!target || (kind && target.kind !== kind)) {
-      throw new Error("Attach target must be a matching candidateContainer in this bounded snapshot.");
+      throw new OrganizationCandidateError("Attach target must be a matching candidateContainer in this bounded snapshot.");
     }
-    if (!memoryWorldsCompatible(target, scopedMembers[0])) throw new Error("Structure target is outside its members' world scope.");
+    if (!memoryWorldsCompatible(target, scopedMembers[0])) throw new OrganizationCandidateError("Structure target is outside its members' world scope.");
     const additions = memberIds.filter(id => !target.memberIds.includes(id));
-    if (!additions.length) throw Object.assign(new Error('Attach proposal must add at least one new member.'),
-      { code: 'MEMORY_STRUCTURE_NO_NEW_MEMBERS' });
-    if (!clean(candidate.content)) throw new Error('Structure attachment requires an updated overall summary.');
+    if (!additions.length) throw new OrganizationCandidateError('Attach proposal must add at least one new member.', 'MEMORY_STRUCTURE_NO_NEW_MEMBERS');
+    if (requireSummary && !clean(candidate.content)) throw new OrganizationCandidateError('Structure attachment requires an updated overall summary.');
     return enforceRetrospectiveParticipation({ ...candidate, kind: target.kind, memberIds: additions,
       expectedTarget: { title: target.title, content: target.content, memberIds: target.memberIds } });
   }
   if (operation !== "create") {
-    throw new Error("Structure operation must be create or attach.");
+    throw new OrganizationCandidateError("Structure operation must be create or attach.");
   }
   if (clean(candidate.targetMemoryId)) {
-    throw new Error("Create proposal cannot name a targetMemoryId.");
+    throw new OrganizationCandidateError("Create proposal cannot name a targetMemoryId.");
   }
   if (memberIds.length < 2) {
-    throw new Error("Create proposal requires at least two current memories.");
+    throw new OrganizationCandidateError("Create proposal requires at least two current memories.");
   }
   const members = memberIds.map((id) => currentById.get(id));
   if (kind === "episode") {
@@ -117,5 +118,5 @@ export function enforceStructureCandidatePolicy(candidate, snapshot, {
       eventEnd: null,
     });
   }
-  throw new Error("Structure kind must be episode or topic.");
+  throw new OrganizationCandidateError("Structure kind must be episode or topic.");
 }

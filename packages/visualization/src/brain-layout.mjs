@@ -33,6 +33,8 @@ const RELATION_FAMILIES = Object.freeze({
   supported_by: "evidence",
   challenged_by: "evidence",
   causes: "causal",
+  reason_for: "causal",
+  condition_for: "causal",
   timeline_next: "temporal",
   same_thread: "temporal",
   followed_by: "temporal",

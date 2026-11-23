@@ -4,12 +4,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { openMemoryDatabase } from "@suzu-memory/core";
 import { ChatHostMemoryAdapter } from '@suzu-memory/host-adapter';
 import { MemoryService } from '@suzu-memory/service';
-import { ZH4O_ANSWER_SCHEMA, ZH4O_ANSWER_SCHEMA_NAME, buildZh4oAnswerRequest,
+import { ZH4O_ANSWER_SCHEMA, buildZh4oAnswerRequest,
   createZh4oEventPlan, assertZh4oEventsHaveNoGoldLabels, loadZh4oDataset,
   runZh4oMemorySystemBenchmark, aggregateZh4oReports } from "../src/index.mjs";
+
+const isAnswerTool = tool => isDeepStrictEqual(tool?.parameters, ZH4O_ANSWER_SCHEMA);
+const isExtractionTool = tool => Boolean(tool?.parameters?.properties?.memories);
+function isExtractionOrRepairTool(tool) {
+  const properties = tool?.parameters?.properties;
+  return isExtractionTool(tool) || Boolean(properties?.entities && properties.results);
+}
 
 function fixture(t, sessions) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "suzu-memory-evaluation-test-"));
@@ -45,7 +53,7 @@ function fixture(t, sessions) {
       ? Object.fromEntries((value.required || []).map(key => [key, minimal(value.properties[key])]))
       : value.type === "array" ? [] : value.type === "boolean" ? false
       : ["number", "integer"].includes(value.type) ? (value.minimum || 0) : "";
-    const output = tool.name === ZH4O_ANSWER_SCHEMA_NAME
+    const output = isAnswerTool(tool)
       ? { choice: body.messages[1].content.includes("苹果味汽水") && body.messages[1].content.indexOf("苹果味汽水") < body.messages[1].content.indexOf("题目：") ? "B" : "A" }
       : minimal(schema);
     return Response.json({ model: "configured-model", choices: [{ message: { tool_calls: [{
@@ -73,7 +81,7 @@ function eventExtractionFetch(f) {
         usage: { prompt_tokens: texts.length } });
     }
     const tool = body.tools[0].function;
-    if (tool.name !== 'long-term-memory-extraction-v4') return f.fetchImpl(url, options);
+    if (!isExtractionTool(tool)) return f.fetchImpl(url, options);
     const output = { memories: [{ kind: 'event', title: '赵齐找到金色书签', content: '赵齐在图书馆找到了金色的书签。',
       subjectRole: 'user', subjectName: '赵齐', actorRoles: [], canonicalKey: '', stateFamily: 'not_applicable',
       stateLabel: '', reality: 'real', evidenceMode: 'explicit', temporalState: 'current', revisionAction: 'add',
@@ -94,7 +102,7 @@ function questionFixture(f, count, intercept = () => undefined) {
   const calls = [];
   return { calls, options: { ...f.options, control: 'none', fetchImpl: async (url, options) => {
     const body = JSON.parse(options.body);
-    if (body.tools?.[0]?.function.name === ZH4O_ANSWER_SCHEMA_NAME) {
+    if (isAnswerTool(body.tools?.[0]?.function)) {
       const input = body.messages[1].content;
       const ordinal = Number(input.match(/第(\d+)题/u)?.[1]);
       const control = input.startsWith('题目：');
@@ -109,7 +117,7 @@ function questionFixture(f, count, intercept = () => undefined) {
 
 function answerResponse(choice) {
   return Response.json({ model: 'configured-model', choices: [{ message: { tool_calls: [{ type: 'function',
-    function: { name: ZH4O_ANSWER_SCHEMA_NAME, arguments: JSON.stringify({ choice }) } }] } }],
+    function: { name: "return_result", arguments: JSON.stringify({ choice }) } }] } }],
   usage: { prompt_tokens: 10, completion_tokens: 2 } });
 }
 
@@ -305,7 +313,7 @@ test('authentication failure aborts promptly and resume preserves prior results,
   const resumed = await runZh4oMemorySystemBenchmark({ ...run.options, resumeReport: JSON.parse(JSON.stringify(aborted)),
     fetchImpl: async (url, options) => {
       const body = JSON.parse(options.body);
-      assert.equal(body.tools[0].function.name, ZH4O_ANSWER_SCHEMA_NAME, 'resume must not repeat memory preparation');
+      assert.ok(isAnswerTool(body.tools[0].function), 'resume must not repeat memory preparation');
       resumedCalls.push(Number(body.messages[1].content.match(/第(\d+)题/u)[1]));
       return f.fetchImpl(url, options);
     } });
@@ -364,7 +372,7 @@ test("configured host pipeline supplies actual memory context, keeps parameters 
   assert.equal(report.samples[0].effectiveDefaults.retrieval.maximumContextChars, 4321);
   assert.equal(report.samples[0].imported, 5);
   assert.equal(fs.existsSync(f.config.databasePath), false);
-  const answers = f.requests.filter(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME);
+  const answers = f.requests.filter(request => isAnswerTool(request.tool));
   assert.ok(answers[0].body.messages[1].content.startsWith(report.results[0].context.context));
   assert.doesNotMatch(answers[0].body.messages[1].content, /2000-\d{2}-\d{2}/);
   assert.ok(!answers[0].body.messages[1].content.includes("[召回片段"));
@@ -373,7 +381,7 @@ test("configured host pipeline supplies actual memory context, keeps parameters 
   assert.ok(f.requests.every(request => request.body.model === "configured-model" && request.body.max_tokens === 1024
     && request.body.configured_marker === "preserved"));
   assert.ok(f.requests.every(request => !JSON.stringify(request.body).includes("PRIVATE_GOLD_MUST_NOT_LEAK")));
-  assert.ok(f.requests.filter(request => request.tool.name !== ZH4O_ANSWER_SCHEMA_NAME)
+  assert.ok(f.requests.filter(request => !isAnswerTool(request.tool))
     .every(request => !request.body.messages[1].content.includes("赵齐喜欢什么")));
   assert.deepEqual(ZH4O_ANSWER_SCHEMA.properties.choice.enum, ["A", "B", "C", "D"]);
   assert.doesNotMatch(buildZh4oAnswerRequest({ question: { question: "测试 A 甲 B 乙 C 丙 D 丁" } }).systemPrompt, /A 到 E/);
@@ -389,7 +397,7 @@ test("retained database reruns only read-only recall and answers without any mai
   assert.equal(rerun.diagnostics.degradedSamples, 0, JSON.stringify(rerun.samples));
   assert.equal(rerun.samples[0].imported, 0);
   assert.equal(rerun.samples[0].maintenanceCalls, 0);
-  assert.ok(f.requests.every(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
+  assert.ok(f.requests.every(request => isAnswerTool(request.tool)));
   assert.equal(databaseSnapshot(first.database.sampleDatabases[0]), before);
   await assert.rejects(runZh4oMemorySystemBenchmark(f.options), /Sample database exists/);
   assert.equal(databaseSnapshot(first.database.sampleDatabases[0]), before);
@@ -520,6 +528,42 @@ for (const embedding of [false, true]) test(`nonempty extraction remains scoreab
   assert.equal(databaseSnapshot(report.database.sampleDatabases[0]), before);
 });
 
+test('the configured benchmark and usage wrappers preserve the unified organization path', async t => {
+  const f = fixture(t, { session_1: [
+    { speaker: '赵齐', dia_id: 'S1:1', text: '我在图书馆依次找到二十张不同的书签，分别放进了二十本书。' },
+    { speaker: '白羽岚', dia_id: 'S1:2', text: '我记住了这些书签。' },
+  ] });
+  const original = eventExtractionFetch(f), calls = [];
+  const isCombinedOrganization = properties => Boolean(properties.structure?.properties?.creations && properties.relations);
+  const fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body), tool = body.tools[0].function;
+    calls.push(tool.parameters.properties);
+    if (isCombinedOrganization(tool.parameters.properties)) return Response.json({ model: body.model,
+      choices: [{ message: { tool_calls: [{ function: { name: tool.name, arguments: JSON.stringify({
+        structure: { creations: [], attachments: null }, relations: { proposals: [], needsFullEvidence: false },
+      }) } }] } }], usage: { prompt_tokens: 20, completion_tokens: 2 } });
+    const response = await original(url, options);
+    if (!isExtractionTool(tool)) return response;
+    const payload = await response.json(), result = payload.choices[0].message.tool_calls[0].function;
+    const output = JSON.parse(result.arguments), template = output.memories[0];
+    output.memories = Array.from({ length: 20 }, (_, index) => ({ ...template,
+      title: `第${index + 1}张书签`, content: `赵齐在图书馆找到第${index + 1}张书签，并将它放入第${index + 1}本书。` }));
+    result.arguments = JSON.stringify(output);
+    return Response.json(payload);
+  };
+  const report = await runZh4oMemorySystemBenchmark({ ...f.options, fetchImpl, control: 'none' });
+  assert.equal(report.diagnostics.degradedSamples, 0, JSON.stringify(report.samples));
+  assert.equal(report.samples[0].finalProgress.failures, 0);
+  assert.equal(calls.filter(isCombinedOrganization).length, 1);
+  assert.equal(calls.some(properties => Object.hasOwn(properties, 'creations')), false);
+  const database = openMemoryDatabase(report.database.sampleDatabases[0], { readOnly: true });
+  try {
+    const plans = database.prepare('SELECT metadata_json FROM memory_consolidation_runs').all();
+    assert.equal(plans.length, 1);
+    assert.equal(JSON.parse(plans[0].metadata_json).organizationMode, 'unified-v1');
+  } finally { database.close(); }
+});
+
 test('an unfit recall budget cannot claim evidence from candidates or the question', async t => {
   const f = fixture(t);
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, maximumContextCharacters: 1, control: 'none' });
@@ -584,14 +628,14 @@ test('nonempty event continuity receives no synthetic calendar dates at the mode
   const base = eventExtractionFetch(f), continuityInputs = [];
   const fetchImpl = async (url, options) => {
     const body = JSON.parse(options.body), tool = body.tools?.[0]?.function;
-    if (tool?.name === 'long-term-memory-extraction-v4') {
+    if (isExtractionTool(tool)) {
       const response = await base(url, options), data = await response.json();
       const memories = JSON.parse(data.choices[0].message.tool_calls[0].function.arguments).memories;
       memories.push({ ...memories[0], title: '赵齐找到银色书签', content: '赵齐在阅览室找到了银色书签。', sourceRefs: ['M0003'] });
       data.choices[0].message.tool_calls[0].function.arguments = JSON.stringify({ memories });
       return Response.json(data);
     }
-    if (tool?.name !== 'memory-event-continuity-v2') return base(url, options);
+    if (!tool?.parameters?.properties?.matches) return base(url, options);
     const input = JSON.parse(body.messages[1].content);
     continuityInputs.push(input);
     const output = { matches: input.events.map(({ memoryId }) => ({ memoryId, resolution: 'new',
@@ -614,7 +658,7 @@ test("persistent extraction failure retains original input but excludes every qu
   const f = fixture(t), fetch = f.fetchImpl;
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, fetchImpl: (url, options) => {
     const tool = JSON.parse(options.body).tools[0].function;
-    if (tool.name.includes("extraction")) return Response.json({ error: { message: "temporary" } }, { status: 503 });
+    if (isExtractionOrRepairTool(tool)) return Response.json({ error: { message: "temporary" } }, { status: 503 });
     return fetch(url, options);
   } });
   assert.equal(report.diagnostics.degradedSamples, 1);
@@ -622,7 +666,26 @@ test("persistent extraction failure retains original input but excludes every qu
   assert.equal(report.scores.exactChoiceAccuracy, null);
   assert.ok(report.results.every(row => row.scoringEligible === false));
   assert.ok(fs.existsSync(report.database.sampleDatabases[0]));
-  assert.ok(!f.requests.some(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
+  assert.ok(!f.requests.some(request => isAnswerTool(request.tool)));
+});
+
+test('a recovered extraction outage stays in diagnostics and the sample remains scored', async t => {
+  const f = fixture(t);
+  const original = MemoryService.prototype.processPendingEvents;
+  let interrupted = false;
+  t.mock.method(MemoryService.prototype, 'processPendingEvents', function (options) {
+    if (interrupted) return original.call(this, options);
+    return original.call(this, { ...options, generator: async () => {
+      interrupted = true;
+      throw Object.assign(new Error('Connection reset while requesting extraction.'), { code: 'ECONNRESET' });
+    } });
+  });
+  const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none' });
+  assert.equal(interrupted, true);
+  assert.ok(report.samples[0].memoryDiagnostics.infrastructureFailures.some(failure => failure.kind === 'network'));
+  assert.deepEqual(report.samples[0].memoryDiagnostics.blockingInputFailures, []);
+  assert.equal(report.diagnostics.degradedSamples, 0);
+  assert.equal(report.scores.completed, 2);
 });
 
 for (const stage of ['runSemanticMaintenance', 'runEmbeddingMaintenance']) test(`an application ${stage} failure stays scored and remains in retained diagnostics`, async t => {
@@ -638,7 +701,7 @@ for (const stage of ['runSemanticMaintenance', 'runEmbeddingMaintenance']) test(
   assert.equal(report.scores.completed, 2);
   assert.ok(report.samples[0].maintenanceFailures.length > 0);
   assert.match(JSON.stringify(report.samples[0].maintenanceFailures), /FIXTURE_MAINTENANCE_FAILURE/);
-  assert.ok(f.requests.some(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME));
+  assert.ok(f.requests.some(request => isAnswerTool(request.tool)));
   const plan = createZh4oEventPlan(loadZh4oDataset(f.datasetPath)[0], report.dataset.sha256);
   const manifest = JSON.parse(fs.readFileSync(path.join(f.options.workDirectory, 'samples', plan.agentId, 'benchmark.json'), 'utf8'));
   assert.equal(manifest.degraded, false);
@@ -719,7 +782,7 @@ test('full conversation controls receive every source turn without recall trunca
     { speaker: '白羽岚', dia_id: 'S1:2', text: '原文末尾确认。' + '乙'.repeat(1000) },
   ], session_2: [{ speaker: '赵齐', dia_id: 'S2:1', text: '第二次会话的完整尾句。' }] });
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'both' });
-  const controls = f.requests.filter(request => request.tool.name === ZH4O_ANSWER_SCHEMA_NAME
+  const controls = f.requests.filter(request => isAnswerTool(request.tool)
     && request.body.messages[1].content.includes('会话 1：'));
   assert.equal(controls.length, 2);
   const source = loadZh4oDataset(f.datasetPath)[0];
@@ -781,7 +844,7 @@ test('invalid extraction output falls back to raw evidence but remains scored', 
   const f = fixture(t);
   const report = await runZh4oMemorySystemBenchmark({ ...f.options, control: 'none', fetchImpl: (url, options) => {
     const tool = JSON.parse(options.body).tools?.[0]?.function;
-    if (!tool?.name.includes('extraction')) return f.fetchImpl(url, options);
+    if (!isExtractionOrRepairTool(tool)) return f.fetchImpl(url, options);
     return Response.json({ model: 'configured-model', choices: [{ message: { tool_calls: [{ type: 'function',
       function: { name: tool.name, arguments: JSON.stringify({ memories: 'invalid' }) } }] } }] });
   } });
@@ -851,11 +914,11 @@ test('a completed database can resume from its earlier preparation checkpoint wi
     else throw new Error('interrupt after preparation');
   } }), /interrupt after preparation/);
   assert.ok(preparing);
-  const extractionBefore = f.requests.filter(request => request.tool.name.includes('extraction')).length;
+  const extractionBefore = f.requests.filter(request => isExtractionOrRepairTool(request.tool)).length;
   const resumed = await runZh4oMemorySystemBenchmark({ ...options, resumeReport: preparing });
   assert.equal(resumed.status, 'completed');
   assert.equal(resumed.samples[0].preparationPending, undefined);
-  assert.equal(f.requests.filter(request => request.tool.name.includes('extraction')).length, extractionBefore);
+  assert.equal(f.requests.filter(request => isExtractionOrRepairTool(request.tool)).length, extractionBefore);
 });
 
 test('missing code identity fails before creating a benchmark database or contacting a provider', async t => {

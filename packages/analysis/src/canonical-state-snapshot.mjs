@@ -152,6 +152,7 @@ export function buildCanonicalStateEvidenceSnapshot({
   subjectRole,
   subjectKey,
   canonicalKey,
+  stateScopeKey,
   currentRepresentationLayer = "",
   subjectLabel,
   stateLabel,
@@ -268,6 +269,7 @@ export function buildCanonicalStateEvidenceSnapshot({
     canonicalKey: normalizedCanonicalKey,
     representationLayer: normalizedCurrentRepresentationLayer,
     stateFamily: normalizedStateFamily,
+    stateScopeKey,
     includePending: normalizedCurrentRepresentationLayer === "reported",
     includeHistorical: normalizedCurrentRepresentationLayer === "reported",
   });
@@ -311,6 +313,7 @@ export function buildCanonicalStateEvidenceSnapshot({
       subjectKey: normalizedSubjectKey,
       canonicalKey: normalizedCanonicalKey,
       currentRepresentationLayer: normalizedCurrentRepresentationLayer,
+      ...(stateScopeKey ? { stateScopeKey } : {}),
       world: fixedWorld,
       subjectLabel: clean(subjectLabel),
       stateLabel: clean(stateLabel),

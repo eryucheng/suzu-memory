@@ -7,7 +7,10 @@ import { fileURLToPath } from "node:url";
 import {
   applyMemoryCandidate,
   enqueueMemoryMaintenanceTasks,
+  entityLabelKey,
+  entityLabelOccurs,
   isStatefulMemoryKind,
+  isCurrentEvidenceSource,
   MAINTENANCE_TASK_TYPES,
   normalizeStateAnalysisTargetSpec,
 } from "@suzu-memory/core";
@@ -15,7 +18,8 @@ import {
   buildArchivedUtteranceIdentity,
 } from "./utterance-evidence.mjs";
 import { buildExtractionParticipants, resolveExtractionActor } from './participant-identity.mjs';
-import { createExtractionTimeValidator } from './temporal-evidence.mjs';
+import { checkExtractionSourceRefs, normalizeExtractionLanguage } from './prompt.mjs';
+import { normalizeExtractionTime } from './temporal-evidence.mjs';
 
 const PACKAGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PROMPT_PATH = path.join(PACKAGE_ROOT, "resources", "system-prompt.md");
@@ -35,10 +39,7 @@ function sourceTimeMetadata(generated, referenced) {
 }
 
 function sourceLanguage(value) {
-  const normalized = clean(value).toLowerCase();
-  return ["zh", "en", "mixed", "unknown"].includes(normalized)
-    ? normalized
-    : "unknown";
+  return normalizeExtractionLanguage(value) || 'unknown';
 }
 
 function referencedSourceLanguage(referenced = []) {
@@ -47,6 +48,21 @@ function referencedSourceLanguage(referenced = []) {
     .filter((value) => value !== "unknown"));
   if (languages.size === 1) return [...languages][0];
   return languages.size > 1 ? "mixed" : "unknown";
+}
+
+function linkSourceEntityMentions(repository, candidate, referenced) {
+  const mentions = (candidate.entityMentions || []).map(mention => ({
+    id: candidate.entityBindings?.[mention.ref],
+    labels: [mention.name, ...mention.aliases].map(entityLabelKey),
+  })).filter(mention => mention.id);
+  if (!mentions.length) return;
+
+  for (const { memoryId, message } of referenced) {
+    const text = entityLabelKey(message.text);
+    const entityIds = mentions.filter(mention => mention.labels.some(label => entityLabelOccurs(text, label)))
+      .map(mention => mention.id);
+    repository.linkMemoryEntities({ memoryId, entityIds });
+  }
 }
 
 function stableId(prefix, ...parts) {
@@ -342,6 +358,7 @@ export function fallbackStateAnalysisToProvisionalReview({
   repository,
   request,
   reason = "state-analysis-specialist-failed",
+  preferenceAccumulationErrorCode,
   recordedAt = new Date().toISOString(),
 } = {}) {
   if (!repository || !request) {
@@ -356,29 +373,35 @@ export function fallbackStateAnalysisToProvisionalReview({
     throw new Error("State analysis fallback could not find its ingestion decision.");
   }
   const generated = { ...decision.candidate, canonicalKey: request.canonical_key };
-  const referenced = decision.sourceIds.map((sourceId, index) => {
-    const source = repository.getSource(sourceId);
-    if (!source) throw new Error(`State analysis fallback source is missing: ${sourceId}`);
-    const memoryId = request.memoryIds[index] || request.memoryIds[0] || "";
-    const speaker = memoryId ? repository.listMemoryRoles(memoryId).find(role => role.role === "speaker") : null;
-    return {
-      source,
-      memoryId,
-      message: {
-        role: source.metadata?.role,
-        speakerIdentity: speaker ? { actorRole: speaker.actor_role, actorKey: speaker.actor_key } : null,
-        worldId: source.world_id,
-        worldFrame: source.world_frame,
-        archiveWindowId: source.metadata?.archiveWindowId,
-        sourceLanguage: source.metadata?.sourceLanguage,
-      },
-    };
-  });
   const fallbackReason = "state-analysis-specialist-fallback";
   // Preserve the extraction decision's identity when an invalid request binding
   // is sent back to review; never reassign the original candidate's subject.
   const actorIdentity = decision.candidate.metadata?.actorIdentity || request.metadata?.actorIdentity || {};
   return repository.transaction(() => {
+    const bySource = new Map();
+    for (const memoryId of request.memoryIds) {
+      const detail = repository.getMemoryDetail(request.agent_id, memoryId);
+      const speaker = detail?.roles.find(role => role.role === 'speaker');
+      for (const source of detail?.sources || []) {
+        if (!isCurrentEvidenceSource(detail.memory, source)) continue;
+        const original = detail.memory.kind !== 'utterance' || (source.relation === 'verbatim' && source.content === detail.memory.content);
+        bySource.set(source.id, { source, memoryId, original, message: {
+          role: source.metadata?.role,
+          speakerIdentity: speaker ? { actorRole: speaker.actor_role, actorKey: speaker.actor_key } : null,
+          worldId: source.world_id, worldFrame: source.world_frame,
+          archiveWindowId: source.metadata?.archiveWindowId, sourceLanguage: source.metadata?.sourceLanguage,
+        } });
+      }
+    }
+    const referenced = decision.sourceIds.map(sourceId => bySource.get(sourceId));
+    if (!referenced.length || referenced.some(item => !item)) return { provisional: null, decision,
+      request: repository.resolveStateAnalysisRequest({ agentId: request.agent_id, requestId: request.id,
+        status: 'cancelled', errorMessage: 'State analysis source changed.', metadata: { outcome: 'source-invalidated' },
+        resolvedAt: recordedAt }) };
+    if (referenced.some(item => !item.original)) return { provisional: null, decision,
+      request: repository.resolveStateAnalysisRequest({ agentId: request.agent_id, requestId: request.id,
+        status: 'completed', errorMessage: 'Edited evidence cannot publish the original extraction as a fallback.',
+        metadata: { outcome: 'stale-extraction-fallback' }, resolvedAt: recordedAt }) };
     const provisional = storeProvisionalEvidence({
       repository,
       agentId: request.agent_id,
@@ -421,6 +444,7 @@ export function fallbackStateAnalysisToProvisionalReview({
         fallbackReason,
         provisionalMemoryId: provisional.id,
         ingestionDecisionId: decision.id,
+        ...(preferenceAccumulationErrorCode && { preferenceAccumulationErrorCode }),
       },
     });
     return {
@@ -431,7 +455,168 @@ export function fallbackStateAnalysisToProvisionalReview({
   });
 }
 
-export function archiveLongTermEvidence({
+function archiveSourceMessages({ repository, agentId, sourceLocator, sourceKind, messages, batchId, recordedAt, conversationTopology, identity,
+  archivedEvidence }) {
+  const evidence = [];
+  let messagesArchived = 0;
+  for (const message of messages) {
+    const stored = archivedEvidence?.get(message.id);
+    if (stored) {
+      evidence.push({ ...stored, message });
+      continue;
+    }
+    const outputLanguage = normalizeExtractionLanguage(message.outputLanguage);
+    const utteranceIdentity = buildArchivedUtteranceIdentity({
+      messageRole: message.role,
+      agentId,
+      primaryUserId: identity.primaryUserId,
+      companionId: identity.companionId,
+      conversationTopology: message.conversationTopology ?? conversationTopology,
+      actualSpeaker: message.speakerIdentity || null,
+      actualParticipants: message.eventSource ? message.participants : [],
+      provenance: "suzu-memory-extraction-v1-utterance",
+    });
+    const source = repository.upsertSource({
+      agentId,
+      sourceKind: clean(message.sourceRecordKind) || sourceKind,
+      sourceLocator: clean(message.sourceLocator) || clean(sourceLocator),
+      externalId: clean(message.externalId) || message.id,
+      occurredAt: isoTimestamp(message.occurredAt || message.timestamp),
+      knownAt: isoTimestamp(message.knownAt || message.timestamp),
+      recordedAt,
+      speaker: message.speaker,
+      worldId: clean(message.worldId) || "primary",
+      worldFrame: clean(message.worldFrame) || "unknown",
+      content: message.text,
+      metadata: {
+        role: message.role,
+        sourceUuid: message.sourceUuid,
+        sourceIndex: message.sourceIndex,
+        sourceKind: message.sourceKind,
+        extractionBatchId: batchId,
+        memoryRef: message.memoryRef,
+        archiveWindowId: clean(message.archiveWindowId),
+        archiveContinuityId: clean(message.archiveContinuityId),
+        participants: Array.isArray(message.participants) ? message.participants : [],
+        inputEventId: clean(message.inputEventId),
+        inputEventIds: Array.isArray(message.inputEventIds)
+          ? message.inputEventIds.map(clean).filter(Boolean)
+          : [clean(message.inputEventId)].filter(Boolean),
+        ...(message.sourceMetadata && typeof message.sourceMetadata === "object"
+          ? message.sourceMetadata
+          : {}),
+        sourceLanguage: sourceLanguage(message.sourceLanguage),
+        ...(outputLanguage ? { outputLanguage } : {}),
+        causalExcerpt: message.causalExcerpt,
+      },
+    });
+    const memoryId = stableId("mem", agentId, "utterance", message.id);
+    repository.upsertMemory({
+      id: memoryId,
+      agentId,
+      kind: "utterance",
+      layer: "evidence",
+      content: message.text,
+      subjectRole: utteranceIdentity.subjectRole,
+      subjectKey: utteranceIdentity.subjectKey,
+      reality: "real",
+      evidenceMode: "imported",
+      temporalState: "historical",
+      eventStart: isoTimestamp(message.occurredAt || message.timestamp),
+      knownAt: isoTimestamp(message.knownAt || message.timestamp),
+      recordedAt,
+      perspective: message.role,
+      worldId: clean(message.worldId) || "primary",
+      worldFrame: clean(message.worldFrame) || "unknown",
+      importance: 0.25,
+      actorRoles: utteranceIdentity.actorRoles,
+      metadata: {
+        sourceKind: message.sourceKind,
+        ...(message.sourceMetadata?.sourceTimeKnown === false ? { sourceTimeKnown: false } : {}),
+        speaker: message.speaker,
+        extractionBatchId: batchId,
+        archiveWindowId: clean(message.archiveWindowId),
+        archiveContinuityId: clean(message.archiveContinuityId),
+        sourceLanguage: sourceLanguage(message.sourceLanguage),
+        ...(outputLanguage ? { outputLanguage } : {}),
+        inputEventIds: Array.isArray(message.inputEventIds)
+          ? message.inputEventIds.map(clean).filter(Boolean)
+          : [clean(message.inputEventId)].filter(Boolean),
+        ...(message.logicalEvent ? { logicalEvent: message.logicalEvent } : {}),
+        ...(message.eventSource ? { eventSource: message.eventSource, conversationTopology: message.conversationTopology } : {}),
+      },
+    });
+    repository.linkSource(memoryId, source.id, "verbatim", {
+      authority: "verbatim_record",
+      sourceTrust: 1,
+      evidenceStrength: 1,
+      provenance: "suzu-memory-extraction-v1",
+    });
+    evidence.push({ source, message, memoryId });
+    messagesArchived++;
+  }
+  for (let index = 1; index < evidence.length; index += 1) {
+    const previous = evidence[index - 1];
+    const current = evidence[index];
+    if (archivedEvidence?.has(previous.message.id) && archivedEvidence.has(current.message.id)) continue;
+    const sameWindow = clean(previous.message.archiveWindowId) === clean(current.message.archiveWindowId);
+    const continuityId = clean(previous.message.archiveContinuityId);
+    const sameExplicitContinuity = continuityId && continuityId === clean(current.message.archiveContinuityId);
+    if (!sameWindow && !sameExplicitContinuity) continue;
+    repository.upsertEdge({
+      agentId,
+      fromMemoryId: previous.memoryId,
+      toMemoryId: current.memoryId,
+      relation: "followed_by",
+      direction: "directed",
+      weight: 1,
+      confidence: 1,
+      provenance: "suzu-memory-extraction-v1",
+    });
+  }
+  return { evidence, messagesArchived };
+}
+
+export function readArchivedExtractionEvidence(repository, agentId, message) {
+  const memoryId = stableId('mem', agentId, 'utterance', message.id);
+  const memory = repository.getMemory(memoryId);
+  if (!memory || memory.agent_id !== agentId || memory.kind !== 'utterance' || memory.content !== clean(message.text)) return null;
+  const occurredAt = isoTimestamp(message.occurredAt || message.timestamp);
+  const knownAt = isoTimestamp(message.knownAt || message.timestamp);
+  const speaker = message.speakerIdentity;
+  if (memory.event_start !== occurredAt || (knownAt && memory.known_at !== knownAt)
+    || (speaker?.actorKey && (memory.subject_role !== speaker.actorRole || memory.subject_key !== speaker.actorKey))) return null;
+  const source = repository.listMemorySources(memoryId).find(item => isCurrentEvidenceSource(memory, item)
+    && item.relation === 'verbatim' && item.content === memory.content
+    && item.occurred_at === occurredAt && (!knownAt || item.known_at === knownAt)
+    && item.speaker === clean(message.speaker) && item.world_id === (clean(message.worldId) || 'primary')
+    && item.world_frame === (clean(message.worldFrame) || 'unknown'));
+  return source ? { source, message, memoryId } : null;
+}
+
+function readArchivedSourceMessages({ repository, agentId, messages }) {
+  const evidence = messages.map(message => {
+    const item = readArchivedExtractionEvidence(repository, agentId, message);
+    if (!item) throw new Error('Extraction repair requires the unchanged archived original message: ' + message.id);
+    return item;
+  });
+  return { evidence, messagesArchived: 0 };
+}
+
+export function archiveLongTermEvidence(input) {
+  return writeLongTermEvidence(input, archiveSourceMessages, true);
+}
+
+// Ingestion passes memories validated against this batch's source messages.
+export function archiveValidatedLongTermEvidence(input) {
+  return writeLongTermEvidence(input, archiveSourceMessages, false);
+}
+
+export function archiveRepairedLongTermEvidence(input) {
+  return writeLongTermEvidence(input, readArchivedSourceMessages, false);
+}
+
+function writeLongTermEvidence({
   repository,
   agentId,
   sourceLocator = "",
@@ -444,17 +629,20 @@ export function archiveLongTermEvidence({
   conversationTopology,
   identity = {},
   timeZone,
-}) {
-  const validateTime = createExtractionTimeValidator(messages, timeZone);
+  archivedEvidence,
+}, prepareSources, verifyEvidence) {
   identity = { ...identity, participants: identity.participants || buildExtractionParticipants(messages, { ...identity, agentId }) };
   if (messages.some(message => message.eventSource)) {
     identity = { ...identity, eventSourceIdentity: true };
   }
-  const sourceByRef = new Map();
-  const messageMemories = [];
-  const results = [];
-  repository.transaction(() => {
+  return repository.transaction(() => {
     const bindEntities = createExtractionEntityBinder(repository, agentId, generatedMemories, identity.participants, batchId);
+    const { evidence, messagesArchived } = prepareSources({
+      repository, agentId, sourceLocator, sourceKind, messages, batchId, recordedAt, conversationTopology, identity, archivedEvidence,
+    });
+    const sourceByRef = new Map(evidence.map(item => [item.message.memoryRef, item]));
+    const findSourceMessage = ref => sourceByRef.get(ref)?.message;
+    const results = [];
     const keepResult = (candidateIndex, generated, result, referenced = []) => {
       const recorded = {
         candidateIndex,
@@ -475,8 +663,11 @@ export function archiveLongTermEvidence({
             identity,
           })
         : null;
-      for (const memoryId of new Set([...referenced.map(item => item.memoryId), result.memoryId, provisional?.id].filter(Boolean))) {
-        repository.linkMemoryEntities({ memoryId, entityIds: generated.entityIds || [] });
+      if (result.memoryId) {
+        repository.linkMemoryEntities({ memoryId: result.memoryId, entityIds: generated.entityIds || [] });
+      }
+      if (result.memoryId || result.stateAnalysisRequestId) {
+        linkSourceEntityMentions(repository, generated, referenced);
       }
       const decision = repository.recordIngestionDecision({
         agentId,
@@ -496,116 +687,6 @@ export function archiveLongTermEvidence({
       recorded.provisionalMemoryId = provisional?.id || "";
       results.push(recorded);
     };
-    for (const message of messages) {
-      const utteranceIdentity = buildArchivedUtteranceIdentity({
-        messageRole: message.role,
-        agentId,
-        primaryUserId: identity.primaryUserId,
-        companionId: identity.companionId,
-        conversationTopology: message.conversationTopology ?? conversationTopology,
-        actualSpeaker: message.speakerIdentity || null,
-        actualParticipants: message.eventSource ? message.participants : [],
-        provenance: "suzu-memory-extraction-v1-utterance",
-      });
-      const source = repository.upsertSource({
-        agentId,
-        sourceKind: clean(message.sourceRecordKind) || sourceKind,
-        sourceLocator: clean(message.sourceLocator) || clean(sourceLocator),
-        externalId: clean(message.externalId) || message.id,
-        occurredAt: isoTimestamp(message.occurredAt || message.timestamp),
-        knownAt: isoTimestamp(message.knownAt || message.timestamp),
-        recordedAt,
-        speaker: message.speaker,
-        worldId: clean(message.worldId) || "primary",
-        worldFrame: clean(message.worldFrame) || "unknown",
-        content: message.text,
-        metadata: {
-          role: message.role,
-          sourceUuid: message.sourceUuid,
-          sourceIndex: message.sourceIndex,
-          sourceKind: message.sourceKind,
-          extractionBatchId: batchId,
-          memoryRef: message.memoryRef,
-          archiveWindowId: clean(message.archiveWindowId),
-          archiveContinuityId: clean(message.archiveContinuityId),
-          participants: Array.isArray(message.participants) ? message.participants : [],
-          inputEventId: clean(message.inputEventId),
-          inputEventIds: Array.isArray(message.inputEventIds)
-            ? message.inputEventIds.map(clean).filter(Boolean)
-            : [clean(message.inputEventId)].filter(Boolean),
-          ...(message.sourceMetadata && typeof message.sourceMetadata === "object"
-            ? message.sourceMetadata
-            : {}),
-          sourceLanguage: sourceLanguage(message.sourceLanguage),
-          causalExcerpt: message.causalExcerpt,
-        },
-      });
-      const memoryId = stableId("mem", agentId, "utterance", message.id);
-      repository.upsertMemory({
-        id: memoryId,
-        agentId,
-        kind: "utterance",
-        layer: "evidence",
-        content: message.text,
-        subjectRole: utteranceIdentity.subjectRole,
-        subjectKey: utteranceIdentity.subjectKey,
-        reality: "real",
-        evidenceMode: "imported",
-        temporalState: "historical",
-        eventStart: isoTimestamp(message.occurredAt || message.timestamp),
-        knownAt: isoTimestamp(message.knownAt || message.timestamp),
-        recordedAt,
-        perspective: message.role,
-        worldId: clean(message.worldId) || "primary",
-        worldFrame: clean(message.worldFrame) || "unknown",
-        importance: 0.25,
-        actorRoles: utteranceIdentity.actorRoles,
-        metadata: {
-          sourceKind: message.sourceKind,
-          ...(message.sourceMetadata?.sourceTimeKnown === false ? { sourceTimeKnown: false } : {}),
-          speaker: message.speaker,
-          extractionBatchId: batchId,
-          archiveWindowId: clean(message.archiveWindowId),
-          archiveContinuityId: clean(message.archiveContinuityId),
-          sourceLanguage: sourceLanguage(message.sourceLanguage),
-          inputEventIds: Array.isArray(message.inputEventIds)
-            ? message.inputEventIds.map(clean).filter(Boolean)
-            : [clean(message.inputEventId)].filter(Boolean),
-          ...(message.logicalEvent ? { logicalEvent: message.logicalEvent } : {}),
-          ...(message.eventSource ? { eventSource: message.eventSource, conversationTopology: message.conversationTopology } : {}),
-        },
-      });
-      repository.linkSource(memoryId, source.id, "verbatim", {
-        authority: "verbatim_record",
-        sourceTrust: 1,
-        evidenceStrength: 1,
-        provenance: "suzu-memory-extraction-v1",
-      });
-      sourceByRef.set(message.memoryRef, { source, message, memoryId });
-      messageMemories.push({
-        memoryId,
-        archiveWindowId: clean(message.archiveWindowId),
-        archiveContinuityId: clean(message.archiveContinuityId),
-      });
-    }
-    for (let index = 1; index < messageMemories.length; index += 1) {
-      const previous = messageMemories[index - 1];
-      const current = messageMemories[index];
-      const sameWindow = previous.archiveWindowId === current.archiveWindowId;
-      const sameExplicitContinuity = previous.archiveContinuityId
-        && previous.archiveContinuityId === current.archiveContinuityId;
-      if (!sameWindow && !sameExplicitContinuity) continue;
-      repository.upsertEdge({
-        agentId,
-        fromMemoryId: previous.memoryId,
-        toMemoryId: current.memoryId,
-        relation: "followed_by",
-        direction: "directed",
-        weight: 1,
-        confidence: 1,
-        provenance: "suzu-memory-extraction-v1",
-      });
-    }
 
     if (!Number.isSafeInteger(candidateIndexOffset) || candidateIndexOffset < 0
       || !Number.isSafeInteger(candidateIndexOffset + generatedMemories.length)) {
@@ -636,33 +717,20 @@ export function archiveLongTermEvidence({
         const person = resolveExtractionActor({ role: generated.stateTarget[`${prefix}Role`], key: generated.stateTarget[`${prefix}Key`], name: generated.stateTarget[`${prefix}Name`], status: generated.stateTarget[`${prefix}IdentityStatus`] }, { ...identity, agentId });
         generated.stateTarget[`${prefix}Key`] = person.key; generated.stateTarget[`${prefix}IdentityStatus`] = person.status;
       }
-      const missingRefs = generated.sourceRefs.filter((reference) => !sourceByRef.has(reference));
-      if (missingRefs.length) {
-        keepResult(candidateIndex, generated, {
-          status: "reject",
-          reasons: ["unknown-source-ref"],
-          missingRefs,
-        }, referenced);
-        continue;
-      }
-      try {
-        validateTime(generated);
-      } catch (error) {
-        if (error.code !== 'MEMORY_EXTRACTION_TIME_CONFLICT') throw error;
-        keepResult(candidateIndex, generated, {
-          status: 'review', reasons: ['source-time-conflict'], timeConflict: error.message,
-        }, referenced);
-        continue;
-      }
-      const referencedArchiveWindows = new Set(referenced.map(({ message }) => (
-        clean(message.archiveWindowId) || "__legacy_single_window__"
-      )));
-      if (referencedArchiveWindows.size > 1) {
-        keepResult(candidateIndex, generated, {
-          status: "reject",
-          reasons: ["cross-window-evidence"],
-        }, referenced);
-        continue;
+      if (verifyEvidence) {
+        const sourceIssue = checkExtractionSourceRefs(generated.sourceRefs, findSourceMessage);
+        if (sourceIssue) {
+          keepResult(candidateIndex, generated, {
+            status: "reject",
+            reasons: [sourceIssue.reason],
+            ...(sourceIssue.missingRefs ? { missingRefs: sourceIssue.missingRefs } : {}),
+          }, referenced);
+          continue;
+        }
+        const time = normalizeExtractionTime({
+          date: generated.eventDate, start: generated.eventStart, end: generated.eventEnd,
+        }, timeZone);
+        generated = { ...generated, eventDate: time?.date || '', eventStart: time?.start || '', eventEnd: time?.end || '' };
       }
       if (referencedWorlds.size > 1) {
         keepResult(candidateIndex, generated, {
@@ -808,17 +876,17 @@ export function archiveLongTermEvidence({
         memoryId: result.memory?.id || "",
       }, referenced);
     }
+    return {
+      messagesArchived,
+      utteranceMemoryIds: evidence.map(item => item.memoryId),
+      candidateResults: results,
+      memoriesStored: results.filter((result) => (
+        ["created", "reinforced", "update", "correct", "contradict", "complete", "cancel"]
+          .includes(result.status)
+      )).length,
+      memoriesForReview: results.filter((result) => result.status === "review").length,
+      memoriesRejected: results.filter((result) => result.status === "reject").length,
+      stateAnalysisRequestsQueued: results.filter((result) => result.stateAnalysisRequestId).length,
+    };
   });
-  return {
-    messagesArchived: messages.length,
-    utteranceMemoryIds: messageMemories.map((item) => item.memoryId),
-    candidateResults: results,
-    memoriesStored: results.filter((result) => (
-      ["created", "reinforced", "update", "correct", "contradict", "complete", "cancel"]
-        .includes(result.status)
-    )).length,
-    memoriesForReview: results.filter((result) => result.status === "review").length,
-    memoriesRejected: results.filter((result) => result.status === "reject").length,
-    stateAnalysisRequestsQueued: results.filter((result) => result.stateAnalysisRequestId).length,
-  };
 }

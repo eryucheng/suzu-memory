@@ -23,7 +23,8 @@ test("console exposes a self-contained review application without a build step",
 
 test('switching reviews preserves the new selection and draft when an old read or action finishes', async () => {
   const elements = new Map(), requests = new Map();
-  const detail = id => ({ id, type: 'relation', title: `Candidate ${id}`, permissions: { canAccept: true }, writePreview: {} });
+  const detail = id => ({ id, type: 'relation', title: `Candidate ${id}`, reviewState: 'pending', applied: true,
+    permissions: { canAccept: true, canDismiss: true }, writePreview: {} });
   let draft = null;
   const element = selector => {
     if (selector === '#decision-reason') return draft;
@@ -61,6 +62,9 @@ test('switching reviews preserves the new selection and draft when an old read o
   await review.loadDetail('relation', 'B'); draft.value = 'Unsent B reason';
   rejectRead(new Error('Old A failed')); await oldRead;
   assert.match(element('#review-detail').innerHTML, /Candidate B/);
+  assert.match(element('#review-detail').innerHTML, /当前结果已自动生效/);
+  assert.match(element('#review-detail').innerHTML, /确认复核/);
+  assert.doesNotMatch(element('#review-detail').innerHTML, /接受并写入|准备写入/);
   assert.equal(draft.value, 'Unsent B reason');
   await review.loadDetail('relation', 'A');
   let resolveAction;

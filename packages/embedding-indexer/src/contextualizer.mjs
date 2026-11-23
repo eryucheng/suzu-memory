@@ -17,6 +17,11 @@ const DEFAULT_POLICY_VERSION = "retrieval-context-v1";
 const DEFAULT_PROMPT_VERSION = "retrieval-context-v1";
 const DEFAULT_CONTEXT_EXCLUDED_KINDS = Object.freeze(["utterance", "topic_or_episode"]);
 const DEFAULT_SHORT_CONTENT_THRESHOLD_CHARS = 32;
+const MODEL_SOURCE_FIELDS = [
+  "kind", "subjectRole", "perspective", "evidenceMode", "reality",
+  "stateFamily", "statePhase", "representationLayer", "temporalState",
+  "eventDate", "eventStart", "eventEnd", "knownAt", "validFrom", "validTo",
+];
 
 const LEADING_REFERENCE_PATTERN = /^(?:(?:对|嗯|啊|哦)[，,。\s]*)?(?:(?:这|那)(?:个|件|次|段|些|种|里|边|时候|句话|回事)|(?:他|她|它)(?:当时|后来|之前|之后|又|也|就|才|说|做|觉得))|^(?:(?:yes|well|right|oh)[,\s]+)?(?:this|that|these|those|it|he|she|they|there|then)\b/iu;
 
@@ -59,6 +64,16 @@ function uniqueStrings(values) {
 function meaningful(value) {
   const normalized = clean(value);
   return normalized && !["unknown", "unspecified", "not_applicable"].includes(normalized);
+}
+
+function buildRetrievalContextModelSource(memory) {
+  const source = buildMemoryRetrievalContextSource(memory);
+  const material = { title: source.title, content: source.content };
+  for (const field of MODEL_SOURCE_FIELDS) {
+    const value = source[field];
+    if (value && value !== "unspecified" && value !== "not_applicable") material[field] = value;
+  }
+  return material;
 }
 
 function contentCharacters(value) {
@@ -299,7 +314,7 @@ export async function generateMemoryRetrievalContexts({
     const memory = pending[index];
     const selection = assessed.find((item) => item.memory.id === memory.id)?.selection || {};
     const criticNeed = assessMemoryRetrievalContextCriticNeed(memory, selection);
-    const source = buildMemoryRetrievalContextSource(memory);
+    const source = buildRetrievalContextModelSource(memory);
     const sourceHash = memoryRetrievalContextSourceHash(memory);
     const sourceMaterial = eventSourceMaterial(repository, normalizedAgentId, [memory.id]);
     let proposalGeneration = null;
@@ -319,6 +334,7 @@ export async function generateMemoryRetrievalContexts({
         ...(sourceMaterial ? { sourceMaterial } : {}),
         analyzerRole: "memory-retrieval-context-proposer",
       });
+      assertEventSourceExecutionCurrent();
       proposal = normalizeProposal(proposalGeneration?.output);
       let critique;
       if (criticNeed.needed) {
@@ -327,7 +343,6 @@ export async function generateMemoryRetrievalContexts({
           task: "审查检索上下文是否完全受源记忆约束。",
           source,
           proposal,
-          riskReasons: criticNeed.reasons,
         });
         report.criticCalls += 1;
         criticGeneration = await critic({
@@ -338,6 +353,7 @@ export async function generateMemoryRetrievalContexts({
           ...(sourceMaterial ? { sourceMaterial } : {}),
           analyzerRole: "memory-retrieval-context-critic",
         });
+        assertEventSourceExecutionCurrent();
         critique = normalizeCritique(criticGeneration?.output);
       } else {
         report.locallyApproved += 1;

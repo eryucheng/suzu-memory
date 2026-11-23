@@ -512,5 +512,9 @@ test("long-term extraction executor uses the production schema contract", async 
   assert.deepEqual(request.schema.required, ["memories"]);
   assert.equal(request.systemPrompt, "只输出结构化记忆。");
   assert.match(request.input, /\[M0001\]/u);
+  assert.match(request.modelInput, /〔1〕今天下雨。/u);
+  const fields = request.modelSchema.properties.memories.items.properties;
+  assert.equal(fields.evidence.type, 'array');
+  assert.deepEqual(fields.time.anyOf.map(branch => branch.type), ['string', 'null', 'object']);
   assert.deepEqual(output, { memories: [] });
 });

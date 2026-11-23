@@ -1,6 +1,7 @@
 import { goalTransitionDecision } from './reported-goal-review.mjs';
 import { invokeEvidenceAnalyzer, recordAnalyzerInvocations, priorAnalyzerRuns } from "./related-analyzer-batch.mjs";
 import { modelCalendarFields } from '@suzu-memory/core';
+import { collectCalendarEvidence } from '@suzu-memory/extraction';
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -272,6 +273,27 @@ function actionPreview({ qualification, target, lifecycle, relation, currentStat
   return transition ? { ...base, ...transition } : base;
 }
 
+function groundedGoalTime(lifecycle, snapshot, timeZone) {
+  const reference = clean(lifecycle.timeReference);
+  if (!reference) return { timeReference: '' };
+  const lookup = reference.toLowerCase();
+  const sources = snapshot.sourceRecords.filter(source => lifecycle.sourceIds.includes(source.id));
+  const deadlines = new Map();
+  for (const source of sources) {
+    if (!source.occurredAt || source.sourceTimeKnown === false) continue;
+    for (const claim of collectCalendarEvidence(source.content, source.occurredAt, timeZone)) {
+      if (['before', 'on-or-before'].includes(claim.boundary) && !claim.yearUnspecified && lookup.includes(claim.expression.toLowerCase())) {
+        deadlines.set(`${claim.expression} (${claim.startDate})`, claim.startDate);
+      }
+    }
+  }
+  if (deadlines.size === 1) {
+    const [[timeReference, deadlineDate]] = deadlines;
+    return { timeReference, deadlineDate };
+  }
+  return { timeReference: sources.some(source => source.content.includes(reference)) ? reference : '' };
+}
+
 function mergeGoalAnalyses({ evaluation, persistEvidenceLedger }) {
   const maps = Object.fromEntries(
     Object.entries(evaluation.analyses).map(([key, items]) => [key, byMemory(items)]),
@@ -284,7 +306,11 @@ function mergeGoalAnalyses({ evaluation, persistEvidenceLedger }) {
     const memory = evaluation.snapshot.memories.find((item) => item.id === memoryId);
     const target = maps.targetIntent?.get(memoryId) || null;
     const holder = maps.holderResponsibility?.get(memoryId) || null;
-    const lifecycle = maps.lifecycle?.get(memoryId) || null;
+    const analyzedLifecycle = maps.lifecycle?.get(memoryId);
+    const lifecycle = analyzedLifecycle ? {
+      ...analyzedLifecycle,
+      ...groundedGoalTime(analyzedLifecycle, evaluation.snapshot, evaluation.repository.timeZone),
+    } : null;
     const relation = maps.currentRelation?.get(memoryId) || null;
     const gate = goalGate({ target, holder, lifecycle, relation, currentState: evaluation.snapshot.currentState });
     const qualification = gate?.qualification || "qualified";

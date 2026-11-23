@@ -7,7 +7,8 @@ import { createMemoryServiceFromConfig, loadMemoryConfig, normalizeMemoryConfig,
 import { createChatHostMemoryAdapter, buildConversationTurnEvents } from "@suzu-memory/host-adapter";
 import { calculateCost } from "@suzu-memory/usage-ledger";
 import { readEvaluationCodeRevision, evaluationPreparationKey } from './code-revision.mjs';
-import { questionFailure, runQuestionOperation, mergeUsageSummaries, memoryPreparationDiagnostics, summarizeMemoryPreparation } from './zh4o-execution.mjs';
+import { questionFailure, runQuestionOperation, mergeUsageSummaries, memoryPreparationDiagnostics, summarizeMemoryPreparation,
+  finalInputBatches } from './zh4o-execution.mjs';
 
 
 import {
@@ -47,7 +48,7 @@ function unique(values) {
 }
 
 function copyGeneratorCapabilities(source, target) {
-  for (const key of ["supportsCombinedStateAnalysis", "supportsCombinedConsolidation", "measureRequest", "assertRequestBudget"]) {
+  for (const key of ["supportsCombinedStateAnalysis", "supportsCombinedConsolidation", "supportsPlannedOrganization", "measureRequest", "assertRequestBudget"]) {
     if (Object.hasOwn(source, key)) target[key] = source[key];
   }
   return target;
@@ -937,9 +938,10 @@ export async function runZh4oMemorySystemBenchmark({
       const stored = inputRows(service);
       const inputMap = internalEventDialogueMap({ events: stored }, plan.eventIdToDialogueId);
       if (!reuse) {
-        sample.memoryDiagnostics = memoryPreparationDiagnostics({ passes, inputEvents: stored, finalProgress,
+        sample.memoryDiagnostics = memoryPreparationDiagnostics({ passes, inputEvents: stored,
+          inputBatches: finalInputBatches(service, stored), finalProgress,
           expectedEvents: plan.events.length, mappedEvents: unique([...inputMap.values()]).length });
-        degraded = sample.memoryDiagnostics.infrastructureFailures.length > 0;
+        degraded = sample.memoryDiagnostics.blockingInputFailures.length > 0;
         fs.mkdirSync(sampleRoot, { recursive: true });
         fs.writeFileSync(manifestPath, JSON.stringify({ protocol: ZH4O_SYSTEM_PROTOCOL_VERSION, datasetSha256,
           sampleId: conversation.sampleId, preparationId: sample.preparationId, degraded, defaults: service.defaults,

@@ -22,15 +22,17 @@ parentPort.on('message', async message => {
     return;
   }
   if (message.type !== 'retrieve') return;
-  const { id, input, embedding } = message;
+  const { id, input, embedding, embeddingBatch } = message;
   const controller = new AbortController();
   controllers.set(id, controller);
   try {
-    const embeddingProvider = embedding ? text => new Promise((resolve, reject) => {
+    const requestEmbedding = payload => new Promise((resolve, reject) => {
       const callId = ++sequence;
       embeddingCalls.set(callId, { resolve, reject, jobId: id });
-      parentPort.postMessage({ type: 'embedding', id, callId, text });
-    }) : null;
+      parentPort.postMessage({ type: 'embedding', id, callId, ...payload });
+    });
+    const embeddingProvider = embedding ? text => requestEmbedding({ text }) : null;
+    if (embeddingProvider && embeddingBatch) embeddingProvider.embedMany = texts => requestEmbedding({ texts });
     const value = await retrieveMemories({ ...input, embeddingProvider, signal: controller.signal });
     parentPort.postMessage({ type: 'result', id, value });
   } catch (error) { parentPort.postMessage({ type: 'result', id, error: failure(error) }); }

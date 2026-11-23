@@ -140,6 +140,22 @@ test("local HTTP product surface reuses Service status, retrieval and editing", 
   }));
   assert.equal(edited.data.title, "周六的晚饭");
 
+  const staleReviews = await json(await fetch(`${address.baseUrl}/v1/high-level-proposals`, { headers }));
+  assert.equal(staleReviews.data.items.some(item => item.id === proposalId), false);
+  const staleReview = await json(await fetch(
+    `${address.baseUrl}/v1/review-console/proposals/structure/${encodeURIComponent(proposalId)}`, { headers }));
+  assert.equal(staleReview.data.permissions.canAccept, false);
+  const staleAccept = await fetch(`${address.baseUrl}/v1/high-level-proposals/structure/${encodeURIComponent(proposalId)}/resolve`, {
+    method: 'POST', headers, body: JSON.stringify({ action: 'accept' }),
+  });
+  assert.equal(staleAccept.ok, false);
+  const previousProposalId = proposalId;
+  proposalId = service.withRepository(repository => proposeMemoryStructure(repository, {
+    agentId: service.agentId, kind: 'episode', content: '根据修订后的记录概括周六晚间相处。',
+    subjectRole: 'shared', subjectKey: 'relationship:test', eventDate: '2026-08-01', memberIds: ['event-dinner', 'event-walk'],
+  }).id);
+  assert.notEqual(proposalId, previousProposalId);
+
   const reviews = await json(await fetch(`${address.baseUrl}/v1/high-level-proposals`, { headers }));
   assert.equal(reviews.data.items[0].id, proposalId);
   const consoleOverview = await json(await fetch(`${address.baseUrl}/v1/review-console`, { headers }));
@@ -165,6 +181,13 @@ test("local HTTP product surface reuses Service status, retrieval and editing", 
     },
   ));
   assert.equal(resolved.data.resolution.status, "accepted");
+  const revoked = await fetch(`${address.baseUrl}/v1/high-level-proposals/structure/${encodeURIComponent(proposalId)}/revoke`, {
+    method: 'POST', headers, body: JSON.stringify({ actor: 'human:test', reason: 'Withdraw my confirmation.' }),
+  });
+  const withdrawal = await json(revoked);
+  assert.equal(revoked.status, 200, JSON.stringify(withdrawal));
+  assert.equal(withdrawal.data.resolution.proposal.review_state, 'dismissed');
+  assert.equal(service.getMemory(resolved.data.resolution.memory.id).memory.status, 'deleted');
 });
 
 test("server refuses an unauthenticated non-loopback binding", async () => {

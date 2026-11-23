@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { withUsageRecorder } from '@suzu-memory/usage-ledger';
 import { createRelatedAnalyzerBatch } from '../src/related-analyzer-batch.mjs';
+import { GOAL_ANALYZERS } from '../src/goal-contracts.mjs';
+import { PREFERENCE_SPECIALIST_ANALYZERS } from '../src/preference-specialist-contracts.mjs';
+import { BEHAVIOR_STATE_ANALYZERS } from '../src/behavior-state-contracts.mjs';
 import { stateAnalysisBudgetError } from "../src/request-budget.mjs";
 
 import {
@@ -10,11 +17,12 @@ import {
   memoryRetrievalContextSourceHash,
   normalizeStateAnalysisTargetSpec,
   modelCalendarFields,
+  withEventSourceExecution,
 } from "@suzu-memory/core";
 import { syncMemoryEmbeddings } from '@suzu-memory/embedding-indexer';
 import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 import { fallbackStateAnalysisToProvisionalReview } from '@suzu-memory/extraction';
-import { autoAcceptReportedStateProposals, runEmbeddingMaintenance } from '@suzu-memory/maintenance';
+import { runEmbeddingMaintenance } from '@suzu-memory/maintenance';
 import { prepareStateMemoryCandidates } from '../src/state-memory-candidates.mjs';
 import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
@@ -31,24 +39,27 @@ function setupRequest({
   suffix = "1",
   targetLabel = "解谜游戏",
   createdAt = "2026-07-11T02:01:00.000Z",
+  sourceAt = "2026-07-10T12:00:00.000Z",
   stateFamily = "preference",
   targetSpec = {},
   eventFields = {},
   content = `我一直很喜欢${targetLabel}，这个可以记住。`,
+  sharedEvidence = null,
+  batchId,
 } = {}) {
   const database = existingDatabase || openMemoryDatabase(":memory:");
   const repository = existingRepository || new MemoryRepository(database);
-  const source = repository.upsertSource({
+  const source = sharedEvidence?.source || repository.upsertSource({
     agentId: "agent-test",
     sourceKind: "transcript-message",
     externalId: `message-preference-${suffix}`,
-    occurredAt: "2026-07-10T12:00:00.000Z",
-    knownAt: "2026-07-10T12:00:00.000Z",
+    occurredAt: sourceAt,
+    knownAt: sourceAt,
     recordedAt: "2026-07-11T02:00:00.000Z",
     speaker: "用户",
     content,
   });
-  const memory = repository.upsertMemory({
+  const memory = sharedEvidence?.memory || repository.upsertMemory({
     id: `utterance-preference-${suffix}`,
     agentId: "agent-test",
     kind: "utterance",
@@ -59,8 +70,8 @@ function setupRequest({
     reality: "real",
     evidenceMode: "imported",
     temporalState: "historical",
-    eventStart: "2026-07-10T12:00:00.000Z",
-    knownAt: "2026-07-10T12:00:00.000Z",
+    eventStart: sourceAt,
+    knownAt: sourceAt,
     recordedAt: "2026-07-11T02:00:00.000Z",
     actorRoles: [{
       role: "speaker",
@@ -77,7 +88,7 @@ function setupRequest({
   });
   const request = repository.recordStateAnalysisRequest({
     agentId: "agent-test",
-    batchId: `compaction-boundary-${suffix}`,
+    batchId: batchId || `compaction-boundary-${suffix}`,
     candidateIndex: Number(suffix) || 0,
     stateFamily,
     subjectRole: "user",
@@ -181,7 +192,8 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
   assert.equal(firstResult.status, 'proposal-pending', JSON.stringify(firstResult));
   assert.equal(firstCalls.length, 1);
   assert.equal(embeddingCalls.length, 1);
-  let old = first.repository.listPendingProvisionalMemories('agent-test')[0];
+  assert.equal(firstResult.proposal.review_state, 'pending');
+  let old = first.repository.getMemory(firstResult.proposal.resultMemoryId);
   assert.equal(old.content, first.source.content);
   if (scenario !== 'pending') old = resolveReportedStateProposal(first.repository, {
     agentId: 'agent-test', proposalId: firstResult.proposal.id, action: 'accept',
@@ -195,25 +207,35 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
     targetLabel: '取消书单安排', content: '我取消周六九点整理小说书单的安排，不是完成了。' });
   const calls = [];
   const native = createOpenAiCompatibleStructuredGenerator({
-    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture' },
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool' },
     fetchImpl: async (_url, { body }) => {
-      const { messages } = JSON.parse(body);
+      const { messages, tools } = JSON.parse(body);
       const input = messages[1].content;
       const snapshot = JSON.parse(input.slice(input.indexOf('{')));
-      const evidence = snapshot.memories.find(memory => memory.content === second.memory.content);
-      assert.ok(evidence && evidence.id !== second.memory.id, 'The provider must receive a local memory reference.');
       const source = snapshot.sourceRecords.find(row => row.content === second.source.content);
       assert.ok(source && source.id !== second.source.id, 'The provider must receive a local source reference.');
+      const evidence = snapshot.memories.find(memory => memory.contentSourceId === source.id);
+      assert.ok(evidence && evidence.id !== second.memory.id, 'The provider must receive a local memory reference.');
+      assert.equal(Object.hasOwn(evidence, 'content'), false, 'Verbatim content is shared through its own source.');
       assert.ok(evidence.sourceIds.includes(source.id));
       const common = { memoryId: evidence.id, sourceIds: [source.id], confidence: 0.98, rationale: '原话明确取消同一约定。' };
       let output;
       if (snapshot.currentState) {
+        assert.equal(Object.hasOwn(snapshot, 'stateCandidates'), false, 'Comparison reads the selected state without the matching pool.');
         assert.equal(snapshot.currentState.content, old.content);
         assert.notEqual(snapshot.currentState.id, old.id);
         output = { analyses: [{ ...common, relation: 'cancels' }] };
       } else {
         const candidate = snapshot.stateCandidates.find(item => item.content === old.content);
         assert.ok(candidate && candidate.id !== old.id);
+        const branches = tools[0].function.parameters.properties.stateMatch.anyOf;
+        assert.ok(Array.isArray(branches), 'Matching must declare candidate-bound resolution branches.');
+        const matched = branches.find(branch => branch.properties.resolution.enum.includes('matched'));
+        const unmatched = branches.find(branch => branch.properties.resolution.enum.includes('new'));
+        assert.deepEqual(new Set(matched.properties.candidateId.enum), new Set(snapshot.stateCandidates.map(item => item.id)));
+        assert.ok(!matched.properties.candidateId.enum.includes('not-a-candidate'));
+        assert.deepEqual(unmatched.properties.resolution.enum, ['new', 'ambiguous']);
+        assert.deepEqual(unmatched.properties.candidateId.enum, ['']);
         output = { stateMatch: { resolution: scenario === 'ambiguous' ? 'ambiguous' : 'matched',
           candidateId: scenario === 'ambiguous' ? '' : scenario === 'invalid' ? 'not-a-candidate' : candidate.id,
           rationale: '比较具体约定。' }, analysis: { results: {
@@ -222,12 +244,16 @@ for (const scenario of ['active', 'pending', 'ambiguous', 'invalid']) test(`earl
           lifecycle: { analyses: [{ ...common, lifecycle: 'cancelled', completionBasis: 'direct_cancellation', timeReference: '' }] },
         } } };
       }
-      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(output) } }] });
+      return Response.json({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ type: 'function',
+        function: { name: tools[0].function.name, arguments: JSON.stringify(output) } }] } }] });
     },
   });
   const generator = Object.assign(async request => {
     assert.equal(embeddingCalls.length, 2, 'new semantic content must be embedded before the specialist');
     calls.push(request);
+    const canonical = JSON.parse(request.input.slice(request.input.indexOf('{')));
+    assert.equal(canonical.memories[0].content, second.memory.content);
+    assert.ok(canonical.stateCandidates.length, 'Canonical evidence retains the matching material for validation.');
     assertMemoryTaskRequest(request);
     const generation = await native(request);
     validateMemoryTaskOutput(request, generation.output);
@@ -331,6 +357,53 @@ test('hiding a synthetic validity date preserves storage concurrency checks for 
     if (changed) assert.throws(resolve, /candidate changed during analysis/);
     else assert.doesNotThrow(resolve);
   }
+});
+
+for (const newerState of [false, true]) test(`a changed comparison state invalidates the waiting analysis before it can record observations; newer state ${newerState}`, async t => {
+  const first = setupRequest({ stateFamily: 'goal', targetLabel: '整理书单', content: '我准备整理书单。' });
+  t.after(() => first.database.close());
+  const established = await processStateAnalysisRequest({ repository: first.repository, agentId: 'agent-test',
+    requestId: first.request.id, generator: combinedGoalGenerator(first, []) });
+  const old = resolveReportedStateProposal(first.repository, { agentId: 'agent-test', proposalId: established.proposal.id, action: 'accept' }).memory;
+  const second = setupRequest({ database: first.database, repository: first.repository, suffix: '2',
+    stateFamily: 'goal', targetLabel: '整理书单', content: '我继续准备整理书单。' });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let comparison = old;
+  const base = combinedGoalGenerator(second, []);
+  const generator = Object.assign(async request => {
+    if (request.schemaName === 'memory-state-match-analysis-v1') {
+      if (newerState) {
+        // A newer state can become visible after candidate selection. Identity
+        // resolution follows the canonical history to this comparison target.
+        comparison = first.repository.upsertMemory({ id: 'newer-current-plan', agentId: 'agent-test', kind: 'plan',
+          layer: 'semantic', status: 'active', content: '书单已列好分类，继续整理。', subjectRole: 'user', subjectKey: 'user',
+          stateFamily: 'goal', representationLayer: 'reported', canonicalKey: old.canonical_key, reality: 'real',
+          evidenceMode: 'explicit', statePhase: 'active', temporalState: 'current', recordedAt: '2026-07-12T00:00:00Z' });
+        first.repository.linkSource(comparison.id, first.source.id, 'evidence');
+        const evidence = first.repository.expand('agent-test', [old.id], {
+          maxDepth: 1, relations: ['supported_by', 'challenged_by'], traversal: 'outgoing' });
+        for (const edge of evidence.edges) first.repository.upsertEdge({ agentId: 'agent-test',
+          fromMemoryId: comparison.id, toMemoryId: edge.to_memory_id, relation: edge.relation });
+      }
+      const evidence = await base(request);
+      return { ...evidence, output: { stateMatch: { resolution: 'matched', candidateId: old.id, rationale: '同一个整理书单的计划。' },
+        analysis: evidence.output } };
+    }
+    assert.equal(request.analyzerRole, 'current-relation');
+    const snapshot = JSON.parse(request.input.slice(request.input.indexOf('{')));
+    assert.equal(snapshot.currentState.id, comparison.id);
+    entered.resolve(); await release.promise;
+    return { output: { analyses: [{ memoryId: second.memory.id, sourceIds: [second.source.id],
+      confidence: 0.98, rationale: '同一个计划。', relation: 'same_goal' }] } };
+  }, { supportsCombinedStateAnalysis: true });
+  const before = first.database.prepare('SELECT COUNT(*) AS n FROM memory_state_evidence_observations').get().n;
+  const pending = processStateAnalysisRequest({ repository: first.repository, agentId: 'agent-test', requestId: second.request.id, generator });
+  await Promise.race([entered.promise, pending.then(result => assert.fail('Comparison was not reached: ' + result.reason))]);
+  first.repository.editMemoryManually({ agentId: 'agent-test', memoryId: comparison.id, patch: { content: '原计划的对象已由人工修正。' } });
+  release.resolve();
+  assert.equal((await pending).reason, 'STATE_ANALYSIS_INPUT_CHANGED');
+  assert.equal(first.database.prepare('SELECT COUNT(*) AS n FROM memory_state_evidence_observations').get().n, before);
+  assert.equal(first.repository.getStateAnalysisRequest('agent-test', second.request.id).status, 'pending');
 });
 
 test('a specialist retry reuses its persisted semantic vector', async t => {
@@ -588,6 +661,539 @@ function combinedGoalGenerator(fixture, calls) {
   return generator;
 }
 
+function sharedStateRequests(options = {}) {
+  const goal = setupRequest({ ...options, stateFamily: 'goal', targetLabel: '整理书单', batchId: 'shared-state-evidence',
+    content: '我喜欢解谜游戏。最近工作很忙，但计划整理书单。', eventFields: { content: '用户计划整理书单。' } });
+  const condition = setupRequest({ database: goal.database, repository: goal.repository, sharedEvidence: goal,
+    suffix: '2', stateFamily: 'condition', targetLabel: '工作繁忙', batchId: goal.request.batch_id,
+    eventFields: { content: '用户最近工作繁忙。' } });
+  return [goal, condition];
+}
+
+async function stateFixtureOutput(request, fixtures, supplied = JSON.parse(request.input.slice(request.input.indexOf('{')))) {
+  if (request.stateAnalysisTasks) {
+    return { results: Object.fromEntries(await Promise.all(request.stateAnalysisTasks.map(async child => [child.key,
+      await stateFixtureOutput(child, fixtures, { ...supplied.shared, ...supplied.tasks[child.key] }),
+    ]))) };
+  }
+  const fixture = fixtures.find(item => item.request.id === request.stateAnalysisRequestId);
+  assert.ok(fixture, 'Each returned task must belong to its original request.');
+  if (request.stateMatchAnalysisTask) return {
+    stateMatch: { resolution: 'matched', candidateId: supplied.stateCandidates[0].id, rationale: '同一主体同一事项的后续证据。' },
+    analysis: await stateFixtureOutput({ ...request.stateMatchAnalysisTask, stateAnalysisRequestId: fixture.request.id }, fixtures, supplied),
+  };
+  const local = { ...fixture, memory: { ...fixture.memory, id: supplied.memories[0].id },
+    source: { ...fixture.source, id: supplied.memories[0].sourceIds[0] } };
+  const definitions = fixture.request.state_family === 'goal' ? GOAL_ANALYZERS
+    : fixture.request.state_family === 'preference' ? PREFERENCE_SPECIALIST_ANALYZERS : BEHAVIOR_STATE_ANALYZERS;
+  const generator = fixture.request.state_family === 'goal' ? directGoalGenerator(local)
+    : fixture.request.state_family === 'preference' ? directPreferenceGenerator(local) : directConditionGenerator(local);
+  if (request.combinedAnalyzerKeys) return { results: Object.fromEntries(await Promise.all(request.combinedAnalyzerKeys.map(async key =>
+    [key, (await generator({ analyzerRole: definitions[key].role })).output]))) };
+  const definition = Object.values(definitions).find(item => item.schemaName === request.schemaName);
+  return (await generator({ analyzerRole: definition.role })).output;
+}
+
+// Produce the provider's compact representation from the fixture's independent
+// semantic judgments; assertions below verify the engine restores their contract.
+function packedStateFixture(schema, output) {
+  if (schema.properties?.analysis) return { ...output, analysis: packedStateFixture(schema.properties.analysis, output.analysis) };
+  const roles = schema.properties?.analyses?.items?.properties?.judgments?.properties;
+  if (!roles) return schema.properties?.results ? { results: Object.fromEntries(Object.entries(output.results).map(([key, value]) =>
+    [key, packedStateFixture(schema.properties.results.properties[key], value)])) } : output;
+  const rows = new Map();
+  for (const [key, result] of Object.entries(output.results)) for (const item of result.analyses) {
+    const { memoryId, sourceIds, rationale, ...fields } = item;
+    if (!rows.has(memoryId)) rows.set(memoryId, { memoryId, sourceIds, rationale,
+      judgments: Object.fromEntries(Object.keys(roles).map(role => [role, null])) });
+    rows.get(memoryId).judgments[key] = { ...fields, sourceIds: null, note: '' };
+  }
+  return { analyses: [...rows.values()] };
+}
+
+for (const confirmsScope of [true, false]) test(`reported preference adds evidence only when it supports the prior scope: ${confirmsScope}`, async t => {
+  const old = setupRequest({ targetLabel: '无糖热茶', content: '半夜写稿我只喜欢喝无糖热茶。', sourceAt: '2026-07-09T12:00:00.000Z' });
+  const { repository } = old;
+  t.after(() => old.database.close());
+  const earlierScope = { scopeKind: 'exact_object', scopeLabel: '无糖热茶', contextLabel: '半夜写稿' };
+  const first = await processStateAnalysisRequest({ repository, agentId: 'agent-test', requestId: old.request.id,
+    generator: Object.assign(async request => {
+      const output = await stateFixtureOutput(request, [old]);
+      Object.assign(output.results.timeScope.analyses[0], earlierScope);
+      return { output, model: 'fixture' };
+    }, { supportsCombinedStateAnalysis: true }) });
+  const stored = resolveReportedStateProposal(repository, {
+    agentId: 'agent-test', proposalId: first.proposal.id, action: 'accept',
+  }).memory;
+  const fresh = setupRequest({ database: old.database, repository, suffix: '2', targetLabel: '无糖热茶',
+    content: confirmsScope ? '深夜动笔我还是爱喝不放糖的热茶。' : '我写稿时喜欢喝无糖热茶。' });
+  let request;
+  const native = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'fixture', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async (_url, { body }) => {
+      const { messages, tools } = JSON.parse(body);
+      const supplied = JSON.parse(messages[1].content);
+      const candidate = supplied.stateCandidates.find(item => item.content === old.source.content);
+      assert.equal(candidate.preferenceClaim.scope.context, earlierScope.contextLabel);
+      assert.ok(!Object.hasOwn(supplied, 'omitted'));
+      assert.ok(!Object.hasOwn(supplied.memories[0], 'sourcesTruncated'));
+      assert.ok(!Object.hasOwn(candidate, 'reviewState'));
+      assert.ok(!Object.hasOwn(supplied.target, 'canonicalKey'));
+      assert.ok(supplied.stateCandidates.every(item => !Object.hasOwn(item, 'canonicalKey')));
+      assert.doesNotMatch(messages[0].content, /身份字段|婚恋状态/u);
+      const output = await stateFixtureOutput(request, [fresh], supplied);
+      output.stateMatch.supportingMemoryIds = confirmsScope ? [supplied.memories[0].id] : [];
+      Object.assign(output.analysis.results.timeScope.analyses[0], {
+        scopeKind: 'exact_object', scopeLabel: confirmsScope ? '不放糖的热茶' : '无糖热茶',
+        contextLabel: confirmsScope ? '深夜动笔' : '写稿时',
+      });
+      const tool = tools[0].function;
+      const packed = packedStateFixture(tool.parameters, output);
+      return Response.json({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{
+        type: 'function', function: { name: tool.name, arguments: JSON.stringify(packed) },
+      }] } }] });
+    },
+  });
+  const generator = Object.assign(async call => {
+    request = call;
+    const generation = await native(call);
+    validateMemoryTaskOutput(call, generation.output);
+    return generation;
+  }, native);
+  const result = await processStateAnalysisRequest({ repository, agentId: 'agent-test', requestId: fresh.request.id, generator });
+  if (confirmsScope) {
+    assert.equal(result.proposal?.action, 'reinforce', result.reason);
+    assert.equal(result.proposal.review_state, 'pending');
+    assert.equal(result.proposal.resultMemoryId, stored.id);
+    assert.deepEqual(repository.listPendingProvisionalMemories('agent-test'), []);
+    const memory = repository.getMemory(stored.id);
+    assert.equal(memory.content, old.source.content);
+    assert.deepEqual(memory.metadata.reportedStateDraft.preferenceClaim, stored.metadata.reportedStateDraft.preferenceClaim);
+  } else {
+    assert.equal(result.status, 'provisional-review');
+    assert.equal(result.reason, 'latest-direct-preference-does-not-prove-a-safe-transition');
+  }
+  assert.deepEqual(new Set(repository.listMemorySources(stored.id).map(source => source.id)),
+    new Set(confirmsScope ? [old.source.id, fresh.source.id] : [old.source.id]));
+});
+
+test('cross-family first stages share evidence on the provider wire and retain independent contracts and billing', async t => {
+  const fixtures = sharedStateRequests();
+  const f = fixtures[0]; t.after(() => f.database.close());
+  fixtures.push(setupRequest({ database: f.database, repository: f.repository, sharedEvidence: f,
+    suffix: '3', stateFamily: 'preference', targetLabel: '解谜游戏', batchId: f.request.batch_id,
+    eventFields: { content: '用户喜欢解谜游戏。' } }));
+  const calls = [], charges = [];
+  let current;
+  const native = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'fixture', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async (_url, { body }) => {
+      const payload = JSON.parse(body), material = JSON.parse(payload.messages[1].content), tool = payload.tools[0].function;
+      assert.equal(current.schemaName, 'memory-state-first-stage-batch-v1');
+      assert.equal(material.shared.sourceRecords.length, 1);
+      assert.equal(payload.messages[1].content.split(f.source.content).length - 1, 1, 'The shared source body is purchased once.');
+      assert.equal(Object.keys(material.tasks).length, 3);
+      assert.deepEqual(current.decodeOutput(material), JSON.parse(current.input), 'Shared fields and per-task references must round-trip exactly.');
+      assert.deepEqual(current.stateAnalysisTasks.map(task => task.stateFamily), ['goal', 'condition', 'preference']);
+      assertMemoryTaskRequest(current);
+      assert.throws(() => assertMemoryTaskRequest({ ...current, stateAnalysisTasks: current.stateAnalysisTasks.map((child, index) =>
+        index === 0 ? { ...child, stateFamily: 'condition' } : child) }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
+      const canonical = await stateFixtureOutput(current, fixtures, material);
+      const output = packedStateFixture(tool.parameters, canonical);
+      assert.ok(output.results.task1.analyses[0].judgments.targetIntent);
+      assert.equal(output.results.task3.analyses[0].judgments.behaviorConditions, null, 'No evidence remains an abstention.');
+      validateMemoryTaskOutput(current, current.decodeOutput(output));
+      return { ok: true, json: async () => ({ id: 'cross-family-receipt', model: 'fixture', usage: { prompt_tokens: 100, completion_tokens: 30 },
+        choices: [{ message: { tool_calls: [{ function: { name: tool.name, arguments: JSON.stringify(output) } }] } }] }) };
+    },
+  });
+  const generator = Object.assign(async request => { current = request; calls.push(request); return native(request); },
+    { supportsCombinedStateAnalysis: true, measureRequest: native.measureRequest });
+  const report = await withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository: f.repository, agentId: 'agent-test', maxRequests: 3, generator, usageLedgerPath: path.join(os.tmpdir(), 'unused-state-ledger.jsonl'),
+  }));
+  assert.equal(calls.length, 1, JSON.stringify(report.results.map(result => ({ status: result.status, reason: result.reason }))));
+  assert.equal(report.selected, 3);
+  assert.ok(report.results.every(result => result.status === 'proposal-pending'), JSON.stringify(report.results.map(result => ({ status: result.status, reason: result.reason }))));
+  assert.equal(charges.length, 1);
+  assert.deepEqual(charges[0].metadata.stateAnalysisRequestIds, fixtures.map(item => item.request.id));
+  const runs = f.repository.listStateAnalysisRuns('agent-test', { limit: 100 });
+  assert.equal(runs.reduce((sum, run) => sum + Number(run.usage.prompt_tokens || 0), 0), 100);
+  for (const fixture of fixtures) {
+    const saved = f.repository.getStateAnalysisRequest('agent-test', fixture.request.id);
+    assert.equal(saved.status, 'completed');
+    assert.equal(saved.lease_owner, '');
+    assert.equal(saved.metadata.firstStage, undefined, 'Completed work releases its temporary recovery checkpoint.');
+  }
+});
+
+for (const failure of ['missing-task', 'invalid-source']) test(`cross-family partial success retries only the failed task: ${failure}`, async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const calls = [], charges = [];
+  const generator = Object.assign(async request => {
+    calls.push(request);
+    const output = await stateFixtureOutput(request, fixtures);
+    if (calls.length === 1) {
+      const failed = request.stateAnalysisTasks.find(task => task.stateFamily === 'condition').key;
+      if (failure === 'missing-task') delete output.results[failed];
+      else output.results[failed].analyses[0].sourceIds = ['unrelated-source'];
+    } else assert.equal(request.stateAnalysisRequestId, fixtures[1].request.id, 'A successful sibling cannot be regenerated.');
+    return { output, model: 'fixture', requestId: `partial-${calls.length}`, usage: { prompt_tokens: 100, completion_tokens: 30 } };
+  }, { supportsCombinedStateAnalysis: true });
+  const report = await withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository: f.repository, agentId: 'agent-test', maxRequests: 2, generator, usageLedgerPath: path.join(os.tmpdir(), 'unused-state-ledger.jsonl'),
+  }));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(report.results.map(result => result.automaticRetries), [0, 1]);
+  assert.ok(report.results.every(result => result.status === 'proposal-pending'));
+  assert.deepEqual(charges.map(charge => charge.requestId), ['partial-1', 'partial-2']);
+  assert.equal(f.repository.listStateAnalysisRuns('agent-test', { limit: 100 })
+    .reduce((sum, run) => sum + Number(run.usage.prompt_tokens || 0), 0), 200);
+  const goalRuns = f.repository.listStateAnalysisRuns('agent-test', { stateFamily: 'goal', limit: 100 });
+  assert.equal(goalRuns.filter(run => run.analyzer_role === 'target-intent').length, 1);
+});
+
+async function establishStateCandidates(fixtures) {
+  const memories = [];
+  for (const [index, fixture] of fixtures.entries()) {
+    const previous = setupRequest({ database: fixture.database, repository: fixture.repository, suffix: String(20 + index),
+      stateFamily: fixture.request.state_family, targetLabel: fixture.request.target_label,
+      content: fixture.request.state_family === 'goal' ? '我计划整理书单。' : '我最近工作很忙。', createdAt: '2026-07-09T02:00:00.000Z' });
+    const result = await processStateAnalysisRequest({ repository: fixture.repository, agentId: 'agent-test', requestId: previous.request.id,
+      generator: Object.assign(async request => ({ output: await stateFixtureOutput(request, [previous]), model: 'fixture' }), { supportsCombinedStateAnalysis: true }) });
+    assert.equal(result.status, 'proposal-pending', result.reason);
+    memories.push(resolveReportedStateProposal(fixture.repository, { agentId: 'agent-test', proposalId: result.proposal.id, action: 'accept' }).memory);
+  }
+  return memories;
+}
+
+test('cross-family matching binds each schema to its own candidates and keeps comparison calls separate', async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const candidates = await establishStateCandidates(fixtures);
+  const calls = [];
+  const generator = Object.assign(async request => {
+    calls.push(request);
+    if (request.stateAnalysisTasks) {
+      const input = JSON.parse(request.modelInput);
+      const candidateSets = request.stateAnalysisTasks.map(task => {
+        const schema = request.modelSchema.properties.results.properties[task.key].properties.stateMatch;
+        const matched = schema.anyOf.find(branch => branch.properties.resolution.enum.includes('matched'));
+        const expected = input.tasks[task.key].stateCandidates.map(item => item.id);
+        assert.deepEqual(matched.properties.candidateId.enum, expected);
+        return new Set(expected);
+      });
+      assert.ok([...candidateSets[0]].every(id => !candidateSets[1].has(id)), 'The two tasks cannot select each other\'s candidates.');
+      assertMemoryTaskRequest(request);
+    } else {
+      assert.equal(request.analyzerRole, 'current-relation');
+      const input = JSON.parse(request.modelInput);
+      assert.equal(Object.hasOwn(input, 'stateCandidates'), false);
+      assert.equal(input.currentState.title, f.request.target_label);
+    }
+    const output = await stateFixtureOutput(request, fixtures);
+    validateMemoryTaskOutput(request, output);
+    return { output, model: 'fixture' };
+  }, { supportsCombinedStateAnalysis: true });
+  const report = await processPendingStateAnalysisRequests({ repository: f.repository, agentId: 'agent-test', maxRequests: 2, generator });
+  assert.equal(calls.length, 2, JSON.stringify({ calls: calls.map(call => call.schemaName),
+    results: report.results.map(result => ({ status: result.status, reason: result.reason })),
+    runs: f.repository.listStateAnalysisRuns('agent-test', { limit: 100 }).map(run => ({ role: run.analyzer_role, error: run.error_message, rejected: run.rejected })) }));
+  assert.equal(report.results.length, 2);
+  for (const [index, fixture] of fixtures.entries()) {
+    const saved = f.repository.getStateAnalysisRequest('agent-test', fixture.request.id);
+    assert.equal(saved.metadata.stateIdentityResolution.candidateId, candidates[index].id);
+    assert.equal(saved.status, 'completed');
+  }
+});
+
+for (const changed of ['none', 'evidence', 'candidate']) test(`cross-family first-stage checkpoints resume after closing the database; changed ${changed}`, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'state-first-stage-restart-'));
+  let database = openMemoryDatabase(path.join(directory, 'memory.db'));
+  t.after(() => { database.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const fixtures = sharedStateRequests({ database }), f = fixtures[0];
+  const candidates = await establishStateCandidates(fixtures);
+  const comparisonEntered = Promise.withResolvers(), release = Promise.withResolvers(), controller = new AbortController();
+  const charges = [];
+  const generator = Object.assign(async request => {
+    if (!request.stateAnalysisTasks) {
+      comparisonEntered.resolve(); await release.promise;
+      controller.signal.throwIfAborted();
+    }
+    return { output: await stateFixtureOutput(request, fixtures), model: 'fixture', requestId: 'before-restart', usage: { prompt_tokens: 100, completion_tokens: 30 } };
+  }, { supportsCombinedStateAnalysis: true });
+  const pending = withUsageRecorder(charge => charges.push(charge), () => withEventSourceExecution(f.repository,
+    () => processPendingStateAnalysisRequests({ repository: f.repository, agentId: 'agent-test', maxRequests: 2, generator,
+      usageLedgerPath: path.join(directory, 'usage.jsonl') }), { signal: controller.signal }));
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await comparisonEntered.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  const beforeStop = fixtures.map(fixture => f.repository.getStateAnalysisRequest('agent-test', fixture.request.id));
+  controller.abort(); release.resolve(); await rejected;
+  assert.ok(beforeStop[0].metadata.firstStage);
+  assert.equal(beforeStop[1].status, 'completed', JSON.stringify({ checkpoint: beforeStop[1].metadata.firstStage,
+    failures: beforeStop[1].metadata.failureHistory }));
+  database.close(); database = openMemoryDatabase(path.join(directory, 'memory.db'));
+  const repository = new MemoryRepository(database);
+  repository.recoverStateAnalysisRequests('agent-test', { force: true });
+  if (changed !== 'none') {
+    const memory = changed === 'evidence' ? f.memory : candidates[0];
+    repository.editMemoryManually({ agentId: 'agent-test', memoryId: memory.id,
+      patch: { content: memory.content + ' 这条记录已补充说明。' } });
+  }
+  const resumed = [];
+  const report = await withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository, agentId: 'agent-test', maxRequests: 2, usageLedgerPath: path.join(directory, 'usage.jsonl'),
+    generator: Object.assign(async request => {
+      resumed.push(request);
+      return { output: await stateFixtureOutput(request, fixtures), model: 'fixture', requestId: 'after-restart', usage: { prompt_tokens: 40, completion_tokens: 10 } };
+    }, { supportsCombinedStateAnalysis: true }),
+  }));
+  assert.equal(report.selected, 1);
+  assert.deepEqual(resumed.map(request => request.analyzerRole), changed === 'none'
+    ? ['current-relation'] : ['combined-evidence', 'current-relation'], 'Only a checkpoint with unchanged evidence and candidates may be reused.');
+  assert.deepEqual(charges.map(charge => charge.requestId), changed === 'none'
+    ? ['before-restart', 'after-restart'] : ['before-restart', 'after-restart', 'after-restart']);
+  assert.equal(repository.getStateAnalysisRequest('agent-test', f.request.id).status, 'completed');
+  assert.equal(repository.getStateAnalysisRequest('agent-test', f.request.id).metadata.firstStage, undefined);
+  assert.equal(repository.listStateAnalysisRuns('agent-test', { stateFamily: 'condition', limit: 100 })
+    .filter(run => run.metadata.stateAnalysisRequestId === fixtures[1].request.id).length, 1);
+});
+
+for (const change of ['evidence', 'edit-and-restore', 'source-record', 'candidate']) test(`cross-family source checks isolate obsolete work and preserve one paid receipt: ${change}`, async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const candidates = await establishStateCandidates(fixtures);
+  const entered = Promise.withResolvers(), release = Promise.withResolvers(), charges = [];
+  let calls = 0;
+  const generator = Object.assign(async request => {
+    calls++; entered.resolve(); await release.promise;
+    return { output: await stateFixtureOutput(request, fixtures), model: 'fixture', requestId: 'obsolete-group', usage: { prompt_tokens: 100, completion_tokens: 30 } };
+  }, { supportsCombinedStateAnalysis: true });
+  const pending = withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository: f.repository, agentId: 'agent-test', maxRequests: 2, generator, usageLedgerPath: path.join(os.tmpdir(), 'unused-state-ledger.jsonl'),
+  }));
+  await entered.promise;
+  const memory = change === 'candidate' ? candidates[0] : f.memory;
+  if (change === 'source-record') f.repository.upsertSource({ agentId: 'agent-test', sourceKind: f.source.source_kind,
+    externalId: f.source.external_id, content: '原始来源已更正。', speaker: f.source.speaker });
+  else f.repository.editMemoryManually({ agentId: 'agent-test', memoryId: memory.id, patch: { content: '记录有误，已更正。' } });
+  if (change === 'edit-and-restore') f.repository.editMemoryManually({ agentId: 'agent-test', memoryId: memory.id, patch: { content: memory.content } });
+  release.resolve();
+  const report = await pending;
+  assert.equal(calls, 1);
+  assert.equal(charges.length, 1);
+  assert.equal(charges[0].requestId, 'obsolete-group');
+  for (const [index, result] of report.results.entries()) {
+    if (change === 'candidate' && index === 1) {
+      assert.equal(result.request.status, 'completed');
+      assert.equal(f.repository.listStateAnalysisRuns('agent-test', { stateFamily: 'condition', limit: 100 })
+        .filter(run => run.metadata.stateAnalysisRequestId === fixtures[index].request.id).length, 1);
+    }
+    else {
+      assert.equal(result.status, 'deferred');
+      assert.equal(result.reason, 'STATE_ANALYSIS_INPUT_CHANGED');
+      const saved = f.repository.getStateAnalysisRequest('agent-test', fixtures[index].request.id);
+      assert.equal(saved.metadata.firstStage, undefined);
+      assert.equal(saved.metadata.attemptCount || 0, 0);
+    }
+  }
+  assert.equal(f.repository.listStateAnalysisRuns('agent-test', { stateFamily: 'goal', limit: 100 })
+    .filter(run => run.metadata.stateAnalysisRequestId === f.request.id).length, 0);
+});
+
+for (const limit of ['request', 'judgments', 'truncation']) test(`cross-family batching splits complete tasks at the ${limit} boundary and records every receipt`, async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const calls = [], charges = [];
+  const generator = Object.assign(async request => {
+    calls.push(request);
+    const receipt = { model: 'fixture', requestId: `budget-${calls.length}`, usage: { prompt_tokens: 100, completion_tokens: 30 } };
+    if (request.stateAnalysisTasks && limit === 'truncation') throw Object.assign(new Error('Output truncated.'), receipt, { code: 'MAX_TOKENS' });
+    assert.equal(request.stateAnalysisTasks, undefined, 'A split must retain the original complete child task.');
+    return { ...receipt, output: await stateFixtureOutput(request, fixtures) };
+  }, { supportsCombinedStateAnalysis: true,
+    measureRequest: request => (request.modelInput || request.input).length + request.systemPrompt.length + JSON.stringify(request.modelSchema || request.schema).length });
+  const report = await withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository: f.repository, agentId: 'agent-test', maxRequests: 2, generator, usageLedgerPath: path.join(os.tmpdir(), 'unused-state-ledger.jsonl'),
+    firstStageBatchOptions: limit === 'request' ? { maximumRequestCharacters: 1000 } : limit === 'judgments' ? { maximumJudgments: 3 } : {},
+  }));
+  assert.equal(calls.length, limit === 'truncation' ? 3 : 2);
+  assert.equal(charges.length, calls.length);
+  assert.equal(new Set(charges.map(charge => charge.requestId)).size, calls.length);
+  assert.deepEqual(calls.slice(-2).map(call => call.stateAnalysisRequestId), fixtures.map(fixture => fixture.request.id));
+  assert.ok(report.results.every(result => result.status === 'proposal-pending'));
+  assert.equal(report.automaticRetries, 0, 'Shrinking the transport batch is not a failed domain judgment.');
+});
+
+for (const replace of [false, true]) test(`cross-family groups own one Agent lane across connections; replacement ${replace}`, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'state-group-lease-'));
+  const database = openMemoryDatabase(path.join(directory, 'memory.db'));
+  const fixtures = sharedStateRequests({ database }), f = fixtures[0];
+  const peerDatabase = openMemoryDatabase(path.join(directory, 'memory.db')), peer = new MemoryRepository(peerDatabase);
+  t.after(() => { peerDatabase.close(); database.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const gates = [0, 1].map(() => ({ entered: Promise.withResolvers(), release: Promise.withResolvers() }));
+  const charges = [], calls = [];
+  const run = (repository, index) => withUsageRecorder(charge => charges.push(charge), () => processPendingStateAnalysisRequests({
+    repository, agentId: 'agent-test', maxRequests: 2, usageLedgerPath: path.join(directory, 'usage.jsonl'),
+    generator: Object.assign(async request => {
+      calls.push(index); gates[index].entered.resolve(); await gates[index].release.promise;
+      return { output: await stateFixtureOutput(request, fixtures), model: 'fixture', requestId: `owner-${index}`, usage: { prompt_tokens: 100, completion_tokens: 30 } };
+    }, { supportsCombinedStateAnalysis: true }),
+  }));
+  const first = run(f.repository, 0); await gates[0].entered.promise;
+  const owners = fixtures.map(fixture => peer.getStateAnalysisRequest('agent-test', fixture.request.id).lease_owner);
+  assert.ok(owners[0]); assert.equal(owners[0], owners[1]);
+  if (replace) peerDatabase.prepare("UPDATE memory_state_analysis_requests SET lease_expires_at='2000-01-01T00:00:00Z'").run();
+  const second = run(peer, 1);
+  if (replace) await gates[1].entered.promise;
+  else assert.deepEqual((await second).results.map(result => result.status), ['deferred', 'deferred']);
+  const activeOwner = peer.getStateAnalysisRequest('agent-test', fixtures[0].request.id).lease_owner;
+  gates[0].release.resolve(); const original = await first;
+  if (replace) {
+    assert.ok(original.results.every(result => result.reason === 'STATE_ANALYSIS_LEASE_LOST'));
+    assert.equal(peer.getStateAnalysisRequest('agent-test', fixtures[0].request.id).lease_owner, activeOwner);
+    assert.equal(f.repository.listStateAnalysisRuns('agent-test', { limit: 100 }).length, 0);
+    gates[1].release.resolve();
+    assert.ok((await second).results.every(result => result.status === 'proposal-pending'));
+  } else assert.ok(original.results.every(result => result.status === 'proposal-pending'));
+  assert.equal(calls.length, replace ? 2 : 1);
+  assert.equal(charges.length, calls.length);
+  assert.ok(fixtures.every(fixture => !peer.getStateAnalysisRequest('agent-test', fixture.request.id).lease_owner));
+});
+
+test('cross-family scheduling respects earlier same-family tasks and distinct extraction boundaries', async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const nextGoal = setupRequest({ database: f.database, repository: f.repository, sharedEvidence: f,
+    suffix: '3', stateFamily: 'goal', targetLabel: '完成书单', batchId: f.request.batch_id,
+    eventFields: { content: '用户计划完成书单。' } });
+  const nextCondition = setupRequest({ database: f.database, repository: f.repository, sharedEvidence: f,
+    suffix: '4', stateFamily: 'condition', targetLabel: '工作繁忙', batchId: 'another-extraction-boundary' });
+  fixtures.push(nextGoal, nextCondition);
+  const calls = [];
+  const report = await processPendingStateAnalysisRequests({ repository: f.repository, agentId: 'agent-test', maxRequests: 4,
+    generator: Object.assign(async request => {
+      calls.push(request);
+      if (request.stateAnalysisRequestId === nextGoal.request.id) {
+        assert.equal(f.repository.getStateAnalysisRequest('agent-test', f.request.id).status, 'completed');
+      }
+      return { output: await stateFixtureOutput(request, fixtures), model: 'fixture' };
+    }, { supportsCombinedStateAnalysis: true }),
+  });
+  assert.equal(report.selected, 4);
+  assert.equal(calls.filter(call => call.stateAnalysisTasks).length, 1);
+  assert.deepEqual(calls[0].stateAnalysisTasks.map(task => task.stateAnalysisRequestId), fixtures.slice(0, 2).map(fixture => fixture.request.id));
+  assert.ok(calls.some(call => call.stateAnalysisRequestId === nextGoal.request.id && call.schemaName === 'memory-state-match-analysis-v1'),
+    'A later goal must see the completed earlier goal before matching.');
+  assert.ok(calls.some(call => call.stateAnalysisRequestId === nextCondition.request.id));
+});
+
+test('cross-family preparation failure releases the ready sibling and does not regenerate it', async t => {
+  const fixtures = sharedStateRequests(), f = fixtures[0]; t.after(() => f.database.close());
+  const calls = [];
+  const report = await processPendingStateAnalysisRequests({ repository: f.repository, agentId: 'agent-test', maxRequests: 2,
+    embeddingProvider: Object.assign(async text => {
+      if (text.includes('用户最近工作繁忙')) throw new Error('The condition embedding is temporarily unavailable.');
+      return { model: 'fixture-embedding', vector: [1, 0] };
+    }, { model: 'fixture-embedding', dimensions: 2 }),
+    generator: Object.assign(async request => {
+      calls.push(request.stateAnalysisRequestId);
+      return { output: await stateFixtureOutput(request, fixtures), model: 'fixture' };
+    }, { supportsCombinedStateAnalysis: true }),
+  });
+  assert.deepEqual(calls, [f.request.id]);
+  assert.deepEqual(report.results.map(result => result.status), ['proposal-pending', 'provisional-review']);
+  assert.deepEqual(report.results.map(result => result.automaticRetries), [0, 2]);
+  assert.ok(fixtures.every(fixture => !f.repository.getStateAnalysisRequest('agent-test', fixture.request.id).lease_owner));
+});
+
+test('state requests are claimed across connections and preserve the Agent analysis order', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'state-request-lease-'));
+  const database = openMemoryDatabase(path.join(directory, 'memory.db'));
+  const f = setupRequest({ database, stateFamily: 'goal' });
+  const peerDatabase = openMemoryDatabase(path.join(directory, 'memory.db'));
+  const peer = new MemoryRepository(peerDatabase);
+  t.after(() => { peerDatabase.close(); database.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const next = setupRequest({ database, repository: f.repository, suffix: '2', stateFamily: 'goal' });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let calls = 0;
+  const base = combinedGoalGenerator(f, []);
+  const generator = Object.assign(async request => { calls++; entered.resolve(); await release.promise; return base(request); },
+    { supportsCombinedStateAnalysis: true });
+  const pending = processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test', requestId: f.request.id, generator });
+  await entered.promise;
+  const competing = [f.request.id, next.request.id].map(requestId =>
+    processStateAnalysisRequest({ repository: peer, agentId: 'agent-test', requestId, generator }));
+  const settled = Promise.allSettled([pending, ...competing]);
+  await new Promise(resolve => setImmediate(resolve));
+  release.resolve();
+  const results = await settled;
+  assert.equal(calls, 1, 'a concurrent maintenance pass must not purchase another analysis');
+  assert.equal(results[0].value.status, 'proposal-pending');
+  for (const result of results.slice(1)) assert.equal(result.value.status, 'deferred');
+  assert.equal(peer.getStateAnalysisRequest('agent-test', f.request.id).lease_owner, '');
+  assert.equal(peer.getStateAnalysisRequest('agent-test', next.request.id).status, 'pending');
+});
+
+test('expired state leases reject late results and keep the replacement worker claim', async t => {
+  const f = setupRequest({ stateFamily: 'goal' });
+  t.after(() => f.database.close());
+  const gates = [0, 1].map(() => ({ entered: Promise.withResolvers(), release: Promise.withResolvers() }));
+  const base = combinedGoalGenerator(f, []);
+  const run = index => processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test', requestId: f.request.id,
+    generator: Object.assign(async request => { gates[index].entered.resolve(); await gates[index].release.promise; return base(request); },
+      { supportsCombinedStateAnalysis: true }) });
+  const original = run(0);
+  await gates[0].entered.promise;
+  f.database.prepare("UPDATE memory_state_analysis_requests SET lease_expires_at='2000-01-01T00:00:00.000Z'").run();
+  const replacement = run(1);
+  await gates[1].entered.promise;
+  const owner = f.repository.getStateAnalysisRequest('agent-test', f.request.id).lease_owner;
+  gates[0].release.resolve();
+  const obsolete = await original;
+  assert.equal(obsolete.status, 'deferred');
+  assert.equal(obsolete.reason, 'STATE_ANALYSIS_LEASE_LOST');
+  assert.equal(f.repository.getStateAnalysisRequest('agent-test', f.request.id).lease_owner, owner);
+  assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM memory_state_evidence_observations').get().n, 0);
+  gates[1].release.resolve();
+  assert.equal((await replacement).status, 'proposal-pending');
+});
+
+for (const change of ['edit', 'edit-and-restore', 'cancel']) test(`in-flight state analysis fences ${change} while retaining its paid receipt`, async t => {
+  const f = setupRequest({ stateFamily: 'goal', targetLabel: '整理书单', content: '我准备整理书单。' });
+  t.after(() => f.database.close());
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const controller = new AbortController(), charges = [];
+  const base = combinedGoalGenerator(f, []);
+  const generator = Object.assign(async request => { entered.resolve(); await release.promise;
+    return { ...await base(request), requestId: 'state-late-receipt' }; }, { supportsCombinedStateAnalysis: true });
+  const pending = withUsageRecorder(charge => charges.push(charge), () => withEventSourceExecution(f.repository,
+    () => processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test', requestId: f.request.id,
+      generator, usageLedgerPath: path.join(os.tmpdir(), 'unused-state-ledger.jsonl') }), { signal: controller.signal }));
+  const rejected = change === 'cancel' ? assert.rejects(pending, { name: 'AbortError' }) : null;
+  await entered.promise;
+  if (change === 'cancel') controller.abort();
+  else {
+    f.repository.editMemoryManually({ agentId: 'agent-test', memoryId: f.memory.id, patch: { content: '这条记录写错了。' } });
+    if (change === 'edit-and-restore') f.repository.editMemoryManually({ agentId: 'agent-test', memoryId: f.memory.id,
+      patch: { content: f.memory.content } });
+  }
+  release.resolve();
+  if (rejected) await rejected;
+  else assert.equal((await pending).reason, 'STATE_ANALYSIS_INPUT_CHANGED');
+  assert.equal(charges.length, 1);
+  assert.equal(charges[0].requestId, 'state-late-receipt');
+  assert.equal(charges[0].usage.prompt_tokens, 100);
+  assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM memory_state_evidence_observations').get().n, 0);
+  assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM memory_reported_state_proposals').get().n, 0);
+  const current = f.repository.getStateAnalysisRequest('agent-test', f.request.id);
+  assert.equal(current.status, 'pending');
+  assert.equal(current.metadata.attemptCount || 0, 0, 'obsolete material is not a model failure or an automatic retry');
+  if (change === 'cancel') {
+    assert.ok(current.lease_owner, 'cancelled executions preserve the lease until recovery');
+    assert.equal(f.repository.recoverStateAnalysisRequests('agent-test', { force: true }).recovered, 1);
+  }
+  assert.equal((await processStateAnalysisRequest({ repository: f.repository, agentId: 'agent-test',
+    requestId: f.request.id, generator: combinedGoalGenerator(f, []) })).status, 'proposal-pending');
+});
+
 for (const language of ['zh', 'en']) test(`specialist fallback queues searchable evidence without provider retries: ${language}`, async t => {
   const fixture = setupRequest({ content: language === 'en' ? 'I have always enjoyed puzzle games.' : '我一直很喜欢解谜游戏。' });
   t.after(() => fixture.database.close());
@@ -692,6 +1298,26 @@ test("processes a request-bound utterance into a pending reported preference pro
     beforeNodes + 2,
   );
   fixture.database.close();
+});
+
+test('reprocessing a withdrawn preference leaves its source and creates no replacement memory', async t => {
+  const first = setupRequest();
+  t.after(() => first.database.close());
+  const { repository } = first;
+  const analyze = fixture => processStateAnalysisRequest({ repository, agentId: 'agent-test', requestId: fixture.request.id,
+    generator: directPreferenceGenerator(fixture) });
+  const created = await analyze(first);
+  const memoryId = created.proposal.resultMemoryId;
+  assert.equal(repository.getMemory(memoryId).status, 'active');
+  resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: created.proposal.id, action: 'dismiss' });
+
+  const replay = setupRequest({ database: first.database, repository, sharedEvidence: first, suffix: '2' });
+  const analyzedAgain = await analyze(replay);
+  assert.equal(analyzedAgain.status, 'completed-without-proposal');
+  assert.equal(repository.getMemory(memoryId).status, 'deleted');
+  assert.equal(repository.getMemory(first.memory.id).content, first.source.content);
+  assert.equal(repository.listMemories('agent-test', { kinds: ['preference'] }).total, 0);
+  assert.deepEqual(repository.listPendingProvisionalMemories('agent-test'), []);
 });
 
 test("processes a request-bound explicit goal without rewriting the utterance provenance", async () => {
@@ -1245,8 +1871,8 @@ test('a newer preference with a rejected essential judgment stays pending and re
     stateFamily: 'preference', canonicalKey: completed.request.canonical_key });
   assert.deepEqual(observations.map(observation => observation.memory_id).sort(),
     [first.memory.id, later.memory.id].sort());
-  assert.equal(autoAcceptReportedStateProposals({ repository: first.repository, agentId: 'agent-test',
-    proposalIds: [completed.proposal.id] }).accepted.length, 1);
+  assert.equal(completed.proposal.review_state, 'pending');
+  assert.equal(first.repository.getMemory(completed.proposal.resultMemoryId).status, 'active');
 });
 
 test('retries only a failed essential role and reuses the identical successful analyses', async t => {
@@ -1314,9 +1940,13 @@ for (const accept of [false, true]) test(`fictional reported states retain scope
   scope(f);
   const result = await processStateAnalysisRequest({ repository: f.repository, agentId: "agent-test", requestId: f.request.id, generator: directPreferenceGenerator(f) });
   assert.equal(result.status, "proposal-pending", JSON.stringify(result));
-  let memory = f.repository.listPendingProvisionalMemories("agent-test")[0];
+  let memory = f.repository.getMemory(result.proposal.resultMemoryId);
   assert.equal(memory.reality, "fictional");
-  if (accept) memory = resolveReportedStateProposal(f.repository, { agentId: "agent-test", proposalId: result.proposal.id, action: "accept" }).memory;
+  assert.equal(memory.status, 'active');
+  if (accept) {
+    const confirmed = resolveReportedStateProposal(f.repository, { agentId: "agent-test", proposalId: result.proposal.id, action: "accept" });
+    assert.deepEqual(confirmed.memory, memory);
+  }
   assert.equal(memory.reality, "fictional");
   assert.equal(memory.world_id, "story-a");
   assert.equal(memory.world_frame, "fictional");

@@ -14,8 +14,12 @@ import {
   normalizeStateAnalysisTargetSpec,
   openMemoryDatabase,
   proposeMemoryRelation,
+  materializePendingMemoryRelationProposals,
+  materializePendingMemoryStructureProposals,
   proposeMemoryStructure,
   rebuildAssociationGraph,
+  recordEventContinuityReview,
+  resolveEventContinuityReview,
   resolveMemoryRelationProposal,
   resolveMemoryStructureProposal,
   revokeMemoryRelationProposal,
@@ -29,6 +33,104 @@ import { createHash } from "node:crypto";
 function temporaryDirectory(prefix) {
   return createTestDirectory(path.join(os.tmpdir(), prefix));
 }
+
+test('v52 relation migration preserves applied records and recovers scoped reasons and conditions', () => {
+  const databasePath = path.join(temporaryDirectory('suzu-relations-v52-'), 'memory.db');
+  const legacy = closeAfterTests(new DatabaseSync(databasePath));
+  legacy.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL) STRICT;');
+  for (const migration of MIGRATIONS.filter(item => item.version <= 52)) {
+    if (migration.apply) migration.apply(legacy); else legacy.exec(migration.sql);
+    legacy.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(migration.version, migration.name, '2026-11-01T00:00:00Z');
+  }
+  legacy.exec(`PRAGMA foreign_keys=ON;
+    CREATE VIRTUAL TABLE memory_fts USING fts5(memory_id UNINDEXED, agent_id UNINDEXED, title, content, tokenize='unicode61');
+    INSERT INTO memory_meta VALUES ('search_tokenizer', 'unicode61');`);
+  const prior = new MemoryRepository(legacy), agentId = 'shift-owner';
+  const source = prior.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'schedule',
+    content: 'Lin says night shifts disrupted practice, so she paused driving lessons for the two-month night-shift period.' });
+  for (const [id, content] of [['shift', 'Lin works night shifts for two months.'], ['pause', 'Lin paused driving lessons.']]) {
+    prior.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+    prior.linkSource(id, source.id);
+  }
+  const original = proposeMemoryRelation(prior, { agentId, relation: 'causes', fromMemoryId: 'shift', toMemoryId: 'pause',
+    evidenceSourceIds: [source.id], rationale: 'Lin attributes the interruption to the shift schedule.' });
+  const originalEdge = prior.getEdge(agentId, original.result_edge_id);
+  legacy.close();
+  const database = closeAfterTests(openMemoryDatabase(databasePath)), repository = new MemoryRepository(database);
+  const { wasInserted, materialization, ...storedOriginal } = original;
+  assert.deepEqual(repository.getRelationProposal(agentId, original.id), storedOriginal);
+  assert.deepEqual(repository.getEdge(agentId, original.result_edge_id), originalEdge);
+  for (const relation of ['reason_for', 'condition_for']) {
+    const input = { agentId, relation, fromMemoryId: 'shift', toMemoryId: 'pause', evidenceSourceIds: [source.id],
+      rationale: 'Lin pauses lessons while night shifts require daytime sleep.', scope: 'The two-month night-shift period.' };
+    const proposal = proposeMemoryRelation(repository, input);
+    assert.equal(proposal.review_state, 'pending');
+    assert.equal(repository.getEdge(agentId, proposal.result_edge_id).metadata.scope, input.scope);
+    database.prepare('DELETE FROM memory_edges WHERE id=?').run(proposal.result_edge_id);
+    const recovered = materializePendingMemoryRelationProposals(repository, { agentId });
+    assert.deepEqual(recovered.materialized, [proposal.id]);
+    assert.deepEqual(recovered.failed, []);
+    const restored = repository.getRelationProposal(agentId, proposal.id);
+    assert.equal(repository.getEdge(agentId, restored.result_edge_id).metadata.scope, input.scope);
+    resolveMemoryRelationProposal(repository, { agentId, proposalId: proposal.id, action: 'dismiss' });
+    assert.equal(proposeMemoryRelation(repository, { ...input, scope: 'Reworded period.' }).review_state, 'dismissed');
+    assert.equal(repository.findEdge(input), null);
+  }
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('restores saved event continuity edges with current evidence during upgrade', () => {
+  const databasePath = path.join(temporaryDirectory('suzu-continuity-upgrade-'), 'memory.db');
+  const old = closeAfterTests(openMemoryDatabase(databasePath));
+  const repository = new MemoryRepository(old), agentId = 'shift-owner';
+  const rationale = '两条原话描述的是同一件事。';
+  const cases = [];
+  for (const mode of ['overwritten', 'reviewed', 'lost-source']) {
+    const fromMemoryId = `${mode}-reminder`, toMemoryId = `${mode}-found`;
+    const pair = { agentId, fromMemoryId, toMemoryId, relation: 'same_thread' };
+    const evidenceSourceIds = [];
+    for (const [id, content] of [[toMemoryId, '在冰桶旁找到了钥匙。'], [fromMemoryId, '那串钥匙前一晚就落在冰桶旁。']]) {
+      repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+      const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: id, content });
+      repository.linkSource(id, source.id);
+      evidenceSourceIds.push(source.id);
+    }
+    const decision = { agentId, memoryId: fromMemoryId, contentHash: mode, candidateIds: [toMemoryId], rationale };
+    if (mode === 'reviewed') {
+      repository.bindEventContinuity({ ...decision, resolution: 'ambiguous' });
+      const review = recordEventContinuityReview(repository, decision);
+      resolveEventContinuityReview(repository, { agentId, taskId: review.id, action: 'accept', candidateMemoryId: toMemoryId });
+    } else {
+      repository.bindEventContinuity({ ...decision, resolution: 'matched', candidateId: toMemoryId,
+        relation: 'same_thread', evidenceSourceIds });
+    }
+    const confirmed = repository.findEdge(pair);
+    if (mode === 'reviewed') {
+      old.prepare('DELETE FROM memory_edges WHERE id = ?').run(confirmed.id);
+    } else {
+      repository.upsertEdge({ ...pair, provenance: 'association-builder-v1',
+        metadata: { canonicalKey: repository.getMemory(fromMemoryId).canonical_key } });
+    }
+    if (mode === 'lost-source') {
+      old.prepare('DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?').run(toMemoryId, evidenceSourceIds[0]);
+    }
+    cases.push({ pair, expected: mode === 'lost-source' ? repository.findEdge(pair) : confirmed,
+      origin: repository.getMemory(fromMemoryId) });
+  }
+  old.prepare('DELETE FROM schema_migrations WHERE name = ?').run('restore-event-continuity-evidence-edges');
+  old.close();
+
+  const upgraded = closeAfterTests(openMemoryDatabase(databasePath)), current = new MemoryRepository(upgraded);
+  assert.equal(databaseInfo(upgraded).schemaVersion, SCHEMA_VERSION);
+  for (const { pair, expected, origin } of cases) {
+    const edge = current.findEdge(pair);
+    assert.equal(edge.id, expected.id);
+    assert.equal(edge.provenance, expected.provenance);
+    assert.deepEqual(edge.metadata, expected.metadata);
+    assert.deepEqual(current.getMemory(origin.id), origin);
+  }
+  assert.deepEqual(upgraded.prepare('PRAGMA foreign_key_check').all(), []);
+});
 
 test("creates a versioned SQLite memory database with Chinese search", () => {
   const database = closeAfterTests(openMemoryDatabase(":memory:"));
@@ -738,7 +840,7 @@ test("stores state family and domain phase without guessing legacy or non-state 
   database.close();
 });
 
-test("keeps causal relations as evidence-backed review proposals until explicit acceptance", () => {
+test("automatically applies evidence-backed causal relations before optional confirmation and revocation", () => {
   const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const causeSource = repository.upsertSource({
@@ -789,7 +891,7 @@ test("keeps causal relations as evidence-backed review proposals until explicit 
     toMemoryId: "cancel-outing",
     evidenceSourceIds: [causeSource.id, effectSource.id],
     rationale: "模型只看出相关性。",
-  }), /causes relation/u);
+  }), /explanatory relation/u);
   assert.throws(() => proposeMemoryRelation(repository, {
     agentId: "agent-test",
     relation: "causes",
@@ -810,12 +912,16 @@ test("keeps causal relations as evidence-backed review proposals until explicit 
     rationale: "原话明确说明大雨是取消出门的原因。",
   });
   assert.equal(proposal.review_state, "pending");
-  assert.equal(repository.findEdge({
+  const appliedEdge = repository.findEdge({
     agentId: "agent-test",
     fromMemoryId: "heavy-rain",
     toMemoryId: "cancel-outing",
     relation: "causes",
-  }), null);
+  });
+  assert.ok(appliedEdge, 'A validated causal proposal must apply without human review.');
+  assert.equal(appliedEdge.id, proposal.result_edge_id);
+  assert.equal(proposal.resolved_by, '');
+  assert.equal(proposal.resolved_at, null);
   assert.deepEqual(
     proposal.evidence.map((source) => source.endpointCoverage).sort(),
     ["from", "to"],
@@ -842,6 +948,7 @@ test("keeps causal relations as evidence-backed review proposals until explicit 
   });
   assert.equal(accepted.proposal.review_state, "accepted");
   assert.equal(accepted.edge.relation, "causes");
+  assert.deepEqual(accepted.edge, appliedEdge, 'Confirmation must not rewrite an already live edge.');
   assert.deepEqual(
     accepted.edge.metadata.evidenceSourceIds.sort(),
     [causeSource.id, effectSource.id].sort(),
@@ -857,7 +964,7 @@ test("keeps causal relations as evidence-backed review proposals until explicit 
   database.close();
 });
 
-test("rejects cross-Agent causal evidence and rolls back a failed acceptance atomically", () => {
+test("rejects cross-Agent evidence and rolls back failed application or confirmation atomically", () => {
   const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const source = repository.upsertSource({
@@ -904,14 +1011,22 @@ test("rejects cross-Agent causal evidence and rolls back a failed acceptance ato
     rationale: "不能跨 Agent 连图。",
   }), /same Agent/u);
 
-  const proposal = proposeMemoryRelation(repository, {
+  const candidate = {
     agentId: "agent-test",
     relation: "causes",
     fromMemoryId: "alarm-failed",
     toMemoryId: "arrived-late",
     evidenceSourceIds: [source.id],
     rationale: "同一条原话直接表达了原因与结果。",
-  });
+  };
+  const originalApply = repository.setPendingRelationProposalResult.bind(repository);
+  repository.setPendingRelationProposalResult = () => { throw new Error('simulated application failure'); };
+  assert.throws(() => proposeMemoryRelation(repository, candidate), /simulated application failure/);
+  assert.equal(repository.listRelationProposals('agent-test').length, 0);
+  assert.equal(repository.findEdge(candidate), null);
+  repository.setPendingRelationProposalResult = originalApply;
+  const proposal = proposeMemoryRelation(repository, candidate);
+  const appliedEdge = repository.getEdge('agent-test', proposal.result_edge_id);
   const originalResolve = repository.resolveRelationProposal.bind(repository);
   repository.resolveRelationProposal = () => {
     throw new Error("simulated relation resolution failure");
@@ -923,12 +1038,12 @@ test("rejects cross-Agent causal evidence and rolls back a failed acceptance ato
   }), /simulated relation resolution failure/u);
   repository.resolveRelationProposal = originalResolve;
   assert.equal(repository.getRelationProposal("agent-test", proposal.id).review_state, "pending");
-  assert.equal(repository.findEdge({
+  assert.deepEqual(repository.findEdge({
     agentId: "agent-test",
     fromMemoryId: "alarm-failed",
     toMemoryId: "arrived-late",
     relation: "causes",
-  }), null);
+  }), appliedEdge, 'Failed confirmation must preserve the automatically applied result.');
   database.close();
 });
 
@@ -970,9 +1085,238 @@ test("refuses to accept a causal relation after its reviewed source becomes inac
     agentId: "agent-test",
     proposalId: proposal.id,
     action: "accept",
-  }), /evidence must still be active/u);
+  }), { code: 'MEMORY_ORGANIZATION_INPUT_CHANGED' });
   assert.equal(repository.getRelationProposal("agent-test", proposal.id).review_state, "pending");
   database.close();
+});
+
+test('organization invalidation rolls back atomically, retires dependent proposals and preserves human-owned results', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause', content: 'Because A, B and C. Because D, E.' });
+  for (const id of ['a', 'b', 'c', 'd', 'e']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, source.id);
+  }
+  const propose = (fromMemoryId, toMemoryId) => proposeMemoryRelation(repository, { agentId, relation: 'causes',
+    fromMemoryId, toMemoryId, evidenceSourceIds: [source.id], rationale: source.content });
+  const owned = propose('a', 'b'), human = propose('a', 'c'), unrelated = propose('d', 'e'), pending = propose('a', 'e');
+  const accept = proposal => resolveMemoryRelationProposal(repository, { agentId, proposalId: proposal.id, action: 'accept' });
+  const ownedEdge = accept(owned).edge, humanEdge = accept(human).edge, unrelatedEdge = accept(unrelated).edge;
+  repository.upsertEdge({ agentId, fromMemoryId: 'a', toMemoryId: 'c', relation: 'causes', provenance: 'human', weight: 0.8 });
+  const humanVersion = repository.getEdge(agentId, humanEdge.id);
+  const structure = proposeMemoryStructure(repository, { agentId, operation: 'create', kind: 'topic',
+    memberIds: ['a', 'b'], content: 'A and B are related.' });
+  const original = repository.getMemory('a');
+  const revoke = repository.revokeRelationProposal.bind(repository);
+  repository.revokeRelationProposal = () => { throw new Error('Simulated storage failure.'); };
+  assert.throws(() => repository.editMemoryManually({ agentId, memoryId: 'a', patch: { content: 'Corrected A.' } }), /Simulated storage failure/);
+  assert.deepEqual(repository.getMemory('a'), original);
+  assert.equal(repository.getStructureProposal(agentId, structure.id).review_state, 'pending');
+  assert.equal(repository.getMemory(structure.result_memory_id).status, 'active');
+  repository.revokeRelationProposal = revoke;
+  repository.editMemoryManually({ agentId, memoryId: 'a', patch: { content: 'Corrected A.' } });
+  assert.equal(repository.getRelationProposal(agentId, pending.id).review_state, 'dismissed');
+  assert.equal(repository.getRelationProposal(agentId, owned.id).review_state, 'revoked');
+  assert.equal(repository.getEdge(agentId, ownedEdge.id), null);
+  assert.deepEqual(repository.getEdge(agentId, humanEdge.id), humanVersion);
+  assert.deepEqual(repository.getEdge(agentId, unrelatedEdge.id), unrelatedEdge);
+  assert.equal(repository.getStructureProposal(agentId, structure.id).review_state, 'dismissed');
+  assert.equal(repository.getMemory(structure.result_memory_id).status, 'deleted');
+  repository.editMemoryManually({ agentId, memoryId: 'a', patch: { content: 'a' } });
+  const restored = propose('a', 'e');
+  assert.notEqual(restored.id, pending.id, 'Returning to old text must not resurrect a dismissed proposal.');
+  assert.equal(accept(restored).status, 'accepted');
+});
+
+for (const manuallyEdited of [false, true]) test(`withdrawing a structure creation preserves independent work, manual edit ${manuallyEdited}`, t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  for (const [id, content] of [['old-a', 'First pottery class.'], ['old-b', 'An order of clay.'], ['new-c', 'The museum accepted the sculpture.']]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', title: content, content });
+  }
+  const proposal = proposeMemoryStructure(repository, { agentId, kind: 'topic', title: 'Pottery', content: 'Pottery classes and supplies.',
+    memberIds: ['old-a', 'old-b'], confidence: 0.9 });
+  const topicId = proposal.result_memory_id;
+  const manual = 'An independently rewritten note on the museum display.';
+  if (manuallyEdited) repository.editMemoryManually({ agentId, memoryId: topicId, patch: { content: manual } });
+  const independent = repository.linkMemoryToTopic({ agentId, topicId, memoryId: 'new-c', provenance: 'human' });
+  repository.editMemoryManually({ agentId, memoryId: 'old-a', patch: { content: 'Corrected class time.' } });
+
+  const topic = repository.getMemory(topicId);
+  assert.equal(topic.status, 'active');
+  assert.equal(topic.content, manuallyEdited ? manual : repository.getMemory('new-c').content);
+  assert.equal(repository.getStructureProposal(agentId, proposal.id).review_state, 'dismissed');
+  const [member] = repository.listTopicMembers({ agentId, topicId });
+  assert.equal(member.id, 'new-c');
+  assert.deepEqual(member.membership, independent);
+  assert.equal(repository.listTopicMembers({ agentId, topicId }).length, 1);
+});
+
+test('startup recovers unapplied structures past already-applied pending rows', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  for (const id of ['a', 'b', 'c', 'd']) repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+  const saved = proposeMemoryStructure(repository, { agentId, kind: 'topic', title: 'Kiln', content: 'Kiln lessons.',
+    memberIds: ['c', 'd'], createdAt: '2026-10-01T09:00:00.000Z' });
+  // Preserve the valid proposal and its input, as an older library did before
+  // automatic application. Use the ordinary startup recovery on the saved row.
+  repository.removeStructureProposalMemberships({ agentId, proposalId: saved.id });
+  database.prepare('UPDATE memory_structure_proposals SET result_memory_id=NULL WHERE id=?').run(saved.id);
+  repository.setMemoryDeleted({ agentId, memoryId: saved.result_memory_id });
+  const proposal = proposeMemoryStructure(repository, { agentId, kind: 'topic', title: 'Pottery', content: 'A series of pottery classes.',
+    memberIds: ['a', 'b'], confidence: 0.9, createdAt: '2026-10-02T09:00:00.000Z' });
+  database.prepare("UPDATE memory_structure_proposals SET metadata_json=json_remove(metadata_json, '$.organizationInput') WHERE id=?")
+    .run(proposal.id);
+  const before = repository.getMemory(proposal.result_memory_id);
+  const recovery = materializePendingMemoryStructureProposals(repository, { agentId, limit: 1 });
+  assert.deepEqual(recovery.failed, []);
+  assert.deepEqual(recovery.materialized.map(item => item.proposal.id), [saved.id]);
+  assert.equal(recovery.materialized[0].proposal.review_state, 'pending');
+  assert.deepEqual(materializePendingMemoryStructureProposals(repository, { agentId, limit: 1 }).materialized, []);
+  const result = resolveMemoryStructureProposal(repository, { agentId, proposalId: proposal.id, action: 'accept' });
+  assert.equal(result.status, 'accepted');
+  assert.equal(result.memory.id, before.id);
+  assert.equal(result.memory.content, before.content);
+  assert.equal(result.memory.status, 'active');
+  assert.deepEqual(result.members.map(member => member.id).sort(), ['a', 'b']);
+});
+
+test('organization source edits retire old reviews and legacy proposals require regeneration', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const sourceInput = { agentId, sourceKind: 'conversation', externalId: 'cause', content: 'Because A, B.', recordedAt: '2026-10-01T00:00:00Z' };
+  const source = repository.upsertSource(sourceInput);
+  for (const id of ['a', 'b']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, source.id);
+  }
+  const propose = () => proposeMemoryRelation(repository, { agentId, relation: 'causes', fromMemoryId: 'a', toMemoryId: 'b',
+    evidenceSourceIds: [source.id], rationale: source.content });
+  const first = propose();
+  repository.upsertSource({ ...sourceInput, content: 'A did not cause B.' });
+  assert.equal(repository.getRelationProposal(agentId, first.id).review_state, 'dismissed');
+  repository.upsertSource(sourceInput);
+  const restored = propose();
+  assert.notEqual(restored.id, first.id);
+  database.prepare('DELETE FROM memory_edges WHERE id = ?').run(restored.result_edge_id);
+  database.prepare("UPDATE memory_relation_proposals SET metadata_json = json_remove(metadata_json, '$.organizationInput') WHERE id = ?").run(restored.id);
+  assert.throws(() => resolveMemoryRelationProposal(repository, { agentId, proposalId: restored.id, action: 'accept' }),
+    { code: 'MEMORY_ORGANIZATION_INPUT_CHANGED' });
+  assert.equal(repository.findEdge({ agentId, fromMemoryId: 'a', toMemoryId: 'b', relation: 'causes' }), null);
+});
+
+test('pending causal withdrawal is atomic, protects subsequent edits and survives duplicate analysis', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause', content: 'Because A, B and C.' });
+  const alternate = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'alternate', content: 'A caused B and C.' });
+  for (const id of ['a', 'b', 'c']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, source.id);
+    repository.linkSource(id, alternate.id);
+  }
+  const candidate = { agentId, relation: 'causes', fromMemoryId: 'a', toMemoryId: 'b',
+    evidenceSourceIds: [source.id], rationale: source.content };
+  const proposal = proposeMemoryRelation(repository, candidate);
+  const edge = repository.getEdge(agentId, proposal.result_edge_id);
+  database.exec(`CREATE TRIGGER fail_withdraw BEFORE UPDATE OF review_state ON memory_relation_proposals
+    WHEN NEW.review_state = 'dismissed' BEGIN SELECT RAISE(ABORT, 'simulated withdrawal failure'); END;`);
+  assert.throws(() => resolveMemoryRelationProposal(repository, { agentId, proposalId: proposal.id, action: 'dismiss' }),
+    /simulated withdrawal failure/);
+  assert.deepEqual(repository.getEdge(agentId, edge.id), edge);
+  assert.equal(repository.getRelationProposal(agentId, proposal.id).review_state, 'pending');
+  database.exec('DROP TRIGGER fail_withdraw');
+  resolveMemoryRelationProposal(repository, { agentId, proposalId: proposal.id, action: 'dismiss' });
+  assert.equal(repository.getEdge(agentId, edge.id), null);
+  assert.equal(proposeMemoryRelation(repository, { ...candidate, rationale: 'Different wording, same evidence.' }).review_state, 'dismissed');
+  assert.equal(proposeMemoryRelation(repository, { ...candidate, evidenceSourceIds: [alternate.id] }).review_state, 'dismissed');
+  database.prepare("UPDATE memory_relation_proposals SET metadata_json = '{}' WHERE id = ?").run(proposal.id);
+  assert.equal(proposeMemoryRelation(repository, candidate).review_state, 'dismissed', 'Legacy withdrawals cannot be silently resurrected.');
+  const other = proposeMemoryRelation(repository, { ...candidate, toMemoryId: 'c' });
+  repository.upsertEdge({ ...candidate, toMemoryId: 'c', provenance: 'human', weight: 0.99 });
+  const human = repository.getEdge(agentId, other.result_edge_id);
+  assert.throws(() => revokeMemoryRelationProposal(repository, { agentId, proposalId: other.id }), /has changed/);
+  resolveMemoryRelationProposal(repository, { agentId, proposalId: other.id, action: 'dismiss' });
+  assert.deepEqual(repository.getEdge(agentId, human.id), human);
+  const third = proposeMemoryRelation(repository, { ...candidate, fromMemoryId: 'b', toMemoryId: 'c' });
+  const owned = repository.getEdge(agentId, third.result_edge_id);
+  const edgeInput = { agentId, fromMemoryId: 'b', toMemoryId: 'c', relation: 'causes',
+    provenance: owned.provenance, metadata: owned.metadata, confidence: owned.confidence };
+  repository.upsertEdge({ ...edgeInput, weight: 0.95 });
+  repository.upsertEdge({ ...edgeInput, weight: owned.weight });
+  assert.notEqual(repository.getEdge(agentId, owned.id).updated_at, owned.updated_at,
+    'An edit/restore cycle must keep a distinct edge version even within one millisecond.');
+  assert.throws(() => revokeMemoryRelationProposal(repository, { agentId, proposalId: third.id }), /has changed/);
+});
+
+test('relation recovery passes failed pages, reuses unchanged legacy evidence and queues changed or unverifiable input', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  function seed(id, { legacy = false, checkpoint = true, changed = false } = {}) {
+    const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: id, content: 'Because A, B.' });
+    const memoryIds = [`${id}-a`, `${id}-b`];
+    for (const memoryId of memoryIds) {
+      repository.upsertMemory({ id: memoryId, agentId, kind: 'event', layer: 'episodic', content: memoryId });
+      repository.linkSource(memoryId, source.id);
+    }
+    const proposal = proposeMemoryRelation(repository, { id, agentId, relation: 'causes', fromMemoryId: memoryIds[0],
+      toMemoryId: memoryIds[1], evidenceSourceIds: [source.id], rationale: source.content });
+    database.prepare('DELETE FROM memory_edges WHERE id = ?').run(proposal.result_edge_id);
+    if (legacy) database.prepare("UPDATE memory_relation_proposals SET metadata_json = '{}' WHERE id = ?").run(id);
+    if (legacy && checkpoint) {
+      const run = repository.recordConsolidationRun({ id: `run-${id}`, agentId, policyVersion: 'legacy',
+        triggerIds: memoryIds, inputHash: id, metadata: { organizationProgress: { parts: [{ relations: { proposed: [proposal] } }] } } });
+      database.prepare("UPDATE memory_consolidation_runs SET relation_proposal_ids_json = ?, status = 'completed' WHERE id = ?")
+        .run(JSON.stringify([id]), run.id);
+    }
+    if (changed) database.prepare('UPDATE source_records SET content = ? WHERE id = ?').run('Correction: A did not cause B.', source.id);
+    return proposal;
+  }
+  const first = seed('a'), legacy = seed('b', { legacy: true });
+  seed('c', { legacy: true, changed: true });
+  seed('d', { legacy: true, checkpoint: false });
+  const apply = repository.setPendingRelationProposalResult.bind(repository);
+  repository.setPendingRelationProposalResult = input => {
+    if (input.proposalId === first.id) throw new Error('simulated first-record failure');
+    return apply(input);
+  };
+  const recovered = materializePendingMemoryRelationProposals(repository, { agentId, batchSize: 1 });
+  assert.deepEqual(recovered.materialized, [legacy.id]);
+  assert.deepEqual(recovered.requeued, ['c', 'd']);
+  assert.deepEqual(recovered.failed.map(item => item.proposalId), [first.id]);
+  assert.equal(repository.getRelationProposal(agentId, legacy.id).review_state, 'pending');
+  assert.equal(repository.getRelationProposal(agentId, legacy.id).resolved_by, '');
+  assert.ok(repository.getRelationProposal(agentId, legacy.id).result_edge_id);
+  assert.equal(repository.findEdge({ agentId, fromMemoryId: 'c-a', toMemoryId: 'c-b', relation: 'causes' }), null);
+  const tasks = database.prepare("SELECT * FROM memory_maintenance_tasks WHERE agent_id = ? AND task_type = 'structure-proposal'").all(agentId);
+  assert.equal(tasks.length, 2);
+  assert.ok(tasks.every(task => task.status === 'pending' && task.review_state !== 'pending'));
+  repository.setPendingRelationProposalResult = apply;
+  assert.deepEqual(materializePendingMemoryRelationProposals(repository, { agentId }).materialized, [first.id]);
+  assert.deepEqual(materializePendingMemoryRelationProposals(repository, { agentId }).materialized, []);
+  assert.equal(database.prepare("SELECT COUNT(*) n FROM memory_maintenance_tasks WHERE task_type = 'structure-proposal'").get().n, 2);
+});
+
+test('source retraction removes applied causality even when both endpoints retain other active evidence', t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const { event } = repository.appendInputEvent({ agentId, externalId: 'turn', eventType: 'conversation.turn', actorRole: 'user',
+    actorKey: 'user', occurredAt: '2026-11-01T00:00:00Z', content: { text: 'Because A, B.' } });
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'turn', content: 'Because A, B.',
+    metadata: { inputEventIds: [event.id] } });
+  const independent = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'other', content: 'A and B happened independently.' });
+  for (const id of ['a', 'b']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    for (const evidence of [source, independent]) repository.linkSource(id, evidence.id);
+  }
+  const proposal = proposeMemoryRelation(repository, { agentId, relation: 'causes', fromMemoryId: 'a', toMemoryId: 'b',
+    evidenceSourceIds: [source.id], rationale: source.content });
+  repository.reviseInputEvent({ agentId, targetExternalId: 'turn', action: 'retract' });
+  assert.equal(repository.getMemory('a').status, 'active');
+  assert.equal(repository.getMemory('b').status, 'active');
+  assert.equal(repository.getEdge(agentId, proposal.result_edge_id), null);
+  assert.equal(repository.getRelationProposal(agentId, proposal.id).review_state, 'dismissed');
 });
 
 test("stores retrieval traces and append-only feedback outside personality memories", () => {
@@ -2851,7 +3195,7 @@ test("orders shared-entity adjacency by state validity instead of import time", 
   database.close();
 });
 
-test("rebuilds shared-entity adjacency when an incremental memory enters the middle", () => {
+test("only changes affected shared-entity edges when an incremental memory enters the middle", () => {
   const database = closeAfterTests(openMemoryDatabase(":memory:"));
   const repository = new MemoryRepository(database);
   const entity = repository.upsertEntity({
@@ -2859,9 +3203,12 @@ test("rebuilds shared-entity adjacency when an incremental memory enters the mid
     kind: "place",
     canonicalName: "科技馆",
   });
+  const other = repository.upsertEntity({ agentId: "agent-test", kind: "place", canonicalName: "图书馆" });
   for (const value of [
-    { id: "entity-old", eventDate: "2026-07-01" },
-    { id: "entity-new", eventDate: "2026-07-03" },
+    { id: "entity-old", eventDate: "2026-07-01", entityId: entity.id },
+    { id: "entity-new", eventDate: "2026-07-03", entityId: entity.id },
+    { id: "library-old", eventDate: "2026-07-01", entityId: other.id },
+    { id: "library-new", eventDate: "2026-07-03", entityId: other.id },
   ]) {
     repository.upsertMemory({
       id: value.id,
@@ -2871,9 +3218,20 @@ test("rebuilds shared-entity adjacency when an incremental memory enters the mid
       content: `实体链 ${value.id}`,
       eventDate: value.eventDate,
     });
-    repository.linkMemoryEntity({ memoryId: value.id, entityId: entity.id, role: "location" });
+    repository.linkMemoryEntity({ memoryId: value.id, entityId: value.entityId, role: "location" });
   }
   rebuildAssociationGraph({ repository, agentId: "agent-test" });
+  database.exec("CREATE TEMP TABLE shared_edge_writes(action TEXT, from_id TEXT, to_id TEXT)");
+  for (const action of ["INSERT", "UPDATE", "DELETE"]) {
+    const row = action === "DELETE" ? "OLD" : "NEW";
+    database.exec(`
+      CREATE TEMP TRIGGER track_shared_edges_${action} AFTER ${action} ON memory_edges
+      WHEN ${row}.provenance = 'association-builder-v1' AND ${row}.relation = 'shares_entity'
+      BEGIN
+        INSERT INTO shared_edge_writes VALUES ('${action}', ${row}.from_memory_id, ${row}.to_memory_id);
+      END;
+    `);
+  }
 
   repository.upsertMemory({
     id: "entity-middle",
@@ -2902,7 +3260,14 @@ test("rebuilds shared-entity adjacency when an incremental memory enters the mid
   `).all().map((row) => [row.from_memory_id, row.to_memory_id]), [
     ["entity-middle", "entity-new"],
     ["entity-middle", "entity-old"],
+    ["library-new", "library-old"],
   ]);
+  assert.deepEqual(database.prepare("SELECT action, from_id, to_id FROM shared_edge_writes ORDER BY action, from_id, to_id")
+    .all().map(Object.values), [
+      ["DELETE", "entity-new", "entity-old"],
+      ["INSERT", "entity-middle", "entity-new"],
+      ["INSERT", "entity-middle", "entity-old"],
+    ]);
   database.close();
 });
 

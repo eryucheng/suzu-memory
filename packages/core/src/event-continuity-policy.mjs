@@ -1,7 +1,61 @@
 import { createHash } from 'node:crypto';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const provenance = ['event-continuity-v1', 'event-continuity-human-v1'];
+const modelProvenance = 'event-continuity-v1';
+const humanProvenance = 'event-continuity-human-v1';
+const provenance = [modelProvenance, humanProvenance];
+
+export function restoreEventContinuityEdges(repository) {
+  const affected = repository.database.prepare(`
+    SELECT origin.agent_id, origin.id, target.id AS target_id,
+      json_extract(origin.metadata_json, '$.eventContinuity') AS decision,
+      COALESCE(json_extract(origin.metadata_json, '$.eventContinuityRevision'), 0) AS revision
+    FROM memory_nodes origin
+    JOIN memory_nodes target ON target.agent_id = origin.agent_id AND target.id <> origin.id
+      AND target.id = json_extract(origin.metadata_json, '$.eventContinuity.targetMemoryId')
+    LEFT JOIN memory_edges edge ON edge.agent_id = origin.agent_id
+      AND edge.from_memory_id = origin.id AND edge.to_memory_id = target.id AND edge.relation = 'same_thread'
+    WHERE json_extract(origin.metadata_json, '$.eventContinuity.resolution') = 'matched'
+      AND origin.kind = 'event' AND target.kind = 'event'
+      AND origin.status IN ('active', 'superseded') AND target.status IN ('active', 'superseded')
+      AND origin.layer <> 'provisional' AND target.layer <> 'provisional'
+      AND origin.canonical_key <> '' AND origin.canonical_key = target.canonical_key
+      AND origin.canonical_key = json_extract(origin.metadata_json, '$.eventIdentityKey')
+      AND target.canonical_key = json_extract(target.metadata_json, '$.eventIdentityKey')
+      AND memory_worlds_compatible(origin.reality, origin.world_id, origin.world_frame,
+        target.reality, target.world_id, target.world_frame) = 1
+      AND (edge.id IS NULL OR edge.provenance = 'association-builder-v1')
+  `).all();
+  const readSources = repository.database.prepare(`
+    SELECT link.memory_id, source.id
+    FROM memory_sources link JOIN source_records source ON source.id = link.source_id
+    WHERE link.memory_id IN (?, ?) AND source.agent_id = ? AND source.lifecycle = 'active'
+  `);
+  const acceptedReview = repository.database.prepare(`
+    SELECT 1 FROM memory_maintenance_tasks review
+    WHERE review.agent_id = ? AND review.task_type = 'event-continuity-review' AND review.review_state = 'accepted'
+      AND json_extract(review.payload_json, '$.memoryId') = ?
+      AND json_extract(review.result_json, '$.contentHash') = ?
+      AND COALESCE(json_extract(review.payload_json, '$.revision'), 0) = ?
+      AND ? IN (SELECT value FROM json_each(review.payload_json, '$.candidateIds'))
+    LIMIT 1
+  `);
+  for (const row of affected) {
+    const { evidenceSourceIds, rationale, contentHash } = JSON.parse(row.decision);
+    if (!Array.isArray(evidenceSourceIds) || !evidenceSourceIds.length) continue;
+    const evidence = new Set(evidenceSourceIds);
+    const links = readSources.all(row.id, row.target_id, row.agent_id).filter(source => evidence.has(source.id));
+    if (new Set(links.map(source => source.memory_id)).size !== 2
+      || new Set(links.map(source => source.id)).size !== evidence.size) continue;
+
+    const reviewed = acceptedReview.get(row.agent_id, row.id, contentHash || '', row.revision, row.target_id);
+    repository.upsertEdge({
+      agentId: row.agent_id, fromMemoryId: row.id, toMemoryId: row.target_id, relation: 'same_thread',
+      direction: 'directed', weight: 1, confidence: 1, provenance: reviewed ? humanProvenance : modelProvenance,
+      metadata: { evidenceSourceIds, rationale },
+    });
+  }
+}
 
 export function eventContinuityFingerprint(repository, agentId, memoryId) {
   const detail = repository.getMemoryDetail(agentId, memoryId);
@@ -50,7 +104,7 @@ export function resolveEventContinuityReview(repository, { agentId, taskId, acti
       }))];
       memory = repository.bindEventContinuity({ agentId, memoryId, resolution: 'matched', candidateId: candidateMemoryId,
         relation: 'same_thread', contentHash: task.result.contentHash, rationale: reason || task.result.rationale,
-        candidateIds, evidenceSourceIds, provenance: 'event-continuity-human-v1' });
+        candidateIds, evidenceSourceIds, provenance: humanProvenance });
     } else if (memory && fingerprints[memoryId] === eventContinuityFingerprint(repository, agentId, memoryId)
       && memory.metadata?.eventContinuity?.resolution === 'ambiguous') {
       memory = repository.bindEventContinuity({ agentId, memoryId, resolution: 'new', contentHash: task.result.contentHash,
@@ -63,25 +117,31 @@ export function resolveEventContinuityReview(repository, { agentId, taskId, acti
   });
 }
 
-export function invalidateEventContinuity(repository, { agentId, memoryId, reason = '事件材料已修改，原关联判断失效。' }) {
+export function invalidateEventContinuity(repository, { agentId, memoryId, sourceIds, reason = '事件材料已修改，原关联判断失效。' }) {
   const memory = repository.getMemory(memoryId);
   if (!memory || memory.agent_id !== agentId) return [];
   return repository.transaction(() => {
+    const changedSources = sourceIds && new Set(sourceIds);
+    const affectedEvidence = evidence => !changedSources || memory.status === 'deleted'
+      || !evidence?.length || evidence.some(id => changedSources.has(id));
     const edges = repository.database.prepare(`SELECT * FROM memory_edges WHERE agent_id = ?
       AND provenance IN (?, ?) AND (from_memory_id = ? OR to_memory_id = ?)`)
-      .all(agentId, ...provenance, memoryId, memoryId);
-    const affected = new Set([memoryId, ...edges.map(edge => edge.from_memory_id)]);
+      .all(agentId, ...provenance, memoryId, memoryId)
+      .filter(edge => affectedEvidence(JSON.parse(edge.metadata_json).evidenceSourceIds));
+    const affected = new Set(edges.map(edge => edge.from_memory_id));
+    if (affectedEvidence(memory.metadata?.eventContinuity?.evidenceSourceIds)) affected.add(memoryId);
     const reviews = repository.database.prepare(`SELECT payload_json FROM memory_maintenance_tasks
       WHERE agent_id = ? AND task_type = 'event-continuity-review' AND review_state = 'pending'
         AND EXISTS (SELECT 1 FROM json_each(payload_json, '$.memoryIds') WHERE value = ?)`)
       .all(agentId, memoryId);
     for (const review of reviews) affected.add(JSON.parse(review.payload_json).memoryId);
+    if (!affected.size) return [];
     const group = memory.metadata?.eventIdentityKey
       ? repository.database.prepare(`SELECT id FROM memory_nodes WHERE agent_id = ?
           AND json_extract(metadata_json, '$.eventIdentityKey') = ? ORDER BY rowid`).all(agentId, memory.metadata.eventIdentityKey).map(row => row.id)
       : [memoryId];
-    repository.database.prepare(`DELETE FROM memory_edges WHERE agent_id = ? AND provenance IN (?, ?)
-      AND (from_memory_id = ? OR to_memory_id = ?)`).run(agentId, ...provenance, memoryId, memoryId);
+    repository.database.prepare(`DELETE FROM memory_edges WHERE agent_id = ?
+      AND id IN (SELECT value FROM json_each(?))`).run(agentId, JSON.stringify(edges.map(edge => edge.id)));
     const remaining = repository.database.prepare(`SELECT from_memory_id, to_memory_id FROM memory_edges WHERE agent_id = ?
       AND provenance IN (?, ?) AND relation = 'same_thread'`).all(agentId, ...provenance);
     const unvisited = new Set(group);

@@ -23,7 +23,8 @@ export function questionFailure(error) {
 }
 
 /** Classify preparation diagnostics without treating memory quality failures as outages. */
-export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], finalProgress, expectedEvents = 0, mappedEvents = 0 } = {}) {
+export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], inputBatches = [], finalProgress,
+  expectedEvents = 0, mappedEvents = 0 } = {}) {
   const infrastructureFailures = new Map();
   const visit = value => {
     if (!value || typeof value !== 'object') return;
@@ -42,6 +43,17 @@ export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], fi
   visit(passes);
   for (const event of inputEvents) visit(event.metadata?.suzuMemoryProcessing?.failureHistory);
   const batches = passes.flatMap(pass => pass.input || []).flatMap(input => input.batches || []);
+  const finalBatches = new Map(inputBatches.map(batch => [batch.id, batch.output]));
+  const blockingInputFailures = new Map();
+  for (const event of inputEvents) {
+    if (event.lifecycle !== 'active' || event.processing_disposition === 'quarantined') continue;
+    const output = finalBatches.get(event.batch_id);
+    const last = event.metadata?.suzuMemoryProcessing?.lastFailure;
+    const failure = event.status === 'archived'
+      ? output?.degraded && questionFailure({ message: output.generationError, code: output.generationErrorCode })
+      : last && questionFailure({ message: last.errorMessage, code: last.errorCode, name: last.errorName });
+    if (failure?.infrastructure) blockingInputFailures.set(JSON.stringify(failure), failure);
+  }
   return {
     quarantinedMessages: new Set(inputEvents.filter(event => event.processing_disposition === 'quarantined')
       .map(event => event.metadata?.suzuMemoryFragment?.parentEventId || event.external_id || event.id)).size,
@@ -52,7 +64,13 @@ export function memoryPreparationDiagnostics({ passes = [], inputEvents = [], fi
     pendingWork: Number(finalProgress?.total || 0), failedWork: Number(finalProgress?.failures || 0),
     missingInputEvents: Math.max(0, expectedEvents - mappedEvents),
     infrastructureFailures: [...infrastructureFailures.values()],
+    blockingInputFailures: [...blockingInputFailures.values()],
   };
+}
+
+export function finalInputBatches(service, events) {
+  const ids = [...new Set(events.map(event => event.batch_id).filter(Boolean))];
+  return service.withRepository(repository => ids.map(id => repository.getInputBatch(service.agentId, id)).filter(Boolean), { readOnly: true });
 }
 
 export function summarizeMemoryPreparation(samples) {

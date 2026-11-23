@@ -3,7 +3,8 @@ import { selectRetrievalContext } from './context-selection.mjs';
 import { fuseCandidateLanes } from './candidate-selection.mjs';
 export { fuseCandidateLanes } from './candidate-selection.mjs';
 import { formatPrimary, closedStateLabel, renderRecallOutput } from './context-renderer.mjs';
-import { createStateReadView, isProvisionalMemory as isProvisionalNode } from '@suzu-memory/core';
+import { createStateReadView, isProvisionalMemory as isProvisionalNode, reportedStateEvidenceAvailable,
+  unavailableStructureSummaryIds } from '@suzu-memory/core';
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
 import { createEventSourceView, DEFAULT_MEMORY_TIME_ZONE, withEventSourceExecution, MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
 
@@ -192,7 +193,7 @@ function loadSourceAuthorities(database, agentId, memoryIds) {
     SELECT link.memory_id, link.authority
     FROM memory_sources AS link
     JOIN memory_nodes AS memory ON memory.id = link.memory_id
-    WHERE memory.agent_id = ? AND link.memory_id IN (${placeholders})
+    WHERE memory.agent_id = ? AND link.memory_id IN (${placeholders}) AND ${reportedStateEvidenceAvailable('link')}
     ORDER BY link.memory_id ASC, link.source_id ASC
   `).all(agentId, ...ids)) {
     if (!result.has(row.memory_id)) result.set(row.memory_id, []);
@@ -402,7 +403,7 @@ function vectorScores(input) {
 async function vectorScoresInExecution({
   repository,
   agentId,
-  query,
+  queries,
   embeddingProvider,
   usageLedgerPath,
   now,
@@ -411,69 +412,65 @@ async function vectorScoresInExecution({
   embeddingCacheMaxBytes,
   signal = null,
 }) {
+  const plans = queries.map((query, index) => ({ ...planVectorQuery(query),
+    ...(index ? { source: 'calendar-topic' } : {}) }));
   if (typeof embeddingProvider !== "function") {
-    return { status: "disabled", scores: new Map(), usageRecorded: false };
+    return plans.map(() => ({ status: "disabled", scores: new Map(), usageRecorded: false }));
   }
-  const queryPlan = planVectorQuery(query);
-  if (!queryPlan.text) return { status: 'not-run', scores: new Map(), usageRecorded: false };
-  let response;
-  let failure;
-  try {
-    signal?.throwIfAborted();
-    response = await embeddingProvider(queryPlan.text, { signal });
-  } catch (error) {
-    failure = error;
-    response = error;
-  }
-  let usageRecorded = false;
-  let warning = "";
-  if (usageLedgerPath && response.usage && Object.keys(response.usage).length) {
+  const pending = plans.filter(plan => plan.text);
+  const received = new Map();
+  async function request(group, batched) {
+    let response, failure, usageRecorded = false, warning = '';
     try {
-      await appendUsageEvent(usageLedgerPath, {
-        timestamp: now.toISOString(),
-        agentId,
-        provider: response.metadata?.provider || "",
-        model: response.model,
-        source: "memory-retriever",
-        feature: "memory-retrieval-embedding",
-        requestId: response.requestId || "",
-        usage: response.usage,
-        metadata: response.metadata || {},
-      });
-      usageRecorded = true;
+      signal?.throwIfAborted();
+      response = await (batched ? embeddingProvider.embedMany(group.map(plan => plan.text), { signal })
+        : embeddingProvider(group[0].text, { signal }));
+      if (batched && (!Array.isArray(response.vectors) || response.vectors.length !== group.length)) {
+        throw new Error('Embedding 批量结果与查询数量不一致。');
+      }
     } catch (error) {
-      warning = `费用流水写入失败：${error.message}`;
+      failure = error;
+      response ??= error;
+    }
+    if (usageLedgerPath && response.usage && Object.keys(response.usage).length) {
+      try {
+        await appendUsageEvent(usageLedgerPath, {
+          timestamp: now.toISOString(), agentId,
+          provider: response.metadata?.provider || '', model: response.model,
+          source: 'memory-retriever', feature: 'memory-retrieval-embedding',
+          requestId: response.requestId || '', usage: response.usage,
+          metadata: { ...response.metadata, ...(batched ? { batchSize: group.length } : {}) },
+        });
+        usageRecorded = true;
+      } catch (error) { warning = `费用流水写入失败：${error.message}`; }
+    }
+    for (const [index, plan] of group.entries()) {
+      received.set(plan, { response, failure, usageRecorded, warning,
+        vector: failure ? null : batched ? response.vectors[index] : response.vector });
     }
   }
+  if (pending.length > 1 && typeof embeddingProvider.embedMany === 'function') await request(pending, true);
+  else await Promise.all(pending.map(plan => request([plan], false)));
   signal?.throwIfAborted();
-  if (failure) {
-    return { status: 'error', scores: new Map(), usageRecorded,
-      queryText: queryPlan.text, querySource: queryPlan.source,
+  const loaded = new Map();
+  return plans.map(plan => {
+    if (!plan.text) return { status: 'not-run', scores: new Map(), usageRecorded: false };
+    const { response, failure, vector, usageRecorded, warning } = received.get(plan);
+    const metadata = { queryText: plan.text, querySource: plan.source, usageRecorded };
+    if (failure) return { ...metadata, status: 'error', scores: new Map(),
       warning: [`Embedding 不可用，已退回文本检索：${failure.message}`, warning].filter(Boolean).join('；') };
-  }
-  const embeddings = repository.listEmbeddings(agentId, response.model, {
-    includeArchived: true,
-    cache: embeddingCache,
-    cacheMaxBytes: embeddingCacheMaxBytes,
-  }).filter((embedding) => (
-    !eligibleMemoryIds || eligibleMemoryIds.has(embedding.memory_id)
-  ));
-  const scores = new Map(embeddings.map((embedding) => [
-    embedding.memory_id,
-    dot(response.vector, embedding.vector),
-  ]));
-  return {
-    status: embeddings.length ? "ready" : "missing-index",
-    scores,
-    vectors: new Map(embeddings.map(embedding => [embedding.memory_id, embedding.vector])),
-    model: response.model,
-    indexedMemories: embeddings.length,
-    dimensions: response.vector.length,
-    queryText: queryPlan.text,
-    querySource: queryPlan.source,
-    usageRecorded,
-    warning,
-  };
+    if (!loaded.has(response.model)) {
+      const embeddings = repository.listEmbeddings(agentId, response.model, {
+        includeArchived: true, cache: embeddingCache, cacheMaxBytes: embeddingCacheMaxBytes,
+      }).filter(embedding => !eligibleMemoryIds || eligibleMemoryIds.has(embedding.memory_id));
+      loaded.set(response.model, { embeddings,
+        vectors: new Map(embeddings.map(embedding => [embedding.memory_id, embedding.vector])) });
+    }
+    const { embeddings, vectors } = loaded.get(response.model);
+    return { ...metadata, status: embeddings.length ? 'ready' : 'missing-index',
+      scores: new Map(embeddings.map(embedding => [embedding.memory_id, dot(vector, embedding.vector)])),
+      vectors, model: response.model, indexedMemories: embeddings.length, dimensions: vector.length, warning };
+  });
 }
 
 export async function retrieveMemories({
@@ -493,7 +490,7 @@ export async function retrieveMemories({
   const recallPolicy = normalizeRecallReactivationOptions(options.recallReactivation);
   const decayPolicy = normalizeNaturalDecayOptions(options.naturalDecay);
   const affectivePolicy = normalizeAffectiveBiasOptions(options.affectiveBias);
-  const { retrievalQuery, temporal } = createRetrievalQueryPlan({
+  const { retrievalQuery, temporal, calendarQuery } = createRetrievalQueryPlan({
     query: normalizedQuery, now: executionTime, timeZone: options.timeZone });
   const requestedAnchors = [...new Set((Array.isArray(anchorMemoryIds) ? anchorMemoryIds : [])
     .map(clean).filter(Boolean))].slice(0, 3);
@@ -522,47 +519,76 @@ export async function retrieveMemories({
     const affective = buildAffectiveCandidateAdjustments({ repository, agentId: normalizedAgentId, policy: affectivePolicy });
     const reader = createNodeReader(database, normalizedAgentId, options);
     if (reader.stats.deferred && !transaction) { database.exec('BEGIN'); transaction = true; }
+    const unavailableSummaries = unavailableStructureSummaryIds(repository, normalizedAgentId);
     const nodes = [...reader.load(['active']), ...reader.load(['superseded', 'disputed']),
       ...loadPendingProvisionalNodes(repository, normalizedAgentId)]
-      .filter(node => (!sourceView || sourceView.allows(node)) && nodeMatchesWorldScope(node, worldScope));
+      .filter(node => !unavailableSummaries.has(node.id) && (!sourceView || sourceView.allows(node))
+        && nodeMatchesWorldScope(node, worldScope));
     const eligibleMemoryIds = new Set(nodes.map(node => node.id)), nodeById = new Map(nodes.map(node => [node.id, node]));
     const decay = buildNaturalDecayAdjustments(nodes.filter(node => !isProvisionalNode(node)), executionTime, decayPolicy);
-    const entities = entitySeedScores(repository, normalizedAgentId, retrievalQuery, { eligibleMemoryIds });
-    const personNames = [...(queryPerspective.speakerNames || []), ...(queryPerspective.addresseeNames || []),
-      ...entities.matches.filter(isPersonEntity).map(match => match.matchedLabel)];
-    const preparedQuery = prepareLexicalQuery(retrievalQuery, { personNames });
-    const topicalIds = new Set(entities.matches.filter(match => !isPersonEntity(match) && match.kind !== 'concept')
-      .flatMap(match => [...match.directMemoryIds, ...match.actorMemoryIds]));
-    const personOnlyIds = new Set(entities.matches.filter(isPersonEntity)
-      .flatMap(match => [...match.directMemoryIds, ...match.actorMemoryIds]).filter(id => !topicalIds.has(id)));
-    const bm25 = collectBm25SeedScores({ repository, agentId: normalizedAgentId, query: retrievalQuery, preparedQuery,
-      maximumQueries: options.maximumBm25Queries, maximumResultsPerQuery: options.maximumBm25ResultsPerQuery,
-      eligibleMemoryIds, worldId: worldScope.allowCrossWorld ? '' : worldScope.id,
-      worldFrame: worldScope.allowCrossWorld ? '' : worldScope.frame });
-    const vector = await vectorScores({ repository, agentId: normalizedAgentId, query: retrievalQuery,
+    const routes = [{ name: 'original', query: retrievalQuery, nodes, eligibleMemoryIds }];
+    const calendarNodes = calendarQuery ? nodes.filter(node => {
+      const date = memoryCalendarDate(node, options.timeZone);
+      return date && date >= calendarQuery.startDate && date <= calendarQuery.endDate;
+    }) : [];
+    if (calendarNodes.length) routes.push({ name: 'calendar-topic', query: calendarQuery.text, nodes: calendarNodes,
+      eligibleMemoryIds: new Set(calendarNodes.map(node => node.id)) });
+    const vectors = await vectorScores({ repository, agentId: normalizedAgentId, queries: routes.map(route => route.query),
       embeddingProvider, usageLedgerPath, now: executionTime, eligibleMemoryIds,
       embeddingCache: options.embeddingCache !== false, embeddingCacheMaxBytes: options.embeddingCacheMaxBytes, signal });
     signal?.throwIfAborted();
-    const coarse = prefilterCandidateIds(database, normalizedAgentId, preparedQuery,
-      { bm25Scores: bm25.scores, vectorScores: vector.scores, entityScores: entities.scores }, options, nodes.length);
-    const candidateNodes = coarse ? nodes.filter(node => isProvisionalNode(node) || coarse.has(node.id)
-      || requestedAnchors.includes(node.id)) : nodes;
-    reader.hydrate(candidateNodes);
-    const conceptLabels = repository.listMemoryConceptLabels({ agentId: normalizedAgentId,
-      memoryIds: candidateNodes.map(node => node.id) });
-    const scoreLexical = createSeedLexicalScorer(preparedQuery, { includeQuestions: true, conceptLabels });
-    const specific = temporal.matched && temporal.precision === 'exact' && decayPolicy.enabled
-      ? new Map(temporalCandidates({ nodes: candidateNodes, temporal, query: temporal.remainingQuery, preparedQuery,
-        options, entityScores: entities.scores }).filter(candidate => Object.values(candidate.specificity).every(Boolean))
-        .map(candidate => [candidate.node.id, candidate.specificity])) : new Map();
-    let convergenceCandidates = applyProvisionalCandidatePolicy(buildOrdinarySeedCandidates({
-      nodes: candidateNodes, query: retrievalQuery, preparedQuery, scoreLexical,
-      bm25Scores: bm25.scores, vectorScores: vector.scores, entityScores: entities.scores, entityRankingScores: entities.rankingScores,
-      subjectOnlyEntityMemoryIds: personOnlyIds, options, includeWeakLexical: true,
-      accessibilityAdjustments: accessibility, recallReactivationAdjustments: reactivation,
-      naturalDecayAdjustments: decay, naturalDecayBypassMemoryIds: new Set(specific.keys()),
-      naturalDecaySpecificityByMemory: specific, affectiveAdjustments: affective.adjustments,
-    }), options);
+    // Both queries use identical admission rules. The date branch changes
+    // only its query and eligible records; scores are fused after admission.
+    const searched = routes.map((route, index) => {
+      const entities = entitySeedScores(repository, normalizedAgentId, route.query,
+        { eligibleMemoryIds: route.eligibleMemoryIds });
+      const personNames = [...(queryPerspective.speakerNames || []), ...(queryPerspective.addresseeNames || []),
+        ...entities.matches.filter(isPersonEntity).map(match => match.matchedLabel)];
+      const preparedQuery = prepareLexicalQuery(route.query, { personNames });
+      const topicalIds = new Set(entities.matches.filter(match => !isPersonEntity(match) && match.kind !== 'concept')
+        .flatMap(match => [...match.directMemoryIds, ...match.actorMemoryIds]));
+      const personOnlyIds = new Set(entities.matches.filter(isPersonEntity)
+        .flatMap(match => [...match.directMemoryIds, ...match.actorMemoryIds]).filter(id => !topicalIds.has(id)));
+      const bm25 = collectBm25SeedScores({ repository, agentId: normalizedAgentId, query: route.query, preparedQuery,
+        maximumQueries: options.maximumBm25Queries, maximumResultsPerQuery: options.maximumBm25ResultsPerQuery,
+        eligibleMemoryIds: route.eligibleMemoryIds, worldId: worldScope.allowCrossWorld ? '' : worldScope.id,
+        worldFrame: worldScope.allowCrossWorld ? '' : worldScope.frame });
+      const vector = vectors[index];
+      const coarse = prefilterCandidateIds(database, normalizedAgentId, preparedQuery,
+        { bm25Scores: bm25.scores, vectorScores: vector.scores, entityScores: entities.scores }, options, route.nodes.length);
+      const candidateNodes = coarse ? route.nodes.filter(node => isProvisionalNode(node) || coarse.has(node.id)
+        || requestedAnchors.includes(node.id)) : route.nodes;
+      reader.hydrate(candidateNodes);
+      const conceptLabels = repository.listMemoryConceptLabels({ agentId: normalizedAgentId,
+        memoryIds: candidateNodes.map(node => node.id) });
+      const scoreLexical = createSeedLexicalScorer(preparedQuery, { includeQuestions: true, conceptLabels });
+      const specific = temporal.matched && temporal.precision === 'exact' && decayPolicy.enabled
+        ? new Map(temporalCandidates({ nodes: candidateNodes, temporal, query: temporal.remainingQuery, preparedQuery,
+          options, entityScores: entities.scores }).filter(candidate => Object.values(candidate.specificity).every(Boolean))
+          .map(candidate => [candidate.node.id, candidate.specificity])) : new Map();
+      const candidates = applyProvisionalCandidatePolicy(buildOrdinarySeedCandidates({
+        nodes: candidateNodes, query: route.query, preparedQuery, scoreLexical,
+        bm25Scores: bm25.scores, vectorScores: vector.scores, entityScores: entities.scores, entityRankingScores: entities.rankingScores,
+        subjectOnlyEntityMemoryIds: personOnlyIds, options, includeWeakLexical: true,
+        accessibilityAdjustments: accessibility, recallReactivationAdjustments: reactivation,
+        naturalDecayAdjustments: decay, naturalDecayBypassMemoryIds: new Set(specific.keys()),
+        naturalDecaySpecificityByMemory: specific, affectiveAdjustments: affective.adjustments,
+      }), options).map(candidate => ({ ...candidate, queryRoute: route.name }));
+      return { ...route, entities, preparedQuery, scoreLexical, bm25, vector, candidates };
+    });
+    const { preparedQuery, scoreLexical, bm25 } = searched[0];
+    const entities = { matches: [...new Map(searched.flatMap(route => route.entities.matches)
+      .map(match => [match.entityId, match])).values()] };
+    const vector = { ...(vectors.find(result => result.status === 'ready') || vectors[0]),
+      queryText: vectors[0].queryText, querySource: vectors[0].querySource,
+      usageRecorded: vectors.some(result => result.usageRecorded),
+      warning: [...new Set(vectors.map(result => result.warning).filter(Boolean))].join('；') };
+    const queryRoutes = searched.map(route => ({ name: route.name, query: route.query,
+      eligibleMemories: route.nodes.length, candidateCount: route.candidates.length,
+      vector: { ...route.vector, scores: undefined, vectors: undefined },
+      bm25: { status: route.bm25.status, audit: route.bm25.audit },
+      ...(route.name === 'calendar-topic' ? { window: { startDate: calendarQuery.startDate, endDate: calendarQuery.endDate } } : {}) }));
+    let convergenceCandidates = searched.flatMap(route => route.candidates);
     // Calendar lookup is an additional route, including when a date has no text topic.
     // It never replaces lexical/vector matches or imposes an inferred date filter.
     const dateCandidates = temporal.matched && !recallCorePhrases(temporal.remainingQuery).length ? temporalOverviewCandidates(nodes, temporal,
@@ -598,10 +624,12 @@ export async function retrieveMemories({
       [queryPerspective.speakerKey, queryPerspective.speakerNames?.[0]],
       [queryPerspective.addresseeKey, queryPerspective.addresseeNames?.[0]],
     ].filter(([key, name]) => key && name));
-    const output = renderRecallOutput({ nodes: chain.nodes }, { ...options, showRecallDate: true, actorNames,
+    const output = renderRecallOutput(chain, { ...options, showRecallDate: true, actorNames,
       sourceAuthoritiesByMemoryId: authorities, closureLabel: node => closedStateLabel(stateView.closurePhase(node)) });
     const displayedIds = output.records.map(record => record.memoryId), displayed = new Set(displayedIds);
     const selectedNodes = chain.nodes.filter(node => displayed.has(node.id));
+    const relations = (chain.relations || []).filter(relation => displayed.has(relation.toMemoryId));
+    const explanationMemoryIds = [...new Set(relations.map(relation => relation.fromMemoryId))];
     const primary = selectedNodes[0];
     const status = primary ? 'ready' : 'no-match';
     const plannedRoutes = ['lexical', 'bm25', 'entity', ...(temporal.matched ? ['temporal'] : []),
@@ -622,10 +650,11 @@ export async function retrieveMemories({
       : vector.status === 'ready' ? 'hybrid' : entities.matches.length ? 'entity-lexical' : 'lexical';
     const trace = retrievalTracePayload({ agentId: normalizedAgentId, query: normalizedQuery,
       resultStatus: status, retrievalMode, seedIds: chain.seeds.candidates.map(candidate => candidate.node.id),
-      selectedIds: selectedNodes.filter(node => !isProvisionalNode(node)).map(node => node.id), paths,
+      selectedIds: [...new Set([...selectedNodes.filter(node => !isProvisionalNode(node)).map(node => node.id), ...explanationMemoryIds])], paths,
       matchedEntities: entities.matches, context: output.context, candidateCount: returnedCandidates.length,
       vectorStatus: vector.status, metadata: {
-        temporal, seedRouting, displayedMemoryIds: displayedIds, provisionalMemoryIds: provisionalIds,
+        temporal, seedRouting, queryRoutes, displayedMemoryIds: displayedIds, provisionalMemoryIds: provisionalIds,
+        explanatoryRelations: relations,
         recalledMemoryIds: displayedIds.filter(id => !provisionalIds.includes(id)),
         focusMemoryId: primary?.id || '', continuationMemoryId: selectedNodes.at(-1)?.id || '',
         continuationAnchorIds: anchors.map(candidate => candidate.node.id),
@@ -648,7 +677,7 @@ export async function retrieveMemories({
         lexicalOverlap: candidate.lexical?.overlap || 0, exactPhrase: Boolean(candidate.lexical?.exactPhrase),
         vectorSimilarity: Number.isFinite(candidate.similarity) ? candidate.similarity : null,
         bm25Score: Number(candidate.bm25?.normalizedScore || 0), entityScore: candidate.entityScore || 0,
-        admission: candidate.admission, routeMatches: candidate.routeMatches,
+        admission: candidate.admission, routeMatches: candidate.routeMatches, queryRoute: candidate.queryRoute,
         retrievalLane: candidate.retrievalLane, laneRank: candidate.laneRank,
         bm25MatchedQueryCount: Number(candidate.bm25?.matchedQueryCount || 0),
         provisionalReview: candidate.provisional ? { reviewDecisionId: candidate.provisional.reviewDecisionId,
@@ -663,16 +692,18 @@ export async function retrieveMemories({
           ...(sourceView ? { eventSources: sourceView.sourcesFor([candidate.node.id]) } : {}) } : {}),
       })),
       records: output.records.map(record => ({ ...record,
-        ...(sourceView ? { eventSources: sourceView.sourcesFor([record.memoryId]) } : {}) })),
+        ...(sourceView ? { eventSources: sourceView.sourcesFor([record.memoryId,
+          ...relations.filter(relation => relation.toMemoryId === record.memoryId).map(relation => relation.fromMemoryId)]) } : {}) })),
       fragments: primary ? [{ memoryId: primary.id, memoryIds: displayedIds, memoryType: primary.kind,
         provisional: isProvisionalNode(primary), provisionalReviewDecisionId: primary.provisional_decision_id || '', text: output.text,
         evidenceIds: selectedNodes.filter(node => node.kind === 'utterance').map(node => node.id),
-        ...(sourceView ? { eventSources: sourceView.sourcesFor(displayedIds) } : {}) }] : [],
+        ...(sourceView ? { eventSources: sourceView.sourcesFor([...displayedIds, ...explanationMemoryIds]) } : {}) }] : [],
       context: output.context, guidance: options.guidance, outputBudget: output.outputBudget, matchedEntities: entities.matches,
       disclosureLevel: !primary ? 'none' : primary.kind === 'utterance' ? 'evidence'
         : selectedNodes.length > 1 ? 'related-memories' : 'conclusion', vector: { ...vector, scores: undefined, vectors: undefined },
-      bm25: { status: bm25.status, audit: bm25.audit }, trace, seedRouting,
+      bm25: { status: bm25.status, audit: bm25.audit }, trace, seedRouting, queryRoutes,
       graph: { seedId: primaryCandidate?.node.id || '', nodeIds: displayedIds,
+        relations,
         edgeIds: [...new Set(paths.flatMap(path => path.edges.map(edge => edge.edgeId)))],
         selectedMemoryIds: displayedIds, paths, activationField: chain.activation, contextSelection: chain.selection,
         evidenceMemoryIds: selectedNodes.filter(node => node.kind === 'utterance').map(node => node.id),

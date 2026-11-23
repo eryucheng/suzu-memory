@@ -33,11 +33,8 @@ export function withEventSourceExecution(repository, callback, { sourceScope = n
  * Committed derivatives and cleanup invalidate it before the next material/claim. */
 export function executionEventSourceView(repository, agentId) {
   const execution = currentEventSourceExecution();
-  execution?.assertCurrent();
+  assertEventSourceExecutionCurrent(agentId);
   if (!execution?.sourceScope) return null;
-  if (execution.sourceScope.agentId !== agentId) {
-    throw eventSourceError('EVENT_SOURCE_AGENT_CONFLICT', 'Execution scope belongs to another Memory Agent.');
-  }
   let cached = execution.views.get(repository);
   if (!cached) {
     const dataVersion = repository.database.prepare('PRAGMA data_version');
@@ -56,8 +53,12 @@ export function executionEventSourceView(repository, agentId) {
   return cached.view;
 }
 
-export function assertEventSourceExecutionCurrent() {
-  currentEventSourceExecution()?.assertCurrent();
+export function assertEventSourceExecutionCurrent(agentId) {
+  const execution = currentEventSourceExecution();
+  execution?.assertCurrent();
+  if (agentId && execution?.sourceScope && execution.sourceScope.agentId !== agentId) {
+    throw eventSourceError('EVENT_SOURCE_AGENT_CONFLICT', 'Execution scope belongs to another Memory Agent.');
+  }
 }
 
 export function eventSourceMaterial(repository, agentId, memoryIds = [], sourceIds = [], inputEventIds = []) {

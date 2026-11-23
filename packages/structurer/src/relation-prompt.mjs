@@ -1,10 +1,11 @@
 import { DEFAULT_MAXIMUM_PROPOSALS, proposalCountLimit, proposalSchemaForLimit } from './prompt.mjs';
+import { MEMORY_EXPLANATORY_RELATIONS, OrganizationCandidateError } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
 }
 
-export const MEMORY_RELATION_OUTPUT_SCHEMA = Object.freeze({
+const LEGACY_RELATION_OUTPUT_SCHEMA = Object.freeze({
   type: "object",
   additionalProperties: false,
   required: ["proposals"],
@@ -37,11 +38,49 @@ export const MEMORY_RELATION_OUTPUT_SCHEMA = Object.freeze({
   },
 });
 
-export function relationOutputSchema(maximumProposals, { excerpted = false } = {}) {
-  const schema = proposalSchemaForLimit(MEMORY_RELATION_OUTPUT_SCHEMA, maximumProposals);
+export const MEMORY_RELATION_OUTPUT_SCHEMA = Object.freeze({ ...LEGACY_RELATION_OUTPUT_SCHEMA,
+  properties: { proposals: { ...LEGACY_RELATION_OUTPUT_SCHEMA.properties.proposals,
+    items: { ...LEGACY_RELATION_OUTPUT_SCHEMA.properties.proposals.items,
+      properties: { ...LEGACY_RELATION_OUTPUT_SCHEMA.properties.proposals.items.properties,
+        relation: { type: 'string', enum: Object.keys(MEMORY_EXPLANATORY_RELATIONS),
+          description: 'causes=经历引发结果；reason_for=行动或决定的理由；condition_for=成立或适用条件。方向均从原因、理由或条件指向受影响的记忆。' },
+        rationale: { type: 'string', minLength: 1, description: '可独立理解的简短解释，保留解释者及原话的确定程度。' },
+        scope: { type: 'string', description: '原话表达的适用时间、对象或场景；未说明时留空。' },
+      },
+    },
+  } },
+});
+
+export function relationOutputSchema(maximumProposals, { excerpted = false, version = 2 } = {}) {
+  const schema = proposalSchemaForLimit(version === 1 ? LEGACY_RELATION_OUTPUT_SCHEMA : MEMORY_RELATION_OUTPUT_SCHEMA, maximumProposals);
   if (!excerpted) return schema;
   return { ...schema, required: [...schema.required, 'needsFullEvidence'],
-    properties: { ...schema.properties, needsFullEvidence: { type: 'boolean' } } };
+    properties: { ...schema.properties, needsFullEvidence: version === 1 ? { type: 'boolean' }
+      : { type: 'boolean', description: '需要完整原话才能判断时为 true。' } } };
+}
+
+export function withRelationModelOutput(request) {
+  const proposals = request.schema.properties.proposals;
+  const properties = { ...proposals.items.properties,
+    anchorMemoryId: { type: 'string', description: '本轮记忆。' }, relatedMemoryId: { type: 'string', description: '与其建立联系的记忆。' },
+    direction: { type: 'string', enum: ['anchor_to_related', 'related_to_anchor'],
+      description: 'anchor_to_related=本轮记忆影响关联记忆；related_to_anchor=关联记忆影响本轮记忆。' },
+  };
+  delete properties.fromMemoryId; delete properties.toMemoryId;
+  return { ...request, modelSchema: { ...request.schema, properties: { ...request.schema.properties,
+    proposals: { ...proposals, items: { type: 'object', additionalProperties: false,
+      required: Object.keys(properties), properties } },
+  } }, decodeModelOutput: output => {
+    if (!output || !Array.isArray(output.proposals)) throw new Error('Relation model output requires a proposals list.');
+    return { ...output, proposals: output.proposals.map(item => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+      const { anchorMemoryId, relatedMemoryId, direction, ...fields } = item;
+      if (!['anchor_to_related', 'related_to_anchor'].includes(direction)) return fields;
+      const forward = direction === 'anchor_to_related';
+      return { ...fields, fromMemoryId: forward ? anchorMemoryId : relatedMemoryId,
+        toMemoryId: forward ? relatedMemoryId : anchorMemoryId };
+    }) };
+  } };
 }
 
 export function buildRelationGenerationInput(snapshot, { excerpted = false } = {}) {
@@ -53,7 +92,8 @@ export function buildRelationGenerationInput(snapshot, { excerpted = false } = {
     const range = excerpted && snapshot.sourceExcerpts?.get(source.id);
     return range ? { ...source, content: source.content.slice(range.start, range.end), excerpt: true } : source;
   });
-  return JSON.stringify({ memories, sourceRecords, retrospectiveContext });
+  return JSON.stringify({ memories, sourceRecords, retrospectiveContext,
+    ...(snapshot.relationContext ? { relationContext: snapshot.relationContext } : {}) });
 }
 
 export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS } = {}) {
@@ -80,8 +120,8 @@ export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXI
   return {
     ...(Object.hasOwn(parsed, 'needsFullEvidence') ? { needsFullEvidence: parsed.needsFullEvidence } : {}),
     proposals: parsed.proposals.map((proposal, index) => {
-      if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
-        throw new Error(`Relation proposal ${index} must be an object.`);
+      if (proposal instanceof OrganizationCandidateError || !proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
+        return proposal;
       }
       return {
         relation: clean(proposal.relation),
@@ -92,6 +132,7 @@ export function parseRelationGeneration(value, { maximumProposals = DEFAULT_MAXI
           : [],
         confidence: proposal.confidence,
         rationale: clean(proposal.rationale),
+        ...(Object.hasOwn(proposal, 'scope') ? { scope: proposal.scope } : {}),
       };
     }),
   };

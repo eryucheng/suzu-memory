@@ -339,7 +339,7 @@ test("renders formal big neurons, state nodes, overlapping memberships, and all 
     visualTier: "major",
     visualFamily: "topic",
   });
-  assert.equal(relationVisualFamily("causes"), "causal");
+  for (const relation of ['causes', 'reason_for', 'condition_for']) assert.equal(relationVisualFamily(relation), 'causal');
   assert.equal(relationVisualFamily("future-real-relation"), "associative");
   database.close();
 });

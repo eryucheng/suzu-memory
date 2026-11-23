@@ -7,17 +7,20 @@ import {
   DEFAULT_MEMORY_TIME_ZONE,
   EVIDENCE_MODES,
   MEMORY_ACTOR_ROLES,
+  MEMORY_KIND_DEFINITIONS,
   MEMORY_STATE_FAMILIES,
   MEMORY_STATE_FAMILY_DEFINITIONS,
   REALITY_STATES,
   REVISION_ACTIONS,
   TEMPORAL_STATES,
+  entityNameKey,
   isMemoryKindAllowedForStateFamily,
   isStatefulMemoryKind,
   timestampInTimeZone,
 } from "@suzu-memory/core";
 import { buildExtractionParticipants, resolveExtractionActor, resolveExtractionSpeaker } from './participant-identity.mjs';
-import { createExtractionTimeValidator } from './temporal-evidence.mjs';
+import { normalizeExtractionTime } from './temporal-evidence.mjs';
+import { decodeExtractionModelOutput, formatExtractionEvidence, EXTRACTION_MODEL_EVIDENCE, EXTRACTION_MODEL_DATE } from './evidence-references.mjs';
 
 const GENERATED_ACTOR_ROLES = MEMORY_ACTOR_ROLES.filter(role => !['subject', 'speaker'].includes(role));
 const GENERATED_EVIDENCE_MODES = EVIDENCE_MODES.filter(mode => ['explicit', 'observed', 'inferred'].includes(mode));
@@ -25,7 +28,8 @@ const objectSchema = properties => ({ type: 'object', additionalProperties: fals
   properties, required: Object.keys(properties) });
 const text = { type: 'string', minLength: 1 };
 const stateKey = { ...text, description: '按状态的维度、对象和适用范围命名的简短稳定键。' };
-const stateLabel = { ...text, description: '可独立更新的状态命题或对象标签。' };
+const stateLabel = { ...text, description: '概括这项人物信息的简短命题。' };
+const memoryContentDescription = '沿用原话的事实表述，使用人物名称写简洁且可独立理解的正文';
 const score = { type: 'number', minimum: 0, maximum: 1 };
 const person = { type: 'object', anyOf: [
   objectSchema({ ref: { type: 'string', pattern: '^[PE][1-9][0-9]*$' } }),
@@ -56,9 +60,11 @@ const CATEGORIES = Object.fromEntries([
     .map(kind => [stateFamily === 'goal' ? kind : stateFamily, { kind, stateFamily }])),
 ]);
 const categoryField = categories => ({ type: 'string', enum: categories,
-  description: categories.map(category => `${category}=${category === 'event' ? '具体经历'
-    : category === 'reflection' ? '已经表达的反思' : category === 'plan' ? '未来打算'
+  description: categories.map(category => `${category}=${category === 'event' ? '需后续沿用的决定、约定、方案或持续事项的新进展，以及原话明确讲述的独立经历或已发生的具体变化'
+    : category === 'reflection' ? MEMORY_KIND_DEFINITIONS.reflection.description : category === 'plan' ? '未来打算'
       : category === 'commitment' ? '已答应的责任' : category === 'open_loop' ? '尚待跟进的事项'
+        : category === 'habit' ? '原文明示频率或条件的重复行为规律'
+          : category === 'disposition' ? '明确自述或跨情境的多次行为支持的稳定倾向'
         : MEMORY_STATE_FAMILY_DEFINITIONS[CATEGORIES[category].stateFamily].description}`).join('；') });
 const classificationBranches = [
   objectSchema({ category: categoryField(['event']) }),
@@ -74,19 +80,20 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
-function normalizeExtractionLanguage(value) {
+export function normalizeExtractionLanguage(value) {
   const normalized = clean(value).toLowerCase();
   if (["zh", "zh-cn", "chinese", "中文", "汉语"].includes(normalized)) return "zh";
   if (["en", "en-us", "en-gb", "english", "英语"].includes(normalized)) return "en";
   if (["mixed", "bilingual", "双语", "中英混合"].includes(normalized)) return "mixed";
+  if (normalized === 'unknown') return 'unknown';
   return "";
 }
 
-/** Infer the Chinese/English output policy from Han and Latin letter counts. */
+/** Set a default for a complete text using Han characters and English words. */
 export function detectExtractionLanguage(value) {
   const text = String(value || "");
   const han = (text.match(/\p{Script=Han}/gu) || []).length;
-  const latin = (text.match(/[A-Za-z]/gu) || []).length;
+  const latin = (text.match(/[A-Za-z]+/gu) || []).length;
   if (!han && !latin) return "unknown";
   if (!han) return "en";
   if (!latin) return "zh";
@@ -95,14 +102,31 @@ export function detectExtractionLanguage(value) {
   return smallerShare >= 0.25 ? "mixed" : han > latin ? "zh" : "en";
 }
 
+export function extractionContextLanguage(records, textOf = record => record.text, languageOf = record => record.outputLanguage) {
+  const languages = new Set();
+  const unlabelled = [];
+  for (const record of records) {
+    const language = normalizeExtractionLanguage(languageOf(record));
+    if (language) {
+      if (language !== 'unknown') languages.add(language);
+    } else {
+      unlabelled.push(textOf(record));
+    }
+  }
+  if (unlabelled.length) {
+    const language = detectExtractionLanguage(unlabelled.join('\n'));
+    if (language !== 'unknown') languages.add(language);
+  }
+  return languages.size > 1 ? 'mixed' : [...languages][0] || 'unknown';
+}
+
 function archiveWindowLanguage(window, messages) {
   const declared = normalizeExtractionLanguage(
     window?.sourceLanguage || window?.outputLanguage || window?.language,
   );
-  if (declared) return declared;
-  const languages = new Set(messages.map(message => message.sourceLanguage)
-    .filter(language => language !== 'unknown'));
-  return languages.size > 1 || languages.has('mixed') ? 'mixed' : [...languages][0] || 'unknown';
+  if (declared && declared !== 'unknown') return declared;
+  return extractionContextLanguage(messages, message => message.text,
+    message => normalizeExtractionLanguage(message.sourceLanguage) === 'unknown' ? '' : message.sourceLanguage);
 }
 
 function roleLabel(role, language) {
@@ -111,17 +135,14 @@ function roleLabel(role, language) {
   return role === "assistant" ? "我" : "对方";
 }
 
-function languageInstruction(language) {
-  if (language === "en") {
-    return ["【本窗口输出语言：English】"];
-  }
-  if (language === "mixed") {
-    return ["【本窗口输出语言：逐候选跟随直接证据】"];
-  }
-  if (language === "unknown") {
-    return ["【本窗口输出语言：保持原文】"];
-  }
-  return ["【本窗口输出语言：中文】"];
+const OUTPUT_LANGUAGE_NAMES = new Map([
+  ['zh', '中文'],
+  ['en', 'English'],
+]);
+
+export function extractionOutputLanguage(language) {
+  const name = OUTPUT_LANGUAGE_NAMES.get(language);
+  return name ? `沿用直接证据的语言，语种不清时用${name}` : '沿用直接证据的语言';
 }
 
 export function assignMemoryRefs(messages = [], start = 1) {
@@ -136,19 +157,24 @@ function formatMessages(messages, {
   language = "unknown",
   participants = [],
   timeZone = DEFAULT_MEMORY_TIME_ZONE,
+  evidenceReferences,
 } = {}) {
-  return messages.map((message) => {
+  const modelLines = [];
+  const input = messages.map((message) => {
     const source = message.eventSource;
     const participant = resolveExtractionSpeaker(message, participants);
     const context = source ? { spaceId: source.spaceId, spaceKind: source.topology?.spaceKind || source.topology?.kind } : null;
-    return `${includeRefs ? `[${message.memoryRef}] ` : ""}[${timestampInTimeZone(message.timestamp, timeZone) || message.timestamp || ""}] ${
+    const header = `${includeRefs ? `[${message.memoryRef}] ` : ""}[${timestampInTimeZone(message.timestamp, timeZone) || message.timestamp || ""}] ${
       message.worldFrame ? `[world=${message.worldFrame}:${message.worldId || "primary"}] ` : ""
     }${language === "mixed" && message.sourceLanguage && message.sourceLanguage !== "unknown"
       ? `[source-language=${message.sourceLanguage}] ` : ""
     }${context ? `[来源 ${JSON.stringify(context)}] ` : ""}${participant ? `${participant.ref} ${participant.displayName}` : source?.sender.name || roleLabel(message.role, language)}${
       source && message.knownAt && message.knownAt !== message.occurredAt ? ` [获知时间=${timestampInTimeZone(message.knownAt, timeZone) || message.knownAt}]` : ''
-    }：${message.text}`;
+    }：`;
+    if (evidenceReferences) modelLines.push(header + formatExtractionEvidence(String(message.text), message.memoryRef, evidenceReferences));
+    return header + message.text;
   }).join("\n\n");
+  return { input, modelInput: modelLines.join("\n\n") };
 }
 
 export const EXTRACTION_ENTITY_SCHEMA = objectSchema({
@@ -164,10 +190,10 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({ ...objectSchema({
     sourceRef: { type: 'string', pattern: '^M[0-9]{4}$' },
     start: { type: 'string', minLength: 1 }, end: { type: 'string', minLength: 1 },
   }) },
-  memories: { type: 'array', description: '本批记忆候选；没有时返回空数组。', items: { ...objectSchema({
+  memories: { type: 'array', description: '本批新增记忆。保留已确定的事项结果、实际进展、明确约定、人物事实和可独立追溯的经历。没有符合条件的信息时返回空数组。', items: { ...objectSchema({
     title: { type: 'string', description: '简短具体的标题。' },
-    content: { ...text, description: '可独立理解的正文；文字字段遵循窗口指定的输出语言。' },
-    classification: { type: 'object', anyOf: classificationBranches },
+    content: { ...text, description: `${memoryContentDescription}；文字字段遵循窗口指定的输出语言。` },
+    classification: { type: 'object', description: '按 category 对应的分支填写类型、稳定键、命题和目标对象。', anyOf: classificationBranches },
     entityRefs: { type: ['array', 'null'], items: { type: 'string', pattern: '^E[1-9][0-9]*$' }, description: '本条明确涉及的实体编号。' },
     subject,
     actors: { type: 'array', description: '有直接证据的人物角色；无法确定的条目省略。', items: objectSchema({
@@ -181,9 +207,9 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({ ...objectSchema({
     temporalState: { type: 'string', enum: TEMPORAL_STATES },
     revisionAction: { type: 'string', enum: REVISION_ACTIONS },
     time: { type: ['object', 'null'], anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: [], properties: {
-      date: { type: ['string', 'null'], description: '已知事发日 YYYY-MM-DD。' },
-      start: { type: ['string', 'null'], description: '已知发生时刻，带 UTC 偏移的 ISO 8601。' },
-      end: { type: ['string', 'null'], description: '已知结束时刻，带 UTC 偏移的 ISO 8601。' },
+      date: { type: ['string', 'null'], description: '原文已确定到日的事发日期 YYYY-MM-DD；仅知年份或月份时为 null。' },
+      start: { type: ['string', 'null'], description: '原文已确定的发生时刻，带 UTC 偏移的 ISO 8601；仅知日期或更粗精度时为 null。' },
+      end: { type: ['string', 'null'], description: '原文已确定的结束时刻，带 UTC 偏移的 ISO 8601；仅知日期或更粗精度时为 null。' },
     } }], description: '未知为 null；已知时填写日期或时刻，省略未知部分。' },
     confidence: { ...score, description: '证据可靠程度。' },
     importance: { ...score, description: '对记忆拥有者的重要程度。' },
@@ -192,11 +218,65 @@ export const LONG_TERM_EXTRACTION_SCHEMA = Object.freeze({ ...objectSchema({
   }), required: ['title', 'content', 'classification', 'subject', 'actors', 'reality', 'evidenceMode', 'temporalState', 'revisionAction', 'time', 'confidence', 'importance', 'sourceRefs'] } },
 }), required: ['memories'] });
 
+// Property order guides generation while the host validates the registered schema.
+const modelExtractionSchema = structuredClone(LONG_TERM_EXTRACTION_SCHEMA);
+const modelMemories = modelExtractionSchema.properties.memories;
+modelMemories.items.properties.content.description = `${memoryContentDescription}。`;
+const modelClassification = modelMemories.items.properties.classification;
+modelClassification.description += ` key 为状态键。${stateKey.description} label 为命题。${stateLabel.description}`;
+const modelClassificationBranches = modelClassification.anyOf;
+const modelEventCategory = modelClassificationBranches.find(branch => branch.properties.category.enum.includes('event'))
+  .properties.category;
+modelEventCategory.description = modelEventCategory.description.replace('决定、约定、方案', '决定、方案');
+for (const branch of modelClassificationBranches) {
+  if (!Object.hasOwn(branch.properties, 'label')) continue;
+  const { category, key: { description: _keyDescription, ...key },
+    label: { description: _labelDescription, ...label }, ...remaining } = branch.properties;
+  branch.properties = { category, label, key, ...remaining };
+}
+export const LONG_TERM_EXTRACTION_MODEL_SCHEMA = Object.freeze(modelExtractionSchema);
+
+const initialModelSchema = structuredClone(LONG_TERM_EXTRACTION_MODEL_SCHEMA);
+const initialModelItem = initialModelSchema.properties.memories.items;
+const { classification, subject: modelSubject, sourceRefs: _sourceRefs, ...memoryFields } = initialModelItem.properties;
+const time = {
+  description: '只有事发日时用日期字符串，有时刻时用原有对象，未知时为 null。',
+  anyOf: [EXTRACTION_MODEL_DATE, ...memoryFields.time.anyOf],
+};
+initialModelItem.properties = {
+  classification,
+  subject: modelSubject,
+  evidence: EXTRACTION_MODEL_EVIDENCE,
+  ...memoryFields,
+  revisionAction: {
+    type: ['string', 'null'],
+    enum: [...REVISION_ACTIONS, null],
+    description: '仅未取消的新增事件可省略或填 null。其余填实际动作。',
+  },
+  time,
+};
+initialModelItem.required = initialModelItem.required.filter(field => field !== 'revisionAction')
+  .map(field => field === 'sourceRefs' ? 'evidence' : field);
+
+export function buildLongTermExtractionRequest({ systemPrompt, ...source }) {
+  const built = buildLongTermExtractionInput(source);
+  return { built, request: {
+    input: built.input,
+    modelInput: built.modelInput,
+    systemPrompt,
+    schema: LONG_TERM_EXTRACTION_SCHEMA,
+    modelSchema: initialModelSchema,
+    schemaName: 'long-term-memory-extraction-v4',
+    decodeOutput: output => decodeExtractionModelOutput(output, built.evidenceReferences, TARGET_PROPERTIES),
+  } };
+}
+
 export function buildLongTermExtractionInput({
   messages = [],
   previousContextMessages = [],
   continuationGuidanceMessages = [],
   archiveWindows = [],
+  outputLanguage,
   memoryOwner = "记忆拥有者",
   userName = "对方",
   identity = {},
@@ -207,6 +287,7 @@ export function buildLongTermExtractionInput({
     : [{
       id: "",
       messages,
+      outputLanguage,
       previousContextMessages,
       continuationGuidanceMessages,
     }];
@@ -220,10 +301,12 @@ export function buildLongTermExtractionInput({
     }
     observedWindowIds.add(archiveWindowId);
     const archiveContinuityId = clean(window.continuityId) || archiveWindowId;
-    const standardized = assignMemoryRefs(window.messages || [], nextRef).map((message) => ({
+    const windowMessages = window.messages || [];
+    const language = archiveWindowLanguage(window, windowMessages);
+    const standardized = assignMemoryRefs(windowMessages, nextRef).map((message) => ({
       ...message,
-      sourceLanguage: normalizeExtractionLanguage(message.sourceLanguage)
-        || detectExtractionLanguage(message.text),
+      sourceLanguage: normalizeExtractionLanguage(message.sourceLanguage) || undefined,
+      outputLanguage: language,
       archiveWindowId,
       archiveContinuityId,
       archiveWindowLabel: `W${String(index + 1).padStart(4, "0")}`,
@@ -233,7 +316,7 @@ export function buildLongTermExtractionInput({
       id: archiveWindowId,
       continuityId: archiveContinuityId,
       label: `W${String(index + 1).padStart(4, "0")}`,
-      sourceLanguage: archiveWindowLanguage(window, standardized),
+      sourceLanguage: language,
       messages: standardized,
       previousContextMessages: [...(window.previousContextMessages || [])],
       continuationGuidanceMessages: [...(window.continuationGuidanceMessages || [])],
@@ -243,14 +326,25 @@ export function buildLongTermExtractionInput({
   const allMessages = standardizedWindows.flatMap(window => [...window.previousContextMessages, ...window.messages, ...window.continuationGuidanceMessages]);
   const participants = buildExtractionParticipants(allMessages, { companionName: memoryOwner, primaryUserName: userName, ...identity });
   const owner = participants.find(participant => participant.actorRole === 'agent');
+  const evidenceReferences = new Map();
+  const language = standardizedWindows[0].sourceLanguage;
+  const sameLanguage = standardizedWindows.every(window => window.sourceLanguage === language);
+  const windowDefaults = standardizedWindows.flatMap(({ label, sourceLanguage }) => {
+    const name = OUTPUT_LANGUAGE_NAMES.get(sourceLanguage);
+    return name ? [`${label} ${name}`] : [];
+  });
+  const languageInstruction = !sameLanguage && windowDefaults.length
+    ? `沿用直接证据的语言，语种不清时按窗口默认（${windowDefaults.join('，')}）`
+    : extractionOutputLanguage(sameLanguage ? language : 'mixed');
   const parts = [
+    `【输出语言：${languageInstruction}】`,
     `记忆拥有者：${owner ? `${owner.ref} ${owner.displayName}` : memoryOwner}`,
     `时间基准时区：${timeZone}。消息时间按该时区显示并带 UTC 偏移；相对日期以对应消息的当地日期为准。`,
     '【人物表】',
     JSON.stringify(participants.map(({ ref, displayName }) => ({ ref, name: displayName }))),
   ];
   for (const window of standardizedWindows) {
-    const previousContext = formatMessages(window.previousContextMessages, {
+    const { input: previousContext } = formatMessages(window.previousContextMessages, {
       timeZone,
       language: window.sourceLanguage,
       participants,
@@ -260,8 +354,9 @@ export function buildLongTermExtractionInput({
       includeRefs: true,
       language: window.sourceLanguage,
       participants,
+      evidenceReferences,
     });
-    const continuationGuidance = formatMessages(window.continuationGuidanceMessages, {
+    const { input: continuationGuidance } = formatMessages(window.continuationGuidanceMessages, {
       timeZone,
       language: window.sourceLanguage,
       participants,
@@ -269,7 +364,6 @@ export function buildLongTermExtractionInput({
     if (standardizedWindows.length > 1 || window.id) {
       parts.push("", `【语义归档窗口 ${window.label}】`);
     }
-    parts.push("", ...languageInstruction(window.sourceLanguage));
     if (previousContext) {
       parts.push(
         "",
@@ -278,8 +372,8 @@ export function buildLongTermExtractionInput({
         previousContext,
       );
     }
-    if (conversation) {
-      parts.push("", "【待提取的标准事件】", "", conversation);
+    if (conversation.input) {
+      parts.push("", "【待提取记忆的对话正文】", "", conversation);
     }
     if (continuationGuidance) {
       parts.push(
@@ -290,8 +384,11 @@ export function buildLongTermExtractionInput({
       );
     }
   }
+  const render = field => `${parts.map(part => typeof part === 'string' ? part : part[field]).join("\n").trim()}\n`;
   return {
-    input: `${parts.join("\n").trim()}\n`,
+    input: render('input'),
+    modelInput: render('modelInput'),
+    evidenceReferences,
     messages: standardized,
     archiveWindows: standardizedWindows,
     previousContextMessages: standardizedWindows.flatMap(
@@ -311,15 +408,6 @@ function stripCodeFence(value) {
   return clean(fenced?.[1] || text);
 }
 
-function validCalendarDate(value) {
-  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
-  const [year, month, day] = value.split("-").map(Number);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  return parsed.getUTCFullYear() === year
-    && parsed.getUTCMonth() === month - 1
-    && parsed.getUTCDate() === day;
-}
-
 function exactFields(value, required, optional, path) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} 必须是对象。`);
   const missing = required.filter(key => !Object.hasOwn(value, key));
@@ -337,25 +425,59 @@ function validatePerson(value, path, { scope = false, world = false } = {}) {
   throw new Error(`${path} 必须是人物引用、原文名称${scope ? '或明确的主体范围' : ''}${world ? '或世界对象' : ''}。`);
 }
 
-/** Parse the model contract. Identity references are resolved only at the
- * ingestion boundary, where the batch's authoritative participant table lives. */
-export function parseGeneratedLongTermExtraction(value, { messages, timeZone } = {}) {
-  let parsed = value;
-  if (typeof value === 'string') {
-    try { parsed = JSON.parse(stripCodeFence(value)); }
-    catch (error) { throw new Error(`长期记忆提取模型输出不是有效 JSON：${error.message}`); }
+export function checkExtractionSourceRefs(sourceRefs, findMessage) {
+  const missingRefs = [];
+  const windows = new Set();
+  for (const ref of sourceRefs) {
+    const message = findMessage(ref);
+    if (message) windows.add(clean(message.archiveWindowId));
+    else missingRefs.push(ref);
   }
-  exactFields(parsed, ['memories'], ['entities', 'causalExcerpts'], '长期记忆提取模型输出');
-  const entities = parseExtractionEntities(parsed.entities ?? []);
-  const entityByRef = new Map(entities.map(entity => [entity.ref, entity]));
+  if (missingRefs.length) return { reason: 'unknown-source-ref', missingRefs };
+  if (windows.size > 1) return { reason: 'cross-window-evidence' };
+  return null;
+}
+
+function decodeExtractionOutput(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(stripCodeFence(value)); }
+  catch (error) { throw new Error(`长期记忆提取模型输出不是有效 JSON：${error.message}`); }
+}
+
+/** Parse the model contract. Identity references are resolved at normalization. */
+export function parseGeneratedLongTermExtraction(value, context = {}) {
+  return parseExtractionCandidates(decodeExtractionOutput(value), context).parsed;
+}
+
+function parseExtractionCandidates(parsed, context, { failures, normalize = false, entityBindings } = {}) {
+  const { messages, timeZone, allowTimeEvidence = false, evidenceReferences } = context;
+  parsed = decodeExtractionModelOutput(parsed, evidenceReferences, TARGET_PROPERTIES);
+  let validationError;
+  try {
+    exactFields(parsed, ['memories'], ['entities', 'causalExcerpts'], '长期记忆提取模型输出');
+  } catch (error) {
+    if (!failures || !Array.isArray(parsed?.memories)) throw error;
+    validationError = error;
+  }
   if (!Array.isArray(parsed.memories)) throw new Error('memories 必须是数组。');
-  const validateTime = createExtractionTimeValidator(messages || [], timeZone);
+  const { byRef: entityByRef, errors: entityErrors, tableError } = extractionEntityTable(parsed.entities, entityBindings, Boolean(failures));
+  const getEntity = ref => {
+    const entity = entityByRef.get(ref);
+    const issue = entityErrors.get(ref) || (!entity && tableError);
+    if (issue) throw issue;
+    return entity;
+  };
+  const normalizeMemory = normalize ? extractionMemoryNormalizer(context, entityByRef) : null;
+  const messagesByRef = messages ? new Map(messages.map(message => [message.memoryRef, message])) : null;
   const properties = LONG_TERM_EXTRACTION_SCHEMA.properties.memories.items.properties;
-  return { ...(parsed.entities != null ? { entities } : {}),
-    ...(Array.isArray(parsed.causalExcerpts) ? { causalExcerpts: parsed.causalExcerpts } : {}),
-    memories: parsed.memories.map((candidate, index) => {
+  const optionalFields = ['entityRefs', 'time', ...(allowTimeEvidence ? ['timeEvidence'] : [])];
+  const requiredFields = Object.keys(properties).filter(key => !optionalFields.includes(key));
+  const parseMemory = (candidate, index) => {
     const path = `memories[${index}]`;
-    exactFields(candidate, Object.keys(properties).filter(key => key !== 'entityRefs'), ['entityRefs'], path);
+    if (evidenceReferences && candidate && Object.hasOwn(candidate, 'evidence')) {
+      throw new Error(`${path}.evidence 的主证据或补充证据编号不符合本批正文。`);
+    }
+    exactFields(candidate, requiredFields, optionalFields, path);
     for (const field of ['title', 'content']) {
       if (typeof candidate[field] !== 'string' || (field === 'content' && !clean(candidate[field]))) throw new Error(`${path}.${field} 无效。`);
     }
@@ -389,64 +511,127 @@ export function parseGeneratedLongTermExtraction(value, { messages, timeZone } =
       validatePerson(actor.person, `${actorPath}.person`);
       if (typeof actor.confidence !== 'number' || !Number.isFinite(actor.confidence) || actor.confidence < 0 || actor.confidence > 1) throw new Error(`${actorPath}.confidence 无效。`);
     }
-    let time = candidate.time;
-    if (time !== null) {
-      exactFields(time, [], ['date', 'start', 'end'], `${path}.time`);
-      if (Object.values(time).some(entry => entry !== null && typeof entry !== 'string')) throw new Error(`${path}.time 字段必须是已知日期、时刻或 null。`);
-      time = Object.fromEntries(Object.entries(time).map(([field, value]) => [field, clean(value) || null]));
-      if (time.date && !validCalendarDate(time.date)) throw new Error(`${path}.time.date 必须是有效 YYYY-MM-DD。`);
-      for (const field of ['start', 'end']) if (time[field] && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/u.test(time[field])
-        || !validCalendarDate(time[field].slice(0, 10)) || !Number.isFinite(new Date(time[field]).getTime()))) {
-        throw new Error(`${path}.time.${field} 必须是带 UTC 偏移的有效 ISO 8601 时间。`);
-      }
-      if (time.start && time.end && new Date(time.end) < new Date(time.start)) throw new Error(`${path}.time.end 不能早于 start。`);
-      if (!Object.values(time).some(Boolean)) time = null;
-    }
     if (!Array.isArray(candidate.sourceRefs) || !candidate.sourceRefs.length
       || candidate.sourceRefs.some(ref => typeof ref !== 'string' || !/^M[0-9]{4}$/u.test(ref))) throw new Error(`${path}.sourceRefs 无效。`);
+    if (messagesByRef) {
+      const issue = checkExtractionSourceRefs(candidate.sourceRefs, ref => messagesByRef.get(ref));
+      if (issue?.missingRefs) throw new Error(`${path}.sourceRefs 引用了允许范围之外的消息：${issue.missingRefs.join('、')}。`);
+      if (issue) throw new Error(`${path}.sourceRefs 跨归档窗口，每条记忆应引用同一窗口的原话。`);
+    }
     for (const field of ['confidence', 'importance']) {
       if (typeof candidate[field] !== 'number' || !Number.isFinite(candidate[field]) || candidate[field] < 0 || candidate[field] > 1) throw new Error(`${path}.${field} 必须在 0 到 1 之间。`);
     }
     const entityRefs = candidate.entityRefs ?? [];
-    if (!Array.isArray(entityRefs) || entityRefs.some(ref => typeof ref !== 'string' || !entityByRef.has(ref))) throw new Error(`${path}.entityRefs 无效。`);
+    if (!Array.isArray(entityRefs) || entityRefs.some(ref => typeof ref !== 'string' || !getEntity(ref))) throw new Error(`${path}.entityRefs 无效。`);
     const inspectRef = (entry, personal) => {
       if (!entry?.ref?.startsWith('E')) return;
-      const entity = entityByRef.get(entry.ref);
+      const entity = getEntity(entry.ref);
       if (!entity || personal && !['person', 'agent'].includes(entity.kind)) throw new Error(`${path} 的实体引用类型不适用。`);
     };
     inspectRef(candidate.subject, true);
     candidate.actors.forEach(actor => inspectRef(actor.person, true));
     if (classification.target) for (const [key, entry] of Object.entries(classification.target)) inspectRef(entry, key === 'counterpart');
-    const normalized = { ...candidate, ...(candidate.entityRefs != null ? { entityRefs: [...new Set(entityRefs)] } : {}), title: clean(candidate.title), content: clean(candidate.content), time,
+    const time = normalizeExtractionTime(candidate.time, timeZone);
+    return { ...candidate, ...(candidate.entityRefs != null ? { entityRefs: [...new Set(entityRefs)] } : {}), title: clean(candidate.title), content: clean(candidate.content), time,
       sourceRefs: [...new Set(candidate.sourceRefs)] };
-    validateTime({ ...normalized, kind, eventDate: time?.date || '', eventStart: time?.start || '', eventEnd: time?.end || '' });
-    return normalized;
-  }) };
+  };
+  const memories = [];
+  for (const [index, candidate] of parsed.memories.entries()) {
+    try {
+      const memory = parseMemory(candidate, index);
+      memories.push(normalizeMemory ? normalizeMemory(memory, index) : memory);
+    } catch (error) {
+      if (!failures) throw error;
+      failures.push({ index, candidate, error });
+      validationError ??= error;
+    }
+  }
+  return { validationError, parsed: { ...(parsed.entities != null ? { entities: [...entityByRef.values()] } : {}),
+    ...(Array.isArray(parsed.causalExcerpts) ? { causalExcerpts: parsed.causalExcerpts } : {}), memories } };
 }
 
-export function parseExtractionEntities(value = []) {
-  if (value === null) return [];
-  if (!Array.isArray(value)) throw new Error('entities 必须是数组。');
+function extractionEntityTable(value, bindings = new Map(), inspect = false) {
+  const byRef = new Map(bindings);
+  const errors = new Map();
+  if (value == null) return { byRef, errors };
+  if (!Array.isArray(value)) {
+    const tableError = new Error('entities 必须是数组。');
+    if (!inspect) throw tableError;
+    return { byRef, errors, tableError };
+  }
   const refs = new Set();
-  return value.map((entity, index) => {
-    exactFields(entity, ['ref', 'kind', 'name', 'aliases'], [], `entities[${index}]`);
-    if (typeof entity.ref !== 'string' || !/^E[1-9][0-9]*$/u.test(entity.ref) || refs.has(entity.ref)
-      || !ENTITY_KINDS.includes(entity.kind) || typeof entity.name !== 'string' || !clean(entity.name)
-      || !Array.isArray(entity.aliases) || entity.aliases.some(alias => typeof alias !== 'string' || !clean(alias))) throw new Error(`entities[${index}] 无效。`);
-    refs.add(entity.ref);
-    return { ...entity, name: clean(entity.name), aliases: [...new Set(entity.aliases.map(clean))] };
-  });
+  for (const [index, entity] of value.entries()) {
+    const ref = entity?.ref;
+    try {
+      exactFields(entity, ['ref', 'kind', 'name', 'aliases'], [], `entities[${index}]`);
+      if (typeof ref !== 'string' || !/^E[1-9][0-9]*$/u.test(ref) || refs.has(ref) || errors.has(ref)
+        || !ENTITY_KINDS.includes(entity.kind) || typeof entity.name !== 'string' || !clean(entity.name)
+        || !Array.isArray(entity.aliases) || entity.aliases.some(alias => typeof alias !== 'string' || !clean(alias))) throw new Error(`entities[${index}] 无效。`);
+      refs.add(ref);
+      const known = bindings.get(ref);
+      if (!known) {
+        byRef.set(ref, { ...entity, name: clean(entity.name), aliases: [...new Set(entity.aliases.map(clean))] });
+      } else {
+        if (known.kind !== entity.kind) throw new Error(`Entity ${ref} has type ${known.kind}; use a new reference for a different type.`);
+        const names = new Set([known.name, ...known.aliases].map(entityNameKey));
+        if ([entity.name, ...entity.aliases].some(name => !names.has(entityNameKey(name)))) {
+          throw new Error(`Entity ${ref} is bound to ${known.name}; use a new reference for a different entity.`);
+        }
+      }
+    } catch (error) {
+      if (!inspect) throw error;
+      errors.set(ref, error);
+      if (!bindings.has(ref)) byRef.delete(ref);
+    }
+  }
+  return { byRef, errors };
+}
+
+export function parseExtractionEntities(value) {
+  return [...extractionEntityTable(value).byRef.values()];
 }
 
 export function extractionEntityScope(messages = []) {
   return createHash('sha256').update(JSON.stringify(messages.map(message => message.id || message.memoryRef))).digest('hex').slice(0, 24);
 }
 
+export function extractionEntityReferences(candidate) {
+  return [...new Set([
+    ...(Array.isArray(candidate?.entityRefs) ? candidate.entityRefs : []), candidate?.subject?.ref,
+    ...(Array.isArray(candidate?.actors) ? candidate.actors.map(actor => actor?.person?.ref) : []),
+    ...Object.values(candidate?.classification?.target || {}).map(value => value?.ref),
+  ].filter(ref => typeof ref === 'string' && /^E[1-9][0-9]*$/u.test(ref)))];
+}
+
+export function extractionEntityDeclarationsFor(memories, entities, boundRefs) {
+  if (entities == null) return [];
+  const refs = new Set(memories.flatMap(extractionEntityReferences));
+  if (!refs.size) return [];
+  return Array.isArray(entities) ? entities.filter(entity => refs.has(entity?.ref) && !boundRefs?.has(entity.ref)) : entities;
+}
+
 /** Resolve host references once; keep declared entity references for the local
  * repository transaction that binds persistent entities. */
 export function normalizeGeneratedLongTermExtraction(value, context = {}) {
-  const parsed = parseGeneratedLongTermExtraction(value, context);
-  const declarations = new Map((parsed.entities || []).map(entity => [entity.ref, entity]));
+  const { parsed } = parseExtractionCandidates(decodeExtractionOutput(value), context, { normalize: true });
+  return { memories: parsed.memories };
+}
+
+/** Inspect a batch once, keeping valid candidates and the original failed drafts. */
+export function inspectGeneratedLongTermExtraction(value, context = {}, entityBindings) {
+  let output;
+  try {
+    output = decodeExtractionOutput(value);
+    const failures = [];
+    const { parsed, validationError } = parseExtractionCandidates(output, context, { failures, normalize: true, entityBindings });
+    return { output: { memories: parsed.memories }, failures, validationError,
+      originalCount: output.memories.length, entities: output.entities, causalExcerpts: parsed.causalExcerpts };
+  } catch (validationError) {
+    return { validationError, causalExcerpts: output?.causalExcerpts };
+  }
+}
+
+function extractionMemoryNormalizer(context, declarations) {
   const identityScope = context.entityScope || extractionEntityScope(context.messages);
   function identity(person) {
     if (person.scope) return { role: person.scope, key: '', name: clean(person.name), status: 'scope' };
@@ -457,9 +642,12 @@ export function normalizeGeneratedLongTermExtraction(value, context = {}) {
     }
     return resolveExtractionActor({ ref: person.ref, name: person.name }, context);
   }
-  return { memories: parsed.memories.map(candidate => {
+  return (candidate, index) => {
     const { kind, stateFamily } = CATEGORIES[candidate.classification.category];
     const holder = identity(candidate.subject);
+    if (kind === 'reflection' && !MEMORY_KIND_DEFINITIONS.reflection.subjectRoles.includes(holder.role)) {
+      throw new Error(`memories[${index}].classification.category: reflection 仅适用于记忆拥有者或共同主体的反思。`);
+    }
     const target = candidate.classification.target;
     let stateTarget;
     if (stateFamily === 'identity') stateTarget = { ...target };
@@ -476,8 +664,8 @@ export function normalizeGeneratedLongTermExtraction(value, context = {}) {
       actorRoles: candidate.actors.map(actor => { const person = identity(actor.person);
         return { role: actor.role, actorRole: person.role, actorKey: person.key, actorName: person.name, identityStatus: person.status,
           ...(person.entity ? { entityRef: person.entity.ref } : {}), confidence: actor.confidence }; }),
-      ...(declarations.size ? { entityScope: identityScope, entityMentions: [...new Set([...(candidate.entityRefs || []), candidate.subject.ref, ...candidate.actors.map(actor => actor.person.ref),
-        ...Object.values(candidate.classification.target || {}).map(value => value?.ref)].filter(ref => declarations.has(ref)))].map(ref => declarations.get(ref)) } : {}),
+      ...(declarations.size ? { entityScope: identityScope, entityMentions: extractionEntityReferences(candidate)
+        .filter(ref => declarations.has(ref)).map(ref => declarations.get(ref)) } : {}),
       canonicalKey: clean(candidate.classification.key), stateFamily, stateLabel: clean(candidate.classification.label),
       ...(stateTarget ? { stateTarget } : {}),
       reality: candidate.reality, evidenceMode: candidate.evidenceMode, temporalState: candidate.temporalState,
@@ -487,5 +675,5 @@ export function normalizeGeneratedLongTermExtraction(value, context = {}) {
       eventEnd: candidate.time?.end ? new Date(candidate.time.end).toISOString() : '',
       confidence: candidate.confidence, importance: candidate.importance, sourceRefs: candidate.sourceRefs,
     };
-  }) };
+  };
 }

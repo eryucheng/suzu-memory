@@ -92,7 +92,7 @@ function currentStablePreference(repository) {
   });
 }
 
-test("keeps a selection tendency pending until explicit acceptance", () => {
+test("applies a selection tendency before its audit confirmation", () => {
   const { database, repository } = setup();
   const choice = evidenceMemory(repository, {
     id: "choice-puzzle",
@@ -100,7 +100,6 @@ test("keeps a selection tendency pending until explicit acceptance", () => {
     source: "我今晚还是想玩解谜游戏。",
     occurredAt: "2026-07-10T12:00:00.000Z",
   });
-  const before = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count);
   const proposal = proposePreferenceState(repository, {
     agentId: "agent-test",
     batchId: "preference-batch-1",
@@ -117,7 +116,8 @@ test("keeps a selection tendency pending until explicit acceptance", () => {
   assert.equal(proposal.review_state, "pending");
   assert.equal(proposal.transition, "create");
   assert.equal(proposal.proposed_kind, "derived_hypothesis");
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), before);
+  const applied = repository.getMemory(proposal.resultMemoryId);
+  assert.equal(applied.status, 'active');
 
   const accepted = resolvePreferenceStateProposal(repository, {
     agentId: "agent-test",
@@ -126,6 +126,7 @@ test("keeps a selection tendency pending until explicit acceptance", () => {
     resolvedBy: "human:test",
   });
   assert.equal(accepted.status, "create");
+  assert.deepEqual(accepted.memory, applied);
   assert.equal(accepted.memory.kind, "derived_hypothesis");
   assert.equal(accepted.memory.evidence_mode, "inferred");
   assert.equal(accepted.memory.metadata.preferenceStateLevel, "selection_tendency");
@@ -311,7 +312,7 @@ test("allows a full canonical review to downgrade while preserving the old state
   database.close();
 });
 
-test("rejects stale preference proposals after another state becomes current", () => {
+test("confirming a historical preference records its audit while preserving the newer current state", () => {
   const { database, repository } = setup();
   currentStablePreference(repository);
   const choice = evidenceMemory(repository, {
@@ -350,12 +351,13 @@ test("rejects stale preference proposals after another state becomes current", (
     status: "active",
     metadata: { preferenceStateLevel: "stable_preference" },
   });
-  assert.throws(() => resolvePreferenceStateProposal(repository, {
+  resolvePreferenceStateProposal(repository, {
     agentId: "agent-test",
     proposalId: proposal.id,
     action: "accept",
-  }), /changed after proposal creation/u);
-  assert.equal(repository.getPreferenceStateProposal("agent-test", proposal.id).review_state, "pending");
+  });
+  assert.equal(repository.getPreferenceStateProposal("agent-test", proposal.id).review_state, "accepted");
+  assert.equal(repository.getMemory('newer-current').status, 'active');
   database.close();
 });
 
@@ -378,4 +380,38 @@ test("a fictional preference and its closure leave the real preference current",
   resolvePreferenceStateProposal(repository, { agentId: 'agent-test', proposalId: closing.id, action: 'accept' });
   assert.equal(repository.getMemory(fictional.id).status, 'superseded');
   assert.equal(repository.getMemory(real.id).status, 'active');
+});
+
+test('revoking an upgraded accepted preference walks past a withdrawn legacy version', t => {
+  const { database, repository } = setup(); t.after(() => database.close());
+  const evidence = [1, 2, 3, 4].map(index => label(evidenceMemory(repository, {
+    id: `legacy-choice-${index}`, content: '用户主动选择了解谜游戏。', source: '我还是选解谜游戏。',
+    occurredAt: `2026-07-${10 + index}T12:00:00.000Z`,
+  }), 'active_choice', 'support'));
+  const args = { agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: 'user:preference:puzzle-games', subjectLabel: '用户', objectLabel: '解谜游戏',
+    policyVersion: 'preference-test-v1', evidenceReviewMode: 'full_canonical', metadata: { accumulatedPreference: true } };
+  function accepted(level, count) {
+    const proposal = proposePreferenceState(repository, { ...args, proposedLevel: level,
+      previewStatus: level === 'selection_tendency' ? 'selection-tendency' : 'stable-preference-review', evidence: evidence.slice(0, count) });
+    resolvePreferenceStateProposal(repository, { agentId: args.agentId, proposalId: proposal.id, action: 'accept' });
+    return repository.getPreferenceStateProposal(args.agentId, proposal.id);
+  }
+  const first = accepted('selection_tendency', 2);
+  const previous = accepted('stable_preference', 3);
+  // The shipped implementation saved accepted versions and supersedes edges without application receipts.
+  for (const proposal of [first, previous]) database.prepare(`UPDATE memory_preference_state_proposals
+    SET metadata_json=json_remove(metadata_json, '$.preferenceApplication') WHERE id=?`).run(proposal.id);
+  database.prepare("UPDATE memory_nodes SET metadata_json=json_remove(metadata_json, '$.reportedStateTransitionId') WHERE id=?")
+    .run(first.resultMemoryId);
+  const latest = proposePreferenceState(repository, { ...args, proposedLevel: 'stable_preference',
+    previewStatus: 'stable-preference-review', evidence: evidence });
+  resolvePreferenceStateProposal(repository, { agentId: args.agentId, proposalId: previous.id, action: 'dismiss' });
+  assert.equal(repository.getMemory(latest.resultMemoryId).status, 'active');
+  resolvePreferenceStateProposal(repository, { agentId: args.agentId, proposalId: latest.id, action: 'dismiss' });
+  const current = repository.getCurrentCanonicalMemory({ ...args, stateFamily: 'preference', representationLayer: 'inferred' });
+  assert.equal(current?.id, first.resultMemoryId);
+  assert.equal(current.metadata.preferenceStateLevel, 'selection_tendency');
+  assert.equal(repository.getPreferenceStateProposal(args.agentId, first.id).review_state, 'accepted');
+  assert.equal(repository.getMemory(previous.resultMemoryId).status, 'deleted');
 });

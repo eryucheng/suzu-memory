@@ -337,6 +337,7 @@ export function createMemoryHttpServer({
         const body = await readJson(request, bodyLimit);
         success(response, await memory.processPendingEvents({
           signal,
+          ...(body.sourceScope === undefined ? {} : { sourceScope: body.sourceScope }),
           chunkPolicy: body.chunkPolicy,
           maximumEvents: integer(body.maximumEvents, 100, 500),
           maximumContentCharacters: integer(
@@ -382,6 +383,7 @@ export function createMemoryHttpServer({
         const body = await readJson(request, bodyLimit);
         success(response, await memory.runMaintenance({
           signal,
+          ...(body.sourceScope === undefined ? {} : { sourceScope: body.sourceScope }),
           chunkPolicy: body.chunkPolicy,
           lane: clean(body.lane) || "all",
           processInputEvents: body.processInputEvents !== false,
@@ -452,12 +454,27 @@ export function createMemoryHttpServer({
       }
       const highLevelRevocation = highLevelProposalPath(url.pathname, "revoke");
       if (method === "POST" && highLevelRevocation) {
-        if (highLevelRevocation.type !== "relation") {
-          failure(response, 400, "UNSUPPORTED_REVOCATION", "Only accepted relation proposals can be revoked safely.");
+        const { type, id } = highLevelRevocation;
+        if (type === "reported-state" || type === 'structure') {
+          const detail = memory.getReviewConsoleProposal(type, id);
+          if (!detail?.permissions?.canRevoke) {
+            failure(response, 400, "UNSUPPORTED_REVOCATION", `This ${type} proposal has no result it can withdraw.`);
+            return;
+          }
+          const body = await readJson(request, bodyLimit);
+          success(response, memory.resolveHighLevelProposal(type, id, {
+            action: "dismiss",
+            actor: body.actor,
+            reason: body.reason,
+          }));
+          return;
+        }
+        if (type !== "relation") {
+          failure(response, 400, "UNSUPPORTED_REVOCATION", "This proposal type does not support withdrawal.");
           return;
         }
         const body = await readJson(request, bodyLimit);
-        success(response, memory.revokeHighLevelRelation(highLevelRevocation.id, {
+        success(response, memory.revokeHighLevelRelation(id, {
           actor: body.actor,
           reason: body.reason,
         }));
@@ -517,6 +534,7 @@ export function createMemoryHttpServer({
         const body = await readJson(request, bodyLimit);
         success(response, await memory.search(body.query, {
           signal,
+          ...(body.sourceScope === undefined ? {} : { sourceScope: body.sourceScope }),
           now: body.now,
           anchors: body.anchors,
           anchorSelection: body.anchorSelection,

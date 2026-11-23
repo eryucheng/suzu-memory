@@ -4,7 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { appendUsageEvent } from "@suzu-memory/usage-ledger";
-import { proposeMemoryStructure } from "@suzu-memory/core";
+import { proposeMemoryStructure, readOrganizationInput, selectOrganizationInput, assertOrganizationInputCurrent,
+  organizationInputIsCurrent, OrganizationInputChangedError } from "@suzu-memory/core";
+import { organizationRejection } from './rejection.mjs';
 
 import {
   buildStructureGenerationInput,
@@ -34,7 +36,7 @@ function stableBatchId(agentId, memoryIds) {
   return `structure-batch-${hash}`;
 }
 
-async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warnings }) {
+export async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warnings, feature = 'memory-structure-proposal' }) {
   if (!clean(usageLedgerPath) || !generation?.model) return false;
   const usage = generation.usage && typeof generation.usage === "object" ? generation.usage : {};
   if (!Object.keys(usage).length) return false;
@@ -44,7 +46,7 @@ async function recordUsage({ generation, usageLedgerPath, agentId, batchId, warn
       provider: generation.metadata?.provider || "",
       model: generation.model,
       source: "memory-structurer",
-      feature: "memory-structure-proposal",
+      feature,
       requestId: generation.requestId || "",
       usage,
       metadata: {
@@ -86,7 +88,8 @@ export function prepareStructureGeneration({
     ...(snapshot.sourceMaterial ? { sourceMaterial: snapshot.sourceMaterial } : {}),
   }));
   assertGenerationRequestBudget(request, maximumRequestCharacters, generator);
-  return { snapshot, request };
+  return { snapshot, request, inputVersion: readOrganizationInput(repository, agentId,
+    [...snapshot.currentMemories.map(memory => memory.id), ...snapshot.candidateContainers.flatMap(container => [container.id, ...container.memberIds])]) };
 }
 
 export async function proposeStructuresForBatch({
@@ -117,10 +120,11 @@ export async function proposeStructuresForBatch({
     repository, agentId: normalizedAgentId, batchId: normalizedBatchId, memoryIds: normalizedMemoryIds,
     nearbyContainerIds, snapshotOptions, systemPromptPath, generator, maximumProposals: limit, maximumRequestCharacters,
   });
-  const { snapshot, request } = prepared;
+  const { snapshot, request, inputVersion } = prepared;
   if (!request) return { status: "skipped", reason: prepared.reason, batchId: normalizedBatchId,
     snapshot, proposed: [], duplicates: [], rejected: [], usageRecorded: false, warnings: [] };
   if (request.schema.properties.proposals.maxItems !== limit) throw new Error('Prepared structure request does not match maximumProposals.');
+  assertOrganizationInputCurrent(repository, normalizedAgentId, inputVersion);
   generator.assertRequestBudget?.(request);
   const warnings = [];
   let generation;
@@ -137,6 +141,7 @@ export async function proposeStructuresForBatch({
     warnings,
   });
   const parsed = parseStructureGeneration(generation?.output, { maximumProposals });
+  const inputChanged = !organizationInputIsCurrent(repository, normalizedAgentId, inputVersion);
   const proposed = [];
   const duplicates = [];
   const rejected = [];
@@ -149,7 +154,7 @@ export async function proposeStructuresForBatch({
         if (!group) { group = []; attachments.set(guardedCandidate.targetMemoryId, group); operations.push(group); }
         group.push({ index, candidate: guardedCandidate });
       } else operations.push([{ index, candidate: guardedCandidate }]);
-    } catch (error) { rejected.push({ index, error: error.message }); }
+    } catch (error) { rejected.push(organizationRejection(error, { index, candidate, inputVersion, generation })); }
   }
   for (const group of operations) {
     const { index, candidate } = group[0];
@@ -168,6 +173,8 @@ export async function proposeStructuresForBatch({
       }
       const proposal = proposeMemoryStructure(repository, {
         ...guardedCandidate,
+        expectedInput: selectOrganizationInput(inputVersion,
+          [...guardedCandidate.memberIds, guardedCandidate.targetMemoryId, ...(guardedCandidate.expectedTarget?.memberIds || [])]),
         agentId: normalizedAgentId,
         batchId: normalizedBatchId,
         provenance: "memory-structurer-v1",
@@ -179,9 +186,12 @@ export async function proposeStructuresForBatch({
       });
       (proposal.wasInserted ? proposed : duplicates).push(proposal);
     } catch (error) {
-      rejected.push({ index, indices: group.map(item => item.index), error: error.message,
-        retryable: error.code !== 'MEMORY_STRUCTURE_NO_NEW_MEMBERS' });
+      rejected.push(organizationRejection(error, { index, indices: group.map(item => item.index),
+        candidate, inputVersion, generation }));
     }
+  }
+  if (inputChanged && !rejected.some(item => item.category === 'stale-input')) {
+    rejected.push(organizationRejection(new OrganizationInputChangedError(), { index: null, inputVersion, generation }));
   }
   return {
     status: rejected.some(item => item.retryable) ? 'partial-failure'

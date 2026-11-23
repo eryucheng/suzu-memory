@@ -2,6 +2,7 @@ import { selectConvergedSeeds, followMemoryChain } from './memory-chain.mjs';
 import { fuseCandidateLanes, normalizedEvidenceLimit } from './candidate-selection.mjs';
 import { selectRankedContext } from './ranked-context.mjs';
 import { isProvisionalMemory, isStructuredStateMemory } from '@suzu-memory/core';
+import { readRelationContext } from './relation-context.mjs';
 
 /** All searches use the same evidence selection, including anchored follow-ups. */
 export function selectRetrievalContext({ database, agentId, primaryCandidate, candidates,
@@ -25,5 +26,6 @@ export function selectRetrievalContext({ database, agentId, primaryCandidate, ca
     maximum: Math.max(1, normalizedEvidenceLimit(options.maximumContextMemories, 5)), stateView, options });
   const selected = new Set(selection.nodes.map(node => node.id));
   return { nodes: selection.nodes, paths: discovered.paths.filter(path => selected.has(path.memoryId)),
+    relations: readRelationContext({ database, agentId, nodes: selection.nodes, eligibleMemoryIds, options }),
     activation: discovered.activation, selection: selection.audit, seeds };
 }

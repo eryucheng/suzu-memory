@@ -1,12 +1,15 @@
 import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
-import { executionEventSourceView } from '@suzu-memory/core';
+import { readArchivedExtractionEvidence } from '@suzu-memory/extraction';
 import { normalizeCompanionIdentity } from "./protocol.mjs";
 import { DEFAULT_LENGTH_ARCHIVE_POLICY, planReplyChunk, selectReplyChunk } from './reply-chunks.mjs';
 import { logicalArchiveEventId } from './archive-windows.mjs';
 import {
   archiveCompanionEventBatch,
-  buildCompanionExtractionRequest,
+  measureCompanionExtractionRequest,
   companionMessagesFromEvents,
+  currentArchivedInputEvents,
+  isExtractionRetryInput,
+  readExtractionContext,
   generateCompanionEventBatch,
   extractionRepairFailure,
   recordingCompanionEventGenerator,
@@ -83,7 +86,7 @@ function terminalFailureFrom({ failure, recorded }) {
 }
 
 async function rawEvidenceFallback({
-  claimed,
+  events,
   previousContextEvents,
   continuationGuidanceEvents,
   archiveWindows,
@@ -92,7 +95,7 @@ async function rawEvidenceFallback({
   timeZone,
 }) {
   return generateCompanionEventBatch({
-    events: claimed.events,
+    events,
     previousContextEvents,
     continuationGuidanceEvents,
     archiveWindows,
@@ -176,18 +179,32 @@ export async function processPendingCompanionEvents({
     return { status: "skipped", reason: "no-pending-events", eventsProcessed: 0 };
   }
 
+  const retryInputIds = new Set(claimed.events.filter(isExtractionRetryInput).map(event => event.id));
+  const events = currentArchivedInputEvents(repository, agentId, claimed.events, normalizedIdentity);
+  const eligibleIds = events === claimed.events ? null : new Set(events.map(event => event.id));
+  const retryWithdrawnEventIds = eligibleIds ? claimed.events.filter(event => !eligibleIds.has(event.id)).map(event => event.id) : [];
+  if (!events.length) {
+    repository.completeInputBatch(agentId, claimed.batch.id, { success: true, leaseOwner: claimed.batch.lease_owner, completedAt,
+      output: { reason: 'source-invalidated', messagesArchived: 0, retryWithdrawnEventIds } });
+    return { status: 'processed', reason: 'source-invalidated', batchId: claimed.batch.id, eventsProcessed: claimed.events.length,
+      quarantined: claimed.quarantined || [], messagesArchived: 0, generationDiagnostics: { degraded: false } };
+  }
+  if (retryWithdrawnEventIds.length) {
+    const logicalIds = new Set(events.map(logicalArchiveEventId));
+    archiveWindows = archiveWindows.flatMap(window => {
+      const coreEventIds = window.coreEventIds.filter(id => logicalIds.has(id));
+      return coreEventIds.length ? [{ ...window, coreEventIds }] : [];
+    });
+  }
   let generated;
   const processSmallerBatch = async (maximumCoreMessages, errorMessage, recordLimit = true) => {
     const selection = await planReplyChunk({
       ...DEFAULT_LENGTH_ARCHIVE_POLICY, ...chunkPolicy, maximumCoreMessages, flush: true,
-      pending: claimed.events, previous: previousContextEvents,
+      pending: events, previous: previousContextEvents,
       resolveReply: chunkPolicy?.resolveReply,
-      measure: selection => {
-        const { request } = buildCompanionExtractionRequest({ ...selection, identity: normalizedIdentity, systemPrompt, timeZone });
-        return request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100;
-      },
+      measure: selection => measureCompanionExtractionRequest({ ...selection, identity: normalizedIdentity, systemPrompt, timeZone }),
     });
-    if (selection.status !== 'ready' || selection.events.length >= claimed.events.length) return null;
+    if (selection.status !== 'ready' || selection.events.length >= events.length) return null;
     const ids = new Set(selection.events.map(logicalArchiveEventId));
     const smallerWindows = archiveWindows.flatMap(window => {
       const coreEventIds = window.coreEventIds.filter(id => ids.has(id));
@@ -199,9 +216,10 @@ export async function processPendingCompanionEvents({
     repository.releaseInputBatchForSplit(agentId, claimed.batch.id, {
       leaseOwner: claimed.batch.lease_owner, maximumCoreMessages, recordLimit, errorMessage, completedAt,
     });
+    const selected = new Set([...selection.events.map(row => row.id), ...retryWithdrawnEventIds]);
     const result = await processPendingCompanionEvents({ repository, agentId, identity: normalizedIdentity,
-      maximumEvents: selection.events.length, maximumContentCharacters: 10_000_000,
-      candidateEventIds: selection.events.map(row => row.id), leaseSeconds, generator,
+      maximumEvents: selected.size, maximumContentCharacters: 10_000_000,
+      candidateEventIds: [...selected], leaseSeconds, generator,
       previousContextEvents: selection.previousContextEvents,
       continuationGuidanceEvents: selection.continuationGuidanceEvents, archiveWindows: smallerWindows,
       usageLedgerPath, systemPrompt, timeZone, memoriesOverride, now: executionTime });
@@ -212,44 +230,44 @@ export async function processPendingCompanionEvents({
       estimatedRequestCharacters: selection.estimatedRequestCharacters,
       maximumRequestCharacters: selection.maximumRequestCharacters } };
   };
-  const priorLimit = claimed.events[0]?.metadata?.suzuMemoryProcessing?.extractionMaximumMessages;
+  const priorLimit = events[0]?.metadata?.suzuMemoryProcessing?.extractionMaximumMessages;
   if (Number.isSafeInteger(priorLimit) && priorLimit > 0
-    && companionMessagesFromEvents(claimed.events, normalizedIdentity).length > priorLimit) {
+    && companionMessagesFromEvents(events, normalizedIdentity).length > priorLimit) {
     const smaller = await processSmallerBatch(priorLimit, undefined, false);
     if (smaller) return smaller;
   }
-  const sourceView = executionEventSourceView(repository, agentId);
-  if (sourceView) {
-    const eligibleContext = rows => rows.filter(row => sourceView.inputIds.has(row.id))
-      .map(row => repository.getInputEvent(agentId, row.id));
-    previousContextEvents = eligibleContext(previousContextEvents);
-    continuationGuidanceEvents = eligibleContext(continuationGuidanceEvents);
-    archiveWindows = archiveWindows.map(window => ({ ...window,
-      previousContextEvents: eligibleContext(window.previousContextEvents || []),
-      continuationGuidanceEvents: eligibleContext(window.continuationGuidanceEvents || []),
-    }));
-  }
   let terminalGenerationFailure = null;
   const usageWarnings = [];
+  const sourceIsCurrent = retryInputIds.size ? message => !(message.inputEventIds || [message.inputEventId])
+    .some(id => retryInputIds.has(id)) || Boolean(readArchivedExtractionEvidence(repository, agentId, message)) : undefined;
   try {
+    const { select, contextIsCurrent } = readExtractionContext(repository, agentId, normalizedIdentity);
+    previousContextEvents = select(previousContextEvents);
+    continuationGuidanceEvents = select(continuationGuidanceEvents);
+    archiveWindows = archiveWindows.map(window => ({ ...window,
+      previousContextEvents: select(window.previousContextEvents || []),
+      continuationGuidanceEvents: select(window.continuationGuidanceEvents || []),
+    }));
     generated = await generateCompanionEventBatch({
-      events: claimed.events,
+      events,
       previousContextEvents,
       continuationGuidanceEvents,
       archiveWindows,
       identity: normalizedIdentity,
-      generator: recordingCompanionEventGenerator({ generator, usageLedgerPath, executionTime,
+      generator: recordingCompanionEventGenerator({ generator, usageLedgerPath,
         agentId, batchId: claimed.batch.id, warnings: usageWarnings }),
       memoriesOverride,
       systemPrompt,
       timeZone,
+      sourceIsCurrent,
+      contextIsCurrent,
     });
     terminalGenerationFailure = extractionRepairFailure(generated.generation);
   } catch (error) {
     assertEventSourceExecutionCurrent();
     if (error?.code === "INPUT_BATCH_LEASE_LOST") throw error;
     if (error?.code === 'MAX_TOKENS') {
-      const count = companionMessagesFromEvents(claimed.events, normalizedIdentity).length;
+      const count = companionMessagesFromEvents(events, normalizedIdentity).length;
       if (count > 1) {
         const smaller = await processSmallerBatch(Math.max(1, Math.floor(count / 2)), error.message);
         if (smaller) return { ...smaller, warnings: [...(smaller.warnings || []), ...usageWarnings] };
@@ -280,7 +298,7 @@ export async function processPendingCompanionEvents({
     }
     terminalGenerationFailure = terminalFailureFrom({ failure, recorded });
     generated = await rawEvidenceFallback({
-      claimed,
+      events,
       previousContextEvents,
       continuationGuidanceEvents,
       archiveWindows,
@@ -301,6 +319,8 @@ export async function processPendingCompanionEvents({
       completedAt,
       terminalFailure: terminalGenerationFailure,
       identity: normalizedIdentity,
+      retryInputIds,
+      retryWithdrawnEventIds,
     });
   } catch (error) {
     assertEventSourceExecutionCurrent();
@@ -326,7 +346,7 @@ export async function processPendingCompanionEvents({
     }
     terminalGenerationFailure = terminalFailureFrom({ failure, recorded });
     generated = await rawEvidenceFallback({
-      claimed,
+      events,
       previousContextEvents,
       continuationGuidanceEvents,
       archiveWindows,
@@ -343,6 +363,8 @@ export async function processPendingCompanionEvents({
         completedAt,
         terminalFailure: terminalGenerationFailure,
         identity: normalizedIdentity,
+        retryInputIds,
+        retryWithdrawnEventIds,
       });
     } catch (fallbackError) {
       failBatch(
@@ -357,6 +379,8 @@ export async function processPendingCompanionEvents({
     }
   }
 
+  generated = archive.generated;
+  terminalGenerationFailure = archive.terminalFailure;
   const postProcessing = archive.postProcessing || {
     relationshipMemberships: { status: "skipped", linked: 0 },
     associations: { status: "skipped", memories: 0 },
@@ -385,7 +409,7 @@ export async function processPendingCompanionEvents({
     eventsProcessed: claimed.events.length,
     quarantined: claimed.quarantined || [],
     inputCharacters: claimed.batch.input_character_count,
-    promptCharacters: generated.input.length,
+    promptCharacters: (generated.modelInput ?? generated.input).length,
     previousContextMessages: generated.previousContextMessages.length,
     continuationGuidanceMessages: generated.continuationGuidanceMessages.length,
     archiveWindows: generated.archiveWindows.length,

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
+  applyAutomaticReportedState,
   materializeReportedStateProposal,
   MEMORY_STATE_FAMILIES,
   REPORTED_STATE_PROPOSAL_ACTIONS,
@@ -61,14 +62,28 @@ export function proposeReportedStateFromReview({
   if (currentStateId !== snapshotCurrentStateId) {
     throw new Error("Reported state review current state does not match its snapshot.");
   }
-  const selectedObservationId = clean(reviewResult.selectedObservationId);
-  const consideredObservationIds = [...new Set(
+  let selectedObservationId = clean(reviewResult.selectedObservationId);
+  let consideredObservationIds = [...new Set(
     (Array.isArray(reviewResult.consideredObservationIds)
       ? reviewResult.consideredObservationIds
       : []).map(clean).filter(Boolean),
   )];
   if (!selectedObservationId || !consideredObservationIds.includes(selectedObservationId)) {
     throw new Error("Reported state review does not preserve its selected evidence observation.");
+  }
+  let proposedState = reviewResult.proposedState || null;
+  if (action === "reinforce" && stateFamily === "preference" && proposedState) {
+    const attached = new Set(repository.listMemorySources(currentStateId).map(source => source.id));
+    const contributors = new Set(proposedState.evidenceObservationIds);
+    const observations = new Map(snapshot.observations.map(item => [item.id, item]));
+    const additions = consideredObservationIds.filter(id => contributors.has(id))
+      .map(id => observations.get(id)).filter(item => item?.sourceIds.some(id => !attached.has(id)));
+    if (!additions.length) return { status: "skipped", reason: "evidence-already-attached", proposal: null };
+    consideredObservationIds = additions.map(item => item.id);
+    if (!consideredObservationIds.includes(selectedObservationId)) selectedObservationId = consideredObservationIds[0];
+    proposedState = { ...proposedState, evidenceObservationIds: consideredObservationIds,
+      evidenceMemoryIds: [...new Set(additions.map(item => item.memoryId))],
+      evidenceSourceIds: [...new Set(additions.flatMap(item => item.sourceIds))] };
   }
   const normalizedReviewVersion = clean(reviewVersion);
   if (!normalizedReviewVersion) throw new Error("Reported state review version is required.");
@@ -78,7 +93,7 @@ export function proposeReportedStateFromReview({
     representationLayer,
     action,
     currentStateId,
-    proposedState: reviewResult.proposedState || null,
+    proposedState,
     selectedObservationId,
     consideredObservationIds,
     snapshot,
@@ -92,7 +107,8 @@ export function proposeReportedStateFromReview({
     canonicalKey: target.canonicalKey,
     action,
     previousMemoryId: currentStateId || null,
-    proposedState: reviewResult.proposedState || null,
+    targetScopeKey: target.stateScopeKey,
+    proposedState,
     reviewVersion: normalizedReviewVersion,
     inputHash,
     selectedObservationId,
@@ -106,10 +122,15 @@ export function proposeReportedStateFromReview({
       truthBoundary: reviewResult.truthBoundary || {},
     },
   });
-  materializeReportedStateProposal(repository, { agentId: snapshot.agentId, proposalId: proposal.id });
+  const application = proposal.review_state === 'pending' && stateFamily !== 'preference'
+    ? applyAutomaticReportedState({ repository, agentId: snapshot.agentId, proposalId: proposal.id })
+    : null;
+  const applied = application?.resolution
+    || materializeReportedStateProposal(repository, { agentId: snapshot.agentId, proposalId: proposal.id });
   return {
-    status: "pending",
+    status: applied.proposal.review_state === "pending" ? "pending" : "existing",
     reason: "",
-    proposal,
+    proposal: { ...applied.proposal, wasInserted: proposal.wasInserted },
+    ...(application ? { automaticApplication: application } : {}),
   };
 }

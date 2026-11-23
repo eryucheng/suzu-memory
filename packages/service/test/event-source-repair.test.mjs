@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createMemoryService, inspectDatabaseBackup } from '@suzu-memory/service';
-import { openMemoryDatabase, stateScopeKeyFromScope } from '@suzu-memory/core';
+import { openMemoryDatabase, stateScopeKeyFromScope, applyReportedStateProposal, materializeReportedStateProposal } from '@suzu-memory/core';
 
 const at = '2026-09-06T04:00:00.000Z';
 const scope = (upper = 20, clears = []) => ({ owner: 'repair-events', agentId: 'agent-a', eventUpperBound: upper, clears });
@@ -33,6 +33,42 @@ function link(repository, exception, root) {
     direction: 'directed', weight: 1, confidence: 1, provenance: 'accepted-reported-state-proposal-v1' });
 }
 const sources = memory => memory.withRepository(repository => repository.database.prepare('SELECT * FROM source_records').all());
+
+test('erasing the source of a current replacement leaves the independent previous state usable', async t => {
+  const { memory } = fixture(t);
+  t.after(() => memory.close());
+  const agentId = memory.agentId, canonicalKey = 'user:goal:gallery-visit';
+  const original = '我计划周六去看展。', correction = '改到周日去看展。';
+  const later = '2026-09-06T05:00:00.000Z';
+  memory.appendEventSources({ scope: scope(), events: [event('plan-source', 1, original),
+    { ...event('correction-source', 2, correction, 'cleared-space'), occurredAt: later }] });
+  await archive(memory);
+  const [first, replacement] = memory.withRepository(repository => {
+    const save = (text, action, time, previousMemoryId) => {
+      const evidence = repository.listMemories(agentId, { kinds: ['utterance'] }).items.find(item => item.content === text);
+      const sourceIds = repository.listMemorySources(evidence.id).map(source => source.id);
+      const target = { stateFamily: 'goal', subjectRole: 'user', subjectKey: 'user-a', canonicalKey, representationLayer: 'reported' };
+      const observed = repository.recordStateEvidenceObservation({ ...target, agentId, memoryId: evidence.id,
+        id: `goal-evidence-${action}`, evidenceGroupId: evidence.id, origin: 'deterministic',
+        signal: 'explicit_goal', claimedDirection: 'support', effectiveDirection: 'support', qualification: 'qualified',
+        scope: { currentRepresentationLayer: 'reported' }, payloadSchemaVersion: '1', payload: { text }, sourceIds, observedAt: time });
+      return repository.recordReportedStateProposal({ ...target, agentId, action, previousMemoryId,
+        reviewVersion: 'goal-repair', inputHash: time, selectedObservationId: observed.id, consideredObservationIds: [observed.id],
+        proposedState: { ...target, kind: 'plan', goalClaim: { text }, temporalState: 'current', statePhase: 'active', validFrom: time,
+          evidenceObservationIds: [observed.id], evidenceMemoryIds: [evidence.id], evidenceSourceIds: sourceIds } });
+    };
+    const base = applyReportedStateProposal(repository, { agentId, proposalId: save(original, 'create', at, null).id }).memory;
+    const changed = materializeReportedStateProposal(repository, { agentId, proposalId: save(correction, 'supersede', later, base.id).id }).memory;
+    return [base, changed];
+  });
+  assert.equal(memory.getMemory(first.id).memory.status, 'superseded');
+  const cleared = scope(20, [{ spaceId: 'cleared-space', throughSequence: 2 }]);
+  assert.equal(memory.eraseEventSources({ id: 'erase-plan-correction', scope: cleared }).complete, true);
+  assert.equal(memory.getMemory(first.id).memory.status, 'active');
+  const result = await memory.search('哪天去看展', { sourceScope: cleared, anchors: [first.id], now: later, persistTrace: false });
+  assert.ok(result.graph.selectedMemoryIds.includes(first.id));
+  assert.ok(!result.graph.selectedMemoryIds.includes(replacement.id));
+});
 
 for (const primaryKind of ['root', 'exception']) for (const excluded of ['future', 'cleared', 'unknown']) {
   test(`scoped state ${primaryKind} preserves its body and excludes a ${excluded} completion`, async t => {

@@ -49,6 +49,48 @@ test('scope-only nested executions do not materialize event bodies or evidence',
   assert.equal(materialReads, 0);
 });
 
+test('source input pages read only the selected source and retain retracted fragments', t => {
+  const { memory } = fixture(t);
+  memory.appendEventSources({ scope: scope(60), events: [
+    ...Array.from({ length: 20 }, (_, i) => event(`unrelated-${i}`, i + 1, `Unrelated ${i}`)),
+    event('fragment-source', 50, '海边旅行的实际记录。'.repeat(6000)),
+  ] });
+  const prepare = DatabaseSync.prototype.prepare, plans = [];
+  let readRows = 0;
+  t.mock.method(DatabaseSync.prototype, 'prepare', function (sql) {
+    const statement = prepare.call(this, sql);
+    if (!/^SELECT \* FROM memory_input_events\b/u.test(sql)) return statement;
+    const database = this;
+    return new Proxy(statement, { get(target, key) {
+      if (key === 'all') return (...args) => {
+        plans.push(prepare.call(database, 'EXPLAIN QUERY PLAN ' + sql).all(...args).map(row => row.detail));
+        const rows = target.all(...args); readRows += rows.length; return rows;
+      };
+      const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  });
+  const selected = { owner, spaceId: 'direct-a', commitSequence: 50, limit: 1 };
+  const first = memory.listEventSourceInputs(selected);
+  assert.ok(first.total > 1, 'Use real fragmented input.');
+  const family = [first.items[0]];
+  for (let offset = 1; offset < first.total; offset++) family.push(...memory.listEventSourceInputs({ ...selected, offset }).items);
+  assert.equal(readRows, first.total);
+  assert.ok(family.every(row => row.metadata.eventSource.eventId === 'fragment-source'));
+  assert.ok(plans.every(plan => plan.some(detail => /SEARCH memory_input_events USING INDEX/u.test(detail)
+    && (detail.match(/<expr>=\?/gu) || []).length === 3)
+    && !plan.some(detail => /^SCAN memory_input_events/u.test(detail))));
+  memory.reviseEvent(family[0].metadata.suzuMemoryFragment.parentEventId, {
+    action: 'retract', revisionId: 'retract-selected-source', reason: 'Source removed.',
+  });
+  const after = memory.listEventSourceInputs({ ...selected, limit: 500 });
+  assert.equal(after.total, first.total);
+  assert.ok(after.items.every(row => row.lifecycle === 'retracted'));
+  assert.equal(memory.listEventSourceInputs({ ...selected, owner: 'another-owner' }).total, 0);
+  assert.equal(memory.listEventSourceInputs({ ...selected, spaceId: 'another-space' }).total, 0);
+  assert.throws(() => memory.listEventSourceInputs({ ...selected, limit: 501 }), /bounded page/u);
+  t.diagnostic(JSON.stringify({ sourceRows: first.total, unrelatedSources: 20, plans: plans[0] }));
+});
+
 test('public consumption progress stays scoped and advances only with a committed batch', t => {
   const { memory } = fixture(t);
   assert.equal(memory.getEventSourceProgress({ scope: scope() }).consumedThroughSequence, 0);
@@ -496,11 +538,11 @@ test('review retries revalidate saved boundary context before sending it to a mo
   const byText = text => inputs.find(input => input.content.text === text);
   const result = await memory.processPendingEvents({ sourceScope: scope(), candidateEventIds: [byText('I swam with that dog.').id],
     previousContextEvents: [byText('The dog is named Mochi.')], continuationGuidanceEvents: [byText('Then we went home.')],
-    generator: async request => ({ output: request.schemaName.endsWith('repair-v4')
+    generator: async request => ({ output: request.schemaName === 'long-term-memory-extraction-repair-v5'
       ? { results: [{ candidateIndex: 0, status: 'pending', reason: 'Correction remains unresolved.' }] }
       : { memories: [{ title: 'Swimming', content: 'Alice swam with Mochi.', classification: { category: 'event' },
         subject: { name: 'Alice' }, actors: [], reality: 'real', evidenceMode: 'explicit', temporalState: 'historical',
-        time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'] }] } }),
+        revisionAction: 'add', time: null, confidence: 1, sourceRefs: ['M0001'] }] } }),
   });
   const task = memory.withRepository(repository => repository.getMaintenanceTask('agent-a', result.generationDiagnostics.failureReviewTaskId), { sourceScope: scope() });
   assert.equal(task.payload.extractionRepair.contextWindows[0].previousContextMessages[0].text, 'The dog is named Mochi.');

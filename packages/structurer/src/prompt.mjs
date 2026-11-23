@@ -1,4 +1,5 @@
 import { structureGenerationMaterial } from './generation-input.mjs';
+import { OrganizationCandidateError } from '@suzu-memory/core';
 import fs from 'node:fs';
 
 export const STRUCTURE_SUMMARY_INSTRUCTIONS = fs.readFileSync(
@@ -68,6 +69,7 @@ const createFields = {
   operation: { type: 'string', enum: ['create'] },
   kind: { type: 'string', enum: ['episode', 'topic'] },
   ...summaryFields,
+  memberIds: { ...summaryFields.memberIds, minItems: 2 },
   subjectRole: { type: 'string', enum: ['user', 'agent', 'shared', 'other', 'world', 'unknown'] },
   subjectKey: { type: 'string' },
   actorRoles: { type: 'array', items: actorRoleSchema },
@@ -81,21 +83,45 @@ const attachFields = {
 // The model uses two uniform lists. Application consumers retain one proposal contract.
 export function withStructureModelOutput(request) {
   const limit = request.schema.properties.proposals.maxItems;
+  const variants = request.schema.properties.proposals.items.anyOf;
+  const createTemplate = variants.find(item => item.properties.operation.enum.includes('create')).properties;
+  const attachTemplate = variants.find(item => item.properties.operation.enum.includes('attach')).properties;
+  // Required scalar references do not depend on provider support for minItems.
+  const memberFields = { firstMemberId: { type: 'string' },
+    additionalMemberIds: { type: 'array', items: { type: 'string' } } };
+  const creationFields = { ...createTemplate, ...memberFields, secondMemberId: { type: 'string' } };
+  const attachmentFields = { ...attachTemplate, additionalMemberIds: memberFields.additionalMemberIds,
+    selection: { type: 'object', additionalProperties: false, required: ['targetMemoryId', 'firstMemberId'],
+      properties: { targetMemoryId: attachFields.targetMemoryId, firstMemberId: memberFields.firstMemberId } } };
+  delete creationFields.memberIds; delete attachmentFields.memberIds;
+  delete attachmentFields.targetMemoryId;
   const list = fields => ({ type: 'array', maxItems: limit, items: {
     type: 'object', additionalProperties: false,
     required: Object.keys(fields).filter(key => key !== 'operation'),
     properties: Object.fromEntries(Object.entries(fields).filter(([key]) => key !== 'operation')),
   } });
+  const selectionInstructions = request.schemaName === 'memory-structure-memberships-v1'
+    ? '每个字段只选 selectionScope 对应列表中的 ID。同一提案内成员不得重复。追加的 targetMemoryId 和 firstMemberId 必须来自同一个 targets 条目。没有额外成员时补充列表为空。选择表中为 null 的类别返回空列表。'
+    : '每个字段只选 Schema 给出的 ID，不重复引用。没有额外成员时补充列表为空。Schema 为 null 的类别没有可执行操作，返回 null。';
   return { ...request,
-    systemPrompt: `${request.systemPrompt}\n\n新建分组写入 creations，追加已有分组写入 attachments；两份列表合计最多 ${limit} 条。`,
+    systemPrompt: `${request.systemPrompt}\n\n新建分组写入 creations，追加已有分组写入 attachments；两份列表合计最多 ${limit} 条。`
+      + '\ncreations 用 firstMemberId 和 secondMemberId 选择两个不同的必要成员，其余成员放入 additionalMemberIds。attachments 的 selection 同时选择 targetMemoryId 和一个必需的新增成员 firstMemberId；additionalMemberIds 填写其余相关新增成员，排除目标已拥有的成员。'
+      + selectionInstructions,
     modelSchema: { type: 'object', additionalProperties: false, required: ['creations', 'attachments'],
-      properties: { creations: list(createFields), attachments: list(attachFields) } },
+      properties: { creations: list(creationFields), attachments: list(attachmentFields) } },
     decodeModelOutput: output => {
-      if (!output || !Array.isArray(output.creations) || !Array.isArray(output.attachments)) {
+      if (!output || !['creations', 'attachments'].every(key => output[key] === null || Array.isArray(output[key]))) {
         throw new Error('Structure model output requires creations and attachments lists.');
       }
       return { proposals: [['creations', 'create'], ['attachments', 'attach']].flatMap(([key, operation]) =>
-        output[key].map(item => ({ ...item, operation }))) };
+        (output[key] || []).map(item => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+          const { selection, firstMemberId, secondMemberId, additionalMemberIds, ...fields } = item;
+          if (additionalMemberIds !== undefined && !Array.isArray(additionalMemberIds)) return { ...fields, operation, memberIds: [] };
+          return { ...fields, ...(operation === 'attach' ? { targetMemoryId: selection?.targetMemoryId } : {}),
+            operation, memberIds: [...new Set([operation === 'attach' ? selection?.firstMemberId : firstMemberId,
+            ...(operation === 'create' ? [secondMemberId] : []), ...(additionalMemberIds || [])].filter(Boolean))] };
+        })) };
     },
   };
 }
@@ -115,6 +141,18 @@ export const MEMORY_STRUCTURE_OUTPUT_SCHEMA = Object.freeze({
   },
 });
 
+// Membership decisions have their own contract. Summaries belong to the final
+// member set, so a staged decision never fabricates an intermediate summary.
+export const MEMORY_STRUCTURE_MEMBERSHIP_SCHEMA = Object.freeze({ ...MEMORY_STRUCTURE_OUTPUT_SCHEMA,
+  properties: { proposals: { ...MEMORY_STRUCTURE_OUTPUT_SCHEMA.properties.proposals,
+    items: { anyOf: [createFields, attachFields].map(fields => {
+      const properties = Object.fromEntries(Object.entries(fields).filter(([key]) => key !== 'content'
+        && !(fields === attachFields && key === 'title')));
+      return { type: 'object', additionalProperties: false, required: Object.keys(properties), properties };
+    }) },
+  } },
+});
+
 export function buildStructureGenerationInput(snapshot) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new Error("Memory structure generation requires a snapshot object.");
@@ -122,7 +160,7 @@ export function buildStructureGenerationInput(snapshot) {
   return JSON.stringify(structureGenerationMaterial(snapshot));
 }
 
-export function parseStructureGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS } = {}) {
+export function parseStructureGeneration(value, { maximumProposals = DEFAULT_MAXIMUM_PROPOSALS, onRejected } = {}) {
   let parsed = value;
   if (typeof parsed === "string") {
     const text = parsed.replace(/^\uFEFF/u, "").trim();
@@ -145,11 +183,14 @@ export function parseStructureGeneration(value, { maximumProposals = DEFAULT_MAX
       { code: 'MEMORY_STRUCTURE_OUTPUT_FULL' });
   }
   return {
-    proposals: parsed.proposals.map((proposal, index) => {
-      if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
-        throw new Error(`Structure proposal ${index} must be an object.`);
+    proposals: parsed.proposals.flatMap((proposal, index) => {
+      if (proposal instanceof OrganizationCandidateError || !proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
+        const error = proposal instanceof OrganizationCandidateError ? proposal : new Error(`Structure proposal ${index} must be an object.`);
+        if (!onRejected) throw error;
+        onRejected({ index, error });
+        return [];
       }
-      return {
+      return [{
         operation: clean(proposal.operation),
         targetMemoryId: clean(proposal.targetMemoryId),
         kind: clean(proposal.kind),
@@ -164,7 +205,7 @@ export function parseStructureGeneration(value, { maximumProposals = DEFAULT_MAX
         actorRoles: Array.isArray(proposal.actorRoles) ? proposal.actorRoles : [],
         confidence: proposal.confidence,
         rationale: clean(proposal.rationale),
-      };
+      }];
     }),
   };
 }

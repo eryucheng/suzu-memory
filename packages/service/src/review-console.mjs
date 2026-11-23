@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveExtractedCandidateIdentity, resolveExtractionParticipant } from '@suzu-memory/extraction';
+import { appliedReportedStateMemory, withdrawableReportedStateMemory,
+  appliedPreferenceStateMemory, relationProposalOwnsEdge } from '@suzu-memory/core';
 
 import { inspectDatabaseBackup } from "./database-backup.mjs";
 
@@ -364,6 +366,9 @@ function reportedStateDetail(repository, agentId, proposal) {
     WHERE agent_id = ? AND layer = 'provisional'
       AND json_extract(metadata_json, '$.reportedStateProposalId') = ? LIMIT 1`).get(agentId, proposal.id)?.id;
   const pending = pendingId ? repository.getMemory(pendingId) : null;
+  const result = appliedReportedStateMemory(repository, proposal);
+  const applied = Boolean(result);
+  const preview = result || pending;
   const observations = (proposal.consideredObservationIds || []).map((observationId) => {
     const observation = repository.getStateEvidenceObservation(agentId, observationId);
     if (!observation) return null;
@@ -389,12 +394,12 @@ function reportedStateDetail(repository, agentId, proposal) {
   }).filter(Boolean);
   return {
     writePreview: {
-      kind: clean(pending?.kind || proposal.draft?.kind),
-      title: clean(pending?.title || proposal.draft?.title),
-      content: clean(pending?.content || proposal.draft?.content),
+      kind: clean(preview?.kind || proposal.draft?.kind),
+      title: clean(preview?.title || proposal.draft?.title),
+      content: clean(preview?.content || proposal.draft?.content),
       stateFamily: clean(proposal.state_family),
-      statePhase: clean(pending?.state_phase || proposal.state_phase),
-      temporalState: clean(pending?.temporal_state || proposal.temporal_state),
+      statePhase: clean(preview?.state_phase || proposal.state_phase),
+      temporalState: clean(preview?.temporal_state || proposal.temporal_state),
       subjectRole: clean(proposal.subject_role),
       subjectKey: clean(proposal.subject_key),
       canonicalKey: clean(proposal.canonical_key),
@@ -403,7 +408,11 @@ function reportedStateDetail(repository, agentId, proposal) {
       action: clean(proposal.action),
     },
     currentState: compactMemory(previous),
-    appliedBeforeReview: Boolean(pending?.metadata?.reportedStateTransition),
+    applied,
+    evidenceSuspended: Boolean(proposal.metadata?.reportedStateTransitionSuspended
+      || pending?.metadata?.reportedStateSuspendedStatus
+      || (!applied && proposal.resultMemoryId && repository.getMemory(proposal.resultMemoryId)?.metadata?.reportedStateSuspendedStatus)),
+    appliedBeforeReview: applied || Boolean(pending?.metadata?.reportedStateTransition),
     observations,
     evidence: uniqueEvidence(observations.flatMap((item) => item.sources)),
     members: [],
@@ -412,6 +421,7 @@ function reportedStateDetail(repository, agentId, proposal) {
 }
 
 function structureDetail(repository, agentId, proposal) {
+  const resultMemory = proposal.result_memory_id ? repository.getMemory(proposal.result_memory_id) : null;
   const members = (proposal.memberIds || []).map((memoryId) => {
     const detail = memoryDetail(repository, agentId, memoryId);
     return detail ? {
@@ -423,6 +433,7 @@ function structureDetail(repository, agentId, proposal) {
     } : null;
   }).filter(Boolean);
   return {
+    applied: ['pending', 'accepted'].includes(proposal.review_state) && resultMemory?.status === 'active',
     writePreview: {
       kind: clean(proposal.kind),
       title: clean(proposal.title),
@@ -451,6 +462,7 @@ function preferenceDetail(repository, agentId, proposal) {
         .map(source => evidenceSource(source, { kind: "source", memoryId: item.memoryId })) };
   });
   return {
+    applied: Boolean(appliedPreferenceStateMemory(repository, proposal)),
     writePreview: { kind: proposal.proposed_kind, title: proposal.title, content: proposal.content,
       stateFamily: "preference", representationLayer: proposal.representation_layer,
       proposedLevel: proposal.proposed_level, subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
@@ -464,6 +476,9 @@ function relationDetail(repository, agentId, proposal) {
   const from = memoryDetail(repository, agentId, proposal.from_memory_id);
   const to = memoryDetail(repository, agentId, proposal.to_memory_id);
   return {
+    applied: ['pending', 'accepted'].includes(proposal.review_state)
+      && proposal.evidence.every(source => source.lifecycle === 'active')
+      && relationProposalOwnsEdge(proposal, repository.getEdge(agentId, proposal.result_edge_id)),
     writePreview: {
       relation: clean(proposal.relation),
       direction: clean(proposal.direction),
@@ -471,6 +486,7 @@ function relationDetail(repository, agentId, proposal) {
       toMemoryId: clean(proposal.to_memory_id),
       weight: Number(proposal.weight || 0),
       rationale: clean(proposal.rationale),
+        scope: clean(proposal.metadata?.scope),
     },
     currentState: null,
     observations: [],
@@ -506,16 +522,21 @@ export function buildReviewProposalDetail({ repository, agentId, envelope }) {
       ? structureDetail(repository, agentId, proposal)
       : relationDetail(repository, agentId, proposal);
   const canRetryLongTermExtraction = Boolean(detail.maintenanceFailure?.canRetryLongTermExtraction);
+  const reportedPreference = type === 'reported-state' && proposal.state_family === 'preference';
+  const preference = reportedPreference || type === 'preference-state';
   return {
     ...proposalSummary(type, proposal),
     proposal,
     ...detail,
     permissions: {
       canAccept: proposal.review_state === "pending"
+        && !detail.evidenceSuspended
+        && (!preference || detail.applied)
         && (type !== "maintenance-failure"
           || (detail.reviewableCandidateCount > 0 && !canRetryLongTermExtraction)),
       canDismiss: proposal.review_state === "pending",
-      canRevoke: type === "relation" && proposal.review_state === "accepted",
+      canRevoke: (type === "relation" || type === 'structure' || type === 'reported-state' || preference) && proposal.review_state === "accepted"
+        && (type === 'reported-state' ? Boolean(withdrawableReportedStateMemory(repository, proposal)) : detail.applied),
       canRetryLongTermExtraction,
     },
   };

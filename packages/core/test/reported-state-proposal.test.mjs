@@ -10,12 +10,16 @@ import { syncMemoryEmbeddings } from "../../embedding-indexer/src/index.mjs";
 import { runSemanticMemoryMaintenance } from "../../maintenance/src/index.mjs";
 import { MemoryService } from "../../service/src/index.mjs";
 import { buildReviewProposalDetail } from "../../service/src/review-console.mjs";
+import { readReportedStateTransition } from '../src/reported-state-policy.mjs';
 
 import {
   MemoryRepository,
   openMemoryDatabase,
   resolveReportedStateProposal,
+  applyReportedStateProposal,
+  recoverAutomaticallyReviewedStates,
   materializeReportedStateProposal,
+  materializePendingReportedStateProposals,
   stateScopeKeyFromScope,
 } from "../src/index.mjs";
 
@@ -239,21 +243,85 @@ test("rejects cross-layer evidence, family-kind mismatch, and stale current stat
   database.close();
 });
 
-test("accepts create, reinforce, and supersede as three distinct reported-state actions", () => {
+for (const scenario of ['pending', 'accepted', 'edited', 'newer', 'withdrawn', 'withdrawn-during-removal']) test(`restoring original speech recovers only its still-valid reported preference, ${scenario}`, t => {
   const { database, repository } = setup();
-  const initialObservation = addReportedBeliefObservation(repository, {
+  t.after(() => database.close());
+  const agentId = 'agent-test', canonicalKey = 'user:preference:rain';
+  const target = { agentId, stateFamily: 'preference', subjectRole: 'user', subjectKey: 'user', canonicalKey };
+  function statement(id, sourceContent, validFrom, polarity = 'positive') {
+    const observation = addReportedBeliefObservation(repository, { id, stateFamily: 'preference', canonicalKey,
+      signal: 'explicit_preference', sourceContent, content: sourceContent, occurredAt: validFrom });
+    const { proposition, ...draft } = beliefDraft(observation, { validFrom });
+    const proposal = repository.recordReportedStateProposal({ ...target, action: 'create',
+      proposedState: { ...draft, kind: 'preference', stateFamily: 'preference', canonicalKey,
+        preferenceClaim: { polarity, scope: { kind: 'exact_object', label: 'rain', context: '' } } },
+      reviewVersion: 'reported-preference-review-v1', inputHash: createHash('sha256').update(id).digest('hex'),
+      selectedObservationId: observation.id, consideredObservationIds: [observation.id] });
+    const applied = materializeReportedStateProposal(repository, { agentId, proposalId: proposal.id });
+    return { observation, proposal: applied.proposal, memory: applied.memory };
+  }
+  const original = statement('original', 'I like rainy days.', '2026-08-02T08:00:00.000Z');
+  const current = () => repository.getCurrentCanonicalMemory({ ...target, representationLayer: 'reported' });
+  assert.equal(current().id, original.memory.id);
+  if (scenario === 'accepted' || scenario.startsWith('withdrawn')) {
+    resolveReportedStateProposal(repository, { agentId, proposalId: original.proposal.id, action: 'accept' });
+  }
+  if (scenario === 'withdrawn') resolveReportedStateProposal(repository, { agentId, proposalId: original.proposal.id, action: 'dismiss' });
+  const rawId = original.observation.memory_id;
+  repository.setMemoryDeleted({ agentId, memoryId: rawId });
+  assert.equal(current(), null);
+  assert.equal(repository.listStateEvidenceObservations(agentId, { ...target, memoryId: rawId }).length, 0);
+  if (scenario !== 'withdrawn') assert.throws(() => repository.setMemoryDeleted({ agentId, memoryId: original.memory.id, deleted: false }),
+    /restoring its original evidence/u);
+  if (scenario === 'withdrawn-during-removal') {
+    const proposal = repository.getReportedStateProposal(agentId, original.proposal.id);
+    assert.equal(buildReviewProposalDetail({ repository, agentId, envelope: { type: 'reported-state', proposal } }).permissions.canRevoke, true);
+    resolveReportedStateProposal(repository, { agentId, proposalId: original.proposal.id, action: 'dismiss' });
+  }
+  if (scenario === 'edited') repository.editMemoryManually({ agentId, memoryId: rawId,
+    patch: { content: 'I meant that I like snowy days.' } });
+  const newer = scenario === 'newer' ? statement('later', 'I dislike rainy days.', '2026-08-03T08:00:00.000Z', 'negative') : null;
+
+  repository.setMemoryDeleted({ agentId, memoryId: rawId, deleted: false });
+  assert.equal(repository.getMemory(rawId).status, 'active');
+  const saved = repository.getReportedStateProposal(agentId, original.proposal.id);
+  if (scenario === 'pending' || scenario === 'accepted') {
+    assert.equal(current().id, original.memory.id);
+    assert.equal(saved.resultMemoryId, original.memory.id);
+    assert.equal(saved.review_state, scenario);
+    assert.ok(repository.findEdge({ agentId, fromMemoryId: original.memory.id, toMemoryId: rawId, relation: 'supported_by' }));
+  } else {
+    assert.equal(repository.getMemory(original.memory.id).status, 'deleted');
+    assert.equal(current()?.id || null, newer?.memory.id || null);
+  }
+});
+
+test("applies and withdraws preference reinforcement while keeping later evidence and state versions", () => {
+  const { database, repository } = setup();
+  const target = 'user:preference:rain';
+  const addObservation = (fields) => addReportedBeliefObservation(repository, {
+    stateFamily: 'preference', canonicalKey: target, signal: 'explicit_preference', ...fields,
+  });
+  const draft = (observation, { validFrom, polarity = 'positive' } = {}) => {
+    const { proposition, ...fields } = beliefDraft(observation, { validFrom });
+    return { ...fields, kind: 'preference', stateFamily: 'preference', canonicalKey: target,
+      preferenceClaim: { polarity, scope: { kind: 'exact_object', label: '雨天', context: '' } } };
+  };
+  const initialObservation = addObservation({
     id: "initial-rain-belief",
+    sourceContent: '我喜欢雨天安静的感觉。',
+    content: '用户喜欢雨天安静的感觉。',
     occurredAt: "2026-08-02T08:00:00.000Z",
   });
   const initialProposal = repository.recordReportedStateProposal({
     agentId: "agent-test",
     batchId: "initial-review",
-    stateFamily: "belief",
+    stateFamily: "preference",
     subjectRole: "user",
     subjectKey: "user",
-    canonicalKey: TARGET,
+    canonicalKey: target,
     action: "create",
-    proposedState: beliefDraft(initialObservation),
+    proposedState: draft(initialObservation),
     reviewVersion: "reported-belief-review-v1",
     inputHash: createHash("sha256").update("initial-review").digest("hex"),
     selectedObservationId: initialObservation.id,
@@ -267,10 +335,10 @@ test("accepts create, reinforce, and supersede as three distinct reported-state 
     resolvedBy: "tester",
   });
   assert.equal(created.status, "created");
-  assert.equal(created.memory.content, "用户明确说自己觉得雨天很安静。");
-  assert.equal(created.memory.state_family, "belief");
+  assert.equal(created.memory.content, "用户喜欢雨天安静的感觉。");
+  assert.equal(created.memory.state_family, "preference");
   assert.equal(created.memory.representation_layer, "reported");
-  assert.equal(created.memory.metadata.reportedStateDraft.proposition.text, "我觉得雨天很安静。");
+  assert.equal(created.memory.metadata.reportedStateDraft.preferenceClaim.scope.label, "雨天");
   assert.equal(repository.findEdge({
     agentId: "agent-test",
     fromMemoryId: created.memory.id,
@@ -278,29 +346,44 @@ test("accepts create, reinforce, and supersede as three distinct reported-state 
     relation: "supported_by",
   }).relation, "supported_by");
 
-  const reinforcement = addReportedBeliefObservation(repository, {
+  const reinforcement = addObservation({
     id: "reinforce-rain-belief",
-    sourceContent: "我还是觉得雨天很安静。",
-    content: "用户再次明确表示自己觉得雨天很安静。",
+    sourceContent: "我还是喜欢雨天这种安静的感觉。",
+    content: "用户再次明确表示喜欢雨天的安静。",
     occurredAt: "2026-08-03T08:00:00.000Z",
   });
-  const reinforceProposal = repository.recordReportedStateProposal({
+  const reinforceInput = {
     agentId: "agent-test",
-    stateFamily: "belief",
+    stateFamily: "preference",
     subjectRole: "user",
     subjectKey: "user",
-    canonicalKey: TARGET,
+    canonicalKey: target,
     action: "reinforce",
     previousMemoryId: created.memory.id,
-    proposedState: beliefDraft(reinforcement, {
-      claimText: "我还是觉得雨天很安静。",
+    proposedState: draft(reinforcement, {
       validFrom: "2026-08-03T08:00:00.000Z",
     }),
     reviewVersion: "reported-belief-review-v1",
     inputHash: createHash("sha256").update("reinforcement").digest("hex"),
     selectedObservationId: reinforcement.id,
     consideredObservationIds: [reinforcement.id],
-  });
+  };
+  const reinforceProposal = repository.recordReportedStateProposal(reinforceInput);
+  const recovered = materializePendingReportedStateProposals(repository, { agentId: 'agent-test', action: 'reinforce' });
+  assert.equal(recovered.materialized[0].proposal.id, reinforceProposal.id);
+  const pending = repository.getReportedStateProposal('agent-test', reinforceProposal.id);
+  assert.equal(pending.review_state, 'pending');
+  assert.equal(pending.resultMemoryId, created.memory.id);
+  assert.equal(buildReviewProposalDetail({ repository, agentId: 'agent-test',
+    envelope: { type: 'reported-state', proposal: pending } }).applied, true);
+  const sourceIds = () => new Set(repository.listMemorySources(created.memory.id).map(source => source.id));
+  const initialSources = new Set(initialObservation.sourceIds);
+  assert.deepEqual(sourceIds(), new Set([...initialSources, ...reinforcement.sourceIds]));
+  assert.deepEqual(repository.listPendingProvisionalMemories('agent-test'), []);
+  const reinforcementEdge = {
+    agentId: 'agent-test', fromMemoryId: created.memory.id, toMemoryId: reinforcement.memory_id, relation: 'supported_by',
+  };
+  const beforeConfirmation = repository.findEdge(reinforcementEdge);
   const reinforced = resolveReportedStateProposal(repository, {
     agentId: "agent-test",
     proposalId: reinforceProposal.id,
@@ -308,31 +391,78 @@ test("accepts create, reinforce, and supersede as three distinct reported-state 
   });
   assert.equal(reinforced.status, "reinforced");
   assert.equal(reinforced.memory.id, created.memory.id);
+  assert.deepEqual(repository.findEdge(reinforcementEdge), beforeConfirmation);
+  assert.equal(buildReviewProposalDetail({ repository, agentId: 'agent-test',
+    envelope: { type: 'reported-state', proposal: reinforced.proposal } }).permissions.canRevoke, true);
+  const setEvidenceDeleted = deleted => repository.setMemoryDeleted({
+    agentId: 'agent-test', memoryId: reinforcement.memory_id, deleted,
+  });
+  setEvidenceDeleted(true);
+  assert.deepEqual(sourceIds(), initialSources);
+  const suspended = buildReviewProposalDetail({ repository, agentId: 'agent-test', envelope: { type: 'reported-state',
+    proposal: repository.getReportedStateProposal('agent-test', reinforceProposal.id) } });
+  setEvidenceDeleted(false);
+  assert.deepEqual(sourceIds(), new Set([...initialSources, ...reinforcement.sourceIds]));
+  assert.equal(suspended.applied, false);
+  assert.equal(suspended.permissions.canRevoke, true);
+  assert.equal(repository.getReportedStateProposal('agent-test', reinforceProposal.id).review_state, 'accepted');
   assert.equal(repository.listCanonicalStateHistory({
     agentId: "agent-test",
     subjectRole: "user",
     subjectKey: "user",
-    canonicalKey: TARGET,
+    canonicalKey: target,
     representationLayer: "reported",
-    stateFamily: "belief",
+    stateFamily: "preference",
   }).length, 1);
 
-  const changedObservation = addReportedBeliefObservation(repository, {
+  const later = addObservation({
+    id: 'later-rain-support', sourceContent: '我喜欢今晚下雨时的安静。', content: '用户喜欢下雨时的安静。',
+    occurredAt: '2026-08-03T17:00:00Z',
+  });
+  const laterProposal = repository.recordReportedStateProposal({
+    ...reinforceInput, proposedState: draft(later), selectedObservationId: later.id, consideredObservationIds: [later.id],
+    inputHash: createHash('sha256').update('later-reinforcement').digest('hex'),
+  });
+  materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: laterProposal.id });
+  setEvidenceDeleted(true);
+  const revoked = resolveReportedStateProposal(repository, {
+    agentId: 'agent-test', proposalId: reinforceProposal.id, action: 'dismiss',
+  });
+  assert.equal(revoked.proposal.review_state, 'dismissed');
+  assert.equal(repository.findEdge(reinforcementEdge), null);
+  setEvidenceDeleted(false);
+  assert.deepEqual(sourceIds(), new Set([...initialSources, ...later.sourceIds]));
+  const repeated = repository.recordReportedStateProposal({
+    ...reinforceInput, inputHash: createHash('sha256').update('replayed-reinforcement').digest('hex'),
+  });
+  materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: repeated.id });
+  assert.deepEqual(sourceIds(), new Set([...initialSources, ...later.sourceIds]));
+
+  const source = repository.getSource(later.sourceIds[0]);
+  repository.upsertSource({ agentId: source.agent_id, sourceKind: source.source_kind, externalId: source.external_id,
+    occurredAt: source.occurred_at, knownAt: source.known_at, speaker: source.speaker, content: '刚才说的是隔壁，雨声很吵。' });
+  assert.deepEqual(sourceIds(), initialSources);
+  const invalidated = repository.getReportedStateProposal('agent-test', laterProposal.id);
+  assert.equal(invalidated.review_state, 'pending');
+  assert.equal(invalidated.resultMemoryId, '');
+  assert.equal(materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: laterProposal.id }).memory, null);
+
+  const changedObservation = addObservation({
     id: "changed-rain-belief",
-    sourceContent: "我现在觉得雨天让人烦躁。",
-    content: "用户明确表示自己现在觉得雨天让人烦躁。",
+    sourceContent: "我现在不喜欢雨天，听着烦躁。",
+    content: "用户明确表示自己现在不喜欢雨天。",
     occurredAt: "2026-08-04T08:00:00.000Z",
   });
   const changedProposal = repository.recordReportedStateProposal({
     agentId: "agent-test",
-    stateFamily: "belief",
+    stateFamily: "preference",
     subjectRole: "user",
     subjectKey: "user",
-    canonicalKey: TARGET,
+    canonicalKey: target,
     action: "supersede",
     previousMemoryId: created.memory.id,
-    proposedState: beliefDraft(changedObservation, {
-      claimText: "我现在觉得雨天让人烦躁。",
+    proposedState: draft(changedObservation, {
+      polarity: 'negative',
       validFrom: "2026-08-04T08:00:00.000Z",
     }),
     reviewVersion: "reported-belief-review-v1",
@@ -352,9 +482,9 @@ test("accepts create, reinforce, and supersede as three distinct reported-state 
     agentId: "agent-test",
     subjectRole: "user",
     subjectKey: "user",
-    canonicalKey: TARGET,
+    canonicalKey: target,
     representationLayer: "reported",
-    stateFamily: "belief",
+    stateFamily: "preference",
   }).id, changed.memory.id);
   assert.equal(repository.findEdge({
     agentId: "agent-test",
@@ -362,6 +492,33 @@ test("accepts create, reinforce, and supersede as three distinct reported-state 
     toMemoryId: created.memory.id,
     relation: "supersedes",
   }).metadata.transition, "supersede");
+
+  const latestObservation = addObservation({
+    id: 'changed-back-to-rain', sourceContent: '我现在又喜欢雨天了。',
+    content: '用户改口说又喜欢雨天了。', occurredAt: '2026-08-05T08:00:00.000Z',
+  });
+  const latestProposal = repository.recordReportedStateProposal({
+    agentId: 'agent-test', stateFamily: 'preference', subjectRole: 'user', subjectKey: 'user',
+    canonicalKey: target, action: 'supersede', previousMemoryId: changed.memory.id,
+    proposedState: draft(latestObservation, { validFrom: '2026-08-05T08:00:00.000Z' }),
+    reviewVersion: 'reported-belief-review-v1', inputHash: createHash('sha256').update('changed-back').digest('hex'),
+    selectedObservationId: latestObservation.id, consideredObservationIds: [latestObservation.id],
+  });
+  const { memory: latest } = materializeReportedStateProposal(repository, { agentId: 'agent-test', proposalId: latestProposal.id });
+  const staleSource = repository.getSource(changedObservation.sourceIds[0]);
+  repository.upsertSource({ agentId: staleSource.agent_id, sourceKind: staleSource.source_kind, externalId: staleSource.external_id,
+    occurredAt: staleSource.occurred_at, knownAt: staleSource.known_at, speaker: staleSource.speaker,
+    content: '我是转述隔壁的看法。' });
+  assert.equal(repository.getReportedStateProposal('agent-test', changedProposal.id).resultMemoryId, '');
+  assert.equal(repository.getMemory(changed.memory.id).status, 'deleted');
+  assert.equal(repository.getMemory(latest.id).status, 'active');
+  assert.equal(repository.getMemory(created.memory.id).status, 'superseded');
+
+  resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: latestProposal.id, action: 'dismiss' });
+  assert.equal(repository.getMemory(created.memory.id).status, 'active');
+  assert.equal(repository.getMemory(changed.memory.id).status, 'deleted');
+  assert.equal(repository.getMemory(latest.id).status, 'deleted');
+  assert.deepEqual(sourceIds(), initialSources);
   database.close();
 });
 
@@ -637,8 +794,8 @@ test("marks a corrected attribution disputed and accepts scoped exceptions witho
     id: "fish-root-change",
     stateFamily: "preference",
     canonicalKey: preferenceKey,
-    sourceContent: "我现在不喜欢鱼了。",
-    content: "用户报告自己现在不喜欢鱼类食物。",
+    sourceContent: "我现在各种鱼都喜欢吃。",
+    content: "用户报告自己现在喜欢吃各种鱼类食物。",
     occurredAt: "2026-08-07T08:00:00.000Z",
     signal: "explicit_preference_change",
   });
@@ -662,7 +819,7 @@ test("marks a corrected attribution disputed and accepts scoped exceptions witho
       validFrom: "2026-08-07T08:00:00.000Z",
       preferenceClaim: {
         objectLabel: "鱼类食物",
-        polarity: "negative",
+        polarity: "positive",
         scope: { kind: "category", label: "鱼类食物" },
       },
       evidenceObservationIds: [rootChangeEvidence.id],
@@ -876,6 +1033,77 @@ function pendingGoalFixture(t) {
   });
   return { repository, database, databasePath, propose, recall };
 }
+
+for (const accepted of [false, true]) test(`removing the source of a replacement restores the original state, accepted=${accepted}`, t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const agentId = 'agent-test';
+  const first = propose({ id: 'sourced-plan', content: '我周六去看展。' });
+  const original = applyReportedStateProposal(repository, { agentId, proposalId: first.id }).memory;
+  const later = propose({ id: 'sourced-change', action: 'supersede', previous: original,
+    content: '改到周日去看展。', time: '2026-08-03T08:00:00Z' });
+  const preview = materializeReportedStateProposal(repository, { agentId, proposalId: later.id }).memory;
+  const added = accepted ? resolveReportedStateProposal(repository, { agentId, proposalId: later.id, action: 'accept' }).memory : preview;
+  const source = later.draft.evidenceMemoryIds[0];
+  const current = () => repository.getCurrentCanonicalMemory({ agentId, subjectRole: original.subject_role,
+    subjectKey: original.subject_key, canonicalKey: original.canonical_key, representationLayer: original.representation_layer,
+    stateFamily: original.state_family, stateScopeKey: original.state_scope_key, includePending: true });
+  const deleteSource = deleted => repository.setMemoryDeleted({ agentId, memoryId: source, deleted });
+  assert.equal(current().id, added.id);
+  deleteSource(true);
+  assert.equal(current().id, original.id);
+  assert.equal(repository.getMemory(added.id).status, 'deleted');
+  deleteSource(false);
+  assert.equal(current().id, added.id);
+
+  const originalEvidence = first.draft.evidenceMemoryIds[0];
+  repository.setMemoryDeleted({ agentId, memoryId: originalEvidence });
+  assert.equal(current().id, added.id);
+  deleteSource(true);
+  assert.equal(current(), null);
+  repository.setMemoryDeleted({ agentId, memoryId: originalEvidence, deleted: false });
+  assert.equal(current().id, original.id);
+
+  repository.editMemoryManually({ agentId, memoryId: original.id, patch: { content: '我周六去看展，上午九点到。' } });
+  deleteSource(false);
+  assert.equal(current().id, original.id, 'Restoring old evidence must preserve a later change.');
+  deleteSource(true);
+  resolveReportedStateProposal(repository, { agentId, proposalId: later.id, action: 'dismiss' });
+  deleteSource(false);
+  assert.equal(current().id, original.id);
+  assert.equal(repository.getReportedStateProposal(agentId, later.id).review_state, 'dismissed');
+});
+
+test('withdraws legacy reported-state reinforcement and keeps later independent evidence', t => {
+  const { repository, database, propose } = pendingGoalFixture(t);
+  const agentId = 'agent-test';
+  const apply = proposal => applyReportedStateProposal(repository, { agentId, proposalId: proposal.id }).memory;
+  const original = propose({ id: 'original-plan', content: '我周末打算去看展。' });
+  const state = apply(original);
+  const legacy = propose({ id: 'legacy-confirmation', action: 'reinforce', previous: state,
+    content: '周末还是照原来的安排去看展。', time: '2026-08-03T08:00:00Z' });
+  apply(legacy);
+  database.prepare(`UPDATE memory_reported_state_proposals SET review_state='accepted',
+    resolved_by='system:auto-explicit-self-report-v1', metadata_json=json_remove(metadata_json, '$.reportedStateApplication')
+    WHERE id=?`).run(legacy.id);
+  const later = propose({ id: 'later-confirmation', action: 'reinforce', previous: state,
+    content: '我已经确认了周末看展的安排。', time: '2026-08-04T08:00:00Z' });
+  apply(later);
+  assert.equal(recoverAutomaticallyReviewedStates(repository, agentId), 1);
+
+  const originalSource = legacy.draft.evidenceMemoryIds[0];
+  repository.setMemoryDeleted({ agentId, memoryId: originalSource });
+  assert.equal(repository.getMemory(state.id).status, 'active');
+  assert.ok(repository.listMemorySources(state.id).every(source => !legacy.draft.evidenceSourceIds.includes(source.id)));
+  resolveReportedStateProposal(repository, { agentId, proposalId: legacy.id, action: 'dismiss' });
+  repository.setMemoryDeleted({ agentId, memoryId: originalSource, deleted: false });
+  const current = repository.getMemoryDetail(agentId, state.id);
+  assert.equal(current.memory.status, 'active');
+  const draft = current.memory.metadata.reportedStateDraft;
+  for (const field of ['evidenceObservationIds', 'evidenceMemoryIds', 'evidenceSourceIds']) {
+    assert.deepEqual(new Set(draft[field]), new Set([...original.draft[field], ...later.draft[field]]));
+  }
+  assert.deepEqual(new Set(current.sources.map(source => source.id)), new Set(draft.evidenceSourceIds));
+});
 
 
 for (const [language, original, query, cancelled, replacement] of [
@@ -1135,8 +1363,8 @@ test("an older pending cancellation does not precede a newer accepted replacemen
     "小夏说：已经重新约好了，下周一起看展。");
 });
 
-for (const resolution of ['accept', 'dismiss']) test(`reviewing an older pending replacement does not undo its successor: ${resolution}`, t => {
-  const { repository, propose } = pendingGoalFixture(t);
+for (const resolution of ['accept', 'dismiss']) test(`reviewing an older pending replacement does not undo its successor: ${resolution}`, async t => {
+  const { repository, propose, databasePath } = pendingGoalFixture(t);
   const initial = propose({ id: 'initial', content: '周六看展。' });
   const { memory: first } = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: initial.id, action: 'accept' });
   const secondProposal = propose({ id: 'second', action: 'supersede', previous: first, content: '改到周日。', time: '2026-08-03T08:00:00Z' });
@@ -1149,6 +1377,67 @@ for (const resolution of ['accept', 'dismiss']) test(`reviewing an older pending
   else assert.equal(reviewed.memory.status, 'superseded');
   assert.equal(repository.getCurrentCanonicalMemory({ agentId: 'agent-test', subjectRole: 'user', subjectKey: 'user',
     canonicalKey: first.canonical_key, representationLayer: 'reported', stateFamily: 'goal', includePending: true }).id, third.id);
+  const withdrawn = resolveReportedStateProposal(repository, { agentId: 'agent-test', proposalId: thirdProposal.id, action: 'dismiss' });
+  assert.equal(withdrawn.restored?.id, resolution === 'dismiss' ? first.id : second.id);
+  if (resolution === 'dismiss') {
+    // Recreate the old database shape. The withdrawn middle version used to
+    // leave its cutoff on the still-supported original after both dismissals.
+    const transition = readReportedStateTransition(repository, repository.getReportedStateProposal('agent-test', secondProposal.id));
+    assert.ok(repository.restoreReportedStateTransition({ agentId: 'agent-test', proposalId: secondProposal.id, ...transition, reapply: true }));
+    const service = new MemoryService({ databasePath, dataRoot: path.dirname(databasePath), agentId: 'agent-test',
+      defaults: { createPrimaryRelationship: false } });
+    try {
+      service.initialize();
+      assert.equal(service.getMemory(first.id).memory.status, 'active');
+      assert.equal(service.getMemory(second.id).memory.status, 'deleted');
+      assert.equal(service.getMemory(third.id).memory.status, 'deleted');
+    } finally { await service.close(); }
+  }
+});
+
+for (const newestFirst of [false, true]) test(`recovers successive state replacements as their sources return, newest first=${newestFirst}`, t => {
+  const { repository, propose } = pendingGoalFixture(t);
+  const agentId = 'agent-test';
+  const first = propose({ id: 'first-visit', content: '周六看展。' });
+  const original = applyReportedStateProposal(repository, { agentId, proposalId: first.id }).memory;
+  const middle = propose({ id: 'second-visit', action: 'supersede', previous: original,
+    content: '改到周日。', time: '2026-08-03T08:00:00Z' });
+  const second = materializeReportedStateProposal(repository, { agentId, proposalId: middle.id }).memory;
+  const latest = propose({ id: 'third-visit', action: 'supersede', previous: second,
+    content: '改到周一。', time: '2026-08-04T08:00:00Z' });
+  const third = materializeReportedStateProposal(repository, { agentId, proposalId: latest.id }).memory;
+  const toggle = (proposal, deleted) => repository.setMemoryDeleted({ agentId, memoryId: proposal.draft.evidenceMemoryIds[0], deleted });
+  const currentId = () => repository.getCurrentCanonicalMemory({ agentId, subjectRole: original.subject_role, subjectKey: original.subject_key,
+    canonicalKey: original.canonical_key, representationLayer: 'reported', stateFamily: 'goal', includePending: true })?.id;
+  toggle(middle, true);
+  assert.equal(currentId(), third.id);
+  toggle(latest, true);
+  assert.equal(currentId(), original.id);
+  toggle(newestFirst ? latest : middle, false);
+  assert.equal(currentId(), newestFirst ? third.id : second.id);
+  toggle(newestFirst ? middle : latest, false);
+  assert.equal(currentId(), third.id);
+  assert.equal(repository.getReportedStateProposal(agentId, latest.id).review_state, 'pending');
+  const confirmed = resolveReportedStateProposal(repository, { agentId, proposalId: latest.id, action: 'accept' });
+  assert.equal(confirmed.memory.id, third.id);
+  resolveReportedStateProposal(repository, { agentId, proposalId: latest.id, action: 'dismiss' });
+  assert.equal(currentId(), second.id);
+});
+
+test('a pending plan without a formal result follows the availability of its own evidence', async t => {
+  const { repository, propose, recall } = pendingGoalFixture(t);
+  const agentId = 'agent-test';
+  const proposal = propose({ id: 'pending-only', content: '我周六准备去看展。' });
+  const { memory } = materializeReportedStateProposal(repository, { agentId, proposalId: proposal.id });
+  const memoryId = proposal.draft.evidenceMemoryIds[0];
+  const recallsPlan = async () => (await recall([memory.id])).context.includes(memory.content);
+  assert.equal(await recallsPlan(), true);
+  repository.setMemoryDeleted({ agentId, memoryId });
+  assert.equal(repository.getMemory(memory.id).status, 'deleted');
+  assert.equal(await recallsPlan(), false);
+  repository.setMemoryDeleted({ agentId, memoryId, deleted: false });
+  assert.equal(await recallsPlan(), true);
+  assert.equal(repository.getReportedStateProposal(agentId, proposal.id).review_state, 'pending');
 });
 
 for (const resolution of ["accept", "dismiss"]) {

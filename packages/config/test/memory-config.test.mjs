@@ -169,6 +169,7 @@ test("config reuses existing OpenAI-compatible generation and embedding provider
   });
   assert.equal(providers.generator.supportsCombinedStateAnalysis, true);
   assert.equal(providers.generator.supportsCombinedConsolidation, true);
+  assert.equal(providers.generator.supportsPlannedOrganization, true);
   assert.equal(providers.interventionGenerator, providers.generator);
   const generated = await providers.generator({ input: "test", systemPrompt: "test", schema: {} });
   assert.deepEqual(generated.output, { ok: true });

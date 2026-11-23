@@ -83,6 +83,13 @@ function createSearchTable(database) {
   return tokenizer;
 }
 
+// Node's filesystem API accepts long Windows paths, but SQLite also needs the
+// native namespace for both its main connection and VACUUM destinations.
+export function sqliteFilePath(filePath) {
+  return filePath !== ':memory:' && process.platform === 'win32'
+    ? path.toNamespacedPath(path.resolve(filePath)) : filePath;
+}
+
 export function openMemoryDatabase(databasePath = ":memory:", {
   readOnly = false,
   timeout = 5000,
@@ -92,7 +99,7 @@ export function openMemoryDatabase(databasePath = ":memory:", {
     fs.mkdirSync(path.dirname(path.resolve(databasePath)), { recursive: true });
   }
 
-  const database = new DatabaseSync(databasePath, {
+  const database = new DatabaseSync(sqliteFilePath(databasePath), {
     readOnly,
     timeout,
   });

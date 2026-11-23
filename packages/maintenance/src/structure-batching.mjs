@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
-import { DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView } from "@suzu-memory/core";
+import { DIRECT_INGESTION_MEMORY_KINDS, assertEventSourceExecutionCurrent, executionEventSourceView, readOrganizationInput } from "@suzu-memory/core";
 
 export const DEFAULT_MINIMUM_STRUCTURE_MEMORIES = 20;
 
 const unique = values => [...new Set(values.filter(Boolean))];
-const versionKey = memory => JSON.stringify([memory.id, memory.updatedAt || memory.updated_at]);
+const versionKey = memory => JSON.stringify([memory.id, memory.fingerprint || memory.updatedAt || memory.updated_at]);
 
 function selectAccumulatedStructureTasks({ repository, agentId, minimumMemories, now }) {
+  assertEventSourceExecutionCurrent(agentId);
+  if (!repository.database.prepare(`SELECT 1 FROM memory_maintenance_tasks
+    WHERE agent_id = ? AND task_type = 'structure-proposal' AND attempt_count < max_attempts
+      AND available_at <= ? AND (status = 'pending'
+        OR (status = 'running' AND lease_expires_at <= ?)) LIMIT 1`).get(agentId, now, now)) {
+    return { taskIds: [], eligible: new Map(), pendingMemoryCount: 0, accumulatingTaskCount: 0 };
+  }
   const sourceView = executionEventSourceView(repository, agentId);
   const queued = [];
   for (let offset = 0; ; offset += 500) {
@@ -32,16 +39,27 @@ function selectAccumulatedStructureTasks({ repository, agentId, minimumMemories,
     const payload = JSON.parse(row.payload_json);
     return (result.processedMemoryVersions || payload.memoryVersions || []).map(versionKey);
   }));
+  const input = readOrganizationInput(repository, agentId, requestedIds);
+  const fingerprints = new Map(input.memories.map(memory => [memory.id, memory.fingerprint]));
   const eligible = new Map(requestedIds.map(id => repository.getMemory(id))
     .filter(memory => memory?.agent_id === agentId && memory.status === "active"
       && memory.layer !== "provisional" && DIRECT_INGESTION_MEMORY_KINDS.includes(memory.kind)
+      && !processed.has(versionKey({ id: memory.id, fingerprint: fingerprints.get(memory.id) }))
       && !processed.has(versionKey(memory)))
-    .map(memory => [memory.id, memory]));
+    .map(memory => [memory.id, { ...memory, fingerprint: fingerprints.get(memory.id) }]));
   const availableTaskIds = new Set(tasks.map(task => task.id));
   const frozen = tasks.find(task => task.result?.structureBatch
-    && task.result.structureBatch.taskIds.every(id => availableTaskIds.has(id)));
+    && task.result.structureBatch.taskIds.every(id => {
+      if (availableTaskIds.has(id)) return true;
+      const settled = repository.getMaintenanceTask(agentId, id);
+      return settled?.status === 'completed' && (settled.result?.reason === 'memory-deleted'
+        || settled.result?.structureBatch?.id === task.result.structureBatch.id);
+    }));
   if (frozen) {
-    const batch = frozen.result.structureBatch;
+    // Earlier releases could retire a deleted member's task independently. The
+    // surviving owners must still be able to settle their shared checkpoint.
+    const batch = { ...frozen.result.structureBatch,
+      taskIds: frozen.result.structureBatch.taskIds.filter(id => availableTaskIds.has(id)) };
     return { taskIds: batch.taskIds, batch, pendingMemoryCount: 0, accumulatingTaskCount: 0 };
   }
   // A waiting/in-flight batch owns these memory versions until it is settled.
@@ -91,6 +109,28 @@ export function inspectAccumulatedStructureTasks(options) {
   return { accumulatingTaskCount, pendingMemoryCount };
 }
 
+function currentStructureBatch(repository, agentId, batch) {
+  const view = executionEventSourceView(repository, agentId);
+  const memories = batch.memoryIds.map(id => repository.getMemory(id)).filter(memory => memory?.agent_id === agentId
+    && memory.status === 'active' && memory.layer !== 'provisional' && DIRECT_INGESTION_MEMORY_KINDS.includes(memory.kind)
+    && (!view || view.memoryIds.has(memory.id)));
+  const memoryIds = memories.map(memory => memory.id);
+  const organizationInput = readOrganizationInput(repository, agentId, memoryIds);
+  if (batch.organizationInput?.hash === organizationInput.hash) return batch;
+  // A checkpoint only proves coverage for its recorded input. Rebuild this
+  // affected batch after a semantic change, keeping other batches untouched.
+  const fingerprints = new Map(organizationInput.memories.map(memory => [memory.id, memory.fingerprint]));
+  const memoryVersions = memories.map(memory => ({ id: memory.id, updatedAt: memory.updated_at, fingerprint: fingerprints.get(memory.id) }));
+  const worlds = new Map();
+  for (const memory of memories) {
+    const key = JSON.stringify([memory.reality, memory.world_id, memory.world_frame]);
+    if (!worlds.has(key)) worlds.set(key, []);
+    worlds.get(key).push(memory.id);
+  }
+  return { id: batch.id, taskIds: batch.taskIds, memoryIds, memoryVersions, organizationInput,
+    parts: [...worlds.values()].map((ids, index) => ({ id: `${batch.id}:world-${index}`, memoryIds: ids, status: 'pending' })) };
+}
+
 export function claimAccumulatedStructureTasks({ repository, agentId, workerId, minimumMemories }) {
   return repository.transaction(() => {
     const now = new Date().toISOString();
@@ -104,24 +144,17 @@ export function claimAccumulatedStructureTasks({ repository, agentId, workerId, 
     });
     if (frozenBatch) {
       if (claimed.tasks.length !== frozenBatch.taskIds.length) throw new Error("Structure batch could not be claimed atomically.");
-      return { ...claimed, batch: frozenBatch, memoryIds: frozenBatch.memoryIds,
-        memoryVersions: frozenBatch.memoryVersions, pendingMemoryCount };
+      const batch = currentStructureBatch(repository, agentId, frozenBatch);
+      for (const task of claimed.tasks) repository.checkpointMaintenanceTask({ agentId, taskId: task.id, workerId,
+        result: { structureBatch: batch } });
+      return { ...claimed, batch, memoryIds: batch.memoryIds, memoryVersions: batch.memoryVersions, pendingMemoryCount };
     }
     const memoryIds = unique(claimed.tasks.flatMap(task => task.payload.memoryIds || []).filter(id => eligible.has(id)));
-    const memoryVersions = memoryIds.map(id => ({ id, updatedAt: eligible.get(id).updated_at }));
     const id = `accumulated-structure:${createHash("sha256").update(claimed.tasks.map(task => task.id).sort().join(":" )).digest("hex").slice(0, 24)}`;
-    const worlds = new Map();
-    for (const memoryId of memoryIds) {
-      const memory = eligible.get(memoryId);
-      const key = JSON.stringify([memory.reality, memory.world_id, memory.world_frame]);
-      if (!worlds.has(key)) worlds.set(key, []);
-      worlds.get(key).push(memoryId);
-    }
-    const batch = { id, taskIds: claimed.tasks.map(task => task.id), memoryIds, memoryVersions,
-      parts: [...worlds.values()].map((ids, index) => ({ id: `${id}:world-${index}`, memoryIds: ids, status: "pending" })) };
+    const batch = currentStructureBatch(repository, agentId, { id, taskIds: claimed.tasks.map(task => task.id), memoryIds });
     for (const task of claimed.tasks) repository.checkpointMaintenanceTask({ agentId, taskId: task.id, workerId,
       result: { structureBatch: batch } });
-    return { ...claimed, batch, memoryIds, pendingMemoryCount, memoryVersions };
+    return { ...claimed, batch, memoryIds, pendingMemoryCount, memoryVersions: batch.memoryVersions };
   });
 }
 
@@ -131,7 +164,7 @@ export function deferSmallConsolidationRuns({ repository, agentId, minimumMemori
   const runs = repository.listClaimableConsolidationRuns(agentId, { now: new Date().toISOString(), limit: 100 });
   for (const run of runs) {
     if (run.triggerIds.length >= minimumMemories || run.structureProposalIds.length || run.relationProposalIds.length
-      || run.metadata?.accumulatedStructureBatchId || run.metadata?.organizationProgress) continue;
+      || run.metadata?.accumulatedStructureBatchId || run.metadata?.organizationProgress || run.metadata?.replannedFrom) continue;
     repository.transaction(() => {
       const workerId = `accumulate:${run.id}`;
       repository.claimConsolidationRun({ agentId, runId: run.id, workerId });

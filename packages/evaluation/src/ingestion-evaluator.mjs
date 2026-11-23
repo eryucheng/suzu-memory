@@ -4,7 +4,7 @@ import path from "node:path";
 
 import {
   buildLongTermExtractionInput,
-  LONG_TERM_EXTRACTION_SCHEMA,
+  buildLongTermExtractionRequest,
   normalizeGeneratedLongTermExtraction,
 } from "@suzu-memory/extraction";
 
@@ -187,12 +187,14 @@ export function createLongTermExtractionExecutor({ generate, systemPrompt }) {
   if (typeof generate !== "function") throw new Error("输入评测需要 generate 函数。");
   if (!clean(systemPrompt)) throw new Error("输入评测需要 systemPrompt。");
   return async (testCase) => {
-    const generation = await generate({
-      input: buildIngestionEvaluationInput(testCase),
+    const item = normalizedIngestionCase(testCase);
+    const { request } = buildLongTermExtractionRequest({
+      memoryOwner: item.memoryOwner,
+      userName: item.userName,
+      messages: item.messages,
       systemPrompt,
-      schema: LONG_TERM_EXTRACTION_SCHEMA,
-      schemaName: "long-term-memory-extraction-v4",
     });
+    const generation = await generate(request);
     return generation?.output ?? generation;
   };
 }

@@ -1,5 +1,6 @@
-import { commonMemoryWorld, memoryWorldScope } from '@suzu-memory/core';
+import { commonMemoryWorld, isCurrentEvidenceSource, memoryWorldScope } from '@suzu-memory/core';
 import { stateAnalysisBudgetError } from "./request-budget.mjs";
+import { analysisEvidenceOutputLanguage, SOURCE_RECORD_OUTPUT_LANGUAGE } from './source-material.mjs';
 import { createHash } from "node:crypto";
 
 import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, DIRECT_INGESTION_MEMORY_KINDS, executionEventSourceView, modelCalendarFields } from "@suzu-memory/core";
@@ -49,14 +50,15 @@ function episodeIdsForMemory(repository, agentId, memoryId, sourceView) {
     .sort();
 }
 
-function contextIdentity(memory, sources, episodeIds, timeZone) {
+export function preferenceEvidenceContext(memory, sources, episodeIds, timeZone) {
   if (episodeIds.length) {
     const id = `episode:${episodeIds[0]}`;
     return { evidenceGroupId: id, contextId: id, contextBasis: "reviewed-episode" };
   }
   const sourceIds = sources.map((source) => source.id).sort();
   const evidenceGroupId = sourceIds.length ? stableSourceGroup(sourceIds) : `memory:${memory.id}`;
-  const spaces = uniqueStrings(sources.map(source => source.metadata?.eventSource?.spaceId));
+  const spaces = uniqueStrings(sources.map(source =>
+    (source.metadata?.eventMetadata?.eventSource || source.metadata?.eventSource)?.spaceId));
   if (spaces.length === 1) {
     return { evidenceGroupId, contextId: `space:${spaces[0]}`, contextBasis: "interaction-space" };
   }
@@ -196,7 +198,7 @@ export function buildPreferenceEvidenceSnapshot({
     const detail = repository.getMemoryDetail(normalizedAgentId, id);
     const acceptedSourceRelation = requestBoundUtterance ? "verbatim" : "evidence";
     const sources = detail.sources
-      .filter((source) => source.relation === acceptedSourceRelation)
+      .filter((source) => source.relation === acceptedSourceRelation && isCurrentEvidenceSource(memory, source))
       .filter((source) => !sourceBoundary.size || sourceBoundary.has(source.id))
       .filter((source) => !sourceView || sourceView.sourceIds.has(source.id));
     if (sources.length > sourceLimit) {
@@ -209,6 +211,7 @@ export function buildPreferenceEvidenceSnapshot({
     for (const source of sources) {
       if (!sourceRecords.has(source.id)) {
         sourceRecords.set(source.id, {
+          [SOURCE_RECORD_OUTPUT_LANGUAGE]: analysisEvidenceOutputLanguage(source),
           id: source.id,
           sourceKind: source.source_kind,
           ...modelCalendarFields(source, ['occurredAt', 'knownAt', 'recordedAt']),
@@ -218,7 +221,7 @@ export function buildPreferenceEvidenceSnapshot({
       }
     }
     const episodeIds = episodeIdsForMemory(repository, normalizedAgentId, memory.id, sourceView);
-    const identity = contextIdentity(memory, sources, episodeIds, timeZone);
+    const identity = preferenceEvidenceContext(memory, sources, episodeIds, timeZone);
     memories.push({
       id: memory.id,
       kind: memory.kind,

@@ -304,7 +304,7 @@ const establishedPromotionPolicy = Object.freeze({
   maximumOppositionRatio: 0.5,
 });
 
-async function acceptedStablePreference(repository, prefix = "established", world = null, semanticWorld = null) {
+async function appliedStablePreference(repository, prefix, world, semanticWorld) {
   const supports = [
     addObservation(repository, {
       world, semanticWorld,
@@ -347,6 +347,11 @@ async function acceptedStablePreference(repository, prefix = "established", worl
     agentId: "agent-test",
     review,
   });
+  return { supports, review, pending };
+}
+
+async function acceptedStablePreference(repository, prefix = "established", world = null, semanticWorld = null) {
+  const { supports, review, pending } = await appliedStablePreference(repository, prefix, world, semanticWorld);
   const accepted = resolvePreferenceStateProposal(repository, {
     agentId: "agent-test",
     proposalId: pending.proposal.id,
@@ -418,7 +423,7 @@ test("runs a complete synthesizer and independent critic as audited shadow revie
   database.close();
 });
 
-test("bridges an approved behavior review into a pending inferred state and preserves reported state", async () => {
+test("applies an approved behavior review before audit and preserves the reported state", async () => {
   const { database, repository } = setup();
   const support = addObservation(repository, {
     id: "bridge-choice",
@@ -438,7 +443,6 @@ test("bridges an approved behavior review into a pending inferred state and pres
   });
   const review = await approvedSelectionReview(repository, support);
   assert.equal(review.status, "approved-shadow");
-  const before = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count);
   const pending = proposePreferenceStateFromCanonicalReview(repository, {
     agentId: "agent-test",
     review,
@@ -447,10 +451,8 @@ test("bridges an approved behavior review into a pending inferred state and pres
   assert.equal(pending.proposal.representation_layer, "inferred");
   assert.equal(pending.proposal.state_scope_key, "root");
   assert.match(pending.proposal.evidence[0].evidenceSnapshotHash, /^[0-9a-f]{64}$/u);
-  assert.equal(
-    Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count),
-    before,
-  );
+  const applied = repository.getMemory(pending.proposal.resultMemoryId);
+  assert.equal(applied.status, 'active');
 
   const reported = repository.upsertMemory({
     id: "reported-puzzle-preference",
@@ -477,6 +479,7 @@ test("bridges an approved behavior review into a pending inferred state and pres
     action: "accept",
   });
   assert.equal(accepted.memory.representation_layer, "inferred");
+  assert.deepEqual(accepted.memory, applied);
   assert.equal(accepted.memory.state_family, "preference");
   assert.equal(accepted.memory.state_scope_key, "root");
   assert.equal(accepted.memory.metadata.preferenceStateLevel, "selection_tendency");
@@ -490,7 +493,7 @@ test("bridges an approved behavior review into a pending inferred state and pres
   database.close();
 });
 
-test("rejects an approved behavior proposal when its evidence changes before acceptance", async () => {
+test("invalidates an applied behavior conclusion when its evidence changes before audit confirmation", async () => {
   const { database, repository } = setup();
   const support = addObservation(repository, {
     id: "drift-choice",
@@ -519,11 +522,12 @@ test("rejects an approved behavior proposal when its evidence changes before acc
     patch: { content: "人工修正后，这条记录不再说明存在真实替代项。" },
     reason: "test evidence drift",
   });
+  assert.equal(repository.getMemory(pending.proposal.resultMemoryId).status, 'deleted');
   assert.throws(() => resolvePreferenceStateProposal(repository, {
     agentId: "agent-test",
     proposalId: pending.proposal.id,
     action: "accept",
-  }), /evidence changed after review/u);
+  }), /no valid result to confirm/u);
   assert.equal(
     repository.getPreferenceStateProposal("agent-test", pending.proposal.id).review_state,
     "pending",
@@ -531,7 +535,7 @@ test("rejects an approved behavior proposal when its evidence changes before acc
   database.close();
 });
 
-test("rejects an approved behavior proposal when its evidence classification is superseded", async () => {
+test("invalidates an applied behavior conclusion when its evidence classification is superseded", async () => {
   const { database, repository } = setup();
   const support = addObservation(repository, {
     id: "classification-choice",
@@ -577,11 +581,12 @@ test("rejects an approved behavior proposal when its evidence classification is 
     sourceIds: [support.source.id],
     observedAt: "2026-07-17T12:00:00.000Z",
   });
+  assert.equal(repository.getMemory(pending.proposal.resultMemoryId).status, 'deleted');
   assert.throws(() => resolvePreferenceStateProposal(repository, {
     agentId: "agent-test",
     proposalId: pending.proposal.id,
     action: "accept",
-  }), /evidence set changed after canonical review/u);
+  }), /no valid result to confirm/u);
   assert.equal(
     repository.getPreferenceStateProposal("agent-test", pending.proposal.id).review_state,
     "pending",
@@ -852,6 +857,20 @@ test("rejects a critic that approves while declaring a critical issue", async ()
   database.close();
 });
 
+test('an effective inferred preference is eligible for the separate promotion policy while awaiting audit', async t => {
+  const { database, repository } = setup();
+  t.after(() => database.close());
+  const { pending } = await appliedStablePreference(repository, 'unconfirmed-promotion');
+  const sourceId = pending.proposal.resultMemoryId;
+  assert.equal(pending.proposal.review_state, 'pending');
+  assert.equal(repository.getMemory(sourceId).status, 'active');
+  const promotion = proposePreferenceEstablishedPromotion(repository, { agentId: 'agent-test', sourceMemoryId: sourceId,
+    policy: establishedPromotionPolicy, createdAt: '2026-08-02T08:00:00.000Z' });
+  const result = resolveStatePromotionProposal(repository, { agentId: 'agent-test', proposalId: promotion.id, action: 'accept' });
+  assert.equal(result.memory.representation_layer, 'established');
+  assert.equal(repository.getPreferenceStateProposal('agent-test', pending.proposal.id).review_state, 'pending');
+});
+
 test("promotes a fully reviewed inferred preference only through a separate pending established review", async () => {
   const { database, repository } = setup();
   const { supports, accepted } = await acceptedStablePreference(repository, "promotion");
@@ -968,9 +987,9 @@ test("keeps an established promotion pending when its audited evidence drifts", 
     agentId: "agent-test",
     proposalId: proposal.id,
     action: "accept",
-  }), /source changed after review/u);
+  }), /requires the active inferred stable preference root/u);
   assert.equal(repository.getStatePromotionProposal("agent-test", proposal.id).review_state, "pending");
-  assert.equal(repository.getMemory(accepted.memory.id).status, "active");
+  assert.equal(repository.getMemory(accepted.memory.id).status, "deleted");
   assert.equal(repository.getCurrentCanonicalMemory({
     agentId: "agent-test",
     subjectRole: "user",

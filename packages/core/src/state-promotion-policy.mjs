@@ -1,4 +1,5 @@
 import { memoryWorldScope } from './ontology.mjs';
+import { appliedPreferenceStateMemory } from './preference-state-policy.mjs';
 import { createHash } from "node:crypto";
 
 import { ROOT_STATE_SCOPE_KEY } from "./state-scope.mjs";
@@ -130,13 +131,12 @@ function preferencePromotionSource(repository, { agentId, sourceMemoryId }) {
     source.metadata?.preferenceProposalId,
   );
   const canonicalReview = source.metadata?.canonicalReview;
-  if (!preferenceProposal || preferenceProposal.review_state !== "accepted"
-    || preferenceProposal.resultMemoryId !== source.id
+  if (!preferenceProposal || appliedPreferenceStateMemory(repository, preferenceProposal)?.id !== source.id
     || preferenceProposal.evidence_review_mode !== "full_canonical"
     || preferenceProposal.representation_layer !== "inferred"
     || preferenceProposal.provenance !== "approved-canonical-preference-review-v1"
     || !canonicalReview || canonicalReview.establishedPromotionAllowed !== false) {
-    throw new Error("Established preference promotion requires an accepted full canonical inferred proposal.");
+    throw new Error("Established preference promotion requires an applied full canonical inferred proposal.");
   }
   assertCanonicalReviewStillCurrent(repository, source, canonicalReview);
   if (repository.listCurrentScopedExceptions({

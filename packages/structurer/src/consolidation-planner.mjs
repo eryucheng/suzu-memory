@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 
-import { DIRECT_INGESTION_MEMORY_KINDS } from "@suzu-memory/core";
+import { DIRECT_INGESTION_MEMORY_KINDS, readOrganizationInput, memoryWorldsCompatible } from "@suzu-memory/core";
+import { buildStructureSnapshot } from './snapshot.mjs';
 
-export const CONSOLIDATION_POLICY_VERSION = "consolidation-plan-v1";
+export const CONSOLIDATION_POLICY_VERSION = "consolidation-plan-v3";
 
 const DEFAULT_RELATIONS = Object.freeze([
   "associated_with",
@@ -59,6 +60,7 @@ export function planMemoryConsolidation({
   minimumEdgeWeight = 0.65,
   relations = DEFAULT_RELATIONS,
   policyVersion = CONSOLIDATION_POLICY_VERSION,
+  organizeNewMemories = false,
   metadata = {},
 } = {}) {
   if (!repository) throw new Error("Memory consolidation planning requires a repository.");
@@ -97,7 +99,17 @@ export function planMemoryConsolidation({
     relations: allowedRelations,
   });
   const triggerSet = new Set(triggerIds);
-  const candidates = graph.nodes
+  // The initial organization plan must discover existing containers before any
+  // generated attachment adds graph edges. Their members remain candidates even
+  // when the new memory has not yet been linked to the container.
+  let containers = organizeNewMemories ? buildStructureSnapshot({ repository, agentId: normalizedAgentId,
+    memoryIds: triggerIds, maxSnapshotChars: Infinity }).candidateContainers : [];
+  const containerMembers = new Map();
+  for (const container of containers) for (const id of container.memberIds) {
+    const memory = repository.getMemory(id);
+    if (memory && triggers.some(trigger => memoryWorldsCompatible(trigger, memory))) containerMembers.set(id, memory);
+  }
+  const candidates = [...new Map([...graph.nodes, ...containerMembers.values()].map(memory => [memory.id, memory])).values()]
     .filter((memory) => (
       !triggerSet.has(memory.id)
       && memory.status === "active"
@@ -107,15 +119,17 @@ export function planMemoryConsolidation({
       const incident = graph.edges.filter((edge) => (
         edge.from_memory_id === memory.id || edge.to_memory_id === memory.id
       ));
-      const reasons = [...new Set(incident.map((edge) => edge.relation))].sort();
+      const reasons = [...new Set([...incident.map((edge) => edge.relation),
+        ...(containerMembers.has(memory.id) ? ['container_member'] : [])])].sort();
       const strongestEdge = incident.reduce(
         (maximum, edge) => Math.max(maximum, edgeStrength(edge)),
         0,
       );
       return {
         memory,
-        depth: Number(memory.depth || 0),
-        score: strongestEdge / Math.max(1, Number(memory.depth || 1)),
+        depth: Number(memory.depth || (containerMembers.has(memory.id) ? 2 : 0)),
+        score: Math.max(strongestEdge, containerMembers.has(memory.id) ? 0.9 : 0)
+          / Math.max(1, Number(memory.depth || (containerMembers.has(memory.id) ? 2 : 1))),
         reasons,
       };
     })
@@ -128,6 +142,9 @@ export function planMemoryConsolidation({
     ))
     .slice(0, candidateLimit);
   const candidateIds = candidates.map((candidate) => candidate.memory.id);
+  if (organizeNewMemories) containers = buildStructureSnapshot({ repository, agentId: normalizedAgentId,
+    memoryIds: [...triggerIds, ...candidateIds], nearbyContainerIds: containers.map(container => container.id),
+    maxSnapshotChars: Infinity }).candidateContainers;
   const selectedIds = new Set([...triggerIds, ...candidateIds]);
   const graphEdgeIds = graph.edges
     .filter((edge) => (
@@ -144,16 +161,21 @@ export function planMemoryConsolidation({
     },
   ]));
   const normalizedPolicyVersion = clean(policyVersion) || CONSOLIDATION_POLICY_VERSION;
+  const organizationInput = readOrganizationInput(repository, normalizedAgentId, [...triggerIds, ...candidateIds]);
   const input = {
     triggerIds,
     candidateIds,
     candidateReasons,
     graphEdgeIds,
+    organizationInput,
+    ...(organizeNewMemories ? { organizationMode: 'unified-v1', nearbyContainerIds: containers.map(container => container.id),
+      containerInput: readOrganizationInput(repository, normalizedAgentId, containers.flatMap(container => [container.id, ...container.memberIds])) } : {}),
     selectionPolicy: {
       maximumCandidates: candidateLimit,
       maximumDepth: depthLimit,
       minimumEdgeWeight: minimumWeight,
       relations: allowedRelations,
+      ...(organizeNewMemories ? { organizeNewMemories: true } : {}),
     },
   };
   const inputHash = stableHash(input);
@@ -171,8 +193,10 @@ export function planMemoryConsolidation({
     graphEdgeIds,
     inputHash,
     metadata: {
-      selectionPolicy: input.selectionPolicy,
       ...metadata,
+      selectionPolicy: input.selectionPolicy,
+      organizationInput,
+      ...(organizeNewMemories ? { organizationMode: input.organizationMode, nearbyContainerIds: input.nearbyContainerIds } : {}),
     },
   });
 }

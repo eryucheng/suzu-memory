@@ -277,6 +277,7 @@ export function createProvidersFromMemoryConfig(config, {
   if (generator) {
     generator.supportsCombinedStateAnalysis = true;
     generator.supportsCombinedConsolidation = true;
+    generator.supportsPlannedOrganization = true;
     generator.measureRequest = request => resolveGenerator().measureRequest(request);
   }
   let resolvedInterventionGenerator = null;

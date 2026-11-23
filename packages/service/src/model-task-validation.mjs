@@ -3,7 +3,7 @@ import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseG
   parseGeneratedLongTermExtraction } from '@suzu-memory/extraction';
 import * as analysis from '@suzu-memory/analysis';
 import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA,
-  MEMORY_STRUCTURE_SUMMARY_SCHEMA, parseStructureSummary,
+  MEMORY_STRUCTURE_SUMMARY_SCHEMA, MEMORY_STRUCTURE_MEMBERSHIP_SCHEMA, parseStructureSummary,
   parseStructureGeneration, parseRelationGeneration, parseSubjectAttributionGeneration, proposalSchemaForLimit,
   relationOutputSchema } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA,
@@ -14,8 +14,10 @@ const tasks = new Map([
   ['long-term-memory-extraction-v4', [LONG_TERM_EXTRACTION_SCHEMA, parseGeneratedLongTermExtraction]],
   ['long-term-memory-extraction-repair-v5', [LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedExtractionRepair]],
   ['memory-structure-proposals-v2', [MEMORY_STRUCTURE_OUTPUT_SCHEMA, parseStructureGeneration]],
+  ['memory-structure-memberships-v1', [MEMORY_STRUCTURE_MEMBERSHIP_SCHEMA, parseStructureGeneration]],
   ['memory-structure-summary-v1', [MEMORY_STRUCTURE_SUMMARY_SCHEMA, parseStructureSummary]],
-  ['memory-relation-proposals-v1', [MEMORY_RELATION_OUTPUT_SCHEMA, parseRelationGeneration]],
+  ['memory-relation-proposals-v1', [relationOutputSchema(undefined, { version: 1 }), parseRelationGeneration]],
+  ['memory-relation-proposals-v2', [MEMORY_RELATION_OUTPUT_SCHEMA, parseRelationGeneration]],
   ['memory-subject-attribution-v1', [MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA, parseSubjectAttributionGeneration]],
   ['memory_retrieval_context_proposal_v1', [MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, parseMemoryRetrievalContextProposal]],
   ['memory_retrieval_context_critic_v1', [MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA, parseMemoryRetrievalContextCritique]],
@@ -57,9 +59,9 @@ function declaredProposalSchema(template, declared) {
   return expected;
 }
 
-function declaredRelationSchema(declared) {
+function declaredRelationSchema(declared, version = 2) {
   const template = relationOutputSchema(MEMORY_RELATION_OUTPUT_SCHEMA.properties.proposals.maxItems,
-    { excerpted: Object.hasOwn(declared?.properties || {}, 'needsFullEvidence') });
+    { excerpted: Object.hasOwn(declared?.properties || {}, 'needsFullEvidence'), version });
   return declaredProposalSchema(template, declared);
 }
 
@@ -100,13 +102,45 @@ function validateWireShape(schema, value, path = 'output') {
 /** Dispatch only registered Memory task schemas to their existing domain parser.
  * Combined calls retain the exact child declarations and validate every child. */
 function resolveTaskParser(request) {
+  if (request?.schemaName === 'memory-structure-summary-batch-v1') {
+    const keys = Object.keys(request.schema?.properties || {});
+    if (keys.length < 2 || keys.some(key => !/^group[1-9][0-9]*$/u.test(key))
+      || !isDeepStrictEqual(request.schema, objectSchema(Object.fromEntries(keys.map(key => [key, MEMORY_STRUCTURE_SUMMARY_SCHEMA]))))) {
+      throw invalid('A summary batch requires distinct groups with the registered summary contract.');
+    }
+    return output => Object.fromEntries(keys.map(key => [key, parseStructureSummary(output[key])]));
+  }
+  if (request?.schemaName === 'memory-state-first-stage-batch-v1') {
+    const children = request.stateAnalysisTasks;
+    const family = child => {
+      if (child?.schemaName === 'memory-state-match-analysis-v1') return family(child.stateMatchAnalysisTask);
+      const combined = /^memory-([a-z_]+)-evidence-combined-v1$/u.exec(child?.schemaName || '');
+      if (combined) return combined[1] === 'state' ? 'preference' : combined[1];
+      const entry = definitions.find(item => item.definition.schemaName === child?.schemaName);
+      return entry && !['current-relation', 'time-current-relation'].includes(entry.definition.role)
+        ? entry.definition.stateFamily || 'preference' : null;
+    };
+    if (!Array.isArray(children) || children.length < 2
+      || children.some(child => !/^task[1-9][0-9]*$/u.test(child.key) || !child.stateAnalysisRequestId
+        || !family(child) || child.stateFamily !== family(child))
+      || ['key', 'stateAnalysisRequestId', 'stateFamily'].some(key => new Set(children.map(child => child[key])).size !== children.length)) {
+      throw invalid('A first-stage batch requires distinct requests and families with registered evidence tasks.');
+    }
+    const parsers = children.map(child => resolveTaskParser(child));
+    const schema = objectSchema({ results: objectSchema(Object.fromEntries(children.map(child => [child.key, child.schema]))) });
+    if (!isDeepStrictEqual(request.schema, schema)) throw invalid('First-stage batching changed a child result contract.');
+    return output => ({ results: Object.fromEntries(children.map((child, index) => [child.key, parsers[index](output.results[child.key])])) });
+  }
   if (request?.schemaName === 'memory-state-match-analysis-v1') {
     const child = request.stateMatchAnalysisTask;
-    if (!child || child.schemaName === request.schemaName || !isMemoryStateAnalysisRequest(child)) {
+    if (!child || child.schemaName === request.schemaName || child.schemaName === 'memory-state-first-stage-batch-v1'
+      || !isMemoryStateAnalysisRequest(child)) {
       throw invalid('State matching requires a registered specialist analysis.');
     }
     const parse = resolveTaskParser(child);
-    if (!isDeepStrictEqual(request.schema, analysis.stateMatchAnalysisSchema(child.schema))) {
+    if (!isDeepStrictEqual(request.schema, analysis.stateMatchAnalysisSchema(child.schema, {
+      includePreferenceSupport: child.includePreferenceSupport === true,
+    }))) {
       throw invalid('State matching changed its result contract.');
     }
     return output => ({ stateMatch: output.stateMatch, analysis: parse(output.analysis) });
@@ -114,7 +148,7 @@ function resolveTaskParser(request) {
   const task = tasks.get(request?.schemaName);
   if (task) {
     if (task[1] === parseStructureGeneration || task[1] === parseRelationGeneration) {
-      const schema = task[1] === parseRelationGeneration ? declaredRelationSchema(request.schema)
+      const schema = task[1] === parseRelationGeneration ? declaredRelationSchema(request.schema, request.schemaName.endsWith('-v1') ? 1 : 2)
         : declaredProposalSchema(task[0], request.schema);
       return output => task[1](output, { maximumProposals: schema.properties.proposals.maxItems });
     }
@@ -123,10 +157,12 @@ function resolveTaskParser(request) {
     else if (!isDeepStrictEqual(request.schema, task[0])) throw invalid('The Memory task schema changed without a version change.');
     return task[1];
   }
-  if (request?.schemaName === 'memory-consolidation-combined-v1') {
+  if (['memory-consolidation-combined-v1', 'memory-organization-decisions-v1',
+    'memory-consolidation-combined-v2', 'memory-organization-decisions-v2'].includes(request?.schemaName)) {
     const schemas = {
-      structure: declaredProposalSchema(MEMORY_STRUCTURE_OUTPUT_SCHEMA, request.schema?.properties?.structure),
-      relations: declaredRelationSchema(request.schema?.properties?.relations),
+      structure: declaredProposalSchema(request.schemaName.startsWith('memory-organization-decisions-')
+        ? MEMORY_STRUCTURE_MEMBERSHIP_SCHEMA : MEMORY_STRUCTURE_OUTPUT_SCHEMA, request.schema?.properties?.structure),
+      relations: declaredRelationSchema(request.schema?.properties?.relations, request.schemaName.endsWith('-v1') ? 1 : 2),
     };
     if (!isDeepStrictEqual(request.schema, objectSchema(schemas))) {
       throw invalid('Combined consolidation requires exactly structure and relations.');
@@ -156,6 +192,7 @@ function resolveTaskParser(request) {
 export function assertMemoryTaskRequest(request) { resolveTaskParser(request); }
 
 export function isMemoryStateAnalysisRequest(request) {
+  if (request?.schemaName === 'memory-state-first-stage-batch-v1') return true;
   if (request?.schemaName === 'memory-state-match-analysis-v1') return true;
   if (definitions.some(({ definition }) => definition.schemaName === request?.schemaName)) return true;
   const combined = /^memory-([a-z_]+)-(evidence|comparison)-combined-v1$/u.exec(request?.schemaName || '');

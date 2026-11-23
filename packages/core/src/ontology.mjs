@@ -324,7 +324,8 @@ export const MEMORY_KIND_DEFINITIONS = Object.freeze({
   reflection: Object.freeze({
     layer: "reflective",
     stateful: false,
-    description: "Agent 对经历形成的看法、理解或自我反思，不冒充外部事实。",
+    subjectRoles: Object.freeze(["agent", "shared"]),
+    description: "记忆拥有者对经历表达的反思，或多位参与者共同表达的反思。",
   }),
 });
 

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MemoryRepository, openMemoryDatabase, locateCausalExcerpt } from "@suzu-memory/core";
-import { planMemoryConsolidation, runMemoryConsolidation, memoryBudgetError, runBudgetedMemoryParts, blockedMemoryPartsError } from "../src/index.mjs";
+import { planMemoryConsolidation, runMemoryConsolidation, processPlannedConsolidationRuns, proposeRelationsForBatch, memoryBudgetError, runBudgetedMemoryParts, blockedMemoryPartsError } from "../src/index.mjs";
+import { deferSmallConsolidationRuns } from '../../maintenance/src/structure-batching.mjs';
+import { prepareRelationGeneration } from '../src/relation-service.mjs';
 import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 import { readUsageEvents } from '@suzu-memory/usage-ledger';
 import { createTestDirectory } from '../../../test/support/suite-resources.mjs';
@@ -9,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
 
-test("retrospective budget splits preserve every new/old pair and resume completed parts", async t => {
+test("organization budget splits preserve new/old and same-batch pairs and resume completed parts", async t => {
   const database = openMemoryDatabase(":memory:");
   t.after(() => database.close());
   const repository = new MemoryRepository(database);
@@ -31,7 +33,8 @@ test("retrospective budget splits preserve every new/old pair and resume complet
     calls.push(request);
     if (calls.length === 2) throw new Error("transient provider failure");
     succeeded.push(request);
-    return { output: { structure: { proposals: [] }, relations: { proposals: [] } } };
+    return { output: request.schemaName === 'memory-consolidation-combined-v2'
+      ? { structure: { proposals: [] }, relations: { proposals: [] } } : { proposals: [] } };
   };
   generator.supportsCombinedConsolidation = true;
   generator.assertRequestBudget = request => {
@@ -45,6 +48,7 @@ test("retrospective budget splits preserve every new/old pair and resume complet
   assert.equal(calls[1].modelInput, calls[2].modelInput);
   assert.equal(new Set(succeeded.map(request => request.input)).size, succeeded.length);
   const pairs = new Set();
+  const currentPairs = new Set(), pairCounts = new Map();
   const historicalPrefixes = new Map();
   const quotedEvidence = JSON.stringify(source.content);
   for (const request of succeeded) {
@@ -52,6 +56,15 @@ test("retrospective budget splits preserve every new/old pair and resume complet
     const evidenceStart = request.modelInput.indexOf(quotedEvidence);
     assert.ok(evidenceStart >= 0, 'The model receives the complete source evidence.');
     const prefix = request.modelInput.slice(0, evidenceStart + quotedEvidence.length);
+    const scope = snapshot.relationContext || { anchorMemoryIds: snapshot.retrospectiveContext.triggerMemoryIds,
+      candidateMemoryIds: snapshot.retrospectiveContext.historicalMemoryIds, includeAnchorPairs: false };
+    const candidates = [...scope.candidateMemoryIds, ...(scope.includeAnchorPairs ? scope.anchorMemoryIds : [])];
+    for (const a of scope.anchorMemoryIds) for (const b of candidates) {
+      if (a !== b && a.startsWith('new-') && b.startsWith('new-')) currentPairs.add([a, b].sort().join(':'));
+    }
+    const requestPairs = new Set(scope.anchorMemoryIds.flatMap(a => candidates.filter(b => b !== a).map(b => [a, b].sort().join(':'))));
+    for (const pair of requestPairs) pairCounts.set(pair, (pairCounts.get(pair) || 0) + 1);
+    if (!snapshot.retrospectiveContext) continue;
     const historicalIds = JSON.stringify(snapshot.retrospectiveContext.historicalMemoryIds);
     if (historicalPrefixes.has(historicalIds)) {
       assert.ok(prefix === historicalPrefixes.get(historicalIds), 'The common prefix must extend through the historical evidence.');
@@ -63,6 +76,80 @@ test("retrospective budget splits preserve every new/old pair and resume complet
   }
   assert.ok(historicalPrefixes.size < succeeded.length, 'Distinct parts must share a historical prefix.');
   assert.equal(pairs.size, 16);
+  assert.equal(currentPairs.size, 6, 'Splitting must also examine pairs of new memories on opposite sides of a split.');
+  assert.ok([...pairCounts.values()].every(count => count === 1), 'A historical split must not duplicate within-batch comparisons.');
+});
+
+for (const withHistory of [false, true]) test(`causal organization includes within-batch links ${withHistory ? 'alongside historical links' : 'without historical candidates'}`, async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'first',
+    content: 'Because the venue was closed, Lin cancelled the museum visit. This cancellation led to a refund.' });
+  for (const [id, content] of [['closure', 'The venue was closed.'], ['cancellation', 'Lin cancelled the museum visit.']]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+    repository.linkSource(id, source.id);
+  }
+  if (withHistory) {
+    repository.upsertMemory({ id: 'refund', agentId, kind: 'event', layer: 'episodic', content: 'Lin received a refund.' });
+    repository.linkSource('refund', source.id);
+    repository.upsertEdge({ agentId, fromMemoryId: 'cancellation', toMemoryId: 'refund', relation: 'associated_with', weight: 1, confidence: 1 });
+  }
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['closure', 'cancellation'] });
+  assert.deepEqual(plan.candidateIds, withHistory ? ['refund'] : []);
+  let calls = 0;
+  const generator = async request => {
+    calls++;
+    assert.equal(request.schemaName, withHistory ? 'memory-consolidation-combined-v2' : 'memory-relation-proposals-v2');
+    const relations = { proposals: [{ relation: 'causes', fromMemoryId: 'closure', toMemoryId: 'cancellation',
+      evidenceSourceIds: [source.id], confidence: 0.9, rationale: 'The source explicitly gives closure as the cause.' }] };
+    if (withHistory) relations.proposals.push({ relation: 'causes', fromMemoryId: 'cancellation', toMemoryId: 'refund',
+      evidenceSourceIds: [source.id], confidence: 0.9, rationale: 'The cancellation led to the refund.' });
+    return { output: withHistory ? { structure: { proposals: [] }, relations } : relations };
+  };
+  generator.supportsCombinedConsolidation = true;
+  const args = { repository, agentId, runId: plan.id, structureGenerator: generator, relationGenerator: generator };
+  const result = await runMemoryConsolidation(args);
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(calls, 1);
+  const proposals = repository.listRelationProposals(agentId);
+  assert.equal(proposals.length, withHistory ? 2 : 1);
+  const proposal = proposals.find(item => item.from_memory_id === 'closure');
+  assert.equal(proposal.from_memory_id, 'closure'); assert.equal(proposal.to_memory_id, 'cancellation');
+  assert.equal(proposal.review_state, 'pending');
+  const applied = repository.findEdge({ agentId, fromMemoryId: 'closure', toMemoryId: 'cancellation', relation: 'causes' });
+  assert.ok(applied, 'Validated same-batch causality must be usable before human review.');
+  assert.equal(repository.getRelationProposal(agentId, applied.metadata.relationProposalId).review_state, 'pending');
+  assert.equal((await runMemoryConsolidation(args)).status, 'already-finished');
+  assert.equal(calls, 1);
+});
+
+test('an older pending checkpoint adds same-batch coverage once and keeps its completed comparisons', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'history',
+    content: 'The closure caused a cancellation. Earlier Lin had planned the visit.' });
+  for (const id of ['closure', 'cancellation', 'old-plan']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id }); repository.linkSource(id, source.id);
+  }
+  repository.upsertEdge({ agentId, fromMemoryId: 'closure', toMemoryId: 'old-plan', relation: 'associated_with', weight: 1, confidence: 1 });
+  const completed = { status: 'no-valid-proposals', proposed: [], duplicates: [], rejected: [] };
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['closure', 'cancellation'], metadata: {
+    organizationProgress: { parts: [{ id: 'legacy-part', memoryIds: ['closure', 'cancellation'], historicalIds: ['old-plan'],
+      status: 'completed', structure: completed, relations: completed }] },
+  } });
+  let calls = 0;
+  const generator = async request => {
+    assert.equal(request.schemaName, 'memory-relation-proposals-v2');
+    assert.ok(JSON.parse(request.input).memories.every(memory => memory.id !== 'old-plan'));
+    if (++calls === 1) throw new Error('Interrupted before the missing comparisons completed.');
+    return { output: { proposals: [] } };
+  };
+  const args = { repository, agentId, runId: plan.id, structureGenerator: generator, relationGenerator: generator };
+  assert.equal((await runMemoryConsolidation(args)).status, 'retry-pending');
+  const result = await runMemoryConsolidation(args);
+  assert.equal(result.status, 'no-proposals', result.error); assert.equal(calls, 2);
+  assert.equal(result.run.metadata.organizationProgress.parts.length, 2);
+  assert.deepEqual(result.run.metadata.organizationProgress.parts[0].structure, completed);
 });
 
 test("consolidation output exhaustion retains diagnostics and stops automatic retry", async t => {
@@ -162,7 +249,7 @@ test('native consolidation shares full evidence and restores references without 
     assert.equal(incoming.actorRoles[0].actorKey, 'r1');
     assert.equal(incoming.eventDate, '2026-10-21'); assert.equal(incoming.worldId, 'shared-history');
     assert.equal(container.content, 'Lin 的博物馆参观经历。'); assert.equal(container.memberCount, 3);
-    assert.deepEqual(container.memberIds, [old.id]); assert.deepEqual(container.addableMemberIds, [incoming.id]);
+    assert.deepEqual(container.memberIds, [old.id]);
     assert.equal(input.currentMemories, undefined);
     const output = { structure: { proposals: [{ operation: 'attach', targetMemoryId: container.id,
       title: '', content: 'Lin 参观过博物馆，后来因场馆闭馆取消了一次参观。', memberIds: [incoming.id], confidence: 0.9,
@@ -171,17 +258,40 @@ test('native consolidation shares full evidence and restores references without 
       rationale: 'The original statement explicitly links the closure to cancellation.' }] } };
     output.structure.proposals.push({ ...output.structure.proposals[0], memberIds: ['not-in-the-supplied-memories'] });
     output.relations.proposals.push({ ...output.relations.proposals[0], fromMemoryId: 'not-in-the-supplied-memories' });
+    output.relations.proposals = output.relations.proposals.map(({ relation, fromMemoryId, toMemoryId, ...fields }) => ({
+      ...fields, relation, scope: '', anchorMemoryId: toMemoryId, relatedMemoryId: fromMemoryId, direction: 'related_to_anchor',
+    }));
+    output.relations.proposals.push(null, { ...output.relations.proposals[0], direction: 'invalid-direction' });
     const { proposals } = output.structure;
-    output.structure = { creations: [], attachments: proposals.map(({ operation, ...item }) => item) };
-    assert.ok(wire.tools[0].function.parameters.properties.structure.properties.attachments);
+    output.structure = { creations: [{ kind: 'episode', title: 'Cancelled museum visit',
+      content: 'The venue closure caused Lin to cancel the museum visit.', firstMemberId: incoming.id, secondMemberId: old.id, additionalMemberIds: [],
+      subjectRole: 'user', subjectKey: 'r1', actorRoles: [], confidence: 0.9, rationale: 'The closure and cancellation describe the same visit.' }],
+      attachments: proposals.map(({ operation, targetMemoryId, memberIds, ...item }) => ({ ...item,
+        selection: { targetMemoryId, firstMemberId: memberIds[0] }, additionalMemberIds: memberIds.slice(1) })) };
+    const schema = wire.tools[0].function.parameters.properties;
+    const creations = schema.structure.properties.creations.items.properties;
+    assert.deepEqual(creations.firstMemberId?.enum, [incoming.id], 'Creation must offer only the selected incoming members.');
+    assert.deepEqual(creations.secondMemberId.enum, [old.id]);
+    assert.ok(schema.structure.properties.creations.items.required.includes('firstMemberId'));
+    assert.ok(schema.structure.properties.creations.items.required.includes('secondMemberId'));
+    const attachments = schema.structure.properties.attachments.items.properties;
+    const targets = attachments.selection.anyOf;
+    assert.equal(targets.length, 1); assert.deepEqual(targets[0].properties.targetMemoryId.enum, [container.id]);
+    assert.deepEqual(targets[0].properties.firstMemberId.enum, [incoming.id], 'Existing members must not be offered as additions.');
+    assert.deepEqual(attachments.additionalMemberIds.items.enum, [incoming.id]);
+    const causal = schema.relations.properties.proposals.items.properties;
+    assert.deepEqual(causal.anchorMemoryId.enum, [incoming.id]);
+    assert.deepEqual(causal.relatedMemoryId.enum, [old.id]);
+    assert.deepEqual(causal.direction.enum, ['anchor_to_related', 'related_to_anchor'], 'History does not determine causal direction.');
     return Response.json({ model: wire.model, choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
       tool_calls: [{ type: 'function', function: { name: wire.tools[0].function.name, arguments: JSON.stringify(output) } }] } }],
       usage: { prompt_tokens: 123, completion_tokens: 33 } });
   } });
   const result = await runMemoryConsolidation({ repository, agentId, runId: plan.id, structureGenerator: generator, relationGenerator: generator });
   assert.equal(result.status, 'completed', result.error); assert.equal(calls, 1);
-  assert.equal(result.structure.proposed.length, 1); assert.equal(result.structure.rejected.length, 1);
-  assert.equal(result.relations.proposed.length, 1); assert.equal(result.relations.rejected.length, 1);
+  assert.equal(result.structure.proposed.length, 2); assert.equal(result.structure.rejected.length, 1);
+  assert.deepEqual(new Set(result.structure.proposed.find(proposal => proposal.operation === 'create').memberIds), new Set(['old', 'new']));
+  assert.equal(result.relations.proposed.length, 1); assert.equal(result.relations.rejected.length, 3);
   assert.deepEqual(repository.listTopicMembers({ agentId, topicId: topic.id }).map(memory => memory.id).sort(), ['new', 'old', 'outside-1', 'outside-2']);
   const relation = repository.listRelationProposals(agentId)[0];
   assert.equal(relation.from_memory_id, 'old'); assert.equal(relation.to_memory_id, 'new');
@@ -213,7 +323,7 @@ test('causal consolidation uses verified passages and restores full evidence on 
     const native = createOpenAiCompatibleStructuredGenerator({ connection: { baseUrl: 'https://fixture.test/v1',
       apiKey: 'fixture-only', model: 'fixture-model', structuredOutputMode: 'strict-tool' }, fetchImpl: async (_url, init) => {
       const wire = JSON.parse(init.body), input = JSON.parse(wire.messages[1].content);
-      const combined = schemas.at(-1) === 'memory-consolidation-combined-v1';
+      const combined = schemas.at(-1) === 'memory-consolidation-combined-v2';
       const sources = [...(input.historicalMaterial?.sourceRecords || []), ...input.sourceRecords];
       const records = [...(input.historicalMaterial?.memories || []), ...input.memories];
       const older = records.find(memory => memory.content === 'The venue was closed.');
@@ -224,7 +334,8 @@ test('causal consolidation uses verified passages and restores full evidence on 
       assert.equal(sources.find(item => item.id !== original.id).content, legacy.content);
       assert.notEqual(older.id, 'old'); assert.notEqual(newer.id, 'new');
       assert.equal(newer.eventDate, '2026-10-21');
-      const proposal = { relation: 'causes', fromMemoryId: older.id, toMemoryId: newer.id,
+      const proposal = { relation: 'reason_for', scope: '这次场馆参观',
+        anchorMemoryId: newer.id, relatedMemoryId: older.id, direction: 'related_to_anchor',
         evidenceSourceIds: [original.id], confidence: 0.95, rationale: passage };
       const relations = combined ? { needsFullEvidence, proposals: needsFullEvidence ? [] : [proposal] } : { proposals: [proposal] };
       const output = combined ? { structure: { creations: [], attachments: [] }, relations } : relations;
@@ -243,16 +354,243 @@ test('causal consolidation uses verified passages and restores full evidence on 
       structureGenerator: generator, relationGenerator: generator,
       structureOptions: { usageLedgerPath: ledgerPath }, relationOptions: { usageLedgerPath: ledgerPath } });
     assert.equal(result.status, 'completed', result.error);
-    assert.deepEqual(schemas, ['memory-consolidation-combined-v1', ...(needsFullEvidence ? ['memory-relation-proposals-v1'] : [])]);
+    assert.deepEqual(schemas, ['memory-consolidation-combined-v2', ...(needsFullEvidence ? ['memory-relation-proposals-v2'] : [])]);
     assert.deepEqual(result.relations.rejected, []);
     const relation = repository.listRelationProposals(agentId)[0];
     assert.equal(relation.from_memory_id, 'old'); assert.equal(relation.to_memory_id, 'new');
+    assert.equal(relation.relation, 'reason_for');
+    assert.equal(relation.metadata.scope, '这次场馆参观');
+    assert.equal(repository.getEdge(agentId, relation.result_edge_id).metadata.scope, '这次场馆参观');
     assert.deepEqual(relation.evidence.map(item => item.id), [source.id]);
     assert.equal(repository.getSource(source.id).content, content);
     const usage = await readUsageEvents(ledgerPath);
     assert.equal(usage.events.length, schemas.length);
     assert.equal(usage.events.reduce((total, item) => total + item.usage.prompt_tokens, 0), schemas.length * 100);
   }
+});
+
+test('verified causal passages fit independently of unused full evidence, including an indivisible fallback', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const passage = 'Because the venue was closed, Lin cancelled the visit.';
+  const content = 'Unrelated background. '.repeat(5000) + passage;
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'long-causal-source', content,
+    metadata: { causalExcerpt: locateCausalExcerpt(content, { start: 'Because the venue was closed,', end: 'Lin cancelled the visit.' }) } });
+  for (const [id, text] of [['old', 'The venue was closed.'], ['new', 'Lin cancelled the visit.']]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: text });
+    repository.linkSource(id, source.id);
+  }
+  repository.upsertEdge({ agentId, fromMemoryId: 'new', toMemoryId: 'old', relation: 'associated_with', weight: 1, confidence: 1 });
+  let needsFullEvidence = false;
+  const calls = [];
+  const generator = Object.assign(async request => {
+    calls.push(request);
+    const input = JSON.parse(request.input);
+    assert.equal(input.sourceRecords[0].content, passage);
+    return { output: request.schemaName === 'memory-consolidation-combined-v2'
+      ? { structure: { proposals: [] }, relations: { needsFullEvidence, proposals: [] } }
+      : { needsFullEvidence, proposals: [] } };
+  }, { supportsCombinedConsolidation: true });
+  const standalone = await proposeRelationsForBatch({ repository, agentId, memoryIds: ['old', 'new'],
+    generator, maximumRequestCharacters: 10000 });
+  assert.equal(standalone.status, 'no-valid-proposals');
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['new'] });
+  const result = await runMemoryConsolidation({ repository, agentId, runId: plan.id,
+    structureGenerator: generator, relationGenerator: generator });
+  assert.equal(result.status, 'no-proposals', result.error);
+  assert.equal(calls.length, 2, 'Unused full evidence must not partition or block a request.');
+  needsFullEvidence = true;
+  const fallback = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['new'], policyVersion: 'fallback-review' });
+  const blocked = await runMemoryConsolidation({ repository, agentId, runId: fallback.id,
+    structureGenerator: generator, relationGenerator: generator });
+  assert.equal(blocked.status, 'failed');
+  assert.equal(blocked.run.review_state, 'pending');
+  assert.equal(calls.length, 3, 'An indivisible full request must enter review before contacting the provider.');
+  assert.equal(repository.getSource(source.id).content, content);
+});
+
+test('requested full evidence partitions and resumes without repeating excerpts or completed structure work', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const incoming = ['visit-a', 'visit-b', 'visit-c', 'visit-d'];
+  repository.upsertMemory({ id: 'closure', agentId, kind: 'event', layer: 'episodic', content: 'The venue was closed.' });
+  for (const id of incoming) {
+    const passage = `Because the venue was closed, Lin cancelled ${id}.`;
+    const content = 'Other background. '.repeat(260) + passage;
+    const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: id, content,
+      metadata: { causalExcerpt: locateCausalExcerpt(content, { start: 'Because the venue was closed,', end: `Lin cancelled ${id}.` }) } });
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: `Lin cancelled ${id}.` });
+    repository.linkSource(id, source.id);
+    repository.upsertEdge({ agentId, fromMemoryId: id, toMemoryId: 'closure', relation: 'associated_with', weight: 1, confidence: 1 });
+  }
+  let excerptCalls = 0, fullCalls = 0;
+  const pairs = new Set(), successfulInputs = new Set();
+  const generator = Object.assign(async request => {
+    const input = JSON.parse(request.input);
+    if (request.schemaName === 'memory-consolidation-combined-v2') {
+      excerptCalls++;
+      assert.ok(input.sourceRecords.every(source => source.excerpt));
+      return { output: { structure: { proposals: [] }, relations: { needsFullEvidence: true, proposals: [] } } };
+    }
+    fullCalls++;
+    assert.ok(input.sourceRecords.every(source => !source.excerpt && source.content.startsWith('Other background. ')));
+    if (fullCalls === 2) throw new Error('Temporary full-evidence provider failure.');
+    const scope = input.relationContext;
+    for (const a of scope.anchorMemoryIds) for (const b of [...scope.candidateMemoryIds,
+      ...(scope.includeAnchorPairs ? scope.anchorMemoryIds : [])]) if (a !== b) pairs.add([a, b].sort().join(':'));
+    assert.ok(!successfulInputs.has(request.input), 'Completed full-evidence scopes must not replay.');
+    successfulInputs.add(request.input);
+    return { output: { proposals: [] } };
+  }, { supportsCombinedConsolidation: true });
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: incoming });
+  // Full evidence for two incoming memories plus the closure fits exactly;
+  // the complete four-memory batch must split. The newly covered incoming
+  // pairs each have two full sources and must also fit this same budget.
+  const sample = prepareRelationGeneration({ repository, agentId, memoryIds: [...incoming.slice(0, 2), 'closure'],
+    snapshotOptions: { retrospective: { triggerMemoryIds: incoming.slice(0, 2), historicalMemoryIds: ['closure'] },
+      relationContext: { anchorMemoryIds: incoming.slice(0, 2), candidateMemoryIds: ['closure'], includeAnchorPairs: true } },
+    useSourceExcerpts: false, maximumRequestCharacters: Infinity }).request;
+  const fullBudget = sample.input.length + sample.systemPrompt.length + JSON.stringify(sample.schema).length;
+  const run = () => runMemoryConsolidation({ repository, agentId, runId: plan.id,
+    structureGenerator: generator, relationGenerator: generator,
+    structureOptions: { maximumRequestCharacters: 5000 }, relationOptions: { maximumRequestCharacters: fullBudget } });
+  assert.equal((await run()).status, 'retry-pending');
+  const result = await run();
+  assert.equal(result.status, 'no-proposals', result.error);
+  assert.equal(excerptCalls, 1, 'A request for full evidence survives partitioning and provider retries.');
+  const expected = new Set(incoming.map(id => ['closure', id].sort().join(':')));
+  for (const a of incoming) for (const b of incoming) if (a !== b) expected.add([a, b].sort().join(':'));
+  assert.deepEqual(pairs, expected);
+  assert.equal(fullCalls, successfulInputs.size + 1, 'Only the failed full-evidence call repeats.');
+});
+
+test('a relation persistence failure stays retryable and does not replay successful structure work', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause',
+    content: 'Because the venue was closed, Lin cancelled the visit.' });
+  for (const [id, content] of [['old', 'The venue was closed.'], ['new', 'Lin cancelled the visit.']]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+    repository.linkSource(id, source.id);
+  }
+  repository.upsertEdge({ agentId, fromMemoryId: 'new', toMemoryId: 'old', relation: 'associated_with', weight: 1, confidence: 1 });
+  const original = repository.recordRelationProposal.bind(repository);
+  let writes = 0, structureCalls = 0, relationCalls = 0;
+  repository.recordRelationProposal = value => {
+    if (++writes === 1) throw new Error('Temporary persistence failure.');
+    return original(value);
+  };
+  const structureGenerator = async () => { structureCalls++; return { output: { proposals: [] } }; };
+  const relationGenerator = async () => {
+    relationCalls++;
+    return { output: { proposals: [{ relation: 'causes', fromMemoryId: 'old', toMemoryId: 'new',
+      evidenceSourceIds: [source.id], confidence: 0.95, rationale: source.content }] } };
+  };
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['new'] });
+  const run = () => runMemoryConsolidation({ repository, agentId, runId: plan.id, structureGenerator, relationGenerator });
+  const first = await run();
+  assert.equal(first.status, 'retry-pending');
+  assert.match(first.relations.rejected[0].error, /Temporary persistence failure/);
+  assert.equal(repository.listRelationProposals(agentId).length, 0);
+  assert.equal((await run()).status, 'completed');
+  assert.equal(repository.listRelationProposals(agentId).length, 1);
+  assert.equal(structureCalls, 1);
+  assert.equal(relationCalls, 2);
+});
+
+test('organization rejects unrelated causal evidence once, preserves valid siblings and records actionable diagnostics', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause',
+    content: 'Because the venue was closed, Lin cancelled the visit.' });
+  const unrelated = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'other', content: 'Lin likes tea.' });
+  for (const [id, evidence] of [['closed', source], ['cancelled', source], ['tea', unrelated]]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, evidence.id);
+  }
+  let calls = 0;
+  const relationGenerator = async () => {
+    calls++;
+    const valid = { relation: 'causes', fromMemoryId: 'closed', toMemoryId: 'cancelled',
+      evidenceSourceIds: [source.id], confidence: 0.9, rationale: source.content };
+    return { requestId: 'provider-request-1', output: { proposals: [
+      { ...valid, evidenceSourceIds: [source.id, unrelated.id] }, valid,
+    ] } };
+  };
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['closed', 'cancelled', 'tea'] });
+  const run = () => runMemoryConsolidation({ repository, agentId, runId: plan.id, relationGenerator });
+  const report = await run();
+  assert.equal(report.status, 'completed');
+  assert.equal(report.relations.proposed.length, 1);
+  const rejection = report.relations.rejected[0];
+  assert.equal(rejection.category, 'invalid-candidate');
+  assert.equal(rejection.retryable, false);
+  assert.deepEqual(rejection.candidate.evidenceSourceIds, [source.id, unrelated.id]);
+  assert.ok(rejection.inputHash);
+  assert.equal(rejection.requestId, 'provider-request-1');
+  assert.equal((await run()).status, 'already-finished');
+  assert.equal(calls, 1, 'A deterministic candidate error must not purchase another generation.');
+  assert.deepEqual(repository.getConsolidationRun(agentId, plan.id).metadata.organizationProgress.parts[0].relations.rejected, [rejection]);
+});
+
+test('organization replans changed input after a partial run while retaining its recorded outputs', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause', content: 'Because the old event happened, the new event followed.' });
+  for (const id of ['old', 'new']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, source.id);
+  }
+  repository.upsertEdge({ agentId, fromMemoryId: 'new', toMemoryId: 'old', relation: 'associated_with', weight: 1, confidence: 1 });
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['new'] });
+  let calls = 0;
+  const first = await runMemoryConsolidation({ repository, agentId, runId: plan.id,
+    structureGenerator: async () => { calls++; return { output: { proposals: [{ operation: 'create', kind: 'topic',
+      memberIds: ['new', 'old'], content: 'These events form a topic.' }] } }; },
+    relationGenerator: async () => { throw new Error('Provider temporarily unavailable.'); } });
+  assert.equal(first.status, 'retry-pending');
+  assert.equal(first.run.structureProposalIds.length, 1);
+  repository.editMemoryManually({ agentId, memoryId: 'old', patch: { content: 'Corrected historical event.' } });
+  const resumed = await runMemoryConsolidation({ repository, agentId, runId: plan.id,
+    structureGenerator: async () => { throw new Error('Stale work must be replanned before generation.'); } });
+  assert.equal(resumed.status, 'replanned');
+  assert.equal(resumed.run.status, 'cancelled');
+  assert.deepEqual(resumed.run.structureProposalIds, first.run.structureProposalIds, 'Retiring a run must preserve its audit trail.');
+  assert.notEqual(resumed.replacementRun.id, plan.id);
+  assert.equal(repository.getStructureProposal(agentId, first.run.structureProposalIds[0]).review_state, 'dismissed');
+  const generator = async request => {
+    calls++;
+    assert.match(request.input, /Corrected historical event/);
+    return { output: { proposals: [] } };
+  };
+  deferSmallConsolidationRuns({ repository, agentId, minimumMemories: 20 });
+  const finished = await processPlannedConsolidationRuns({ repository, agentId, generator, minimumTriggerMemories: 20, maximumRuns: 10 });
+  assert.equal(finished.selected, 1, 'A replacement for already started work must not return to the initial accumulation threshold.');
+  assert.equal(finished.results[0].runId, resumed.replacementRun.id);
+  assert.equal(finished.results[0].status, 'no-proposals');
+  assert.equal(calls, 3);
+});
+
+test('organization preserves an unaffected causal sibling when evidence changes while the model is running', async t => {
+  const database = openMemoryDatabase(':memory:'); t.after(() => database.close());
+  const repository = new MemoryRepository(database), agentId = 'owner';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'cause', content: 'Because A, B. Because C, D.' });
+  for (const id of ['a', 'b', 'c', 'd']) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content: id });
+    repository.linkSource(id, source.id);
+  }
+  const plan = planMemoryConsolidation({ repository, agentId, triggerMemoryIds: ['a', 'b', 'c', 'd'] });
+  const report = await runMemoryConsolidation({ repository, agentId, runId: plan.id, relationGenerator: async () => {
+    repository.editMemoryManually({ agentId, memoryId: 'a', patch: { content: 'Corrected A.' } });
+    return { output: { proposals: [['a', 'b'], ['c', 'd']].map(([fromMemoryId, toMemoryId]) => ({ relation: 'causes',
+      fromMemoryId, toMemoryId, evidenceSourceIds: [source.id], rationale: source.content, confidence: 0.9 })) } };
+  } });
+  assert.equal(report.status, 'replanned');
+  const pending = repository.listRelationProposals(agentId);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].from_memory_id, 'c');
+  assert.deepEqual(report.run.relationProposalIds, [pending[0].id]);
+  assert.equal(report.run.metadata.organizationProgress.parts[0].relations.rejected[0].category, 'stale-input');
 });
 
 test('retrospective attachments join old evidence to a topic already containing the trigger and preserve identity and dates', async t => {
@@ -282,12 +620,13 @@ test('retrospective attachments join old evidence to a topic already containing 
       model: 'fixture', structuredOutputMode: 'strict-tool' }, fetchImpl: async (_url, init) => {
       calls++; const wire = JSON.parse(init.body), material = JSON.parse(wire.messages[1].content);
       const older = material.historicalMaterial.memories.find(item => item.eventDate === '2026-10-20'), target = material.candidateContainers[0];
-      assert.ok(target.memberIds.includes(material.retrospectiveContext.triggerMemoryIds[0]));
-      assert.deepEqual(target.addableMemberIds, [older.id]);
+      assert.ok(target.memberIds.includes(material.memories[0].id));
+      const selection = wire.tools[0].function.parameters.properties.structure.properties.attachments.items.properties.selection;
+      assert.deepEqual(selection.anyOf[0].properties.firstMemberId.enum, [older.id]);
       return Response.json({ model: 'fixture', choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ type: 'function',
         function: { name: wire.tools[0].function.name, arguments: JSON.stringify({
-          structure: { creations: [], attachments: [{ targetMemoryId: target.id, title: '', content: summary,
-            memberIds: [older.id], confidence: 0.9, rationale: 'The earlier activities develop the same topic.' }] },
+          structure: { creations: [], attachments: [{ selection: { targetMemoryId: target.id, firstMemberId: older.id }, title: '', content: summary,
+            additionalMemberIds: [], confidence: 0.9, rationale: 'The earlier activities develop the same topic.' }] },
           relations: { proposals: [] },
         }) } }] } }], usage: { prompt_tokens: 123, completion_tokens: 45 } });
     } });
@@ -325,6 +664,7 @@ test('proposal saturation preserves accepted work and resumes only unfinished co
     requests.push(request.input);
     if (requests.length === 2) { interrupted = true; throw new Error('Temporary connection failure.'); }
     const input = JSON.parse(request.input), selected = input.retrospectiveContext;
+    if (!selected) return { output: { proposals: [] } }; // The two cancellations do not cause each other.
     return { output: { proposals: selected.triggerMemoryIds.flatMap(incoming => selected.historicalMemoryIds.map(old => ({
       relation: 'causes', fromMemoryId: old, toMemoryId: incoming, evidenceSourceIds: [source.id],
       confidence: 0.95, rationale: '原话明确说明这两个原因导致了取消和推迟。' }))).slice(0, 2) } };

@@ -1,4 +1,5 @@
 import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
+import { extractionModelFixture } from '../../../test/support/extraction-fixtures.mjs';
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -148,6 +149,37 @@ async function assertPortReleased(port) {
   try { await new Promise((resolve, reject) => { probe.once("error", reject); probe.listen(port, "127.0.0.1", resolve); }); }
   finally { if (probe.listening) await new Promise(resolve => probe.close(resolve)); }
 }
+
+test('HTTP SDK preserves the Event cutoff through extraction, maintenance and retrieval', async context => {
+  const agentId = 'sdk-source-cutoff', requests = [];
+  const scope = upper => ({ owner: 'http-source', agentId, eventUpperBound: upper, clears: [] });
+  const memory = closeAfterTests(createEmbeddedMemoryClient({ dataRoot: temporaryDirectory(), agentId,
+    providers: {
+      generator: async request => { requests.push(request); return { output: extractionModelFixture({ memories: [] }) }; },
+      embedding: Object.assign(async () => ({ model: 'sdk-source-vector', vector: [1, 2, 3] }), { model: 'sdk-source-vector', dimensions: 3 }),
+    } }));
+  memory.appendEventSources({ scope: scope(2), events: [1,2].map(n => ({ occurredAt: '2026-09-06T00:00:00.000Z',
+    content: { text: n === 1 ? 'The museum visit is eligible.' : 'The museum visit includes FUTURE_HTTP_DETAIL.' },
+    source: { version: 1, owner: 'http-source', recipientAgentId: agentId, eventId: `http-${n}`, commitSequence: n,
+      spaceId: 'museum', eventType: 'message.created', sender: { kind: 'local-user', id: 'user' }, topology: { kind: 'space' } } })) });
+  const server = createMemoryHttpServer({ service: memory });
+  const address = await server.listen({ port: 0 });
+  context.diagnostic(`HTTP source check PID=${process.pid} port=${address.port}`);
+  const client = createHttpMemoryClient({ baseUrl: address.baseUrl });
+  try {
+    await client.processPendingEvents({ sourceScope: scope(1), maximumEvents: 1 });
+    assert.deepEqual(requests[0].sourceMaterial.eventSources.map(source => source.eventId), ['http-1']);
+    assert.equal(memory.listInputEvents({ statuses: ['pending'] }).total, 1);
+    await client.runMaintenance({ sourceScope: scope(1), processInputEvents: false, lane: 'embedding' });
+    await client.processPendingEvents({ sourceScope: scope(2), maximumEvents: 1 });
+    const historical = await client.search('museum visit', { sourceScope: scope(1), persistTrace: false });
+    assert.ok(historical.records.length);
+    assert.ok(historical.records.every(record => record.eventSources.every(source => source.eventId === 'http-1')));
+    assert.ok(!historical.context.includes('FUTURE_HTTP_DETAIL'));
+    const current = await client.search('FUTURE_HTTP_DETAIL', { sourceScope: scope(2), persistTrace: false });
+    assert.ok(current.context.includes('FUTURE_HTTP_DETAIL'));
+  } finally { await server.close(); await assertPortReleased(address.port); }
+});
 
 test("cancelling an HTTP SDK search cancels its service operation", { timeout: 5000 }, async context => {
   let entered, release;

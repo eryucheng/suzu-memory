@@ -260,12 +260,13 @@ export function buildStructureSnapshot({
     const triggerMemoryIds = uniqueStrings(retrospective.triggerMemoryIds);
     const historicalMemoryIds = uniqueStrings(retrospective.historicalMemoryIds);
     const currentIds = new Set(current.map((memory) => memory.id));
-    if (!triggerMemoryIds.length || !historicalMemoryIds.length
+    if (!triggerMemoryIds.length || (!historicalMemoryIds.length && !retrospective.includeTriggerPairs)
       || [...triggerMemoryIds, ...historicalMemoryIds].some((id) => !currentIds.has(id))
       || triggerMemoryIds.some((id) => historicalMemoryIds.includes(id))) {
       throw new Error("Retrospective structure context must partition current memories into trigger and historical IDs.");
     }
-    retrospectiveContext = { triggerMemoryIds, historicalMemoryIds };
+    retrospectiveContext = { triggerMemoryIds, historicalMemoryIds,
+      ...(retrospective.includeTriggerPairs ? { includeTriggerPairs: true } : {}) };
   }
   const continuityMemories = new Map(current.map(memory => [memory.id, memory]));
   const candidateContainers = candidateIds.slice(0, containerLimit).map((id) => (

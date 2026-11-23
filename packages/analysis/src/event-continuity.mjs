@@ -1,14 +1,58 @@
 import { executionEventSourceView, eventSourceMaterial, assertEventSourceExecutionCurrent, memoryWorldsCompatible,
   recordEventContinuityReview, modelCalendarFields, withModelReferences } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
-import { lexicalScore } from '@suzu-memory/retriever';
+import { lexicalScore, prepareLexicalQuery } from '@suzu-memory/retriever';
 import { appendUsageEvent } from '@suzu-memory/usage-ledger';
 import { stateAnalysisBudgetError } from './request-budget.mjs';
 
 const eventReferenceFields = new Set(['id', 'memoryId', 'candidateId', 'candidateIds', 'memorySourceIds', 'candidateSourceIds', 'canonicalKey']);
 
 function withEventReferences(request) {
-  return withModelReferences(request, { material: JSON.parse(request.input), fields: eventReferenceFields });
+  const referenced = withModelReferences(request, { material: JSON.parse(request.input), fields: eventReferenceFields });
+  const material = JSON.parse(referenced.modelInput);
+  const defaults = {};
+  for (const field of ['reality', 'worldId', 'worldFrame', 'temporalState', 'evidenceMode', 'subjectRole', 'subjectKey']) {
+    if (!material.memories.every(memory => Object.hasOwn(memory, field))) continue;
+    const frequencies = new Map();
+    for (const memory of material.memories) {
+      const key = JSON.stringify(memory[field]); frequencies.set(key, (frequencies.get(key) || 0) + 1);
+    }
+    const [value, count] = [...frequencies].sort((left, right) => right[1] - left[1])[0] || [];
+    if (count > 1) defaults[field] = JSON.parse(value);
+  }
+  const compact = { ...material, memoryDefaults: defaults,
+    memories: material.memories.map(memory => Object.fromEntries(Object.entries(memory)
+      .filter(([key, value]) => !Object.hasOwn(defaults, key) || JSON.stringify(value) !== JSON.stringify(defaults[key])))) };
+  let instructions = 'memoryDefaults 给出 memories 每项的共同字段，单项同名字段覆盖默认值。';
+  const pools = [];
+  const events = material.events.map(event => {
+    const ids = [...new Set([event.memoryId, ...event.candidateIds])].sort();
+    let index = pools.findIndex(pool => JSON.stringify(pool) === JSON.stringify(ids));
+    if (index < 0) { index = pools.length; pools.push(ids); }
+    const { candidateIds, ...fields } = event;
+    return { ...fields, candidatePool: index };
+  });
+  const poolInstructions = 'candidatePool 是 candidatePools 的零起始下标，该集合排除当前 memoryId 自己后就是此事件允许的候选。';
+  if (JSON.stringify({ events, candidatePools: pools }).length + poolInstructions.length < JSON.stringify({ events: material.events }).length) {
+    compact.events = events; compact.candidatePools = pools; instructions += poolInstructions;
+  }
+  const input = JSON.stringify(compact);
+  return input.length + instructions.length < referenced.modelInput.length
+    ? { ...referenced, eventContinuityPrompt: request.systemPrompt, modelInput: input,
+      systemPrompt: `${request.systemPrompt}\n\n${instructions}` } : referenced;
+}
+
+function assertEventContinuityRequestBudget(request, generator, maximumRequestCharacters, phase = 'request') {
+  if (maximumRequestCharacters !== Infinity) {
+    // The provider measures short references, escaping and its complete payload.
+    // Injected generators without a serializer retain the existing input check.
+    const characters = generator?.measureRequest ? generator.measureRequest(request)
+      : request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length;
+    if (characters > maximumRequestCharacters) throw stateAnalysisBudgetError(
+      `Complete event continuity ${phase} (${characters} characters) exceeds maximumRequestCharacters (${maximumRequestCharacters}).`,
+    );
+  }
+  generator?.assertRequestBudget?.(request);
 }
 
 export const EVENT_CONTINUITY_SCHEMA = {
@@ -105,13 +149,14 @@ export async function prepareEventContinuity({ repository, agentId, memoryIds, e
   };
   const items = memories.map(memory => {
     const vector = embeddings.get(memory.id)?.vector;
+    const query = prepareLexicalQuery(`${memory.title}\n${memory.content}`);
     const ranked = stored.filter(candidate => positions.get(candidate.id) < positions.get(memory.id)
       && memoryWorldsCompatible(memory, candidate, { allowRealSpaces: true })).map(candidate => {
       const row = embeddings.get(candidate.id);
       const valid = row && row.vector.length === vector?.length
         && row.content_hash === contentHash(candidate);
       return { memory: candidate, score: valid ? vector.reduce((sum, value, i) => sum + value * row.vector[i], 0) : -1,
-        lexical: lexicalScore(`${memory.title}\n${memory.content}`, `${candidate.title}\n${candidate.content}`).score };
+        lexical: lexicalScore(query, `${candidate.title}\n${candidate.content}`).score };
     });
     const candidates = [...new Map([
       ...[...ranked].sort((a, b) => b.score - a.score || b.lexical - a.lexical).slice(0, 6),
@@ -140,29 +185,20 @@ export async function prepareEventContinuity({ repository, agentId, memoryIds, e
       memories: inputMemories }),
     ...(material ? { sourceMaterial: material } : {}),
   }) : null;
-  if (request) {
-    const characters = request.input.length + request.systemPrompt.length + JSON.stringify(request.schema).length;
-    if (characters > maximumRequestCharacters) throw stateAnalysisBudgetError(
-      `Complete event continuity request (${characters} characters) exceeds maximumRequestCharacters (${maximumRequestCharacters}).`,
-    );
-    generator?.assertRequestBudget?.(request);
-  }
+  if (request) assertEventContinuityRequestBudget(request, generator, maximumRequestCharacters);
   return { items, request, snapshots, maximumRequestCharacters };
 }
 
-function coveredMatches(matches, items) {
-  const byId = new Map(matches.map(match => [match?.memoryId, match]));
-  if (byId.size !== matches.length || byId.size !== items.length || items.some(item => !byId.has(item.memory.id))) {
-    const expectedIds = new Set(items.map(item => item.memory.id));
-    throw Object.assign(new Error('Event continuity output must cover exactly the requested events.'), {
-      code: 'MEMORY_EVENT_CONTINUITY_COVERAGE',
-      diagnostics: { expectedCount: items.length, returnedCount: matches.length,
-        missingMemoryIds: [...expectedIds].filter(id => !byId.has(id)),
-        unexpectedMemoryIds: [...byId.keys()].filter(id => !expectedIds.has(id)),
-        duplicateMemoryIds: [...byId.keys()].filter(id => matches.filter(match => match?.memoryId === id).length > 1) },
-    });
-  }
-  return byId;
+function indexMatches(matches, items) {
+  const byId = Map.groupBy(matches, match => match?.memoryId);
+  const expectedIds = new Set(items.map(item => item.memory.id));
+  const missingMemoryIds = [...expectedIds].filter(id => !byId.has(id));
+  const unexpectedMemoryIds = [...byId.keys()].filter(id => !expectedIds.has(id));
+  const duplicateMemoryIds = [...byId.keys()].filter(id => byId.get(id).length > 1);
+  const diagnostics = missingMemoryIds.length || unexpectedMemoryIds.length || duplicateMemoryIds.length
+    ? { expectedCount: items.length, returnedCount: matches.length, missingMemoryIds, unexpectedMemoryIds, duplicateMemoryIds }
+    : null;
+  return { byId, diagnostics };
 }
 
 function decisionProblems(item, match) {
@@ -174,6 +210,7 @@ function decisionProblems(item, match) {
   }
   if (match.resolution !== 'matched') {
     if (match.candidateId || match.relation || match.memorySourceIds.length || match.candidateSourceIds.length) problems.push('unresolved-decision-must-not-bind-an-event-or-sources');
+    if (match.resolution === 'new' && item.allowNew === false) problems.push('pair-only-repair-cannot-declare-an-event-new');
     return problems;
   }
   const target = item.candidates.find(candidate => candidate.id === match.candidateId);
@@ -185,6 +222,14 @@ function decisionProblems(item, match) {
     if (match[field].some(id => !ids.has(id))) problems.push(`${field}:source-does-not-belong-to-its-endpoint`);
   }
   return problems;
+}
+
+function inspectDecision(item, matches = []) {
+  if (matches.length !== 1) {
+    return { match: null, problems: [matches.length ? 'duplicate-decision' : 'missing-decision'] };
+  }
+  const [match] = matches;
+  return { match, problems: decisionProblems(item, match) };
 }
 
 function decision(item, match) {
@@ -216,12 +261,21 @@ export async function applyEventContinuity({ repository, agentId, prepared, gene
     }
   };
   const generation = request ? await generate(request, 'event-continuity') : null;
-  const byId = coveredMatches(generation ? parseEventContinuity(generation.output).matches : [], items.filter(item => item.candidates.length));
+  const requested = items.filter(item => item.candidates.length);
+  const { byId, diagnostics } = indexMatches(generation ? parseEventContinuity(generation.output).matches : [], requested);
+  if (diagnostics && !requested.some(item => byId.get(item.memory.id)?.length === 1)) {
+    throw Object.assign(new Error('Event continuity output contains no uniquely returned decision for a requested event.'), {
+      code: 'MEMORY_EVENT_CONTINUITY_COVERAGE', diagnostics,
+    });
+  }
+  const coverage = diagnostics ? { initial: diagnostics } : {};
   const accepted = new Map(), invalid = [], reviews = new Map();
   for (const item of items) {
-    const match = byId.get(item.memory.id) || { memoryId: item.memory.id, resolution: 'new', candidateId: '', relation: '',
-      memorySourceIds: [], candidateSourceIds: [], rationale: '没有可用的历史事件候选。' };
-    const problems = decisionProblems(item, match);
+    const matches = item.candidates.length ? byId.get(item.memory.id) : [{
+      memoryId: item.memory.id, resolution: 'new', candidateId: '', relation: '',
+      memorySourceIds: [], candidateSourceIds: [], rationale: '没有可用的历史事件候选。',
+    }];
+    const { match, problems } = inspectDecision(item, matches);
     if (problems.length) invalid.push({ item, match, problems });
     else accepted.set(item.memory.id, decision(item, match));
   }
@@ -230,32 +284,29 @@ export async function applyEventContinuity({ repository, agentId, prepared, gene
     // A citation repair for a known endpoint compares only that pair. It may
     // withdraw the association, but cannot declare all other candidates new.
     const focused = invalid.map(({ item, match }) => {
-      const selected = item.candidates.find(candidate => candidate.id === match.candidateId);
+      const selected = item.candidates.find(candidate => candidate.id === match?.candidateId);
       return { ...item, candidates: selected ? [selected] : item.candidates, allowNew: !selected };
     });
     const materials = [...new Map(focused.flatMap(item => [item.memory, ...item.candidates]).map(memory => [memory.id, memory])).values()];
     const originalInput = JSON.parse(request.input);
     const repairRequest = withEventReferences({ ...request,
-      systemPrompt: request.systemPrompt + ' 逐条修正 validationErrors 中列出的判断，按各端自己的 sources.id 举证。allowNew=false 时仅比较所选候选，证据不足用 ambiguous；候选不全时无法判断为 new。',
+      systemPrompt: (request.eventContinuityPrompt || request.systemPrompt) + ' 对 validationErrors 中每条事件补齐或修正一次判断，按各端自己的 sources.id 举证。allowNew=false 时仅比较所选候选，证据不足用 ambiguous；候选不全时无法判断为 new。',
       input: JSON.stringify({ memoryOwner: originalInput.memoryOwner, narrativePolicy: originalInput.narrativePolicy,
         events: focused.map(item => ({ memoryId: item.memory.id, candidateIds: item.candidates.map(candidate => candidate.id), allowNew: item.allowNew })),
         memories: materials, validationErrors: invalid.map(({ item, match, problems }) => ({ memoryId: item.memory.id,
-          previousDecision: match, problems })) }),
+          ...(match ? { previousDecision: match } : {}), problems })) }),
       ...(request.sourceMaterial ? { sourceMaterial: eventSourceMaterial(repository, agentId, materials.map(memory => memory.id)) } : {}),
     });
     let repaired = new Map(), repairError = '';
     try {
-      if (repairRequest.input.length + repairRequest.systemPrompt.length + JSON.stringify(repairRequest.schema).length > maximumRequestCharacters) {
-        throw stateAnalysisBudgetError('Complete event continuity repair exceeds maximumRequestCharacters.');
-      }
-      generator.assertRequestBudget?.(repairRequest);
+      assertEventContinuityRequestBudget(repairRequest, generator, maximumRequestCharacters, 'repair');
       const response = await generate(repairRequest, 'event-continuity-repair');
-      repaired = coveredMatches(parseEventContinuity(response.output).matches, focused);
+      const indexed = indexMatches(parseEventContinuity(response.output).matches, focused);
+      repaired = indexed.byId;
+      if (indexed.diagnostics) coverage.repair = indexed.diagnostics;
     } catch (error) { assertEventSourceExecutionCurrent(); repairError = error.message; }
     for (const [index, entry] of invalid.entries()) {
-      const match = repaired.get(entry.item.memory.id);
-      const problems = match ? decisionProblems(focused[index], match) : ['repair-returned-no-usable-decision'];
-      if (match?.resolution === 'new' && !focused[index].allowNew) problems.push('pair-only-repair-cannot-declare-an-event-new');
+      const { match, problems } = inspectDecision(focused[index], repaired.get(entry.item.memory.id));
       if (!problems.length) accepted.set(entry.item.memory.id, decision(entry.item, match));
       else {
         const rationale = '自动事件关联未通过校验，已停止重试并转人工审核。';
@@ -279,5 +330,6 @@ export async function applyEventContinuity({ repository, agentId, prepared, gene
   });
   return { status: 'completed', warnings, reviews: reviewTasks,
     repair: { requested: invalid.length, repaired: invalid.length - reviews.size, sentToReview: reviews.size },
+    ...(Object.keys(coverage).length ? { coverage } : {}),
     results: results.map(memory => ({ memoryId: memory.id, ...memory.metadata.eventContinuity })) };
 }

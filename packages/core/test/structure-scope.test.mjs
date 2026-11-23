@@ -225,7 +225,7 @@ test('review rechecks member and result scopes after a proposal has been materia
         .run('story-b', changed === 'member' ? members[1] : proposal.result_memory_id);
       assert.throws(() => resolveMemoryStructureProposal(repository, {
         agentId: 'test', proposalId: proposal.id, action: 'accept',
-      }), /reality and world scope/u);
+      }), changed === 'member' ? { code: 'MEMORY_ORGANIZATION_INPUT_CHANGED' } : /reality and world scope/u);
       assert.equal(repository.getStructureProposal('test', proposal.id).review_state, 'pending');
       assert.equal(repository.getMemory(proposal.result_memory_id).metadata.structureReviewState, 'pending');
     }

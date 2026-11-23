@@ -3,6 +3,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { MemoryRepository, openMemoryDatabase, beginEventSourceCleanup, cleanEventSourceDatabase,
   advanceEventSourceCleanup, eventSourceState, getEventSourceCleanup, eventSourceError } from '@suzu-memory/core';
+import { withEventSourceExecution } from '@suzu-memory/core';
+import { reconcileInferredPreferences } from '@suzu-memory/analysis';
 
 function ownedPath(memory, target) {
   const base = path.resolve(memory.paths.agentRoot);
@@ -91,8 +93,48 @@ function scrubBackup(memory, target, job) {
   }
   return true;
 }
+function savePreferenceRecalculation(repository, job, failures) {
+  const targets = job.result.pendingPreferenceTargets;
+  const pendingPreferenceTargets = targets.filter(target => failures.some(({ target: failed }) => (
+    target.subjectRole === failed.subjectRole && target.subjectKey === failed.subjectKey
+    && target.canonicalKey === failed.canonicalKey
+  )));
+  if (pendingPreferenceTargets.length === targets.length) return job;
+  return advanceEventSourceCleanup(repository, job.agentId, job.id, job.phase,
+    { ...job.result, pendingPreferenceTargets });
+}
+
+export function clearReconciledPreferenceTargets(repository, agentId, failures) {
+  const rows = repository.database.prepare(`SELECT id FROM memory_event_source_cleanups
+    WHERE agent_id=? AND phase='complete' AND json_array_length(result_json, '$.pendingPreferenceTargets')>0`).all(agentId);
+  for (const { id } of rows) savePreferenceRecalculation(repository, getEventSourceCleanup(repository, agentId, id), failures);
+}
+
+function finishPreferenceRecalculation(memory, repository, job) {
+  if (!job.result.pendingPreferenceTargets?.length) return job;
+  const state = eventSourceState(repository, job.scope);
+  let scope = job.scope;
+  if (state.experienceScope) {
+    const fence = state.experienceScope;
+    // A different source protocol or generation cannot reuse this job's read scope.
+    // The remaining targets stay available to the normal library reconciliation.
+    if (scope.version !== 2 || scope.agentGeneration !== fence.agentGeneration) return job;
+    const clearedThroughExperienceSequence = Math.max(scope.clearedThroughExperienceSequence,
+      fence.clearedThroughExperienceSequence);
+    scope = { ...scope, clearedThroughExperienceSequence,
+      experienceUpperBound: Math.max(scope.experienceUpperBound, clearedThroughExperienceSequence),
+      contentRevision: Math.max(scope.contentRevision, fence.contentRevision) };
+  } else if (scope.version !== 2) {
+    scope = { ...scope, clears: [...scope.clears, ...state.clears] };
+  }
+  const results = withEventSourceExecution(repository, () => reconcileInferredPreferences({
+    repository, agentId: memory.agentId, targets: job.result.pendingPreferenceTargets,
+  }), { sourceScope: scope });
+  return savePreferenceRecalculation(repository, job, results.flatMap(result => result.failure ? [result.failure] : []));
+}
+
 function finish(memory, repository, job, onProgress = () => {}) {
-  if (job.complete) return job;
+  if (job.complete) return finishPreferenceRecalculation(memory, repository, job);
   job = cleanEventSourceDatabase(repository, { agentId: memory.agentId, id: job.id });
   onProgress(job);
   const files = managedFiles(memory, memory.paths.backupDirectory);
@@ -109,7 +151,12 @@ function finish(memory, repository, job, onProgress = () => {}) {
   const cache = ownedPath(memory, memory.paths.visualizationCachePath);
   if (fs.existsSync(cache)) fs.unlinkSync(cache);
   scrubAccounting(memory);
-  job = advanceEventSourceCleanup(repository, memory.agentId, job.id, 'complete', { ...job.result, backups });
+  const { preferenceTargets: legacyTargets, ...result } = job.result;
+  job = advanceEventSourceCleanup(repository, memory.agentId, job.id, job.phase, {
+    ...result, backups, pendingPreferenceTargets: result.pendingPreferenceTargets || legacyTargets || [],
+  });
+  job = finishPreferenceRecalculation(memory, repository, job);
+  job = advanceEventSourceCleanup(repository, memory.agentId, job.id, 'complete', job.result);
   onProgress(job);
   return job;
 }

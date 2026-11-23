@@ -1,4 +1,4 @@
-import { memoryWorldsCompatible } from '@suzu-memory/core';
+import { memoryWorldsCompatible, OrganizationCandidateError, MEMORY_EXPLANATORY_RELATIONS } from '@suzu-memory/core';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -12,20 +12,20 @@ export function enforceRelationCandidatePolicy(candidate, snapshot, {
   const relation = clean(candidate?.relation);
   const fromMemoryId = clean(candidate?.fromMemoryId);
   const toMemoryId = clean(candidate?.toMemoryId);
-  if (relation !== "causes") {
-    throw new Error("Relation candidate must use the causes relation.");
+  if (!Object.hasOwn(MEMORY_EXPLANATORY_RELATIONS, relation)) {
+    throw new OrganizationCandidateError("Relation candidate must use an explanatory relation.");
   }
   if (!fromMemoryId || !toMemoryId || fromMemoryId === toMemoryId) {
-    throw new Error("Relation candidate requires two distinct directed endpoints.");
+    throw new OrganizationCandidateError("Relation candidate requires two distinct directed endpoints.");
   }
   const memories = new Map(snapshot.memories.map((memory) => [memory.id, memory]));
   const from = memories.get(fromMemoryId);
   const to = memories.get(toMemoryId);
   if (!from || !to) {
-    throw new Error("Every relation endpoint must come from the bounded snapshot.");
+    throw new OrganizationCandidateError("Every relation endpoint must come from the bounded snapshot.");
   }
   if (!memoryWorldsCompatible(from, to, { allowRealSpaces: true })) {
-    throw new Error('Relation endpoints must belong to compatible worlds.');
+    throw new OrganizationCandidateError('Relation endpoints must belong to compatible worlds.');
   }
   const availableSourceIds = new Set(snapshot.sourceRecords.map((source) => source.id));
   const evidenceSourceIds = [...new Set(
@@ -35,16 +35,25 @@ export function enforceRelationCandidatePolicy(candidate, snapshot, {
   )];
   if (!evidenceSourceIds.length
     || evidenceSourceIds.some((sourceId) => !availableSourceIds.has(sourceId))) {
-    throw new Error("Relation evidence must come from the bounded source records.");
+    throw new OrganizationCandidateError("Relation evidence must come from the bounded source records.");
   }
   const fromSources = new Set(from.sourceIds);
   const toSources = new Set(to.sourceIds);
   if (!evidenceSourceIds.some((sourceId) => fromSources.has(sourceId))
     || !evidenceSourceIds.some((sourceId) => toSources.has(sourceId))) {
-    throw new Error("Relation evidence must cover both endpoints in the bounded snapshot.");
+    throw new OrganizationCandidateError("Relation evidence must cover both endpoints in the bounded snapshot.");
   }
   if (!clean(candidate?.rationale)) {
-    throw new Error("Relation candidate requires a reviewable rationale.");
+    throw new OrganizationCandidateError("Relation candidate requires a reviewable rationale.");
+  }
+  if (snapshot.relationContext) {
+    const { anchorMemoryIds, candidateMemoryIds, includeAnchorPairs } = snapshot.relationContext;
+    const anchor = new Set(anchorMemoryIds), candidates = new Set(candidateMemoryIds);
+    const cross = (anchor.has(fromMemoryId) && candidates.has(toMemoryId))
+      || (candidates.has(fromMemoryId) && anchor.has(toMemoryId));
+    if (!cross && !(includeAnchorPairs && anchor.has(fromMemoryId) && anchor.has(toMemoryId))) {
+      throw new OrganizationCandidateError('Relation proposal is outside the selected anchor/candidate pairs.');
+    }
   }
   if (requireRetrospectiveParticipation) {
     const triggers = new Set(
@@ -59,7 +68,7 @@ export function enforceRelationCandidatePolicy(candidate, snapshot, {
     }
     if (![...triggers].some((id) => endpoints.has(id))
       || ![...historical].some((id) => endpoints.has(id))) {
-      throw new Error("Retrospective relation proposal must connect a trigger memory with a historical memory.");
+      throw new OrganizationCandidateError("Retrospective relation proposal must connect a trigger memory with a historical memory.");
     }
   }
   return {

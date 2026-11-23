@@ -58,7 +58,9 @@ async function acquire(databasePath, signal, idleTimeoutMs) {
     if (!job) return;
     if (message.type === 'embedding') {
       try {
-        const value = await job.scope(() => job.embeddingProvider(message.text, { signal: job.controller.signal }));
+        const value = await job.scope(() => message.texts
+          ? job.embeddingProvider.embedMany(message.texts, { signal: job.controller.signal })
+          : job.embeddingProvider(message.text, { signal: job.controller.signal }));
         if (pool.jobs.has(message.id)) worker.postMessage({ type: 'embedding-result', callId: message.callId, value });
       } catch (error) {
         if (pool.jobs.has(message.id)) worker.postMessage({ type: 'embedding-result', callId: message.callId, error: errorValue(error) });
@@ -134,7 +136,8 @@ export async function retrieveMemories(input = {}) {
     const cleanup = () => signal?.removeEventListener('abort', onAbort);
     pool.jobs.set(id, { resolve, reject, cleanup, embeddingProvider, controller: new AbortController(), scope: AsyncLocalStorage.snapshot() });
     signal?.addEventListener('abort', onAbort, { once: true });
-    pool.worker.postMessage({ type: 'retrieve', id, input: clone, embedding: typeof embeddingProvider === 'function' });
+    pool.worker.postMessage({ type: 'retrieve', id, input: clone, embedding: typeof embeddingProvider === 'function',
+      embeddingBatch: typeof embeddingProvider?.embedMany === 'function' });
     if (signal?.aborted) onAbort();
   });
 }

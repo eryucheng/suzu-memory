@@ -3,10 +3,25 @@ import test from 'node:test';
 import * as analysis from '@suzu-memory/analysis';
 import { createRelatedAnalyzerBatch } from '../../analysis/src/related-analyzer-batch.mjs';
 import { LONG_TERM_EXTRACTION_SCHEMA, LONG_TERM_EXTRACTION_REPAIR_SCHEMA, parseGeneratedLongTermExtraction, normalizeGeneratedLongTermExtraction } from '@suzu-memory/extraction';
-import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA } from '@suzu-memory/structurer';
+import { MEMORY_STRUCTURE_OUTPUT_SCHEMA, MEMORY_RELATION_OUTPUT_SCHEMA, MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA, relationOutputSchema } from '@suzu-memory/structurer';
 import { MEMORY_RETRIEVAL_CONTEXT_PROPOSAL_SCHEMA, MEMORY_RETRIEVAL_CONTEXT_CRITIC_SCHEMA } from '@suzu-memory/embedding-indexer';
 import { assertMemoryTaskRequest, validateMemoryTaskOutput } from '../src/index.mjs';
 import { createOpenAiCompatibleStructuredGenerator } from '../../providers/src/index.mjs';
+
+test('relation contracts accept scoped additions and retain legacy request validation', () => {
+  const legacy = { relation: 'causes', fromMemoryId: 'a', toMemoryId: 'b', evidenceSourceIds: ['s'], confidence: 0.9,
+    rationale: 'The stated experience changed the decision.' };
+  const v1 = { schemaName: 'memory-relation-proposals-v1', schema: relationOutputSchema(undefined, { version: 1 }) };
+  validateMemoryTaskOutput(v1, { proposals: [legacy] });
+  assert.throws(() => validateMemoryTaskOutput(v1, { proposals: [{ ...legacy, relation: 'reason_for' }] }));
+  const v2 = { schemaName: 'memory-relation-proposals-v2', schema: MEMORY_RELATION_OUTPUT_SCHEMA };
+  for (const relation of ['causes', 'reason_for', 'condition_for']) {
+    const output = validateMemoryTaskOutput(v2, { proposals: [{ ...legacy, relation, scope: 'Night-shift period.' }] });
+    assert.equal(output.proposals[0].scope, 'Night-shift period.');
+  }
+  validateMemoryTaskOutput(v2, { proposals: [] });
+  assert.throws(() => validateMemoryTaskOutput(v2, { proposals: [{ ...legacy, scope: [] }] }));
+});
 
 test('extraction contracts retain typed targets without replicating the common memory body', async () => {
   const request = { schemaName: 'long-term-memory-extraction-v4', schema: LONG_TERM_EXTRACTION_SCHEMA };
@@ -18,7 +33,7 @@ test('extraction contracts retain typed targets without replicating the common m
       const tool = JSON.parse(options.body).tools[0].function;
       wireSchema = tool.parameters;
       return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{
-        function: { name: tool.name, arguments: tool.name.endsWith('repair-v4') ? '{"results":[]}' : '{"memories":[]}' },
+        function: { name: tool.name, arguments: '{"memories":[]}' },
       }] } }] }) };
     },
   });
@@ -126,10 +141,16 @@ test('extraction, repair, structure, relation and attribution use their register
   assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'repaired', memories: [] }] }));
   assert.throws(() => validateMemoryTaskOutput(repair, { results: [{ candidateIndex: 2, status: 'rejected', reason: '' }] }));
   assert.throws(() => validateMemoryTaskOutput(repair, { memories: [] }));
-  for (const [schemaName, schema] of [['memory-structure-proposals-v2', MEMORY_STRUCTURE_OUTPUT_SCHEMA], ['memory-relation-proposals-v1', MEMORY_RELATION_OUTPUT_SCHEMA]]) {
+  for (const [schemaName, schema] of [['memory-structure-proposals-v2', MEMORY_STRUCTURE_OUTPUT_SCHEMA], ['memory-relation-proposals-v2', MEMORY_RELATION_OUTPUT_SCHEMA]]) {
     validateMemoryTaskOutput({ schemaName, schema }, { proposals: [] });
     assert.throws(() => validateMemoryTaskOutput({ schemaName, schema }, { proposals: [{}] }));
   }
+  const structureRequest = { schemaName: 'memory-structure-proposals-v2', schema: MEMORY_STRUCTURE_OUTPUT_SCHEMA };
+  const creation = { operation: 'create', kind: 'topic', title: 'Museum visits', content: 'Repeated museum visits.',
+    memberIds: ['first', 'second'], subjectRole: 'unknown', subjectKey: '', actorRoles: [], confidence: 0.9, rationale: 'A recurring activity.' };
+  validateMemoryTaskOutput(structureRequest, { proposals: [creation] });
+  assert.throws(() => validateMemoryTaskOutput(structureRequest, { proposals: [{ ...creation, memberIds: ['first'] }] }),
+    { code: 'MEMORY_TASK_SCHEMA_INVALID' });
   const attribution = { schemaName: 'memory-subject-attribution-v1', schema: MEMORY_SUBJECT_ATTRIBUTION_OUTPUT_SCHEMA };
   validateMemoryTaskOutput(attribution, { decision: 'abstain', subjectRole: '', subjectKey: '', sourceIds: [], actorRoles: [], confidence: 0, rationale: 'insufficient evidence' });
   assert.throws(() => validateMemoryTaskOutput(attribution, { decision: 'abstain' }), { code: 'MEMORY_TASK_SCHEMA_INVALID' });
@@ -151,7 +172,7 @@ test('retrieval-context wire bounds precede normalization and real critic semant
 test('combined consolidation validates both child domains and disallows undeclared children', () => {
   const schema = { type: 'object', additionalProperties: false, required: ['structure', 'relations'],
     properties: { structure: MEMORY_STRUCTURE_OUTPUT_SCHEMA, relations: MEMORY_RELATION_OUTPUT_SCHEMA } };
-  const request = { schemaName: 'memory-consolidation-combined-v1', schema };
+  const request = { schemaName: 'memory-consolidation-combined-v2', schema };
   const output = { structure: { proposals: [] }, relations: { proposals: [] } };
   validateMemoryTaskOutput(request, output);
   assert.throws(() => validateMemoryTaskOutput(request, { ...output, relations: { proposals: [{}] } }));

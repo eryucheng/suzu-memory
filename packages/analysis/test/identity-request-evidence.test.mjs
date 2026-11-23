@@ -83,7 +83,10 @@ for (const statement of ['我现在是单身。', 'I am single now.']) {
     assert.equal(result.proposal.draft.identityClaim.identityField, 'relationship_status');
     assert.equal(result.proposal.draft.identityClaim.fieldCardinality, 'single');
     assert.equal(result.proposal.draft.identityClaim.valueText, statement);
-    assert.equal(f.repository.listPendingProvisionalMemories(f.agentId)[0].content, statement);
+    assert.equal(result.proposal.review_state, 'pending');
+    const published = f.repository.getMemory(result.proposal.resultMemoryId);
+    assert.equal(published.status, 'active');
+    assert.equal(published.content, statement);
     assert.equal(calls.length, 1);
     assert.equal(f.repository.listStateAnalysisRequests(f.agentId, { stateFamily: 'relationship' }).length, 0,
       'single status must not invent a counterpart relationship');

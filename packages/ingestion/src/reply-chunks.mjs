@@ -1,5 +1,4 @@
-import { executionEventSourceView } from '@suzu-memory/core';
-import { buildCompanionExtractionRequest } from './processing-stages.mjs';
+import { measureCompanionExtractionRequest } from './processing-stages.mjs';
 import { logicalArchiveEventId } from './archive-windows.mjs';
 
 export const DEFAULT_LENGTH_ARCHIVE_POLICY = Object.freeze({
@@ -49,7 +48,8 @@ const characters = rows => rows.reduce((sum, row) => sum + String(row.content?.t
 
 export async function planReplyChunk({ pending, previous = [], resolveReply = companionReply, measure,
   maximumCoreCharacters = DEFAULT_LENGTH_ARCHIVE_POLICY.maximumCoreCharacters, maximumCoreMessages = 100,
-  maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false }) {
+  maximumRequestCharacters = 64_000, maximumContextCharacters = maximumCoreCharacters, flush = false, scanFull = false,
+  readPrevious = null }) {
   for (const value of [maximumCoreCharacters, maximumCoreMessages, maximumRequestCharacters, maximumContextCharacters]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Archive character limits must be positive integers.');
   }
@@ -75,6 +75,7 @@ export async function planReplyChunk({ pending, previous = [], resolveReply = co
     && groups.length < maximumCoreMessages * 2) {
     return { status: 'waiting', reason: 'following-round', characters: total, maximumCoreCharacters, eventsProcessed: 0 };
   }
+  if (readPrevious) previous = await readPrevious();
   const historyStart = previous.findIndex(row => !row.metadata?.suzuMemoryFragment || row.metadata.suzuMemoryFragment.index === 1);
   const history = logicalGroups(previous.slice(historyStart < 0 ? previous.length : historyStart));
   const historyEnds = await roundEnds(history, resolveReply, 2, true);
@@ -112,20 +113,18 @@ export async function planReplyChunk({ pending, previous = [], resolveReply = co
 
 
 export async function selectReplyChunk({ repository, agentId, identity, systemPrompt, timeZone, policy }) {
-  const eligibleIds = executionEventSourceView(repository, agentId)?.inputIds ?? null;
-  const scope = { hostId: policy.hostId, sessionId: policy.sessionId, sourceOrder: !policy.hostId, eligibleIds };
+  const scope = { hostId: policy.hostId, sessionId: policy.sessionId, sourceOrder: !policy.hostId };
   const page = repository.listInputEvents(agentId, { ...scope, statuses: ['pending'], limit: 500 });
-  const previous = page.items.length ? repository.listInputEvents(agentId, { statuses: ['archived'], limit: 500,
+  const retryTaskId = page.items[0]?.metadata?.suzuMemoryProcessing?.retryRequestedBy;
+  const otherWork = retryTaskId ? page.items.findIndex(row => row.metadata?.suzuMemoryProcessing?.retryRequestedBy !== retryTaskId) : -1;
+  const pending = otherWork === -1 ? page.items : page.items.slice(0, otherWork);
+  const readPrevious = () => page.items.length ? repository.listInputEvents(agentId, { statuses: ['archived'], limit: 500,
     ...scope, descending: true, beforeSourceEvent: page.items[0] }).items
     .filter(row => row.processing_disposition !== 'quarantined').reverse() : [];
   const splitLimit = page.items[0]?.metadata?.suzuMemoryProcessing?.extractionMaximumMessages;
   const splitPolicy = Number.isSafeInteger(splitLimit) && splitLimit > 0 ? { maximumCoreMessages: Math.min(
     policy.maximumCoreMessages ?? DEFAULT_LENGTH_ARCHIVE_POLICY.maximumCoreMessages, splitLimit), flush: true } : {};
-  return planReplyChunk({ pending: page.items, previous, scanFull: page.total > page.items.length,
-    ...policy, ...splitPolicy, measure: selection => {
-      const request = buildCompanionExtractionRequest({
-      ...selection, identity, systemPrompt, timeZone,
-      }).request;
-      return String(request.input).length + request.systemPrompt.length + JSON.stringify(request.schema).length + 100;
-    } });
+  return planReplyChunk({ pending, readPrevious, scanFull: page.total > page.items.length,
+    ...policy, ...(retryTaskId ? { flush: true } : {}), ...splitPolicy,
+    measure: selection => measureCompanionExtractionRequest({ ...selection, identity, systemPrompt, timeZone }) });
 }

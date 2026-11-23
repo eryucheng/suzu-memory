@@ -4,6 +4,14 @@
 
 来源范围支持按 Event 全局提交位置限定的 v1 格式，以及按 Agent 已接纳经历位置限定的 v2 格式。以下两种范围按宿主已有的坐标模型选用；现有 companion API 继续可用。
 
+## 按来源读取输入
+
+`memory.listEventSourceInputs({ owner, spaceId, commitSequence, offset: 0, limit: 100 })`
+按所属 Agent 和原始 Event 的来源位置读取输入，返回 `{ items, total, offset, limit }`。
+页大小为 1–500，offset 为非负整数。查询使用已有 Product Event 来源索引，
+包括该来源的分片、修订及已撤回输入，供宿主执行来源撤回和恢复核对。
+该维护接口不代替正常检索的来源有效性过滤。
+
 ## 消费已提交 Event
 
 ### Event 提交位置（v1）
@@ -91,6 +99,8 @@ const result = await memory.search(query, { sourceScope: scope, persistTrace: fa
 
 范围在候选装载、图扩展、当前状态补全、embedding 候选和最终物化中生效。输入必须为有效 protocol 2，来源字段与实际输入类型、sender 一致；原始来源正文必须能由其输入分片重建。每条记忆的全部来源都有效才可进入候选。未知来源、未来 Event、撤回/清空来源及混合失效来源的派生节点被排除；独立的有效原文和记忆仍参与原有 RAG。
 
+主题和事件摘要按实际摘要保存的输入记忆及有类型的成员关系追溯来源，支持事件摘要再归入主题。移除成员关系不会使旧摘要中的信息消失；只有从当前完整成员重新生成摘要，才能更新它的材料范围。摘要刷新任务按当前成员范围认领，向量化和检索按已存摘要的完整材料范围筛选。来源清理沿相同依赖删除派生内容，普通关联边不构成来源依赖。
+
 `scoped_exception_to` 的宽泛状态→局部例外、局部例外→宽泛状态两个方向，均使用同一读快照的 eligible memory IDs。补全先排除不合格来源，再按原顺序选择；较新的失效根不会挡住后面的有效根。没有有效补全时保留原有效节点，正文、选中节点与片段来源保持一致。
 
 有范围检索的全部数据库读取使用同一 SQLite 读事务，跨 embedding await 的并发归档不会替换最终证据正文。返回前释放读事务，再读取当前 epoch 和截止位置验证；清理或 v2 来源修订可以否定在途旧快照。新的有效 Event 保留在库中，供后续上界读取。
@@ -139,7 +149,9 @@ memory.recoverEventSourceCleanups();
 | --- | --- |
 | `fenced` | 同事务保存来源截止位置、清理请求和新的写入 epoch。新调用不能退回旧范围。 |
 | `database-cleaned` | 同事务清掉命中的全部输入分片正文、原始来源正文、混合或专属派生记忆、FTS、相关向量、修订/提取/维护/检索快照与其真实引用；校验所有外键。 |
-| `complete` | 清理 Memory 管理的备份及 import/restore 暂存数据库、更新备份 hash，移除可视化缓存并净化本 Agent 的 usage 诊断正文；才确认完成。 |
+| `complete` | 清理 Memory 管理的备份及 import/restore 暂存数据库、更新备份 hash，移除可视化缓存并净化本 Agent 的 usage 诊断正文。仍需重算的偏好保存在 `result.pendingPreferenceTargets`，可在启动时继续处理。 |
+
+重试清理用原请求核对任务 ID 和物理清理范围。派生偏好重算遵循当前已提交的清理边界，读取继续受原任务的可见上限约束。遇到已切换协议或 Agent 世代的旧任务时，保留重算目标供库级恢复处理。
 
 清理依据输入 ID、source links、memory links、辅助记录的外键和结构化快照引用，不通过正文关键字猜测归属。混合派生节点及混合批次/分析快照被移除；有效来源、原文、独立派生记忆及其审计保留。同批的有效 processing 输入重新变为 pending，继续走原租约机制。实体名称和别名只保留可由剩余来源验证的部分，已配置的 Agent/用户身份不被清除。
 
@@ -155,11 +167,21 @@ memory.recoverEventSourceCleanups();
 
 ## 提取校验与验证
 
-`@suzu-memory/service` 导出 `validateMemoryExtractionOutput(request, output)`，使用正式 extraction parser，支持 `long-term-memory-extraction-v4` 和 `long-term-memory-extraction-repair-v5`，拒绝未知 schema。service 显式声明 extraction 依赖；usage-ledger 显式声明 core 依赖，锁文件同步。
+`@suzu-memory/service` 导出 `validateMemoryExtractionOutput(request, output)`，支持 `long-term-memory-extraction-v4` 和 `long-term-memory-extraction-repair-v5`，拒绝未知 schema。首抽将 `modelInput` 和 `modelSchema` 发送给模型。`decodeOutput` 将 `evidence` 还原为 `sourceRefs`，将日期字符串还原为时间对象。普通新增事件的 `revisionAction` 可省略或填 `null`，由程序解码为 `add`。取消状态、事件的其他动作及非事件条目须填写实际动作。service 显式声明 extraction 依赖，usage-ledger 显式声明 core 依赖，锁文件随之同步。
+
+模型判断每条记忆的时间归属。程序核对来源以及日期、时刻字段的格式和一致性。时间缺失、无效或互相矛盾时，事件仍可按正常证据规则入库，时间字段按可确定的精度保存。旧修复草稿仍可读取，续修先校验已保存的草稿。
 
 抽取 v3 的模型输出使用 `classification` 选择语义类别，`subject` 和 `actors[].person` 引用本批人物表中的 `P` 编号，表外人物使用明确名称，`time` 保存已知日期或时刻，未知时为 `null`。类别对应的状态目标由同一合同限定。
 
 `parseGeneratedLongTermExtraction` 校验模型输出；`normalizeGeneratedLongTermExtraction(output, built)` 使用 `buildLongTermExtractionInput` 返回的人物表，将其转换成归档所需的主体、人物角色和状态目标。正常事件处理入口已完成这一步；直接调用 `archiveLongTermEvidence` 的接入方传入转换后的 `memories`。人物引用只在所属批次解析，真实身份及存储键由程序处理。
+
+抽取修复请求的每个 `candidates[]` 项包含固定的 `candidateIndex`、最新 `draft` 和对应的 `validationError`。有窗口标识时，`sourceWindows` 列出该候选从初始引用确定的可用窗口。引用无法定位时采用原批次材料。首抽、修复和归档校验消息引用，单条记忆的证据须来自同一窗口。
+
+`draft` 保留待修的拆分条目及其实体声明。无法解析的初始输出保存在 `draft.rawOutput`。`responseFeedback` 记录上一轮回包问题，草稿自身的校验错误另存。顶层 `entities` 保存已确立的绑定，修复可复用这些引用或为新对象分配新编号。已通过的拆分条目和相关实体及时保留。截断时拆小待修范围，继续使用本轮预算。未完成草稿随维护失败任务保存，沿用原人物表和实体作用域。旧版单候选任务由同一入口读取。
+
+续修时按条核对仍有效的原话和窗口。来源已撤回或原话版本变化时，终止依赖它的草稿，继续处理原话仍有效的草稿。本次范围以外的草稿等待合格范围。模型只接收当前有资格使用的正文和上下文，归档前再核对实际引用。原始 Event 修订与既有库启动会清理引用失效来源的临时回退结果和事件关联。
+
+仅保留原话的整批重试读取已归档的证据版本，只追加通过校验的候选。删改过的原档从当前重试退出，生成后提交前核对仍可用的引用。按逐条归档或撤回回执结算，拆批后只完成一段时返回 `retry-partial` 并保留原任务。来源撤回和启动恢复使用同一结算规则。重开后从后续段继续，已完成段沿用原回执。重试仍产生待修结果时，保留对应的新失败记录。
 
 
 `packages/service/test/event-source-contracts.test.mjs` 使用真实 SQLite、既有提取/检索/embedding API、备份和外键校验。覆盖 v41 有数据迁移、其他 Agent/本地用户/Space、长分片和修订正文、混合来源、同批恢复、跨 Agent 保留、范围检索、迟到提取/embedding 写回。两个子进程分别停在持久 `fenced` 和 `database-cleaned` 阶段，由父进程 SIGKILL 后重开真实数据库恢复。其他延迟 provider 和回调异常是注入故障，分别标明，不冒充远端服务中断。
@@ -171,6 +193,10 @@ memory.recoverEventSourceCleanups();
 ## 固定来源范围内的维护与模型材料
 
 `runMaintenance`、`runSemanticMaintenance` 和 `runEmbeddingMaintenance` 接收 `{sourceScope, signal}`。已有 Event 来源的数据库要求显式 scope；缺少时抛 `EVENT_SOURCE_SCOPE_REQUIRED`。未接入 Event 的旧数据库仍支持原 API。`processPendingEvents/syncEmbeddings/analyzePendingState/processConsolidation/search` 也接收该范围与取消信号，嵌套调用由 `withRepository(callback,{sourceScope,signal})` 传播，复用原 Repository、队列和租约。
+
+HTTP SDK 的 `processPendingEvents`、`runMaintenance` 和 `search` 同样通过选项传入 `sourceScope`；HTTP 层将它交给同一 Service 校验。
+
+状态分析在原请求行上持久认领，并按 Agent 串行推进身份匹配与状态形成；多个 Service 实例不会同时购买同一分析。默认租约为 15 分钟，过期后可重新认领，显式 `recoverRunningMaintenance({force:true})` 也会回收状态分析认领。已被接管的执行不能写入迟到结果。分析等待期间证据或比较状态变化时返回 `deferred`，保留后续处理机会；该变化不算模型失败，不立即自动重试。已完成的模型调用仍记入费用流水。
 
 原有 input、maintenance、state request 和 consolidation 选择在 SQL LIMIT 前筛选来源；带未来、未知或混合失效来源的任务不认领、不增加 attempt，不制造失败审核。范围内任务继续按原顺序处理，后续合格上界可处理先前等待任务。已有当前 canonical state 若不合格，相关分析请求等待，不将它解释成“没有当前状态”。scope 只是调用选择，不改变已消费的其他有效 Event。
 
@@ -192,6 +218,18 @@ memory.recoverEventSourceCleanups();
 它来自实际 typed snapshot/input builder，并通过原输入→source→memory 链验证。结构和关系 prompt 的序列化省略这项追溯元数据；组合调用合并子请求来源；抽取修复继承原抽取来源。embedding 函数与 embedMany 的第二参数也带 `{sourceMaterial,signal,model,dimensions}`；旧 provider 可以忽略新增参数。`createOpenAiCompatibleEmbeddingProvider.describeRequest(texts)` 与实际 HTTP 共用构造器，返回不含授权头的 URL/body，便于 Host 在发送前保存准确请求。
 
 状态分析 run 将材料存到原 `metadata_json.eventSourceMaterial`，不升级数据库 schema。范围内 canonical review 只读取依赖全部可验证的 observation/run。迁移前没有这份实际材料的历史 analysis run 不被当成范围内模型证据，仍保留在库供旧 API/人工检查；此边界不通过猜测旧 prompt 重建来源。
+
+生成请求的 `input` 与 `schema` 保留程序使用的完整合同；发送模型时优先使用 `modelInput` 与 `modelSchema`，结果经 `decodeOutput` 还原引用后再进入领域校验。状态分析的模型输入使用紧凑 JSON：记忆正文与其已有来源完全相同时，`contentSourceId` 指向该来源的完整正文，人物归属等其他字段保留。`stateCandidates` 仅发送给身份匹配，后续分析保留选定状态和各自所需的比较材料。匹配的模型 schema 使用实际短引用限定候选，并分别约束匹配与新建、未确定分支。
+
+当 generator 声明 `supportsCombinedStateAnalysis` 时，状态调度可将同一抽取批次、主体、世界、表示层、证据模式及记忆/来源边界的不同类型就绪任务合并首轮调用。调度按待办顺序取连续的一组，每组每种类型最多一个任务；同类型后续任务和不同证据边界继续按序执行，历史截止范围保持在本次 `sourceScope` 内。比较阶段仍按各任务已解析的当前状态执行。
+
+同一任务包含多个专科时，模型侧结果按记忆合并为 `analyses[]`：共同的 `memoryId`、`sourceIds`、`rationale` 写一次，`judgments.<专科>` 保留该专科字段和独立 `confidence`。专科 `sourceIds: null` 继承公共证据，也可填写自己的证据子集；`note` 补充专有依据；整个专科判断为 `null` 表示无相关证据。解码恢复原 `results.<专科>.analyses` 合同，缺失或无效判断仍由该专科校验和重试，不使用其他专科结论补齐。
+
+事件延续请求在有收益时使用 `memoryDefaults` 保存共同元数据，单条记忆字段覆盖默认值；重复候选列表可引用 `candidatePools`，每项 `candidatePool` 是从零开始的下标，排除当前事件自身后得到其允许候选。正文、来源、不同空间的字段及修复请求的 `allowNew` 保持完整，程序侧 input 仍是原始逐项合同。
+
+合并请求使用 `memory-state-first-stage-batch-v1`：`input.shared` 保存完全一致的公共字段，`input.tasks.<key>` 补充各任务材料；`stateAnalysisTasks[]` 声明 `key`、原请求 ID、实际 `stateFamily` 及已有子合同，输出为 `results.<key>`。短引用统一分配，但匹配候选枚举和领域校验仍分别绑定各任务。单任务请求继续使用已有合同。`analyzePendingState` 和批处理入口接受 `firstStageBatchOptions`，合批默认上限为 `maximumRequestCharacters: 120000`（完整模型请求字符数）及 `maximumJudgments: 80`（各专职分析 schema 声明的判断数量之和）；达到上限时拆回完整子任务，并继续执行原单任务预算检查。合批输出截断时缩小批次，已发生的调用仍记账。
+
+一组任务在原请求表中由同一执行者原子领取，并分别校验租约、输入及候选版本。通过领域校验的首轮结果保存在各自任务的恢复点，后续比较失败或重启后，在材料、提示词及合同一致时复用；任务最终解决时移除恢复点。缺失或无效的子结果仅使对应任务失败，已完成任务不重复调用。共享模型回执在分发结果前记账一次，各任务关联同一回执；来源变化或租约被接管使结果失效时，已收到的费用回执仍保留。
 
 `@suzu-memory/service` 新导出 `assertMemoryTaskRequest(request)` 和 `validateMemoryTaskOutput(request,output)`。前者检查注册版本和精确 schema，后者先检查声明的 wire 形状，再调用既有 extraction/repair、structure/relation/subject-attribution、检索上下文 proposal/critic 和全部十组专职分析的领域 parser。组合状态分析使用实际 family/phase/analyzerKeys，组合巩固分别检查两个子域；未知 schema 拒绝。`managementStatus()` 返回真实数据库路径与计数，不执行生成；既有管理、审核和 staging 备份 API 可继续复用。
 

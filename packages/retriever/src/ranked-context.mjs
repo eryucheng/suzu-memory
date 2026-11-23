@@ -2,6 +2,7 @@ import { fuseCandidateLanes } from './candidate-selection.mjs';
 import { lexicalTerms } from './query.mjs';
 import { utteranceStatements } from './query-text.mjs';
 import { createSeedLexicalScorer } from './seed-routes.mjs';
+import { reportedStateEvidenceAvailable } from '@suzu-memory/core';
 
 const clean = value => String(value || '').normalize('NFKC').toLowerCase().trim();
 const occurrenceKey = node => [node.world_id, node.world_frame, node.subject_role, node.subject_key,
@@ -19,11 +20,12 @@ function createEvidenceCoverage(database, agentId, eligibleMemoryIds, options) {
     const edgeIds = withChildren ? ids.filter(id => !children.has(id)) : [];
     if (!sourceIds.length && !edgeIds.length) return;
     read ||= database.prepare(`
-      SELECT memory_id AS parent, source_id AS target, 0 AS is_edge FROM memory_sources
-        WHERE memory_id IN (SELECT value FROM json_each(?))
+      SELECT memory_id AS parent, source_id AS target, 0 AS is_edge FROM memory_sources link
+        WHERE memory_id IN (SELECT value FROM json_each(?)) AND ${reportedStateEvidenceAvailable('link')}
       UNION ALL
-      SELECT from_memory_id, to_memory_id, 1 FROM memory_edges INDEXED BY memory_edges_from
+      SELECT from_memory_id, to_memory_id, 1 FROM memory_edges edge INDEXED BY memory_edges_from
         WHERE agent_id = ? AND from_memory_id IN (SELECT value FROM json_each(?)) AND relation = 'supported_by'
+          AND ${reportedStateEvidenceAvailable('edge')}
       UNION ALL
       SELECT to_memory_id, from_memory_id, 1 FROM memory_edges INDEXED BY memory_edges_to
         WHERE agent_id = ? AND to_memory_id IN (SELECT value FROM json_each(?)) AND relation IN ('supports_topic', 'part_of_episode')

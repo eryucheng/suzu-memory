@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
-import { resolveTemporalQuery, retrieveMemories } from '../src/index.mjs';
+import { closeRetrievalWorkers, resolveTemporalQuery, retrieveMemories } from '../src/index.mjs';
 import { memoryCalendarDate, temporalAffinity } from '../src/temporal-ranking.mjs';
 
 const now = new Date('2026-10-23T07:30:00+08:00');
@@ -96,17 +96,21 @@ test('time affinity is bounded, tapers to zero, and never penalizes outside date
 
 function fixture(t, memories) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-temporal-window-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(async () => { await closeRetrievalWorkers(); fs.rmSync(root, { recursive: true, force: true }); });
   const databasePath = path.join(root, 'memory.db');
   const database = openMemoryDatabase(databasePath);
   const repository = new MemoryRepository(database);
   try {
-    for (const memory of memories) repository.upsertMemory({ agentId: 'window-agent', kind: 'event', layer: 'episodic',
-      subjectRole: 'user', subjectKey: 'user', content: '讨论过灯塔博物馆的展览。',
-      importance: 0.5, ...memory });
+    for (const { embedding, ...memory } of memories) {
+      repository.upsertMemory({ agentId: 'window-agent', kind: 'event', layer: 'episodic',
+        subjectRole: 'user', subjectKey: 'user', content: '讨论过灯塔博物馆的展览。',
+        importance: 0.5, ...memory });
+      if (embedding) repository.upsertEmbedding({ memoryId: memory.id, model: 'calendar-test',
+        vector: embedding, sourceMemoryIds: [memory.id] });
+    }
   } finally { database.close(); }
-  return (query, options = {}, extra = {}) => retrieveMemories({ databasePath, agentId: 'window-agent', query, now,
-    options: { maximumReturnedCandidates: 10, includeCandidateContext: true, ...options }, ...extra });
+  return Object.assign((query, options = {}, extra = {}) => retrieveMemories({ databasePath, agentId: 'window-agent', query, now,
+    options: { maximumReturnedCandidates: 10, includeCandidateContext: true, ...options }, ...extra }), { root });
 }
 
 test('vague time boosts topic matches without admitting unrelated or discarding old memories', async t => {
@@ -185,4 +189,119 @@ test('a topicless empty window returns no matches and a topic still falls back o
   const recall = fixture(t, [{ id: 'old', eventDate: '2026-09-13' }]);
   assert.equal((await recall('最近我们聊了什么')).status, 'no-match');
   assert.equal((await recall('最近聊过灯塔博物馆吗')).candidates[0].memoryId, 'old');
+});
+
+const testVector = (original, topic) => [original, topic, Math.sqrt(1 - original ** 2 - topic ** 2)];
+const mealQuery = '2026年10月20日中午我吃了什么？';
+const mealMemories = () => [
+  { id: 'meal', content: '煮了碗面，坐在阳台享用。', embedding: testVector(0.45, 0.55) },
+  { id: 'weak', content: '今天整理了书柜。', embedding: testVector(0.2, 0.49) },
+  { id: 'duplicate', content: '午间做了一份炒饭。', embedding: testVector(0.6, 0.6) },
+  { id: 'outside', content: '昨天煮了一碗粥。', eventStart: '2026-10-19T04:00:00Z', embedding: testVector(0.2, 0.85) },
+  { id: 'ordinary-outside', content: '上周煮过一碗面。', eventStart: '2026-10-13T04:00:00Z', embedding: testVector(0.6, 0.2) },
+  { id: 'unknown-date', content: '曾经做过一道炖菜。', metadata: { sourceTimeKnown: false }, embedding: testVector(0.2, 0.85) },
+].map(memory => ({ kind: 'utterance', layer: 'evidence', eventStart: '2026-10-20T04:00:00Z', ...memory }));
+
+test('exact-date topic retrieval preserves admission, dates, deduplication and batched billing in both execution modes', async t => {
+  const recall = fixture(t, mealMemories());
+  let first;
+  for (const execution of ['inline', 'worker']) {
+    const calls = [];
+    const embeddingProvider = Object.assign(async () => { throw new Error('Queries should share the batch request.'); }, {
+      async embedMany(texts) {
+        calls.push(texts);
+        return { model: 'calendar-test', vectors: [[1, 0, 0], [0, 1, 0]],
+          requestId: 'one-batch', usage: { prompt_tokens: 17, total_tokens: 17 } };
+      },
+    });
+    const usageLedgerPath = path.join(recall.root, `${execution}.jsonl`);
+    const result = await recall(mealQuery, { execution, sqlPrefilterThreshold: 1 }, { embeddingProvider, usageLedgerPath });
+    assert.deepEqual(result.candidates.map(candidate => candidate.memoryId).sort(), ['duplicate', 'meal', 'ordinary-outside']);
+    assert.match(result.context, /煮了碗面/u);
+    assert.doesNotMatch(result.context, /书柜|一碗粥|炖菜/u);
+    assert.equal(result.candidates.find(candidate => candidate.memoryId === 'meal').lexicalScore, 0);
+    assert.equal(result.candidates.find(candidate => candidate.memoryId === 'meal').queryRoute, 'calendar-topic');
+    assert.equal(result.candidates.find(candidate => candidate.memoryId === 'ordinary-outside').queryRoute, 'original');
+    assert.equal(result.records.filter(record => record.memoryId === 'duplicate').length, 1);
+    assert.deepEqual(calls, [['2026年10月20日中午我吃了什么?', '中午我吃了什么?']]);
+    const ledger = fs.readFileSync(usageLedgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0].usage.prompt_tokens, 17);
+    assert.equal(ledger[0].metadata.batchSize, 2);
+    if (first) assert.deepEqual(result.candidates, first.candidates);
+    else first = result;
+  }
+  const sameVector = Object.assign(async () => ({ model: 'calendar-test', vector: [1, 0, 0] }), {
+    async embedMany() { return { model: 'calendar-test', vectors: [[1, 0, 0], [1, 0, 0]] }; },
+  });
+  const shared = await recall(mealQuery, { execution: 'inline' }, { embeddingProvider: sameVector });
+  assert.equal(shared.candidates.find(candidate => candidate.memoryId === 'duplicate').score,
+    first.candidates.find(candidate => candidate.memoryId === 'duplicate').score, 'Two routes must not add relevance or the date bonus twice.');
+});
+
+test('embedding failures retain successful routes and record each actual receipt', async t => {
+  const recall = fixture(t, mealMemories());
+  for (const failed of ['original', 'calendar-topic']) {
+    const calls = [];
+    const usageLedgerPath = path.join(recall.root, `${failed}.jsonl`);
+    const embeddingProvider = async text => {
+      calls.push(text);
+      const original = text.includes('2026');
+      const receipt = { model: 'calendar-test', requestId: text, usage: { prompt_tokens: 3, total_tokens: 3 } };
+      if (original === (failed === 'original')) throw Object.assign(new Error('temporary provider failure'), receipt);
+      return { ...receipt, vector: original ? [1, 0, 0] : [0, 1, 0] };
+    };
+    const result = await recall(mealQuery, { execution: 'inline' }, { embeddingProvider, usageLedgerPath });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.vector.status, 'ready');
+    assert.match(result.vector.warning, /temporary provider failure/u);
+    assert.equal(result.candidates.some(candidate => candidate.memoryId === 'meal'), failed === 'original');
+    assert.equal(result.candidates.some(candidate => candidate.memoryId === 'ordinary-outside'), failed === 'calendar-topic');
+    assert.ok(!result.candidates.some(candidate => ['weak', 'outside', 'unknown-date'].includes(candidate.memoryId)));
+    assert.equal(calls.length, 2);
+    assert.equal(fs.readFileSync(usageLedgerPath, 'utf8').trim().split('\n').length, 2);
+  }
+  let batches = 0;
+  const usageLedgerPath = path.join(recall.root, 'failed-batch.jsonl');
+  const failedBatch = Object.assign(async () => { throw new Error('Unexpected scalar retry.'); }, {
+    async embedMany() {
+      batches++;
+      throw Object.assign(new Error('batch unavailable'), { model: 'calendar-test', usage: { prompt_tokens: 6 } });
+    },
+  });
+  const failed = await recall(mealQuery, { execution: 'worker' }, { embeddingProvider: failedBatch, usageLedgerPath });
+  assert.equal(failed.status, 'no-match');
+  assert.equal(failed.vector.status, 'error');
+  assert.equal(batches, 1);
+  assert.equal(fs.readFileSync(usageLedgerPath, 'utf8').trim().split('\n').length, 1);
+});
+
+test('date routing avoids extra requests without a scoped topic and cancels an active worker batch', async t => {
+  const recall = fixture(t, mealMemories());
+  const inputs = [];
+  const embeddingProvider = async text => { inputs.push(text); return { model: 'calendar-test', vector: [1, 0, 0] }; };
+  for (const query of ['中午我吃了什么？', '2026年10月20日', '2026年10月1日中午我吃了什么？', '“2026年10月20日”这句话']) {
+    const previous = inputs.length;
+    await recall(query, { execution: 'inline' }, { embeddingProvider });
+    assert.equal(inputs.length - previous, 1, query);
+  }
+  const controller = new AbortController();
+  let announce;
+  const entered = new Promise(resolve => { announce = resolve; });
+  let cancelled = false;
+  const blocking = Object.assign(async () => { throw new Error('Expected batch.'); }, {
+    embedMany(_texts, { signal }) {
+      return new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => { cancelled = true; reject(signal.reason); }, { once: true });
+        announce();
+      });
+    },
+  });
+  const pending = recall(mealQuery, { execution: 'worker' }, { embeddingProvider: blocking, signal: controller.signal });
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await entered;
+  controller.abort();
+  await rejected;
+  await closeRetrievalWorkers();
+  assert.equal(cancelled, true);
 });

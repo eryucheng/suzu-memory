@@ -1,3 +1,5 @@
+import { entityLabelKey, entityLabelOccurs } from './entity-identity.mjs';
+
 export function normalizedSearchDocument(value) {
   return String(value || '').normalize('NFKC').toLowerCase().replace(/\s+/gu, '');
 }
@@ -33,23 +35,12 @@ export function memoryConceptLabels(database, agentId, memoryIds) {
 // Names already present in the record are the same textual evidence, not
 // another occurrence to reward. Keep missing names/aliases searchable.
 export function conceptSearchText(text, labels = []) {
-  const normalize = value => String(value || '').normalize('NFKC').toLowerCase()
-    .replace(/’/gu, "'").replace(/\s+/gu, ' ').trim();
-  let document = normalize(text);
+  let document = entityLabelKey(text);
   const additions = [];
   for (const label of [...labels].sort((left, right) => right.length - left.length)) {
-    const value = normalize(label);
+    const value = entityLabelKey(label);
     if (!value) continue;
-    let index = document.indexOf(value), present = false;
-    while (index >= 0) {
-      const before = document[index - 1] || '', after = document[index + value.length] || '';
-      if ((!/^[\p{Script=Latin}\p{N}_]/u.test(value) || !/[\p{Script=Latin}\p{N}_]/u.test(before))
-        && (!/[\p{Script=Latin}\p{N}_]$/u.test(value) || !/[\p{Script=Latin}\p{N}_]/u.test(after))) {
-        present = true; break;
-      }
-      index = document.indexOf(value, index + 1);
-    }
-    if (!present) { additions.push(label); document += `\n${value}`; }
+    if (!entityLabelOccurs(document, value)) { additions.push(label); document += `\n${value}`; }
   }
   return additions.join('\n');
 }

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
+import { OrganizationCandidateError, OrganizationInputChangedError } from './organization-error.mjs';
+import { readOrganizationInput, assertOrganizationInputCurrent, organizationInputIsCurrent } from './organization-input.mjs';
+import { expectedStructureSummary, structureSummaryMaterial, readStructureSummaryMaterial } from './structure-provenance.mjs';
+import { enqueueStructureSummaryRefresh } from './organization-invalidation.mjs';
 
 import {
   MEMORY_ACTOR_ROLES,
@@ -36,13 +40,13 @@ function normalizeActorRoles(values) {
     const actorRole = clean(value?.actorRole ?? value?.actor_role);
     const actorKey = clean(value?.actorKey ?? value?.actor_key);
     if (!MEMORY_ACTOR_ROLES.includes(role)) {
-      throw new Error(`Unknown memory actor role: ${role || "(empty)"}.`);
+      throw new OrganizationCandidateError(`Unknown memory actor role: ${role || "(empty)"}.`);
     }
     if (!SUBJECT_ROLES.includes(actorRole)) {
-      throw new Error(`Unknown actor identity role: ${actorRole || "(empty)"}.`);
+      throw new OrganizationCandidateError(`Unknown actor identity role: ${actorRole || "(empty)"}.`);
     }
     if (!["world", "unknown"].includes(actorRole) && !actorKey) {
-      throw new Error("Memory actor role requires actorKey.");
+      throw new OrganizationCandidateError("Memory actor role requires actorKey.");
     }
     const key = `${role}\u001f${actorRole}\u001f${actorKey}`;
     if (seen.has(key)) continue;
@@ -77,29 +81,29 @@ function validateMembers(repository, {
     (Array.isArray(memberIds) ? memberIds : []).map(clean).filter(Boolean),
   )];
   if (ids.length < minimum) {
-    throw new Error(`A structure proposal requires at least ${minimum} distinct member${minimum === 1 ? "" : "s"}.`);
+    throw new OrganizationCandidateError(`A structure proposal requires at least ${minimum} distinct member${minimum === 1 ? "" : "s"}.`);
   }
   if (clean(targetMemoryId) && ids.includes(clean(targetMemoryId))) {
-    throw new Error("A structure target cannot also be one of its members.");
+    throw new OrganizationCandidateError("A structure target cannot also be one of its members.");
   }
   const members = ids.map((id) => repository.getMemory(id));
   if (members.some((memory) => !memory || memory.agent_id !== agentId)) {
-    throw new Error("Every proposed member must exist for the same Agent.");
+    throw new OrganizationCandidateError("Every proposed member must exist for the same Agent.");
   }
   if (members.some((memory) => memory.status === "deleted")) {
-    throw new Error("Deleted memories cannot become structure proposal members.");
+    throw new OrganizationCandidateError("Deleted memories cannot become structure proposal members.");
   }
   if (
     kind === "episode"
     && members.some((memory) => ["episode", "topic", "topic_or_episode"].includes(memory.kind))
   ) {
-    throw new Error("An episode proposal can contain only concrete memories.");
+    throw new OrganizationCandidateError("An episode proposal can contain only concrete memories.");
   }
   if (
     kind === "topic"
     && members.some((memory) => ["topic", "topic_or_episode"].includes(memory.kind))
   ) {
-    throw new Error("A topic proposal cannot contain another topic.");
+    throw new OrganizationCandidateError("A topic proposal cannot contain another topic.");
   }
   return members;
 }
@@ -116,7 +120,7 @@ function existingMembershipIds(repository, { agentId, kind, targetMemoryId }) {
 function structureScope(members, target = null) {
   const origin = target || members[0];
   if (members.some(member => !memoryWorldsCompatible(origin, member))) {
-    throw new Error("Structure members and target must share their reality and world scope.");
+    throw new OrganizationCandidateError("Structure members and target must share their reality and world scope.");
   }
   return { reality: origin.reality, worldId: origin.world_id, worldFrame: origin.world_frame };
 }
@@ -133,30 +137,31 @@ export function structureKnownAt(members) {
 function validateAttachTarget(repository, { agentId, kind, targetMemoryId }) {
   const target = repository.getMemory(clean(targetMemoryId));
   if (!target || target.agent_id !== agentId) {
-    throw new Error("Attach proposal target must exist for the same Agent.");
+    throw new OrganizationCandidateError("Attach proposal target must exist for the same Agent.");
   }
   if (target.status !== "active" || target.kind !== kind) {
-    throw new Error(`Attach proposal target must be an active ${kind} node.`);
+    throw new OrganizationCandidateError(`Attach proposal target must be an active ${kind} node.`);
   }
   return target;
 }
 
-function normalizeProposal(repository, input = {}) {
+function normalizeProposal(repository, input = {}, { requireSummary = true } = {}) {
   if (!repository) throw new Error("Structure proposal requires a repository.");
   const agentId = clean(input.agentId);
   const operation = clean(input.operation) || "create";
   const targetMemoryId = clean(input.targetMemoryId ?? input.target_memory_id);
   const kind = clean(input.kind);
   if (!agentId || !["create", "attach"].includes(operation) || !["episode", "topic"].includes(kind)) {
-    throw new Error("Structure proposal requires agentId, create/attach operation, and episode/topic kind.");
+    throw new OrganizationCandidateError("Structure proposal requires agentId, create/attach operation, and episode/topic kind.");
   }
   if (operation === "create" && targetMemoryId) {
-    throw new Error("Create proposal cannot reference an existing target.");
+    throw new OrganizationCandidateError("Create proposal cannot reference an existing target.");
   }
   if (operation === "attach" && !targetMemoryId) {
-    throw new Error("Attach proposal requires targetMemoryId.");
+    throw new OrganizationCandidateError("Attach proposal requires targetMemoryId.");
   }
 
+  if (input.expectedInput) assertOrganizationInputCurrent(repository, agentId, input.expectedInput);
   const target = operation === "attach"
     ? validateAttachTarget(repository, { agentId, kind, targetMemoryId })
     : null;
@@ -174,23 +179,23 @@ function normalizeProposal(repository, input = {}) {
   let existing = new Set();
   if (target) {
     if (input.expectedTarget && (target.title !== input.expectedTarget.title || target.content !== input.expectedTarget.content)) {
-      throw new Error('Structure target summary changed after generation; regenerate from its current summary.');
+      throw new OrganizationInputChangedError('Structure target summary changed after generation; regenerate from its current summary.');
     }
     existing = existingMembershipIds(repository, { agentId, kind, targetMemoryId });
     if (input.expectedTarget?.memberIds && (existing.size !== input.expectedTarget.memberIds.length
       || input.expectedTarget.memberIds.some(id => !existing.has(id)))) {
-      throw Object.assign(new Error('Structure target members changed after generation; regenerate from its current members.'),
-        { code: 'MEMORY_STRUCTURE_STALE' });
+      throw new OrganizationInputChangedError('Structure target members changed after generation; regenerate from its current members.');
     }
     memberIds = memberIds.filter((id) => !existing.has(id));
     if (!memberIds.length) {
-      throw Object.assign(new Error("Attach proposal must add at least one new member."), { code: 'MEMORY_STRUCTURE_NO_NEW_MEMBERS' });
+      throw new OrganizationCandidateError("Attach proposal must add at least one new member.", 'MEMORY_STRUCTURE_NO_NEW_MEMBERS');
     }
   }
   const content = clean(input.content) || target?.content || '';
   const title = clean(input.title) || target?.title || '';
   const summaryChange = target && (title !== target.title || content !== target.content) ? {
     structureSummaryBefore: { title: target.title, content: target.content,
+      material: readStructureSummaryMaterial(repository, target),
       proposalId: target.metadata?.structureSummaryProposalId || '' },
   } : {};
   const subjectRole = target ? target.subject_role : clean(input.subjectRole) || "unknown";
@@ -201,31 +206,35 @@ function normalizeProposal(repository, input = {}) {
   const actorRoles = target
     ? normalizeActorRoles(repository.listMemoryRoles(target.id))
     : normalizeActorRoles(input.actorRoles);
-  if (!content) throw new Error("Structure proposal content cannot be empty.");
+  const primarySubjects = actorRoles.filter(actor => actor.role === 'subject' && actor.isPrimary);
+  if (primarySubjects.length > 1 || primarySubjects.some(actor => actor.actorRole !== subjectRole || actor.actorKey !== subjectKey)) {
+    throw new OrganizationCandidateError('A primary subject in actorRoles must match subjectRole and subjectKey.', 'MEMORY_STRUCTURE_INVALID_SUBJECT');
+  }
+  if (requireSummary && !content) throw new OrganizationCandidateError("Structure proposal content cannot be empty.");
   if (!SUBJECT_ROLES.includes(subjectRole)) {
-    throw new Error(`Unknown structure subject role: ${subjectRole}.`);
+    throw new OrganizationCandidateError(`Unknown structure subject role: ${subjectRole}.`);
   }
   if (!["world", "unknown"].includes(subjectRole) && !subjectKey) {
-    throw new Error("Structure proposal subject requires subjectKey.");
+    throw new OrganizationCandidateError("Structure proposal subject requires subjectKey.");
   }
   if (kind === "episode") {
     if (eventDate && !validIsoDate(eventDate)) {
-      throw new Error("Episode proposal eventDate must be a valid YYYY-MM-DD date.");
+      throw new OrganizationCandidateError("Episode proposal eventDate must be a valid YYYY-MM-DD date.");
     }
     if (eventStart && !validTimestamp(eventStart)) {
-      throw new Error("Episode proposal eventStart must be a valid timestamp.");
+      throw new OrganizationCandidateError("Episode proposal eventStart must be a valid timestamp.");
     }
     if (eventEnd && !validTimestamp(eventEnd)) {
-      throw new Error("Episode proposal eventEnd must be a valid timestamp.");
+      throw new OrganizationCandidateError("Episode proposal eventEnd must be a valid timestamp.");
     }
     if (eventEnd && !eventStart) {
-      throw new Error("Episode proposal eventEnd requires eventStart.");
+      throw new OrganizationCandidateError("Episode proposal eventEnd requires eventStart.");
     }
     if (eventStart && eventEnd && Date.parse(eventEnd) < Date.parse(eventStart)) {
-      throw new Error("Episode proposal eventEnd cannot be before eventStart.");
+      throw new OrganizationCandidateError("Episode proposal eventEnd cannot be before eventStart.");
     }
   } else if (eventDate || eventStart || eventEnd) {
-    throw new Error("Topic proposal cannot carry event time.");
+    throw new OrganizationCandidateError("Topic proposal cannot carry event time.");
   }
   return {
     agentId,
@@ -246,7 +255,7 @@ function normalizeProposal(repository, input = {}) {
     rationale: clean(input.rationale),
     provenance: clean(input.provenance) || "structure-proposal-v1",
     metadata: { ...(input.metadata && typeof input.metadata === "object" && !Array.isArray(input.metadata) ? input.metadata : {}),
-      ...summaryChange },
+      ...summaryChange, organizationInput: readOrganizationInput(repository, agentId, [...memberIds, ...existing]) },
     createdAt: clean(input.createdAt) || new Date().toISOString(),
   };
 }
@@ -270,16 +279,31 @@ function proposalHash(candidate) {
       actorKey: actor.actorKey,
       isPrimary: actor.isPrimary,
     })),
+    inputHash: candidate.metadata.organizationInput.hash,
   })).digest("hex");
 }
 
+function findWithdrawnStructure(repository, candidate) {
+  return repository.database.prepare(`SELECT id FROM memory_structure_proposals
+    WHERE agent_id=? AND operation=? AND target_memory_id IS ? AND kind=? AND subject_role=? AND subject_key=?
+      AND review_state='dismissed' AND resolved_by NOT LIKE 'system:%'
+      AND (json_extract(metadata_json, '$.organizationInput.hash')=?
+        OR json_type(metadata_json, '$.organizationInput') IS NULL)
+      AND json_array_length(member_ids_json)=? AND NOT EXISTS (
+        SELECT 1 FROM json_each(member_ids_json) member WHERE member.value NOT IN (SELECT value FROM json_each(?)))
+    ORDER BY resolved_at DESC, id LIMIT 1`).get(candidate.agentId, candidate.operation, candidate.targetMemoryId || null,
+    candidate.kind, candidate.subjectRole, candidate.subjectKey, candidate.metadata.organizationInput.hash,
+    candidate.memberIds.length, JSON.stringify(candidate.memberIds));
+}
+
 function pendingStructureMetadata(proposal) {
+  const { organizationInput, structureSummaryBefore, ...metadata } = proposal.metadata;
   return {
-    ...proposal.metadata,
+    ...metadata,
     structureProposalId: proposal.id,
     structureProposalProvenance: proposal.provenance,
-    structureProposalRationale: proposal.rationale,
     structureReviewState: "pending",
+    structureSummaryMaterial: structureSummaryMaterial(proposal.title, proposal.content, proposal.memberIds, organizationInput),
   };
 }
 
@@ -337,6 +361,11 @@ export function materializeMemoryStructureProposal(repository, {
   if (proposal.review_state !== "pending") {
     throw new Error(`Only a pending structure proposal can be materialized; it is ${proposal.review_state}.`);
   }
+  // A completed legacy write already has a result and owned membership. A
+  // proposal that has never been applied still needs its original input version.
+  if (!proposal.result_memory_id || proposal.metadata.organizationInput) {
+    assertOrganizationInputCurrent(repository, normalizedAgentId, proposal.metadata.organizationInput);
+  }
   const target = proposal.operation === "attach"
     ? validateAttachTarget(repository, {
       agentId: normalizedAgentId,
@@ -355,6 +384,14 @@ export function materializeMemoryStructureProposal(repository, {
   if (proposal.result_memory_id) {
     const memory = proposalResultMemory(repository, proposal);
     structureScope(members, memory);
+    if (!proposal.metadata.organizationInput) {
+      const ownsResult = proposal.operation === 'attach' ? proposal.targetMemoryId === memory.id
+        : memory.metadata?.structureProposalId === proposal.id;
+      const linked = existingMembershipIds(repository, { agentId: normalizedAgentId, kind: proposal.kind, targetMemoryId: memory.id });
+      if (!ownsResult || memory.status !== 'active' || members.some(member => !linked.has(member.id))) {
+        throw new OrganizationInputChangedError('The legacy structure result and its membership can no longer be verified.');
+      }
+    }
     return {
       status: "already-materialized",
       proposal,
@@ -369,12 +406,17 @@ export function materializeMemoryStructureProposal(repository, {
   }
 
   return repository.transaction(() => {
+    const withdrawn = findWithdrawnStructure(repository, { ...proposal, agentId: normalizedAgentId,
+      subjectRole: proposal.subject_role, subjectKey: proposal.subject_key });
+    if (withdrawn) return { status: 'withdrawn', memory: null, addedMemberIds: [], members: [],
+      proposal: repository.resolveStructureProposal({ agentId: normalizedAgentId, proposalId: proposal.id,
+        resolution: 'dismissed', resolvedBy: 'system:structure-recovery', note: `Grouping was withdrawn as ${withdrawn.id}.` }) };
     const summaryBefore = proposal.metadata.structureSummaryBefore;
     if (target && summaryBefore && (target.title !== summaryBefore.title || target.content !== summaryBefore.content)) {
-      throw new Error('Structure target summary changed before this attachment could be applied.');
+      throw new OrganizationInputChangedError('Structure target summary changed before this attachment could be applied.');
     }
     const knownAt = structureKnownAt(members);
-    if (!knownAt) throw new Error('Structure members require a valid known or recorded time.');
+    if (!knownAt) throw new OrganizationCandidateError('Structure members require a valid known or recorded time.');
     const common = {
       ...scope,
       agentId: normalizedAgentId,
@@ -429,7 +471,7 @@ export function materializeMemoryStructureProposal(repository, {
         statuses: ['active', 'superseded', 'disputed', 'archived'],
       });
       const attachedKnownAt = structureKnownAt(allMembers);
-      if (!attachedKnownAt) throw new Error('Structure members require a valid known or recorded time.');
+      if (!attachedKnownAt) throw new OrganizationCandidateError('Structure members require a valid known or recorded time.');
       if (Date.parse(target.known_at) !== Date.parse(attachedKnownAt)) {
         repository.database.prepare(`UPDATE memory_nodes SET known_at = ?, updated_at = ?
           WHERE agent_id = ? AND id = ?`).run(attachedKnownAt, new Date().toISOString(), normalizedAgentId, target.id);
@@ -472,35 +514,54 @@ export function materializePendingMemoryStructureProposals(repository, {
   if (!repository) throw new Error("Materializing pending structure proposals requires a repository.");
   const normalizedAgentId = clean(agentId);
   if (!normalizedAgentId) throw new Error("Materializing pending structure proposals requires agentId.");
-  const proposals = repository.listStructureProposals(normalizedAgentId, {
-    reviewStates: ["pending"],
-    limit,
-  });
   const materialized = [];
   const skipped = [];
+  const retired = [];
   const failed = [];
-  for (const proposal of proposals) {
-    try {
-      const result = materializeMemoryStructureProposal(repository, {
-        agentId: normalizedAgentId,
-        proposalId: proposal.id,
-      });
-      (result.status === "already-materialized" ? skipped : materialized).push(result);
-    } catch (error) {
-      failed.push({ proposalId: proposal.id, error: error.message });
+  const size = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 100)));
+  const page = repository.database.prepare(`SELECT id FROM memory_structure_proposals
+    WHERE agent_id = ? AND review_state = 'pending' AND result_memory_id IS NULL AND id > ?
+    ORDER BY id LIMIT ?`);
+  let cursor = '';
+  for (;;) {
+    const proposals = page.all(normalizedAgentId, cursor, size);
+    if (!proposals.length) break;
+    for (const { id } of proposals) {
+      cursor = id;
+      try {
+        const result = materializeMemoryStructureProposal(repository, { agentId: normalizedAgentId, proposalId: id });
+        if (result.status === 'already-materialized') skipped.push(result);
+        else if (result.status === 'withdrawn') retired.push(result);
+        else materialized.push(result);
+      } catch (error) {
+        failed.push({ proposalId: id, error: error.message });
+      }
     }
   }
   return {
-    total: proposals.length,
+    total: materialized.length + skipped.length + retired.length + failed.length,
     materialized,
     skipped,
+    retired,
     failed,
   };
+}
+
+// Membership planning uses the same semantic boundary as persistence, before
+// purchasing a summary. No proposal or temporary container is written here.
+export function validateStructureMembership(repository, input) {
+  const candidate = normalizeProposal(repository, input, { requireSummary: false });
+  if (findWithdrawnStructure(repository, candidate)) {
+    throw new OrganizationCandidateError('This structure grouping was withdrawn for the same evidence.', 'MEMORY_STRUCTURE_WITHDRAWN');
+  }
+  return candidate;
 }
 
 export function proposeMemoryStructure(repository, input = {}) {
   return repository.transaction(() => {
     const candidate = normalizeProposal(repository, input);
+    const withdrawn = findWithdrawnStructure(repository, candidate);
+    if (withdrawn) return { ...repository.getStructureProposal(candidate.agentId, withdrawn.id), wasInserted: false };
     const hash = proposalHash(candidate);
     const id = clean(input.id) || `structure-proposal-${createHash("sha256")
       .update(`${candidate.agentId}\u001f${hash}`).digest("hex").slice(0, 24)}`;
@@ -538,30 +599,85 @@ function restoreStructureSummary(repository, memory, dismissedId) {
     const before = owner.metadata.structureSummaryBefore;
     if (!before) return null;
     versions.push(owner);
-    restored = { title: before.title, content: before.content, proposalId: '' };
+    restored = { title: before.title, content: before.content, proposalId: '', material: before.material || null };
     const previous = before.proposalId ? repository.getStructureProposal(memory.agent_id, before.proposalId) : null;
     if (!previous || previous.title !== before.title || previous.content !== before.content) break;
     owner = previous;
   }
   const replayed = new Set();
   for (const version of versions.reverse()) {
-    if (version.id === dismissedId || version.review_state === 'dismissed' || version.memberIds.some(id => !members.has(id))) break;
-    restored = { title: version.title, content: version.content, proposalId: version.id };
+    const input = version.metadata.organizationInput;
+    if (version.id === dismissedId || version.review_state === 'dismissed'
+      || !organizationInputIsCurrent(repository, memory.agent_id, input)
+      || input.memories.some(item => !members.has(item.id))) break;
+    restored = { title: version.title, content: version.content, proposalId: version.id,
+      material: structureSummaryMaterial(version.title, version.content, input.memories.map(item => item.id), input) };
     replayed.add(version.id);
   }
   if (restored.proposalId === ownerId) return null;
+  if (restored.material && (!organizationInputIsCurrent(repository, memory.agent_id, restored.material.inputVersion)
+    || restored.material.memoryIds.some(id => !members.has(id)))) {
+    enqueueStructureSummaryRefresh(repository, memory.agent_id, memory);
+    return memory;
+  }
   const needsRefresh = versions.some(version => version.id !== dismissedId && version.review_state !== 'dismissed'
     && !replayed.has(version.id) && version.memberIds.some(id => members.has(id)));
   const result = repository.updateStructureSummary({ agentId: memory.agent_id, memoryId: memory.id,
     title: restored.title, content: restored.content, proposalId: ownerId,
+    sourceMemoryIds: restored.material?.memoryIds || null,
     reason: 'Structure attachment dismissed.' });
   if (needsRefresh) repository.enqueueMaintenanceTask({ agentId: memory.agent_id, lane: 'semantic',
     taskType: MAINTENANCE_TASK_TYPES.structureSummary,
     payload: { batchId: dismissedId, memoryIds: [memory.id],
-      expectedSummary: { title: result.title, content: result.content } } });
+      expectedSummary: expectedStructureSummary(result) } });
   else enqueueMemoryMaintenanceTasks({ repository, agentId: memory.agent_id, batchId: dismissedId,
     memoryIds: [memory.id], taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding] });
   return result;
+}
+
+function withdrawStructureCreation(repository, proposal, memory, actor, reason) {
+  if (!memory || memory.status !== 'active' || memory.metadata?.manuallyEdited
+    || memory.metadata?.structureProposalId !== proposal.id) return null;
+  const agentId = memory.agent_id;
+  const remaining = repository.listContainerMembers({ agentId, containerId: memory.id, containerKind: memory.kind,
+    relation: memory.kind === 'topic' ? 'supports_topic' : 'part_of_episode',
+    statuses: ['active', 'superseded', 'disputed', 'archived'] });
+  const material = readStructureSummaryMaterial(repository, memory);
+  const ownsSummary = !memory.metadata?.structureSummaryProposalId
+    && memory.title === proposal.title && memory.content === proposal.content;
+  if (!remaining.length) {
+    if (ownsSummary) return repository.setMemoryDeleted({ agentId, memoryId: memory.id, actor, reason });
+    // A later generated summary with no surviving members can no longer serve as evidence.
+    if (material?.memoryIds.length) return repository.updateMemoryStatus(memory.id, 'archived');
+    return null;
+  }
+  const ids = new Set(remaining.map(member => member.id));
+  if (!ownsSummary && (!material || material.memoryIds.every(id => ids.has(id)))) return null;
+
+  // Retain the container and independent membership. Immediately use existing
+  // evidence in place of the old summary while its normal refresh is pending.
+  const [first] = remaining;
+  const result = repository.updateStructureSummary({ agentId, memoryId: memory.id, title: first.title,
+    content: first.content, sourceMemoryIds: [first.id], actor, reason });
+  if (remaining.length > 1) repository.enqueueMaintenanceTask({ agentId, lane: 'semantic', taskType: MAINTENANCE_TASK_TYPES.structureSummary,
+    payload: { batchId: proposal.id, memoryIds: [memory.id], expectedSummary: expectedStructureSummary(result),
+      invalidatesSummary: false } });
+  enqueueMemoryMaintenanceTasks({ repository, agentId, batchId: proposal.id, memoryIds: [memory.id],
+    taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding] });
+  return result;
+}
+
+function withdrawStructureResult(repository, proposal, actor, reason) {
+  const original = proposal.result_memory_id ? repository.getMemory(proposal.result_memory_id) : null;
+  if (original && (original.agent_id !== proposal.agent_id || original.kind !== proposal.kind)) {
+    throw new Error('Structure proposal points to an invalid result memory.');
+  }
+  const removedMemberships = proposal.result_memory_id ? repository.removeStructureProposalMemberships({
+    agentId: proposal.agent_id, proposalId: proposal.id,
+  }) : 0;
+  const memory = proposal.operation === 'create' ? withdrawStructureCreation(repository, proposal, original, actor, reason)
+    : original ? restoreStructureSummary(repository, original, proposal.id) : null;
+  return { memory, removedMemberships };
 }
 
 export function resolveMemoryStructureProposal(repository, {
@@ -576,7 +692,8 @@ export function resolveMemoryStructureProposal(repository, {
   const normalizedAction = clean(action);
   const proposal = repository.getStructureProposal(normalizedAgentId, proposalId);
   if (!proposal) throw new Error("Structure proposal does not exist for this Agent.");
-  if (proposal.review_state !== "pending") {
+  const withdrawing = normalizedAction === 'dismiss' && proposal.review_state === 'accepted' && proposal.result_memory_id;
+  if (proposal.review_state !== "pending" && !withdrawing) {
     throw new Error(`Structure proposal is already ${proposal.review_state}.`);
   }
   if (!["accept", "dismiss"].includes(normalizedAction)) {
@@ -584,26 +701,8 @@ export function resolveMemoryStructureProposal(repository, {
   }
   if (normalizedAction === "dismiss") {
     return repository.transaction(() => {
-      const provisional = proposal.result_memory_id
-        ? repository.getMemory(proposal.result_memory_id)
-        : null;
-      if (provisional && (provisional.agent_id !== normalizedAgentId || provisional.kind !== proposal.kind)) {
-        throw new Error("Structure proposal points to an invalid result memory.");
-      }
-      const removedMemberships = proposal.result_memory_id
-        ? repository.removeStructureProposalMemberships({
-          agentId: normalizedAgentId,
-          proposalId: proposal.id,
-        })
-        : 0;
-      const memory = provisional && provisional.status !== "deleted" && proposal.operation === "create"
-        ? repository.setMemoryDeleted({
-          agentId: normalizedAgentId,
-          memoryId: provisional.id,
-          actor: resolvedBy,
-          reason: clean(note) || "Structure proposal was dismissed during review.",
-        })
-        : provisional && proposal.operation === 'attach' ? restoreStructureSummary(repository, provisional, proposal.id) : null;
+      const result = withdrawStructureResult(repository, proposal, resolvedBy,
+        clean(note) || 'Structure proposal was dismissed during review.');
       return {
         status: "dismissed",
         proposal: repository.resolveStructureProposal({
@@ -613,8 +712,7 @@ export function resolveMemoryStructureProposal(repository, {
           resolvedBy,
           note,
         }),
-        memory,
-        removedMemberships,
+        ...result,
         members: [],
       };
     });
@@ -624,6 +722,9 @@ export function resolveMemoryStructureProposal(repository, {
     agentId: normalizedAgentId,
     proposalId: proposal.id,
   });
+  if (materialized.status === 'withdrawn') {
+    throw new OrganizationCandidateError('This structure grouping was withdrawn for the same evidence.', 'MEMORY_STRUCTURE_WITHDRAWN');
+  }
   return repository.transaction(() => {
     let memory = materialized.memory;
     const reviewedAt = new Date().toISOString();

@@ -1,5 +1,7 @@
-import { commonMemoryWorld, memoryWorldScope } from '@suzu-memory/core';
+import { commonMemoryWorld, memoryWorldScope, preferenceEvidenceKind } from '@suzu-memory/core';
 import { simulatePreferenceFormation } from "./preference-simulator.mjs";
+
+const REPORTED_EXPRESSION = "reported_expression";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -126,7 +128,7 @@ function mergedConfidence(items) {
   return values.length ? Math.min(...values) : 0.5;
 }
 
-function buildMergedCandidates(evaluation) {
+function buildMergedCandidates(evaluation, preserveAttributedReports) {
   const maps = Object.fromEntries(
     Object.entries(evaluation.analyses).map(([key, items]) => [key, byMemory(items)]),
   );
@@ -137,9 +139,13 @@ function buildMergedCandidates(evaluation) {
     const sharing = maps.sharingAffect?.get(memory.id) || null;
     const timeScope = maps.timeScope?.get(memory.id) || null;
     const selected = selectSignal({ explicit, behavior, sharing, timeScope });
+    if (!selected.signal && preserveAttributedReports && preferenceEvidenceKind({
+      objectGrounding: object, explicitExpression: explicit, timeScope,
+    }) === "report") selected.signal = REPORTED_EXPRESSION;
     if (!selected.signal) return [];
-    const preGate = prerequisiteGate({ object, timeScope, signal: selected.signal, contextId: memory.contextId });
-    const signalEvidence = selected.explicitSignal ? explicit : selected.behaviorSignal ? behavior : sharing;
+    const reportOnly = selected.signal === REPORTED_EXPRESSION;
+    const preGate = reportOnly ? null : prerequisiteGate({ object, timeScope, signal: selected.signal, contextId: memory.contextId });
+    const signalEvidence = selected.explicitSignal || reportOnly ? explicit : selected.behaviorSignal ? behavior : sharing;
     const sourceIds = [...new Set(
       [object, explicit, behavior, sharing, timeScope]
         .filter(Boolean)
@@ -209,7 +215,8 @@ export function preferenceEvidenceRetryMemoryIds(evaluation) {
     const required = ["objectGrounding", "timeScope"];
     // Preserve signal priority even when its analysis has not returned yet.
     // A complete self statement does not depend on behavior or sharing.
-    if (expressionSignal(explicit) || pending("explicitExpression", memory.id)) {
+    if (expressionSignal(explicit) || pending("explicitExpression", memory.id)
+      || (evaluation.snapshot.inputPolicy?.requestBoundUtteranceEvidence && explicit?.directness === "explicit_reported_statement")) {
       required.push("explicitExpression");
     } else if (behaviorSignal(behavior, timeScope) || pending("behaviorConditions", memory.id)) {
       required.push("behaviorConditions");
@@ -236,7 +243,16 @@ export function mergePreferenceSpecialistEvidence(repository, {
   const semantic = persistedRequest ? repository.getStateAnalysisRequestSemanticMemory(persistedRequest.agent_id, persistedRequest.id) : null;
   const world = semantic ? memoryWorldScope(semantic) : commonMemoryWorld(evaluation.snapshot.memories);
   if (!world) return { status: 'blocked', reason: 'world-scope-required', observations: [], labels: [] };
-  const currentState = repository.getCurrentCanonicalMemory({
+  const reportedRequest = persistedRequest?.representation_layer === 'reported';
+  const evidence = buildMergedCandidates(evaluation, Boolean(persistedRequest));
+  // Direct reports in the archive pipeline have a fixed target and go to
+  // reported-state scope and change checks. Independent evaluations can still
+  // compare opposition against a specific current preference.
+  const requiresCounterMatch = candidate => !candidate.preGate
+    && !(reportedRequest && candidate.selected.explicitSignal === 'explicit_rejection')
+    && !(policy && persistedRequest && !candidate.label.signal.startsWith("explicit_"))
+    && directionForSignal(candidate.label.signal) === "opposition";
+  const currentState = evidence.some(requiresCounterMatch) && repository.getCurrentCanonicalMemory({
     ...world,
     agentId: evaluation.snapshot.agentId,
     subjectRole: evaluation.snapshot.target.subjectRole,
@@ -244,10 +260,8 @@ export function mergePreferenceSpecialistEvidence(repository, {
     canonicalKey: evaluation.snapshot.target.canonicalKey,
     stateFamily: "preference",
   });
-  const candidates = buildMergedCandidates(evaluation).map((candidate) => {
-    if (candidate.preGate || !currentState
-      || (policy && persistedRequest && !candidate.label.signal.startsWith("explicit_"))
-      || directionForSignal(candidate.label.signal) !== "opposition") return candidate;
+  const candidates = evidence.map((candidate) => {
+    if (!currentState || !requiresCounterMatch(candidate)) return candidate;
     return {
       ...candidate,
       preGate: {
@@ -256,7 +270,7 @@ export function mergePreferenceSpecialistEvidence(repository, {
       },
     };
   }).map((candidate) => {
-    if (candidate.preGate || policy
+    if (candidate.preGate || policy || candidate.label.signal === REPORTED_EXPRESSION
       || ["explicit_preference", "explicit_rejection"].includes(candidate.label.signal)) {
       return candidate;
     }
@@ -268,7 +282,7 @@ export function mergePreferenceSpecialistEvidence(repository, {
       },
     };
   });
-  const eligibleLabels = candidates.filter((item) => !item.preGate).map((item) => item.label);
+  const eligibleLabels = candidates.filter((item) => !item.preGate && item.label.signal !== REPORTED_EXPRESSION).map((item) => item.label);
   const preview = policy ? simulatePreferenceFormation({
     timeZone: repository.timeZone,
     subjectRole: evaluation.snapshot.target.subjectRole,

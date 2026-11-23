@@ -1,5 +1,6 @@
 import { mergeEventSourceMaterials } from '@suzu-memory/core';
-import { mergeGenerationMaterials, withGenerationReferences } from './generation-input.mjs';
+import { assertGenerationRequestBudget, mergeGenerationMaterials, withGenerationReferences } from './generation-input.mjs';
+import { isMemoryBudgetError } from './budgeted-parts.mjs';
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -11,17 +12,14 @@ function combinedSchema(calls, model = false) {
     additionalProperties: false,
     required: calls.map((call) => call.key),
     properties: Object.fromEntries(calls.map((call) => [call.key,
-      model ? call.request.modelSchema || call.request.schema : call.request.schema])),
+      model ? call.request.modelSchemaTemplate || call.request.modelSchema || call.request.schema : call.request.schema])),
   };
 }
 
 function combinedPrompt(calls, historicalPrefix) {
   return [
-    "根据共享材料分别生成 structure 结构提案与 relations 因果提案。",
+    "使用共享材料，分别完成以下任务。",
     ...(historicalPrefix ? ["将 historicalMaterial 和顶层的 memories、sourceRecords 按各自同名表合用。"] : []),
-    "structure 依据 memories、candidateContainers 和 eventContinuity 归组；relations 依据 memories 与 sourceRecords 判断因果。",
-    "不得为了让结构与关系彼此一致而补充快照中不存在的事实；任何一类都可以返回空 proposals。",
-    "按 JSON Schema 分别输出 structure 与 relations。",
     "",
     ...calls.map((call) => [
       `## ${call.key}`,
@@ -42,40 +40,58 @@ function splitGeneration(generation, calls) {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     throw new Error("Combined consolidation did not return an object.");
   }
-  return calls.map((call, index) => {
-    if (!Object.hasOwn(output, call.key)) {
-      throw new Error(`Combined consolidation omitted ${call.key}.`);
-    }
-    return {
+  return calls.map((call, index) => ({
       ...generation,
       output: output[call.key],
       ...outputUsage(generation, calls, index),
-    };
-  });
+    }));
 }
 
-export function buildConsolidationRequest(calls) {
+export function buildConsolidationRequest(calls, { sharedNewFirst = false } = {}) {
   if (calls.length === 1) return calls[0].request;
   const first = calls[0].request;
   const material = mergeGenerationMaterials(calls.map(call => JSON.parse(call.request.input)));
   const historicalPrefix = Boolean(material.retrospectiveContext);
+  const planned = calls.some(call => call.request.schemaName === 'memory-structure-memberships-v1');
   return withGenerationReferences({
     ...first,
     input: JSON.stringify(material),
     systemPrompt: combinedPrompt(calls, historicalPrefix),
     schema: combinedSchema(calls),
     modelSchema: combinedSchema(calls, true),
-    decodeModelOutput: output => Object.fromEntries(calls.map(call => [call.key,
-      call.request.decodeModelOutput && output?.[call.key] !== undefined
-        ? call.request.decodeModelOutput(output[call.key]) : output?.[call.key]])),
-    schemaName: "memory-consolidation-combined-v1",
+    decodeModelOutput: output => Object.fromEntries(calls.map(call => {
+      const value = output?.[call.key];
+      // Each child owner diagnoses malformed output without discarding another
+      // child's valid, already-paid result.
+      try { return [call.key, call.request.decodeModelOutput && value !== undefined
+        ? call.request.decodeModelOutput(value) : value]; }
+      catch { return [call.key, value]; }
+    })),
+    schemaName: planned ? 'memory-organization-decisions-v2' : 'memory-consolidation-combined-v2',
     analyzerRole: "memory-consolidation-combined",
     combinedOutputs: calls.map(call => call.key),
     ...(first.sourceMaterial ? { sourceMaterial: mergeEventSourceMaterials(calls.map(call => call.request.sourceMaterial)) } : {}),
-  }, { historicalPrefix });
+  }, { historicalPrefix, sharedNewFirst, selectionInBody: planned });
 }
 
-export function createConsolidationGenerationBatch(generator) {
+export function prepareConsolidationGeneration(calls, { generator, taskBudgets, sharedNewFirst, fullRelationRequest }) {
+  const maximumCharacters = calls.reduce((total, call) => total + taskBudgets[call.key], 0);
+  const budgeted = inputs => {
+    const request = buildConsolidationRequest(inputs, { sharedNewFirst });
+    assertGenerationRequestBudget(request, maximumCharacters, generator);
+    return request;
+  };
+  if (fullRelationRequest && calls.length === 2) {
+    const fullCalls = calls.map(call => call.key === 'relations' ? { ...call, request: fullRelationRequest } : call);
+    try { return { request: budgeted(fullCalls), fullRelationSelected: true }; }
+    catch (error) {
+      if (!isMemoryBudgetError(error)) throw error;
+    }
+  }
+  return { request: budgeted(calls), fullRelationSelected: false };
+}
+
+export function createConsolidationGenerationBatch(generator, combinedRequest, taskBudgets) {
   if (typeof generator !== "function") {
     throw new Error("Combined consolidation requires a generator.");
   }
@@ -93,10 +109,15 @@ export function createConsolidationGenerationBatch(generator) {
         let generation;
         try {
           if (pending.length === 1) {
-            pending[0].resolve(await generator(pending[0].request));
+            const call = pending[0];
+            // A sibling can fail its input check before joining the prepared batch.
+            if (combinedRequest.combinedOutputs?.length > 1) {
+              assertGenerationRequestBudget(call.request, taskBudgets[call.key], generator);
+            }
+            call.resolve(await generator(call.request));
             return;
           }
-          generation = await generator(buildConsolidationRequest(pending));
+          generation = await generator(combinedRequest);
           const outputs = splitGeneration(generation, pending);
           pending.forEach((call, index) => call.resolve(outputs[index]));
         } catch (error) {

@@ -6,7 +6,7 @@ import { loadMemoryConfig, normalizeMemoryConfig, createMemoryServiceFromConfig,
 import { createChatHostMemoryAdapter } from '@suzu-memory/host-adapter';
 import { createMemorySearchSession } from '@suzu-memory/service';
 import { answerWithMemoryTools } from './memory-tool-answer.mjs';
-import { questionFailure, memoryPreparationDiagnostics, runQuestionOperation } from './zh4o-execution.mjs';
+import { questionFailure, memoryPreparationDiagnostics, finalInputBatches, runQuestionOperation } from './zh4o-execution.mjs';
 import { MEMORY_BENCHMARK_VERSION, normalizeMemoryBenchmarkDataset, benchmarkInteger, gradeExactBenchmarkAnswer } from './benchmark-contract.mjs';
 import { createBenchmarkCompletion } from './benchmark-completion.mjs';
 import { readMemoryBenchmarkPreparation } from './benchmark-progress.mjs';
@@ -307,11 +307,12 @@ export async function runMemoryBenchmark({ dataset: input, config: configInput, 
           const events = inputRows(memory);
           const expectedEvents = sample.turns.slice(0, cutoff).reduce((sum, turn) => sum + Number(Boolean(turn.userMessage)) + Number(Boolean(turn.assistantMessage)), 0);
           state.diagnostics = { ...memoryPreparationDiagnostics({ inputEvents: events,
+            inputBatches: finalInputBatches(memory, events),
             finalProgress: state.lastProgress, expectedEvents, mappedEvents: events.length }), ...state.quality };
           state.diagnostics.infrastructureFailures = [...state.diagnostics.infrastructureFailures, ...Object.values(state.infrastructure)];
           if (state.diagnostics.missingInputEvents) throw new Error('Benchmark history was not fully archived.');
-          const outage = state.diagnostics.infrastructureFailures[0];
-          if (outage && (state.diagnostics.pendingWork || state.diagnostics.failedWork)) {
+          const outage = state.diagnostics.blockingInputFailures[0];
+          if (outage) {
             throw Object.assign(new Error(outage.message), { status: outage.status, code: outage.code });
           }
           state.vectors = config.providers.embedding ? await memory.syncEmbeddings({ dryRun: true, signal }) : { status: 'disabled' };

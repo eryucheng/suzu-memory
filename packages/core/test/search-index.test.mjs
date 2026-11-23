@@ -190,3 +190,45 @@ test('v50 concept links become searchable on upgrade while stored records and so
     assert.ok(plan.some(row => /SEARCH link.*memory_id/u.test(row.detail)), JSON.stringify(plan));
   } finally { database.close(); }
 });
+
+test('upgrading archived utterances removes inherited search labels and keeps direct mentions', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'suzu-utterance-label-upgrade-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'memory.db');
+  let database = openMemoryDatabase(file);
+  try {
+    const repository = new MemoryRepository(database);
+    const concept = repository.upsertEntity({ agentId: 'test', kind: 'concept',
+      canonicalName: 'recovery point objective', aliases: ['RPO'] });
+    const manual = repository.upsertEntity({ agentId: 'test', kind: 'concept', canonicalName: 'infrastructure review' });
+    for (const [id, content] of [['inspection', 'I checked the server.'], ['backup', 'The RPO is ten minutes.']]) {
+      repository.upsertMemory({ id, agentId: 'test', kind: 'utterance', layer: 'evidence', content });
+      const source = repository.upsertSource({
+        id: id + '-source', agentId: 'test', sourceKind: 'input-event', externalId: id, content,
+      });
+      repository.linkSource(id, source.id, 'verbatim', { provenance: 'suzu-memory-extraction-v1' });
+      repository.linkMemoryEntity({ memoryId: id, entityId: concept.id });
+    }
+    repository.linkMemoryEntity({ memoryId: 'inspection', entityId: manual.id });
+    repository.upsertMemory({ id: 'event', agentId: 'test', kind: 'event', layer: 'episodic',
+      content: 'Server maintenance completed.' });
+    repository.linkMemoryEntity({ memoryId: 'event', entityId: concept.id });
+    repository.recordIngestionDecision({
+      agentId: 'test', batchId: 'maintenance', candidateIndex: 0, decision: 'store', resultStatus: 'created', memoryId: 'event',
+      sourceIds: ['inspection-source', 'backup-source'], candidate: { entityIds: [concept.id] },
+    });
+    const query = 'recovery point objective';
+    const ids = repo => repo.search('test', query).map(item => item.id).sort();
+    assert.deepEqual(ids(repository), ['backup', 'event', 'inspection']);
+    database.exec('DELETE FROM schema_migrations WHERE version = 54');
+    database.close();
+    database = null;
+    database = openMemoryDatabase(file);
+    const upgraded = new MemoryRepository(database);
+    assert.deepEqual(ids(upgraded), ['backup', 'event']);
+    assert.equal(upgraded.getMemory('inspection').content, 'I checked the server.');
+    assert.deepEqual(upgraded.listMemoryEntities('inspection').map(entity => entity.id), [manual.id]);
+    assert.equal(upgraded.search('test', 'infrastructure review')[0].id, 'inspection');
+    assert.equal(upgraded.listMemoryEntities('backup')[0].id, concept.id);
+  } finally { database?.close(); }
+});

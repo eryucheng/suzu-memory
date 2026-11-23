@@ -4,11 +4,40 @@ import { createMemorySearchSession } from '../src/index.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { MemoryRepository, openMemoryDatabase } from '@suzu-memory/core';
+import { MemoryRepository, openMemoryDatabase, proposeMemoryRelation } from '@suzu-memory/core';
+import { createTestDirectory, closeAfterTests } from '../../../test/support/suite-resources.mjs';
 import { retrieveMemories, closeRetrievalWorker, DEFAULT_RETRIEVAL_OPTIONS } from '@suzu-memory/retriever';
 
 const record = (id, text = id) => ({ memoryId: id, text: `记忆编号：${id}\n${text}` });
 const reply = records => ({ status: records.length ? 'ready' : 'no-match', records });
+
+test('search continuation delivers an explanation and its scope with a stable memory reference', async t => {
+  const root = createTestDirectory(path.join(os.tmpdir(), 'memory-explanation-pages-'));
+  const databasePath = path.join(root, 'memory.db');
+  const database = closeAfterTests(openMemoryDatabase(databasePath)), repository = new MemoryRepository(database), agentId = 'test';
+  const scope = '两个月的夜班安排期间', rationale = '林说夜班后需要白天补觉，因此暂时无法安排练车。';
+  const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'schedule',
+    content: '林因两个月的夜班安排暂停学车，白天需要补觉，之后再考虑恢复。' });
+  for (const [id, content] of [['shift', '林连续两个月排夜班。'], ['pause', '林暂停驾驶课程。' + '林谈到课程和练习安排。'.repeat(55)]]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content }); repository.linkSource(id, source.id);
+  }
+  proposeMemoryRelation(repository, { agentId, relation: 'reason_for', fromMemoryId: 'shift', toMemoryId: 'pause',
+    evidenceSourceIds: [source.id], scope, rationale, weight: 1, confidence: 1 });
+  database.close();
+  const memory = { search(query, options) { return retrieveMemories({ databasePath, agentId, query,
+    anchorMemoryIds: options.anchors, options: { ...options.options, execution: 'inline' } }); } };
+  const session = createMemorySearchSession({ memory, maximumContextChars: 200 }); t.after(() => session.close());
+  const pages = [], versions = new Set();
+  for (let page = 0; page < 10; page++) {
+    const result = await session.execute({ query: '驾驶课程', limit: 1, ...(page ? { anchors: ['m1'] } : {}) });
+    assert.deepEqual(result.memoryIds, ['pause']); assert.ok(result.text.length <= 200);
+    versions.add(result.records[0].textVersion);
+    pages.push(result.text.replace(/^记忆编号：m1\n/u, '').replace(/…$/u, ''));
+    if (result.records[0].nextOffset === null) break;
+  }
+  assert.ok(pages.length > 1); assert.equal(versions.size, 1);
+  assert.ok(pages.join('').includes(`决策理由（${scope}）：${rationale}`));
+});
 
 test('native searches continue unread text with stable references and exclude only completed records', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-search-continuation-'));

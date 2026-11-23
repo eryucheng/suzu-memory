@@ -1,11 +1,12 @@
-import { isProvisionalMemory as isProvisionalNode } from '@suzu-memory/core';
+import { isProvisionalMemory as isProvisionalNode, MEMORY_EXPLANATORY_RELATIONS, reportedStateEvidenceAvailable } from '@suzu-memory/core';
 import { appliedPlasticityAudit, edgeRelationUtilityAdjustment } from './plasticity-ranking.mjs';
 import { normalizedEvidenceLimit } from './candidate-selection.mjs';
+import { APPLIED_RELATION_JOIN } from './relation-context.mjs';
 const parseJson = (value, fallback = {}) => { try { return JSON.parse(value); } catch { return fallback; } };
 const RELATION_UTILITY_BY_VIEW = Object.freeze({
   associative: Object.freeze({
     associated_with: 1,
-    causes: 1,
+    ...Object.fromEntries(Object.keys(MEMORY_EXPLANATORY_RELATIONS).map(relation => [relation, 1])),
     timeline_next: 1,
     part_of_episode: 1,
     supports_topic: 0.9,
@@ -60,7 +61,7 @@ function propagationPolicy(relation) {
     "same_thread",
     "part_of_episode",
     "supports_topic",
-    "causes",
+    ...Object.keys(MEMORY_EXPLANATORY_RELATIONS),
   ].includes(relation)) return "conditional";
   return "associative";
 }
@@ -86,7 +87,7 @@ function relationFactor(relation) {
   if (relation === "shares_entity") return 0.97;
   if (relation === "timeline_next") return 0.98;
   if (relation === "associated_with") return 0.95;
-  if (relation === "causes") return 1;
+  if (Object.hasOwn(MEMORY_EXPLANATORY_RELATIONS, relation)) return 1;
   if (relation === "scoped_exception_to") return 1;
   return 0.9;
 }
@@ -152,12 +153,11 @@ export function followMemoryChain({
       learned.last_observation_window_id AS learned_utility_window_id,
       learned.last_applied_at AS learned_utility_applied_at
     FROM memory_edges AS edge
-    LEFT JOIN memory_relation_proposals AS proposal
-      ON proposal.agent_id = edge.agent_id AND proposal.result_edge_id = edge.id
+    ${APPLIED_RELATION_JOIN}
     LEFT JOIN memory_edge_relation_utility_state AS learned
       ON learned.agent_id = edge.agent_id AND learned.edge_id = edge.id
       AND learned.intent_view = ?
-    WHERE edge.agent_id = ? AND edge.from_memory_id = ?
+    WHERE edge.agent_id = ? AND edge.from_memory_id = ? AND ${reportedStateEvidenceAvailable('edge')}
     ORDER BY edge.weight DESC, edge.updated_at DESC${edgeLimit}
   `);
   const incoming = database.prepare(`
@@ -167,12 +167,11 @@ export function followMemoryChain({
       learned.last_observation_window_id AS learned_utility_window_id,
       learned.last_applied_at AS learned_utility_applied_at
     FROM memory_edges AS edge
-    LEFT JOIN memory_relation_proposals AS proposal
-      ON proposal.agent_id = edge.agent_id AND proposal.result_edge_id = edge.id
+    ${APPLIED_RELATION_JOIN}
     LEFT JOIN memory_edge_relation_utility_state AS learned
       ON learned.agent_id = edge.agent_id AND learned.edge_id = edge.id
       AND learned.intent_view = ?
-    WHERE edge.agent_id = ? AND edge.to_memory_id = ?
+    WHERE edge.agent_id = ? AND edge.to_memory_id = ? AND ${reportedStateEvidenceAvailable('edge')}
     ORDER BY edge.weight DESC, edge.updated_at DESC${edgeLimit}
   `);
   const nodeQuery = database.prepare(`
@@ -214,7 +213,7 @@ export function followMemoryChain({
         ...outgoing.all(relationView, agentId, current.id),
         ...incoming.all(relationView, agentId, current.id),
       ].filter((edge) => (relationUtility(edge.relation, relationView) > 0
-        && (edge.relation !== 'causes' || edge.relation_review_state === 'accepted'))
+        && (!Object.hasOwn(MEMORY_EXPLANATORY_RELATIONS, edge.relation) || ['pending', 'accepted'].includes(edge.relation_review_state)))
         || (edge.relation === 'supported_by' && edge.from_memory_id === current.id))
         .map((edge) => {
           const neighborId = edge.from_memory_id === current.id
@@ -403,8 +402,8 @@ export function selectConvergedSeeds({
   const placeholders = ids.map(() => "?").join(", ");
   const relationPlaceholders = CONVERGENCE_RELATIONS.map(() => "?").join(", ");
   const edges = database.prepare(`
-    SELECT * FROM memory_edges
-    WHERE agent_id = ?
+    SELECT * FROM memory_edges edge
+    WHERE agent_id = ? AND ${reportedStateEvidenceAvailable('edge')}
       AND relation IN (${relationPlaceholders})
       AND (from_memory_id IN (${placeholders}) OR to_memory_id IN (${placeholders}))
   `).all(agentId, ...CONVERGENCE_RELATIONS, ...ids, ...ids).filter((edge) => (

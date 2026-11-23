@@ -12,6 +12,13 @@ const DEFAULT_OPTIONS = Object.freeze({
   maximumTermDocumentRatio: 0.12,
 });
 
+const ASSOCIATION_NODE_FILTER = `node.status = 'active'
+  AND node.kind NOT IN ('utterance', 'episode', 'topic', 'topic_or_episode')`;
+
+function writeAssociationEdge(repository, edge) {
+  repository.upsertEdge(edge, { preserveOtherProvenance: true });
+}
+
 function clean(value) {
   return String(value ?? "").normalize("NFKC").toLowerCase().trim();
 }
@@ -219,13 +226,19 @@ function selectAssociationBudget(candidates, options) {
     });
 }
 
-function loadAssociationNodes(repository, agentId, options) {
+function loadAssociationNodes(repository, agentId, options, requestedIds = null) {
+  if (requestedIds && !repository.database.prepare(`
+    SELECT 1 FROM json_each(?) AS requested
+    CROSS JOIN memory_nodes AS node ON node.id = requested.value
+    WHERE node.agent_id = ? AND ${ASSOCIATION_NODE_FILTER}
+    LIMIT 1
+  `).get(JSON.stringify([...requestedIds]), agentId)) return [];
+
   const rows = repository.database.prepare(`
-    SELECT *
-    FROM memory_nodes
-    WHERE agent_id = ? AND status = 'active'
-      AND kind NOT IN ('utterance', 'episode', 'topic', 'topic_or_episode')
-    ORDER BY recorded_at ASC, id ASC
+    SELECT node.*
+    FROM memory_nodes AS node
+    WHERE node.agent_id = ? AND ${ASSOCIATION_NODE_FILTER}
+    ORDER BY node.recorded_at ASC, node.id ASC
   `).all(agentId);
   const nodes = rows.map((row) => ({
     ...row,
@@ -255,8 +268,7 @@ function loadAssociationNodes(repository, agentId, options) {
     SELECT embedding.memory_id, embedding.model, embedding.dimensions, embedding.vector
     FROM memory_embeddings AS embedding
     JOIN memory_nodes AS node ON node.id = embedding.memory_id
-    WHERE node.agent_id = ? AND node.status = 'active'
-      AND node.kind NOT IN ('utterance', 'episode', 'topic', 'topic_or_episode')
+    WHERE node.agent_id = ? AND ${ASSOCIATION_NODE_FILTER}
   `).all(agentId);
   for (const row of embeddings) {
     const node = byId.get(row.memory_id);
@@ -265,7 +277,7 @@ function loadAssociationNodes(repository, agentId, options) {
   return nodes;
 }
 
-function entityAssociations(repository, agentId, nodes, seedIds = null) {
+function entityAssociations(repository, agentId, nodes) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const groups = new Map();
   for (const row of repository.database.prepare(`
@@ -273,17 +285,16 @@ function entityAssociations(repository, agentId, nodes, seedIds = null) {
       entity.kind AS entity_kind, entity.canonical_name
     FROM memory_entities AS link
     JOIN entities AS entity ON entity.id = link.entity_id
-    JOIN memory_nodes AS memory ON memory.id = link.memory_id
-    WHERE entity.agent_id = ? AND memory.agent_id = ? AND memory.status = 'active'
+    JOIN memory_nodes AS node ON node.id = link.memory_id
+    WHERE entity.agent_id = ? AND node.agent_id = ? AND ${ASSOCIATION_NODE_FILTER}
     GROUP BY link.memory_id, link.entity_id, entity.kind, entity.canonical_name
-    ORDER BY link.entity_id ASC, memory.recorded_at ASC, link.memory_id ASC
+    ORDER BY link.entity_id ASC, node.recorded_at ASC, link.memory_id ASC
   `).all(agentId, agentId)) {
     if (!byId.has(row.memory_id)) continue;
     const values = groups.get(row.entity_id) || [];
     values.push(row);
     groups.set(row.entity_id, values);
   }
-  const selectedSeeds = seedIds ? new Set(seedIds) : null;
   const edges = new Map();
   const addEdge = (left, right, entity) => {
     const leftNode = byId.get(left.memory_id);
@@ -315,19 +326,47 @@ function entityAssociations(repository, agentId, nodes, seedIds = null) {
         : Number.POSITIVE_INFINITY;
       return leftTime - rightTime || left.memory_id.localeCompare(right.memory_id);
     });
-    if (!selectedSeeds) {
-      for (let index = 1; index < members.length; index += 1) {
-        addEdge(members[index - 1], members[index], members[index]);
-      }
-      continue;
-    }
-    for (let index = 0; index < members.length; index += 1) {
-      if (!selectedSeeds.has(members[index].memory_id)) continue;
-      if (index > 0) addEdge(members[index - 1], members[index], members[index]);
-      if (index < members.length - 1) addEdge(members[index], members[index + 1], members[index]);
+    for (let index = 1; index < members.length; index += 1) {
+      addEdge(members[index - 1], members[index], members[index]);
     }
   }
-  return [...edges.values()];
+  return edges;
+}
+
+function syncEntityAssociations(repository, agentId, provenance, edges) {
+  const direction = "undirected";
+  const weight = 0.9;
+  const confidence = 1;
+  const existing = repository.database.prepare(`
+    SELECT id, from_memory_id, to_memory_id, direction, weight, confidence, metadata_json
+    FROM memory_edges
+    WHERE agent_id = ? AND provenance = ? AND relation = 'shares_entity'
+  `).all(agentId, provenance);
+  const remove = repository.database.prepare("DELETE FROM memory_edges WHERE id = ?");
+  const changes = new Map(edges);
+  for (const edge of existing) {
+    const key = pairKey(edge.from_memory_id, edge.to_memory_id);
+    const expected = edges.get(key);
+    if (!expected || expected.fromMemoryId !== edge.from_memory_id) {
+      remove.run(edge.id);
+    } else if (edge.direction === direction && edge.weight === weight && edge.confidence === confidence
+      && edge.metadata_json === JSON.stringify({ entities: expected.entities })) {
+      changes.delete(key);
+    }
+  }
+  for (const edge of changes.values()) {
+    writeAssociationEdge(repository, {
+      agentId,
+      fromMemoryId: edge.fromMemoryId,
+      toMemoryId: edge.toMemoryId,
+      relation: "shares_entity",
+      direction,
+      weight,
+      confidence,
+      provenance,
+      metadata: { entities: edge.entities },
+    });
+  }
 }
 
 export function rebuildAssociationGraph({
@@ -396,13 +435,13 @@ export function rebuildAssociationGraph({
   let associationEdges = 0;
   let timelineEdges = 0;
   let threadEdges = 0;
-  let entityEdges = 0;
+  const entityEdges = sharedEntities.size;
   repository.transaction(() => {
     repository.database.prepare(`
-      DELETE FROM memory_edges WHERE agent_id = ? AND provenance = ?
+      DELETE FROM memory_edges WHERE agent_id = ? AND provenance = ? AND relation <> 'shares_entity'
     `).run(normalizedAgentId, options.provenance);
     for (const value of associations) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -421,7 +460,7 @@ export function rebuildAssociationGraph({
       associationEdges += 1;
     }
     for (const value of timelines) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -441,7 +480,7 @@ export function rebuildAssociationGraph({
       timelineEdges += 1;
     }
     for (const value of threads.edges.values()) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -454,20 +493,7 @@ export function rebuildAssociationGraph({
       });
       threadEdges += 1;
     }
-    for (const value of sharedEntities) {
-      repository.upsertEdge({
-        agentId: normalizedAgentId,
-        fromMemoryId: value.fromMemoryId,
-        toMemoryId: value.toMemoryId,
-        relation: "shares_entity",
-        direction: "undirected",
-        weight: 0.9,
-        confidence: 1,
-        provenance: options.provenance,
-        metadata: { entities: value.entities },
-      });
-      entityEdges += 1;
-    }
+    syncEntityAssociations(repository, normalizedAgentId, options.provenance, sharedEntities);
   });
 
   return {
@@ -494,7 +520,7 @@ export function updateAssociationGraph({
   if (!normalizedAgentId) throw new Error("updateAssociationGraph 需要 agentId。");
   const requestedIds = new Set(memoryIds.map(String).map((value) => value.trim()).filter(Boolean));
   const options = { ...DEFAULT_OPTIONS, ...overrides };
-  const nodes = loadAssociationNodes(repository, normalizedAgentId, options);
+  const nodes = loadAssociationNodes(repository, normalizedAgentId, options, requestedIds);
   const seeds = nodes.filter((node) => requestedIds.has(node.id));
   if (!seeds.length) {
     return {
@@ -585,7 +611,7 @@ export function updateAssociationGraph({
       FROM memory_edges edge
       JOIN memory_nodes source ON source.agent_id = edge.agent_id AND source.id = edge.from_memory_id
       JOIN memory_nodes target ON target.agent_id = edge.agent_id AND target.id = edge.to_memory_id
-      WHERE edge.agent_id = ? AND edge.provenance = ?
+      WHERE edge.agent_id = ? AND edge.provenance = ? AND edge.relation <> 'shares_entity'
     `).all(normalizedAgentId, options.provenance);
     const deleteWorldEdge = repository.database.prepare('DELETE FROM memory_edges WHERE id = ? AND agent_id = ?');
     for (const edge of existingWorldEdges) {
@@ -596,7 +622,7 @@ export function updateAssociationGraph({
     }
     repository.database.prepare(`
       DELETE FROM memory_edges
-      WHERE agent_id = ? AND provenance = ?
+      WHERE agent_id = ? AND provenance = ? AND relation <> 'shares_entity'
         AND (
           from_memory_id IN (${placeholders})
           OR to_memory_id IN (${placeholders})
@@ -607,10 +633,6 @@ export function updateAssociationGraph({
       ...seeds.map((node) => node.id),
       ...seeds.map((node) => node.id),
     );
-    repository.database.prepare(`
-      DELETE FROM memory_edges
-      WHERE agent_id = ? AND provenance = ? AND relation = 'shares_entity'
-    `).run(normalizedAgentId, options.provenance);
     const existingAssociations = repository.database.prepare(`
       SELECT *
       FROM memory_edges
@@ -661,7 +683,7 @@ export function updateAssociationGraph({
       );
     }
     for (const value of associations) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -679,7 +701,7 @@ export function updateAssociationGraph({
       });
     }
     for (const value of timelines.values()) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -698,7 +720,7 @@ export function updateAssociationGraph({
       });
     }
     for (const value of threads.edges.values()) {
-      repository.upsertEdge({
+      writeAssociationEdge(repository, {
         agentId: normalizedAgentId,
         fromMemoryId: value.fromMemoryId,
         toMemoryId: value.toMemoryId,
@@ -710,19 +732,7 @@ export function updateAssociationGraph({
         metadata: { canonicalKey: value.canonicalKey },
       });
     }
-    for (const value of sharedEntities) {
-      repository.upsertEdge({
-        agentId: normalizedAgentId,
-        fromMemoryId: value.fromMemoryId,
-        toMemoryId: value.toMemoryId,
-        relation: "shares_entity",
-        direction: "undirected",
-        weight: 0.9,
-        confidence: 1,
-        provenance: options.provenance,
-        metadata: { entities: value.entities },
-      });
-    }
+    syncEntityAssociations(repository, normalizedAgentId, options.provenance, sharedEntities);
   });
   return {
     status: "completed",
@@ -731,8 +741,8 @@ export function updateAssociationGraph({
     prunedAssociationEdges,
     timelineEdges: timelines.size,
     threadEdges: threads.edges.size,
-    entityEdges: sharedEntities.length,
-    totalEdges: associations.length + timelines.size + threads.edges.size + sharedEntities.length,
+    entityEdges: sharedEntities.size,
+    totalEdges: associations.length + timelines.size + threads.edges.size + sharedEntities.size,
     provenance: options.provenance,
   };
 }

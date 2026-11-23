@@ -20,6 +20,7 @@ import {
   buildLongTermExtractionInput,
   buildExtractionParticipants,
   detectExtractionLanguage,
+  parseGeneratedLongTermExtraction,
   normalizeGeneratedLongTermExtraction,
   resolveExtractionParticipant,
   resolveExtractionActor,
@@ -157,7 +158,7 @@ test("long-term extraction input only contains submitted standard events", () =>
   });
   assert.equal(built.messages.length, 1);
   assert.equal(built.messages[0].memoryRef, "M0001");
-  assert.match(built.input, /【待提取的标准事件】/u);
+  assert.match(built.input, /【待提取记忆的对话正文】/u);
   assert.doesNotMatch(built.input, /既有记忆摘要|切点|短期上下文/u);
 });
 
@@ -181,7 +182,7 @@ test("labels boundary context as read-only and assigns evidence refs only to arc
   assert.equal(built.previousContextMessages[0].memoryRef, undefined);
   assert.equal(built.continuationGuidanceMessages[0].memoryRef, undefined);
   assert.match(built.input, /【只读的前文衔接】[\s\S]*之前的问题是什么/u);
-  assert.match(built.input, /【待提取的标准事件】[\s\S]*\[M0001\][\s\S]*我今天去了科技馆/u);
+  assert.match(built.input, /【待提取记忆的对话正文】[\s\S]*\[M0001\][\s\S]*我今天去了科技馆/u);
   assert.match(built.input, /【只读的后文衔接】[\s\S]*这件事还没有讲完/u);
   assert.equal((built.input.match(/\[M\d{4}\]/gu) || []).length, 1);
 });
@@ -201,10 +202,12 @@ test("packs semantic archive windows into one prompt without sharing evidence na
   });
   assert.deepEqual(built.messages.map((item) => item.memoryRef), ["M0001", "M0002"]);
   assert.deepEqual(built.messages.map((item) => item.archiveWindowId), ["window-a", "window-b"]);
+  assert.match(built.modelInput, /^【输出语言：沿用直接证据的语言，语种不清时用中文】\n/u);
+  assert.equal(built.modelInput.match(/输出语言：/gu)?.length, 1);
   assert.match(built.input, /【语义归档窗口 W0001】[\s\S]*\[M0001\][\s\S]*【语义归档窗口 W0002】[\s\S]*\[M0002\]/u);
 });
 
-test("annotates each archive window and message with its source language in the extraction request", () => {
+test("declares different output languages once before the archive windows", () => {
   const message = (id, role, text) => ({
     id,
     timestamp: "2026-08-04T00:00:00.000Z",
@@ -214,6 +217,7 @@ test("annotates each archive window and message with its source language in the 
   assert.equal(detectExtractionLanguage("今天去科技馆看AI展。"), "zh");
   assert.equal(detectExtractionLanguage("I went to the science museum today."), "en");
   assert.equal(detectExtractionLanguage("今天我和你一起看 a science museum video。"), "mixed");
+  assert.equal(detectExtractionLanguage("用 Codex"), "mixed");
 
   const built = buildLongTermExtractionInput({
     archiveWindows: [
@@ -229,22 +233,25 @@ test("annotates each archive window and message with its source language in the 
     ],
   });
   assert.deepEqual(built.archiveWindows.map((window) => window.sourceLanguage), ["zh", "en", "mixed"]);
-  assert.match(built.input, /本窗口输出语言：中文/u);
-  assert.match(built.input, /本窗口输出语言：English/u);
-  assert.match(built.input, /本窗口输出语言：逐候选跟随直接证据/u);
+  assert.match(built.modelInput, /^【输出语言：沿用直接证据的语言，语种不清时按窗口默认（W0001 中文，W0002 English）】\n/u);
+  assert.equal(built.modelInput.match(/输出语言：/gu)?.length, 1);
   assert.match(built.input, /P1 记忆拥有者：I painted a sunrise last year/u);
-  assert.match(built.input, /\[source-language=zh\] P2 对方：我今天去了科技馆/u);
-  assert.match(built.input, /\[source-language=en\] P1 记忆拥有者：I loved the science exhibit/u);
+  assert.match(built.input, /P2 对方：我今天去了科技馆/u);
+  assert.match(built.input, /P1 记忆拥有者：I loved the science exhibit/u);
+  assert.doesNotMatch(built.modelInput, /\[source-language=/u);
 });
 
-test('a short English message retains its language in a mostly Chinese batch', () => {
+test('a Chinese window supplies a default and preserves independent English evidence', () => {
   const built = buildLongTermExtractionInput({ messages: [
     { id: 'long-chinese', role: 'assistant', text: '今天一起整理了读书群的书单。'.repeat(30) },
+    { id: 'short-chinese', role: 'user', text: '用 Codex' },
     { id: 'short-english', role: 'user', text: 'I prefer mysteries.' },
   ] });
-  assert.equal(built.archiveWindows[0].sourceLanguage, 'mixed');
-  assert.deepEqual(built.messages.map(message => message.sourceLanguage), ['zh', 'en']);
-  assert.match(built.input, /\[source-language=en\] P2 对方：I prefer mysteries\./u);
+  assert.equal(built.archiveWindows[0].sourceLanguage, 'zh');
+  assert.ok(built.messages.every(message => message.sourceLanguage === undefined));
+  assert.match(built.modelInput, /^【输出语言：沿用直接证据的语言，语种不清时用中文】\n/u);
+  assert.match(built.input, /P2 对方：用 Codex/u);
+  assert.match(built.input, /P2 对方：I prefer mysteries\./u);
 });
 
 test('the extraction parser preserves supplied multilingual names, time ranges and state labels without mutating its input', () => {
@@ -278,7 +285,7 @@ test('owner and same-name speakers use supplied identities throughout core and b
   };
   const original = structuredClone(source);
   const built = buildLongTermExtractionInput(source);
-  assert.match(built.input, /^记忆拥有者：P1 Echo\n/u);
+  assert.match(built.input, /^记忆拥有者：P1 Echo$/mu);
   const lines = built.input.split('\n');
   for (const [body, name, spaceId] of [
     ['前文内容', 'P1 Echo', 'group-a'],
@@ -304,7 +311,7 @@ test('captured speakers supply an unconfigured owner name to the extraction mode
     const owner = built.participants.find(person => person.actorRole === 'agent');
     assert.equal(owner.name, name);
     assert.equal(owner.actorKey, 'owner');
-    assert.ok(built.input.startsWith(`记忆拥有者：${owner.ref} ${name}\n`));
+    assert.ok(built.input.split('\n').includes(`记忆拥有者：${owner.ref} ${name}`));
     assert.equal(resolveExtractionActor({ ref: owner.ref }, built).name, name);
   }
   assert.equal(buildExtractionParticipants([], { agentId: 'unnamed-owner' })[0].name, '未命名人物');
@@ -317,7 +324,7 @@ test('named human and Agents omit person IDs from model input while retaining so
   const built = buildLongTermExtractionInput({ memoryOwner: 'Suzu', userName: '私聊角色',
     identity: { companionId: 'private-owner-id', primaryUserId: 'private-human-id' },
     messages: [{ id: 'source-message', role: 'user', text: '我负责整理书单。', eventSource: source }] });
-  assert.match(built.input, /^记忆拥有者：P1 Suzu\n/u);
+  assert.match(built.input, /^记忆拥有者：P1 Suzu$/mu);
   assert.match(built.input, /"ref":"P2","name":"小夏"/u);
   assert.match(built.input, /P2 小夏：我负责整理书单。/u);
   assert.doesNotMatch(built.input, /private-owner-id|private-human-id|私聊角色|"id":/u);
@@ -325,7 +332,7 @@ test('named human and Agents omit person IDs from model input while retaining so
   assert.deepEqual(built.messages[0].eventSource, source);
 });
 
-test("persists each raw message's detected source language for later audit", () => {
+test("persists the window language with its original evidence", () => {
   const { root, database, repository } = temporaryDatabase();
   try {
     const built = buildLongTermExtractionInput({
@@ -348,7 +355,8 @@ test("persists each raw message's detected source language for later audit", () 
       recordedAt: "2026-08-04T00:01:00.000Z",
     });
     const utterance = repository.getMemory(archive.utteranceMemoryIds[0]);
-    assert.equal(utterance.metadata.sourceLanguage, "en");
+    assert.equal(utterance.metadata.outputLanguage, "en");
+    assert.equal(repository.listMemorySources(utterance.id)[0].metadata.outputLanguage, "en");
   } finally {
     database.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -389,6 +397,32 @@ for (const [language, text] of [["en", "Xia's hands were shaking."], ["zh", "小
     assert.ok(recalled.candidates.some(item => item.memoryId === processed.provisional.id), JSON.stringify(recalled.candidates));
   });
 }
+
+test('event action defaults preserve explicit actions and keep cancellation, state and source validation', () => {
+  const visit = { title: '参观博物馆', content: '小夏参观了博物馆。', classification: { category: 'event' },
+    subject: { name: '小夏' }, actors: [], reality: 'real', evidenceMode: 'explicit', temporalState: 'completed',
+    time: null, confidence: 1, importance: 0.5, sourceRefs: ['M0001'] };
+  const cancelled = { ...visit, title: '取消参观', content: '小夏取消了参观。', temporalState: 'cancelled' };
+  const correction = { ...visit, content: '小夏更正参观地点为科技馆。', revisionAction: 'correct' };
+  const parse = (...memories) => parseGeneratedLongTermExtraction({ memories }).memories;
+  assert.deepEqual(parse(visit, correction, { ...cancelled, revisionAction: 'cancel' }).map(memory => memory.revisionAction),
+    ['add', 'correct', 'cancel']);
+  assert.equal(Object.hasOwn(visit, 'revisionAction'), false);
+  const preference = { ...visit, classification: { category: 'preference', key: 'museums', label: '爱逛博物馆' },
+    content: '小夏爱逛博物馆。', temporalState: 'current' };
+  for (const candidate of [cancelled, { ...cancelled, revisionAction: null }, preference, { ...preference, revisionAction: null },
+    { ...visit, revisionAction: '' }, { ...visit, revisionAction: 'unrecognized' }]) {
+    assert.throws(() => parse(candidate), /revisionAction/u);
+  }
+
+  const built = buildLongTermExtractionInput({ timeZone: 'Asia/Shanghai',
+    messages: [{ id: 'museum', role: 'user', speaker: '小夏', timestamp: '2026-08-04T08:00:00Z', text: '昨天我参观了博物馆。' }] });
+  assert.throws(() => parseGeneratedLongTermExtraction({ memories: [{ ...visit, sourceRefs: ['M0002'] }] }, built), /sourceRefs/u);
+  const { sourceRefs, ...wire } = visit;
+  const dated = parseGeneratedLongTermExtraction({ memories: [{ ...wire, evidence: sourceRefs,
+    time: '2026-08-03' }] }, built).memories[0];
+  assert.deepEqual(dated.time, { date: '2026-08-03' });
+});
 
 for (const language of ['zh', 'en']) test(`compact references preserve directed state targets, changes and evidence: ${language}`, () => {
   const owner = language === 'zh' ? '小铃' : 'Suzu';
@@ -435,7 +469,8 @@ test('each semantic category retains its domain kind without a second classifica
       ...(['event', 'reflection'].includes(category) ? {} : { label: 'A supported fact' }),
       ...(targets[category] ? { target: targets[category] } : {}) };
     const memory = normalizeGeneratedLongTermExtraction({ memories: [{ title: 'A supported fact', content: 'Xia stated a fact.',
-      classification, subject: { name: 'Xia' }, actors: [], reality: 'real', evidenceMode: 'inferred',
+      classification, subject: category === 'reflection' ? { scope: 'shared', name: '' } : { name: 'Xia' },
+      actors: [], reality: 'real', evidenceMode: 'inferred',
       temporalState: 'unknown', revisionAction: 'update', time: null, confidence: 0.8, importance: 0.5, sourceRefs: ['M0001'] }] }).memories[0];
     assert.deepEqual([memory.kind, memory.stateFamily], kinds, category);
     assert.equal(memory.evidenceMode, 'inferred');

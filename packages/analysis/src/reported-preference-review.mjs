@@ -1,4 +1,5 @@
-import { readReportedStateDraft } from "@suzu-memory/core";
+import { isDeepStrictEqual } from "node:util";
+import { readReportedStateDraft, ROOT_STATE_SCOPE_KEY, withdrawnReportedPreferenceSources } from "@suzu-memory/core";
 import { buildCanonicalStateEvidenceSnapshot } from "./canonical-state-snapshot.mjs";
 import {
   normalizeReportedClaim,
@@ -91,9 +92,7 @@ function candidateFromObservation(repository, snapshot, observation) {
   };
 }
 
-function currentClaim(repository, snapshot) {
-  if (!snapshot.currentState) return null;
-  const memory = repository.getMemory(snapshot.currentState.id);
+export function readReportedPreferenceClaim(memory) {
   const stored = readReportedStateDraft(memory).preferenceClaim;
   if (!stored || !["positive", "negative"].includes(clean(stored.polarity))) return null;
   const scope = stored.scope && typeof stored.scope === "object"
@@ -118,24 +117,29 @@ function sameScope(left, right) {
     && normalized(left.context) === normalized(right.context);
 }
 
-function isNarrowerScope(candidate, current) {
+function isNarrowerScope(candidate, current, sameObject) {
   const candidateRank = SCOPE_RANK[candidate.kind] ?? 99;
   const currentRank = SCOPE_RANK[current.kind] ?? 99;
   if (candidateRank > currentRank) return false;
   if (candidateRank < currentRank) return true;
-  if (normalized(candidate.label) !== normalized(current.label)) return false;
+  if (!sameObject && normalized(candidate.label) !== normalized(current.label)) return false;
   return !normalized(current.context) && Boolean(normalized(candidate.context));
 }
 
-function actionAgainstCurrent(candidate, current) {
+function actionAgainstCurrent(candidate, current, { supportsCurrentScope, sameObject, stateScopeKey }) {
   const cue = candidate.time.revisionCue;
   const samePolarity = candidate.polarity === current.polarity;
-  if (samePolarity && sameScope(candidate.scope, current.scope)) return "reinforce";
-  if (cue === "clarified" && isNarrowerScope(candidate.scope, current.scope)) {
-    return samePolarity ? "narrow_scope" : "add_scoped_exception";
+  if (samePolarity && supportsCurrentScope) return "reinforce";
+  const narrower = isNarrowerScope(candidate.scope, current.scope, sameObject);
+  const isException = stateScopeKey !== ROOT_STATE_SCOPE_KEY;
+  if (narrower && (cue === "clarified" || cue === "changed")) {
+    if (samePolarity && cue === "clarified") return "narrow_scope";
+    if (!samePolarity && !isException) return "add_scoped_exception";
+    return "review_required";
   }
+  if (isException && current.scope.context && !candidate.scope.context) return "review_required";
   if (!samePolarity && cue === "changed") return "supersede";
-  if (!samePolarity && cue === "denies_prior_state") return "correct_attribution";
+  if (!samePolarity && cue === "denies_prior_state" && !narrower) return "correct_attribution";
   return "review_required";
 }
 
@@ -199,6 +203,9 @@ export function reviewReportedPreferenceState({
   canonicalKey,
   subjectLabel,
   objectLabel,
+  stateScopeKey = ROOT_STATE_SCOPE_KEY,
+  preferenceSupport = null,
+  analysisRequestId = '',
   snapshotOptions = {},
 } = {}) {
   if (!SUBJECT_ROLES.has(clean(subjectRole))) {
@@ -214,13 +221,25 @@ export function reviewReportedPreferenceState({
     subjectLabel,
     stateLabel: objectLabel,
     ...snapshotOptions,
+    stateScopeKey,
     currentRepresentationLayer: "reported",
   });
   if (baseResult.status !== "ready") {
     return { ...baseResult, representationLayer: "reported", ...flags() };
   }
   const snapshot = baseResult.snapshot;
-  const candidates = snapshot.observations
+  const withdrawnSources = withdrawnReportedPreferenceSources(repository, { agentId: snapshot.agentId, ...snapshot.target });
+  const isWithdrawn = observation => observation.sourceIds.some(id => withdrawnSources.has(id));
+  const incoming = analysisRequestId ? snapshot.observations.filter(observation =>
+    observation.analysis?.analysisRequest?.id === analysisRequestId) : [];
+  if (incoming.length && incoming.every(isWithdrawn)) {
+    return { status: 'skipped', reason: 'reported-preference-evidence-withdrawn', snapshot,
+      representationLayer: 'reported', ...flags() };
+  }
+  // Each request compares its own evidence with the matched scope. Earlier
+  // observations may belong to another scope of the same preference.
+  const candidates = (analysisRequestId && snapshot.currentState ? incoming : snapshot.observations)
+    .filter(observation => !isWithdrawn(observation))
     .map((observation) => candidateFromObservation(repository, snapshot, observation))
     .filter(Boolean);
   if (!candidates.length) {
@@ -241,7 +260,7 @@ export function reviewReportedPreferenceState({
     return reviewRequired(snapshot, selection.reason, selection);
   }
   const selected = selection.selected;
-  const existing = currentClaim(repository, snapshot);
+  const existing = snapshot.currentState ? readReportedPreferenceClaim(repository.getMemory(snapshot.currentState.id)) : null;
   if (snapshot.currentState && !existing) {
     return reviewRequired(
       snapshot,
@@ -249,7 +268,19 @@ export function reviewReportedPreferenceState({
       selection,
     );
   }
-  const action = existing ? actionAgainstCurrent(selected, existing) : "create";
+  const comparedCurrent = preferenceSupport?.stateId === snapshot.currentState?.id
+    && isDeepStrictEqual(preferenceSupport?.claim, existing);
+  const supportsScope = candidate => (
+    preferenceSupport?.memoryIds && candidate.observation.analysis?.analysisRequest?.id === preferenceSupport.requestId
+      ? comparedCurrent && preferenceSupport.memoryIds.has(candidate.observation.memoryId)
+        && !CHANGE_CUES.has(candidate.time.revisionCue)
+      : sameScope(candidate.scope, existing.scope)
+  );
+  const sameObject = comparedCurrent && selected.observation.analysis?.analysisRequest?.id === preferenceSupport.requestId
+    && selected.object.targetMatch === 'exact';
+  const action = existing ? actionAgainstCurrent(selected, existing, {
+    supportsCurrentScope: supportsScope(selected), sameObject, stateScopeKey,
+  }) : "create";
   if (action === "review_required") {
     return reviewRequired(
       snapshot,
@@ -257,7 +288,9 @@ export function reviewReportedPreferenceState({
       selection,
     );
   }
-  const proposed = action === "correct_attribution" ? null : withReportedEvidence(proposedState(selected, snapshot), selection);
+  const contributions = action === "reinforce" && preferenceSupport
+    ? selection.contributions.filter(supportsScope) : selection.contributions;
+  const proposed = action === "correct_attribution" ? null : withReportedEvidence(proposedState(selected, snapshot), { contributions });
   return {
     status: "ready",
     reason: "",

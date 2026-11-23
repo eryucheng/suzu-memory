@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createMemoryService } from '../src/index.mjs';
+import { createOpenAiCompatibleStructuredGenerator } from '../../providers/src/index.mjs';
 
 const agentId = 'agent-a';
 const scope = { owner: 'test-events', agentId, eventUpperBound: 100, clears: [] };
@@ -39,6 +40,51 @@ async function process(memory, memories, entities) {
   return { result, request };
 }
 
+test('a single extraction archives independent facts and their conditions from another Agent’s message', async t => {
+  const memory = fixture(t);
+  t.after(() => memory.close());
+  const text = '林岚雨天爱听老爵士，晴天少听。她吃辣就胃疼。';
+  memory.appendEventSources({ scope, events: [event(1, 'agent-b', 'Mio', text)] });
+  const facts = [
+    { category: 'preference', key: 'music-rain', content: '林岚雨天爱听老爵士，晴天少听。', evidence: ['M0001.1'] },
+    { category: 'condition', key: 'spicy-stomach', content: '林岚吃辣就胃疼。', evidence: ['M0001.3'] },
+  ];
+  let calls = 0;
+  const result = await memory.processPendingEvents({ sourceScope: scope, generator: createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://example.test', model: 'fixture', apiKey: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async (_url, { body }) => {
+      calls += 1;
+      const packet = JSON.parse(body);
+      assert.match(packet.messages[1].content, /Mio：〔1〕林岚雨天爱听老爵士，〔2〕晴天少听。〔3〕她吃辣就胃疼。/u);
+      const tool = packet.tools[0].function;
+      assert.equal(tool.parameters.properties.memories.items.properties.evidence.type, 'array');
+      const memories = facts.map(({ category, key, content, evidence }) => ({
+        title: content, content, classification: { category, key, label: content, target: null },
+        subject: { ref: 'E1' }, actors: [], reality: 'real', evidenceMode: 'explicit', temporalState: 'current',
+        revisionAction: 'add', time: null, confidence: 0.95, importance: 0.5, evidence,
+      }));
+      const output = { entities: [{ ref: 'E1', kind: 'person', name: '林岚', aliases: [] }], memories };
+      return Response.json({ choices: [{ finish_reason: 'tool_calls',
+        message: { tool_calls: [{ function: { name: tool.name, arguments: JSON.stringify(output) } }] } }] });
+    },
+  }) });
+  assert.equal(calls, 1);
+  assert.equal(result.stateAnalysisRequestsQueued, 2);
+  assert.deepEqual(result.candidateResults.map(item => item.candidate.content), facts.map(fact => fact.content));
+  memory.withRepository(repository => {
+    const requests = repository.listStateAnalysisRequests(agentId, { statuses: ['pending'] });
+    assert.equal(new Set(requests.map(item => item.subject_key)).size, 1);
+    for (const item of requests) {
+      assert.match(item.subject_key, /^entity:/u);
+      assert.equal(item.sourceIds.length, 1);
+      const source = repository.getSource(item.sourceIds[0]);
+      assert.equal(source.content, text);
+      assert.equal(source.speaker, 'Mio');
+      assert.equal(repository.getMemory(item.memoryIds[0]).metadata.eventSource.sender.id, 'agent-b');
+    }
+  });
+});
+
 test('English evidence retains language, names, quotation and source identity through archive and recall', async t => {
   const memory = fixture(t, { primaryUserId: '', userName: '' });
   t.after(() => memory.close());
@@ -51,7 +97,7 @@ test('English evidence retains language, names, quotation and source identity th
     eventDate: '2026-09-20',
   })]);
   assert.equal(result.memoriesStored, 1);
-  assert.match(request.input, /本窗口输出语言：English/);
+  assert.match(request.modelInput, /^【输出语言：沿用直接证据的语言，语种不清时用English】\n/u);
   const saved = memory.listMemories({ kinds: ['event'] }).items[0];
   assert.equal(saved.content, content);
   assert.equal(saved.subject_key, 'agent-b');
@@ -357,6 +403,210 @@ function directStateAnalysis({ input, analyzerRole, stateFamily }) {
   return { output: { analyses: [{ ...common, ...fields[analyzerRole] }] }, usage: {} };
 }
 
+test('a commitment and its progress from one message become one sourced current state', async t => {
+  const memory = fixture(t);
+  t.after(() => memory.close());
+  const raw = '我答应把木刻画册借给老贺，下周三之前寄出。现在还在书桌上，没寄呢。';
+  const later = '给老贺的木刻画册已经打包了，还没寄。';
+  memory.appendEventSources({ scope, events: [{ ...event(1, 'agent-b', 'Mio', raw), occurredAt: '2026-06-22T10:31:00.000Z' }] });
+  const goal = (kind, title, content) => candidate({ kind, stateFamily: 'goal', stateLabel: title,
+    canonicalKey: title, title, content, temporalState: 'current', eventDate: '' });
+  const { result: extracted } = await process(memory, [
+    goal('commitment', '寄木刻画册给老贺', 'Mio 答应下周三之前寄出木刻画册。'),
+    goal('open_loop', '木刻画册尚未寄出', '木刻画册还在书桌上，尚未寄出。'),
+  ]);
+  assert.equal(extracted.stateAnalysisRequestsQueued, 2);
+
+  const generator = Object.assign(async ({ input, analyzerRole, schemaName }) => {
+    const snapshot = JSON.parse(input.slice(input.indexOf('{')));
+    const evidence = snapshot.memories.find(item => item.content === raw || item.content === later);
+    assert.ok(evidence, 'Both analyses receive the complete original statement.');
+    const common = { memoryId: evidence.id, sourceIds: evidence.sourceIds, confidence: 0.98, rationale: '原话直接支持。' };
+    if (analyzerRole === 'current-relation') {
+      assert.ok(snapshot.currentState);
+      return { output: { analyses: [{ ...common, relation: 'progress_update' }] } };
+    }
+    const analysis = { results: {
+      targetIntent: { analyses: [{ ...common, targetMatch: 'exact', goalText: '寄木刻画册给老贺',
+        intentionLevel: 'commitment', specificity: 'actionable', peerRelations: [] }] },
+      holderResponsibility: { analyses: [{ ...common, holderMatch: 'yes', attribution: 'explicit_self_statement',
+        responsibility: 'subject', agency: 'self_chosen', acceptsResponsibility: 'yes' }] },
+      lifecycle: { analyses: [{ ...common, lifecycle: 'in_progress', completionBasis: 'none',
+        timeReference: evidence.content === raw ? '下周三之前（发言时为2026-06-22，即2026-06-24前）' : '' }] },
+    } };
+    if (schemaName !== 'memory-state-match-analysis-v1') return { output: analysis };
+    const existing = snapshot.stateCandidates.find(item => item.kind === 'commitment');
+    return { output: { stateMatch: { resolution: 'matched', candidateId: existing.id, rationale: '同一承诺的寄出进度。' }, analysis } };
+  }, { supportsCombinedStateAnalysis: true });
+  const maintained = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
+    generator, structureGenerator: null });
+  assert.deepEqual(maintained.automaticStateAcceptance.accepted.map(row => row.resolution.proposal.action), ['create', 'progress_update'],
+    JSON.stringify(maintained.stateAnalysis.results.map(({ status, reason, evaluation }) => ({ status, reason,
+      errors: Object.values(evaluation?.runs || {}).map(run => run.error_message).filter(Boolean),
+    }))));
+  assert.deepEqual(maintained.automaticStateAcceptance.deferred, []);
+  const [creation, progress] = maintained.automaticStateAcceptance.accepted.map(item => item.resolution.proposal);
+  assert.equal(creation.review_state, 'pending');
+  assert.equal(progress.review_state, 'pending');
+  const [state, duplicate] = memory.listMemories({ kinds: ['commitment', 'open_loop'] }).items;
+  assert.equal(duplicate, undefined);
+  assert.equal(state.temporal_state, 'in_progress');
+  assert.equal(state.metadata.reportedStateDraft.goalClaim.timeReference, '下周三之前 (2026-07-01)');
+  assert.ok(memory.getMemory(state.id).sources.some(source => source.content === raw));
+  const recalled = await memory.search('答应老贺哪天之前寄木刻画册，当时寄了吗？', { sourceScope: scope,
+    now: '2026-06-30T12:00:00Z', persistTrace: false });
+  assert.match(recalled.context, /下周三之前 \(2026-07-01\)/u);
+  assert.match(recalled.context, /没寄呢/u);
+  const beforeConfirmation = memory.getMemory(state.id);
+  const confirmed = memory.resolveHighLevelProposal('reported-state', creation.id, { action: 'accept' });
+  assert.equal(confirmed.resolution.proposal.review_state, 'accepted');
+  assert.deepEqual(memory.getMemory(state.id), beforeConfirmation);
+  assert.equal(memory.getReviewConsoleProposal('reported-state', creation.id).permissions.canRevoke, true);
+  memory.resolveHighLevelProposal('reported-state', progress.id, { action: 'dismiss' });
+  assert.equal(memory.getMemory(state.id).memory.status, 'active');
+
+  memory.appendEventSources({ scope, events: [{ ...event(2, 'agent-b', 'Mio', later), occurredAt: '2026-06-23T10:31:00.000Z' }] });
+  await process(memory, [goal('open_loop', '画册已打包', '木刻画册已经打包，尚未寄出。')]);
+  const subsequent = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
+    generator, structureGenerator: null });
+  assert.equal(subsequent.automaticStateAcceptance.accepted.length, 0);
+  assert.deepEqual(subsequent.automaticStateAcceptance.deferred.map(item => item.reason), ['state-transition-requires-review']);
+  assert.equal(memory.listMemories({ kinds: ['commitment'] }).items[0].id, state.id);
+  memory.resolveHighLevelProposal('reported-state', creation.id, { action: 'dismiss' });
+  assert.equal(memory.getMemory(state.id).memory.status, 'deleted');
+});
+
+test('a reported preference change and its scoped exception are usable before confirmation', async t => {
+  const memory = fixture(t);
+  t.after(() => memory.close());
+  const object = '无糖热茶';
+  const original = '我平时喜欢喝无糖热茶。';
+  const changed = '以前喜欢无糖热茶，现在我不喜欢喝无糖热茶了。';
+  const exception = '我平时还是不喜欢无糖热茶，唯独夜班时喜欢喝不加糖的热茶。';
+  const now = '2026-10-01T10:00:00Z';
+  async function analyze(sequence, raw, {
+    expressionType, revisionCue = 'none', contextLabel = '', objectLabel = object, previous, confirmsPrior = false,
+    spaceId = 'group-only',
+  }) {
+    const when = `2026-09-${20 + sequence}T09:00:00.000Z`;
+    memory.appendEventSources({ scope, events: [{ ...event(sequence, 'agent-b', 'Mio', raw, { spaceId }), occurredAt: when }] });
+    const { result } = await process(memory, [candidate({
+      kind: 'preference', stateFamily: 'preference', stateLabel: object, canonicalKey: `mio-tea-${sequence}`,
+      title: object, content: raw, temporalState: 'current', eventDate: '',
+      actorRoles: [{ role: 'preference_holder', actorRole: 'other', actorName: 'Mio', confidence: 1 }],
+    })]);
+    assert.equal(result.stateAnalysisRequestsQueued, 1);
+    const generator = Object.assign(async request => {
+      const supplied = JSON.parse(request.input.slice(request.input.indexOf('{')));
+      const evidence = supplied.memories.find(item => item.content === raw);
+      assert.ok(evidence);
+      const common = { memoryId: evidence.id, sourceIds: evidence.sourceIds, confidence: 0.99, rationale: '原话支持。' };
+      const analysis = { results: {
+        objectGrounding: { analyses: [{ ...common, targetMatch: 'exact', matchedLabel: objectLabel }] },
+        explicitExpression: { analyses: [{ ...common, expressionType, directness: 'explicit_self_statement' }] },
+        behaviorConditions: { analyses: [] },
+        sharingAffect: { analyses: [] },
+        timeScope: { analyses: [{ ...common, stateTime: 'current', occurrencePattern: 'repeated',
+          scopeKind: 'exact_object', scopeLabel: objectLabel, contextLabel, revisionCue }] },
+      } };
+      if (!request.stateMatchAnalysisTask) return { output: analysis };
+      assert.ok(supplied.stateCandidates.some(item => item.id === previous));
+      return { output: { stateMatch: { resolution: 'matched', candidateId: previous,
+        supportingMemoryIds: confirmsPrior ? [evidence.id] : [], rationale: '原话对应这条偏好的对象和场合。' }, analysis } };
+    }, { supportsCombinedStateAnalysis: true });
+    const report = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
+      generator, structureGenerator: null, retrievalContextGenerator: null });
+    assert.equal(report.automaticStateAcceptance.accepted.length, 0);
+    return report.stateAnalysis.results[0];
+  }
+  const recall = query => memory.search(query, { sourceScope: scope, now, persistTrace: false });
+  const initial = await analyze(1, original, { expressionType: 'likes' });
+  assert.equal(initial.proposal?.review_state, 'pending', initial.reason);
+  const originalId = initial.proposal.resultMemoryId;
+  assert.equal(memory.getMemory(originalId).memory.status, 'active');
+
+  const conflicting = await analyze(2, '我不喜欢喝无糖热茶。', { expressionType: 'dislikes', previous: originalId });
+  assert.ok(!conflicting.proposal?.resultMemoryId);
+  assert.equal(memory.getMemory(originalId).memory.status, 'active');
+
+  const replacement = await analyze(3, changed, { expressionType: 'dislikes', revisionCue: 'changed', previous: originalId });
+  assert.equal(replacement.proposal?.action, 'supersede', replacement.reason);
+  const replacementId = replacement.proposal.resultMemoryId;
+  assert.equal(replacement.proposal.review_state, 'pending');
+  assert.equal(memory.getMemory(originalId).memory.status, 'superseded');
+  assert.equal(memory.getMemory(originalId).memory.valid_to, '2026-09-23T09:00:00.000Z');
+  assert.equal(memory.getMemory(replacementId).memory.status, 'active');
+  assert.ok((await recall('Mio 现在喜欢喝无糖热茶吗？')).graph.selectedMemoryIds.includes(replacementId));
+
+  const scoped = await analyze(4, exception, { expressionType: 'likes', revisionCue: 'clarified',
+    contextLabel: '夜班', objectLabel: '不加糖的热茶', previous: replacementId });
+  assert.equal(scoped.proposal?.action, 'add_scoped_exception', scoped.reason);
+  assert.equal(scoped.proposal.review_state, 'pending');
+  const scopedId = scoped.proposal.resultMemoryId;
+  const edge = { agentId, fromMemoryId: scopedId, toMemoryId: replacementId, relation: 'scoped_exception_to' };
+  assert.ok(memory.withRepository(repository => repository.findEdge(edge)));
+  const visible = await recall('Mio 夜班时喜欢喝无糖热茶吗？');
+  assert.ok(visible.graph.selectedMemoryIds.includes(scopedId), visible.context);
+  assert.ok(visible.graph.selectedMemoryIds.includes(replacementId), visible.context);
+
+  const restated = '夜班的时候我还是喜欢喝无糖热茶。';
+  const reinforcement = await analyze(5, restated, {
+    expressionType: 'likes', contextLabel: '值夜班', previous: scopedId, confirmsPrior: true,
+  });
+  assert.equal(reinforcement.proposal?.action, 'reinforce', reinforcement.reason);
+  assert.equal(reinforcement.proposal.resultMemoryId, scopedId);
+  assert.ok(memory.getMemory(scopedId).sources.some(source => source.content === restated));
+
+  const allScopes = await analyze(6, '我改主意了，平时和夜班我都喜欢喝无糖热茶了。', {
+    expressionType: 'likes', revisionCue: 'changed', previous: replacementId,
+  });
+  assert.equal(allScopes.proposal?.action, 'supersede', allScopes.reason);
+  const allScopesId = allScopes.proposal.resultMemoryId;
+  const carriedEdge = { ...edge, toMemoryId: allScopesId };
+  assert.equal(memory.getMemory(scopedId).memory.status, 'active');
+  assert.ok(memory.withRepository(repository => repository.findEdge(carriedEdge)));
+  memory.resolveHighLevelProposal('reported-state', allScopes.proposal.id, { action: 'dismiss' });
+  assert.equal(memory.getMemory(replacementId).memory.status, 'active');
+  assert.equal(memory.getMemory(scopedId).memory.status, 'active');
+  assert.equal(memory.withRepository(repository => repository.findEdge(carriedEdge)), null);
+  assert.ok(memory.withRepository(repository => repository.findEdge(edge)));
+
+  const changedScope = await analyze(7, '夜班的时候我也改主意了，不喜欢喝无糖热茶了。', {
+    expressionType: 'dislikes', contextLabel: '夜班', revisionCue: 'changed', previous: scopedId,
+  });
+  assert.equal(changedScope.proposal?.action, 'supersede', changedScope.reason);
+  const changedScopeId = changedScope.proposal.resultMemoryId;
+  assert.equal(memory.getMemory(changedScopeId).memory.state_scope_key, memory.getMemory(scopedId).memory.state_scope_key);
+  assert.equal(memory.getMemory(scopedId).memory.status, 'superseded');
+  assert.equal(memory.getMemory(replacementId).memory.status, 'active');
+  assert.ok(memory.withRepository(repository => repository.findEdge({ ...edge, fromMemoryId: changedScopeId })));
+  memory.resolveHighLevelProposal('reported-state', changedScope.proposal.id, { action: 'dismiss' });
+  assert.equal(memory.getMemory(scopedId).memory.status, 'active');
+
+  const before = memory.getMemory(replacementId).memory;
+  const confirmed = memory.resolveHighLevelProposal('reported-state', replacement.proposal.id, { action: 'accept' });
+  assert.equal(confirmed.resolution.proposal.review_state, 'accepted');
+  assert.equal(confirmed.maintenance.status, 'not-required');
+  assert.deepEqual(memory.getMemory(replacementId).memory, before);
+  assert.equal(memory.getReviewConsoleProposal('reported-state', replacement.proposal.id).permissions.canRevoke, true);
+  memory.resolveHighLevelProposal('reported-state', scoped.proposal.id, { action: 'dismiss' });
+  assert.equal(memory.withRepository(repository => repository.findEdge(edge)), null);
+  assert.equal(memory.getMemory(replacementId).memory.status, 'active');
+  memory.resolveHighLevelProposal('reported-state', replacement.proposal.id, { action: 'dismiss' });
+  assert.equal(memory.getMemory(originalId).memory.status, 'active');
+  assert.equal(memory.getMemory(originalId).memory.valid_to, null);
+  assert.ok(!(await recall('Mio 现在喜欢喝无糖热茶吗？')).graph.selectedMemoryIds.includes(replacementId));
+
+  const later = await analyze(8, '我还是改主意了，现在不喜欢无糖热茶。', { expressionType: 'dislikes',
+    revisionCue: 'changed', previous: originalId, spaceId: 'preference-update' });
+  assert.equal(later.proposal?.action, 'supersede', later.reason);
+  assert.equal(memory.getMemory(originalId).memory.status, 'superseded');
+  const cleared = { ...scope, clears: [{ spaceId: 'preference-update', throughSequence: 8 }] };
+  assert.equal(memory.eraseEventSources({ id: 'erase-preference-update', scope: cleared }).complete, true);
+  assert.equal(memory.getMemory(originalId).memory.status, 'active');
+  assert.equal(memory.getMemory(originalId).memory.valid_to, null);
+});
+
 test('state holders use resolved identities across English apostrophes and Chinese name typography', async t => {
   const memory = fixture(t);
   t.after(() => memory.close());
@@ -382,7 +632,7 @@ test('state holders use resolved identities across English apostrophes and Chine
   assert.ok(result.candidateResults[2].reasons.includes('holder-conflicts-with-subject'));
 });
 
-test('one Agent keeps separate states for same-name Agents and humans across group spaces', async t => {
+test('independent analysis writes separate states for same-name Agents and humans across group spaces', async t => {
   const memory = fixture(t);
   const people = [
     { kind: 'agent', id: 'agent-b', name: 'Mio' },
@@ -399,9 +649,10 @@ test('one Agent keeps separate states for same-name Agents and humans across gro
     return { ...wire, subject: { ref: `P${index + 2}` },
       actors: [{ role: 'experiencer', person: { ref: `P${index + 2}` }, confidence: 1 }] };
   }));
-  const result = await memory.runSemanticMaintenance({ processInputEvents: false, sourceScope: scope,
-    generator: directStateAnalysis, structureGenerator: null });
-  assert.equal(result.automaticStateAcceptance.accepted.length, people.length, JSON.stringify(result));
+  const result = await memory.analyzePendingState({ sourceScope: scope, generator: directStateAnalysis });
+  assert.equal(result.results.length, people.length, JSON.stringify(result));
+  assert.ok(result.results.every(item => item.request.status === 'completed'
+    && item.proposal.review_state === 'pending' && item.proposal.resultMemoryId));
   const states = memory.listMemories({ kinds: ['plan'] }).items;
   assert.equal(states.length, people.length);
   assert.deepEqual(new Set(states.map(state => state.subject_key)), new Set(people.map(person => person.id)));
@@ -414,6 +665,26 @@ test('one Agent keeps separate states for same-name Agents and humans across gro
       assert.equal(new Set(sources.map(source => source.id)).size, 1, 'Other speakers do not become evidence for this holder.');
     }
   });
+  const state = states.find(item => item.subject_key === 'agent-b');
+  const originalId = result.results.find(item => item.proposal.resultMemoryId === state.id).request.memoryIds[0];
+  memory.deleteMemory(originalId);
+  assert.equal(memory.getMemory(state.id).memory.status, 'deleted');
+  assert.equal(memory.listMemories({ kinds: ['plan'] }).total, people.length - 1);
+
+  await memory.close();
+  const reopened = createMemoryService({ dataRoot: memory.paths.dataRoot, agentId, defaults: memory.defaults });
+  t.after(() => reopened.close());
+  reopened.initialize();
+  assert.equal(reopened.getMemory(state.id).memory.status, 'deleted');
+  reopened.restoreMemory(originalId);
+  assert.equal(reopened.getMemory(state.id).memory.status, 'active');
+  assert.equal(reopened.listMemories({ kinds: ['plan'] }).total, people.length);
+
+  reopened.deleteMemory(originalId);
+  const owner = result.results.find(item => item.proposal.resultMemoryId === state.id).proposal.id;
+  reopened.resolveHighLevelProposal('reported-state', owner, { action: 'dismiss' });
+  reopened.restoreMemory(originalId);
+  assert.equal(reopened.getMemory(state.id).memory.status, 'deleted', 'Restoring the original cannot undo a separate withdrawal.');
 });
 
 test('group relationship analysis accepts owner and multiple counterpart identities without inventing reverse relations', async t => {
@@ -510,6 +781,45 @@ for (const language of ['en', 'zh']) test(`named objects reach entity recall wit
   assert.ok(recall.candidates.some(item => item.memoryId === saved[0].memory.id && item.routeMatches.some(route => route.route === 'entity')), JSON.stringify(recall.candidates.map(item => ({ id: item.memoryId, routes: item.routeMatches }))));
 });
 
+
+test('source search uses each utterance’s entity mentions while an event retains all its sources', async t => {
+  const memory = fixture(t);
+  t.after(() => memory.close());
+  const inspection = '我完成了服务器巡检。';
+  const recovery = '同一次维护里，我把备份的 ＲＰＯ 定为十分钟。';
+  memory.appendEventSources({ scope, events: [event(1, 'mio', 'Mio', inspection), event(2, 'mio', 'Mio', recovery)] });
+  const base = {
+    classification: { category: 'event' }, subject: { ref: 'P2' }, actors: [],
+    reality: 'real', evidenceMode: 'explicit', temporalState: 'completed', revisionAction: 'add', time: null,
+    confidence: 0.95, importance: 0.8,
+  };
+  const { result } = await process(memory, [
+    { ...base, title: '确定备份恢复点目标', content: 'Mio 完成服务器巡检，并将备份的恢复点目标定为十分钟。',
+      sourceRefs: ['M0001', 'M0002'], entityRefs: ['E1'] },
+    { ...base, title: '完成服务器巡检', content: 'Mio 完成服务器巡检。',
+      sourceRefs: ['M0001'], entityRefs: ['E2'], temporalState: 'unknown' },
+  ], [
+    { ref: 'E1', kind: 'concept', name: '恢复点目标', aliases: ['RPO'] },
+    { ref: 'E2', kind: 'concept', name: '服务器巡检', aliases: [] },
+  ]);
+  const [saved, review] = result.candidateResults;
+  assert.equal(saved.status, 'created');
+  assert.equal(review.status, 'review');
+  const archived = memory.listMemories({ kinds: ['utterance'] }).items;
+  const inspectionId = archived.find(item => item.content === inspection).id;
+  const recoveryId = archived.find(item => item.content === recovery).id;
+  assert.deepEqual(memory.getMemory(inspectionId).entities.map(entity => entity.canonical_name), []);
+  assert.deepEqual(memory.getMemory(recoveryId).entities.map(entity => entity.canonical_name), ['恢复点目标']);
+  const detail = memory.getMemory(saved.memoryId);
+  assert.ok(detail.entities.some(entity => entity.canonical_name === '恢复点目标'));
+  assert.deepEqual(new Set(detail.sources.map(source => source.content)), new Set([inspection, recovery]));
+  assert.deepEqual(new Set(detail.edges.filter(edge => edge.relation === 'supported_by').map(edge => edge.to_memory_id)),
+    new Set([inspectionId, recoveryId]));
+  const recall = await memory.search('恢复点目标', { sourceScope: scope, persistTrace: false, now: '2026-09-22T00:00:00Z' });
+  assert.ok(recall.candidates.some(item => item.memoryId === recoveryId && item.routeMatches.some(route => route.route === 'lexical')));
+  assert.ok(!recall.candidates.some(item => item.memoryId === inspectionId
+    && item.routeMatches.some(route => ['lexical', 'bm25', 'entity'].includes(route.route))));
+});
 
 test('entity references survive semantic state materialization and source erasure removes derived names', async t => {
   const memory = fixture(t); t.after(() => memory.close());

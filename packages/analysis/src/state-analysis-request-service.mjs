@@ -1,4 +1,6 @@
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+import { assertEventSourceExecutionCurrent, materializePreferenceEvidenceMemory, PreferenceStateValidationError } from '@suzu-memory/core';
+import { withStateAnalysisExecution, withStateAnalysisExecutions, isStateAnalysisExecutionObsolete } from './state-analysis-execution.mjs';
+import { createStateFirstStageBatch, selectStateFirstStageGroup } from './state-first-stage-batch.mjs';
 import {
   buildPreferenceEvidenceSnapshot,
 } from "./preference-snapshot.mjs";
@@ -54,7 +56,7 @@ import { isStateAnalysisBudgetError } from "./request-budget.mjs";
 import { accumulateInferredPreference, DEFAULT_PREFERENCE_FORMATION_POLICY } from "./inferred-preference.mjs";
 import { prepareStateMemoryCandidates } from './state-memory-candidates.mjs';
 
-export const STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION = "state-analysis-request-v8";
+export const STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION = "state-analysis-request-v9";
 export const REPORTED_PREFERENCE_REVIEW_VERSION = "reported-preference-review-v2";
 export const REPORTED_STATE_REQUEST_REVIEW_VERSIONS = Object.freeze({
   preference: REPORTED_PREFERENCE_REVIEW_VERSION,
@@ -95,15 +97,18 @@ function supportedRequest(request) {
     && isStateAnalysisTargetComplete(request.state_family, request.targetSpec);
 }
 
-function requestAnalyzers(definitions, generator, request, onBudgetExceeded, stateContext = null) {
+function requestAnalyzers(definitions, generator, request, onBudgetExceeded, stateContext, analysisExecution, firstStageBatch) {
   return createRelatedAnalyzerBatch({
     definitions,
     generator,
     onBudgetExceeded,
     stateContext,
+    analysisExecution,
+    firstStageBatch,
     onGenerationError: error => { if (error?.code === 'MAX_TOKENS') onBudgetExceeded(error); },
     request: {
       id: request.id,
+      stateFamily: request.state_family,
       processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
       attempt: Number(request.metadata?.attemptCount || 0) + 1,
     },
@@ -348,15 +353,16 @@ function validatePreflight(repository, request, snapshot) {
   return "";
 }
 
-function fallbackRequest(repository, request, reason) {
+function fallbackRequest(repository, request, reason, preferenceAccumulationErrorCode) {
   const fallback = fallbackStateAnalysisToProvisionalReview({
     repository,
     request,
     reason,
+    preferenceAccumulationErrorCode,
   });
   return {
-    status: "provisional-review",
-    reason,
+    status: fallback.provisional ? "provisional-review" : "completed-without-proposal",
+    reason: fallback.provisional ? reason : fallback.request.error_message,
     request: fallback.request,
     evaluation: null,
     merged: null,
@@ -408,6 +414,8 @@ async function processStateAnalysisRequestInternal({
   snapshotOptions = {},
   reviewVersion = "",
   preferencePolicy = DEFAULT_PREFERENCE_FORMATION_POLICY,
+  analysisExecution,
+  firstStageBatch,
 } = {}) {
   if (!repository) throw new Error("State analysis request processing requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -462,6 +470,11 @@ async function processStateAnalysisRequestInternal({
   const stateContext = evidenceOnly ? null
     : await prepareStateMemoryCandidates({ repository, request, embeddingProvider, usageLedgerPath });
   if (stateContext) boundedSnapshotOptions.prepareStateSnapshot = snapshot => stateContext.attach(snapshot);
+  analysisExecution?.track([
+    ...(preflight.memories || []).flatMap(memory => memory.episodeIds || []),
+    preflight.currentState?.id, preflight.relationshipComparison?.memoryId,
+    stateContext?.draft?.id, ...(stateContext?.candidates || []).map(memory => memory.id),
+  ]);
   // An unresolved state binding requires a fresh identity decision before replay.
   boundedSnapshotOptions.reuseAnalysisRuns = Number(request.metadata?.attemptCount || 0) > 0
     && (!stateContext || stateContext.resolved);
@@ -473,7 +486,7 @@ async function processStateAnalysisRequestInternal({
   let budgetError = null;
   const onBudgetExceeded = error => { budgetError = error; };
   if (request.state_family === "preference") {
-    const analyzers = requestAnalyzers(PREFERENCE_SPECIALIST_ANALYZERS, generator, request, onBudgetExceeded, stateContext);
+    const analyzers = requestAnalyzers(PREFERENCE_SPECIALIST_ANALYZERS, generator, request, onBudgetExceeded, stateContext, analysisExecution, firstStageBatch);
     evaluation = await evaluatePreferenceEvidenceSpecialists({
       repository,
       agentId: normalizedAgentId,
@@ -486,19 +499,23 @@ async function processStateAnalysisRequestInternal({
       usageLedgerPath,
       snapshotOptions: boundedSnapshotOptions,
     });
+    analysisExecution?.finishAnalysis();
     if (stateContext?.ambiguous && evaluation.status !== 'incomplete') {
       return { ...fallbackRequest(repository, request, 'state-identity-needs-human-resolution'), evaluation };
     }
     if (evaluation.status !== "incomplete") {
-      merged = mergePreferenceSpecialistEvidence(repository, {
-        evaluation,
-        analysisRequest: request,
-        policy: preferencePolicy,
+      merged = repository.transaction(() => {
+        const result = mergePreferenceSpecialistEvidence(repository, {
+          evaluation, analysisRequest: request, policy: preferencePolicy,
+        });
+        for (const observation of result.observations) materializePreferenceEvidenceMemory(repository, observation);
+        return result;
       });
       inferredPreference = accumulateInferredPreference({ repository, request, policy: preferencePolicy });
       if (request.representation_layer === "inferred") {
         if (inferredPreference.status === "review-required") {
-          return { ...fallbackRequest(repository, request, inferredPreference.reason), evaluation, merged, inferredPreference };
+          return { ...fallbackRequest(repository, request, inferredPreference.reason, inferredPreference.failure?.code),
+            evaluation, merged, inferredPreference };
         }
         const resolved = repository.resolveStateAnalysisRequest({ agentId: normalizedAgentId, requestId: request.id,
           status: "completed", analysisBatchId: evaluation.batchId,
@@ -514,6 +531,9 @@ async function processStateAnalysisRequestInternal({
         canonicalKey: request.canonical_key,
         subjectLabel: subjectLabel(request),
         objectLabel: request.target_label,
+        stateScopeKey: stateContext?.stateScopeKey,
+        preferenceSupport: stateContext?.preferenceSupport,
+        analysisRequestId: request.id,
       });
     }
   } else {
@@ -526,9 +546,10 @@ async function processStateAnalysisRequestInternal({
     );
     evaluation = await adapter.evaluate(
       common,
-      requestAnalyzers(adapter.definitions, generator, request, onBudgetExceeded, stateContext),
+      requestAnalyzers(adapter.definitions, generator, request, onBudgetExceeded, stateContext, analysisExecution, firstStageBatch),
       request,
     );
+    analysisExecution?.finishAnalysis();
     if (request.state_family === 'relationship' && request.representation_layer === "reported") {
       evaluation.counterpartRequests = queueCounterpartRelationshipRequests(repository, request, evaluation);
     }
@@ -596,6 +617,12 @@ async function processStateAnalysisRequestInternal({
 
   const resolvedReviewVersion = clean(reviewVersion)
     || REPORTED_STATE_REQUEST_REVIEW_VERSIONS[request.state_family];
+  if (review.reason === 'reported-preference-evidence-withdrawn') {
+    const resolved = repository.resolveStateAnalysisRequest({ agentId: normalizedAgentId, requestId: request.id,
+      status: 'completed', analysisBatchId: evaluation.batchId,
+      metadata: { outcome: 'no-proposal', reviewStatus: review.status, reviewReason: review.reason } });
+    return { status: 'completed-without-proposal', reason: review.reason, request: resolved, evaluation, merged, review };
+  }
   if (review.status !== "ready") {
     if (request.state_family === "preference" && inferredPreference
       && inferredPreference.status !== "review-required"
@@ -613,8 +640,8 @@ async function processStateAnalysisRequestInternal({
   // The stored narrative must not depend on whether vector matching was enabled.
   const semanticMemory = stateContext?.draft
     || repository.materializeStateAnalysisMemory(normalizedAgentId, request.id);
-  const proposalResult = review.status === "ready"
-    ? proposeReportedStateFromReview({
+  return repository.transaction(() => {
+    const proposalResult = proposeReportedStateFromReview({
       repository,
       reviewResult: review,
       reviewVersion: resolvedReviewVersion,
@@ -625,43 +652,60 @@ async function processStateAnalysisRequestInternal({
         ...(semanticMemory ? { semanticMemorySnapshot: { title: semanticMemory.title, content: semanticMemory.content } } : {}),
         processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
       },
-    })
-    : { status: "skipped", reason: review.reason, proposal: null };
-  const resolved = repository.resolveStateAnalysisRequest({
-    agentId: normalizedAgentId,
-    requestId: request.id,
-    status: "completed",
-    analysisBatchId: evaluation.batchId,
-    metadata: {
-      processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
-      outcome: proposalResult.status === "pending" ? "proposal-pending" : "no-proposal",
-      reviewStatus: review.status,
-      reviewReason: clean(review.reason),
-      proposalId: clean(proposalResult.proposal?.id),
-    },
+    });
+    const resolved = repository.resolveStateAnalysisRequest({
+      agentId: normalizedAgentId,
+      requestId: request.id,
+      status: "completed",
+      analysisBatchId: evaluation.batchId,
+      metadata: {
+        processorVersion: STATE_ANALYSIS_REQUEST_PROCESSOR_VERSION,
+        outcome: proposalResult.status === "pending" ? "proposal-pending" : "no-proposal",
+        reviewStatus: review.status,
+        reviewReason: clean(review.reason),
+        proposalId: clean(proposalResult.proposal?.id),
+      },
+    });
+    return {
+      status: proposalResult.status === "pending" ? "proposal-pending" : "completed-without-proposal",
+      reason: clean(proposalResult.reason),
+      request: resolved,
+      evaluation,
+      merged,
+      review,
+      proposal: proposalResult.proposal,
+      ...(proposalResult.automaticApplication ? { automaticApplication: proposalResult.automaticApplication } : {}),
+      inferredPreference,
+      preferenceProposal: inferredPreference?.proposal || null,
+    };
   });
-  return {
-    status: proposalResult.status === "pending" ? "proposal-pending" : "completed-without-proposal",
-    reason: clean(proposalResult.reason),
-    request: resolved,
-    evaluation,
-    merged,
-    review,
-    proposal: proposalResult.proposal,
-    inferredPreference,
-    preferenceProposal: inferredPreference?.proposal || null,
-  };
 }
 
-export async function processStateAnalysisRequest(options = {}) {
+async function processClaimedStateAnalysisRequest(options) {
   try {
     return await processStateAnalysisRequestInternal(options);
   } catch (error) {
     assertEventSourceExecutionCurrent();
-    if (!isStateAnalysisBudgetError(error)) throw error;
+    if (isStateAnalysisExecutionObsolete(error)) throw error;
     const request = options.repository.getStateAnalysisRequest(options.agentId, options.requestId);
-    return fallbackRequest(options.repository, request, error.message);
+    if (isStateAnalysisBudgetError(error) || error instanceof PreferenceStateValidationError) {
+      return fallbackRequest(options.repository, request, error.message);
+    }
+    if (!options.retryFailures || ['EVENT_SOURCE_TASK_DEFERRED', 'EVENT_SOURCE_MATERIAL_INELIGIBLE'].includes(error.code)) throw error;
+    return retryOrFallbackRequest(options.repository, request, clean(error.message) || 'state-analysis-request-failed', {
+      stage: 'state-analysis-request', stateFamily: request.state_family,
+      errorCode: clean(error.code), errorName: clean(error.name), providerDiagnostics: error.diagnostics || {},
+    });
   }
+}
+
+export async function processStateAnalysisRequest(options = {}) {
+  const firstStageBatch = createStateFirstStageBatch({ ...options.firstStageBatchOptions,
+    generator: options.generator, agentId: options.agentId, usageLedgerPath: options.usageLedgerPath,
+    requestIds: [options.requestId] });
+  try {
+    return await withStateAnalysisExecution(options, guarded => processClaimedStateAnalysisRequest({ ...guarded, firstStageBatch }));
+  } finally { firstStageBatch.complete(options.requestId); }
 }
 
 export async function processPendingStateAnalysisRequests({
@@ -674,6 +718,8 @@ export async function processPendingStateAnalysisRequests({
   snapshotOptions = {},
   reviewVersion = "",
   preferencePolicy = DEFAULT_PREFERENCE_FORMATION_POLICY,
+  onProposal,
+  firstStageBatchOptions = {},
 } = {}) {
   if (!repository) throw new Error("State analysis batch processing requires a repository.");
   const normalizedAgentId = clean(agentId);
@@ -694,61 +740,59 @@ export async function processPendingStateAnalysisRequests({
     limit: 500,
   }).filter(supportedRequest).slice(0, normalizedMaximum);
   const results = [];
-  for (const request of requests) {
-    const attempts = [];
-    let result = null;
-    do {
-      try {
-        result = await processStateAnalysisRequest({
-          repository,
-          embeddingProvider,
-          agentId: normalizedAgentId,
-          requestId: request.id,
-          generator,
-          usageLedgerPath,
-          snapshotOptions,
-          reviewVersion,
-          preferencePolicy,
-        });
-      } catch (error) {
-        assertEventSourceExecutionCurrent();
-        if (['EVENT_SOURCE_TASK_DEFERRED', 'EVENT_SOURCE_MATERIAL_INELIGIBLE'].includes(error.code)) {
-          result = { status: 'deferred', reason: error.message, request };
-          break;
-        }
-        const reason = clean(error?.message) || "state-analysis-request-failed";
-        try {
-          result = retryOrFallbackRequest(repository, request, reason, {
-            stage: "state-analysis-request",
-            stateFamily: request.state_family,
-            errorCode: clean(error?.code),
-            errorName: clean(error?.name),
-            providerDiagnostics: error?.diagnostics || {},
-          });
-        } catch (fallbackError) {
-          result = {
-            status: "retryable-failure",
-            reason: clean(fallbackError?.message) || reason,
-            request: repository.getStateAnalysisRequest(normalizedAgentId, request.id),
-            evaluation: null,
-            merged: null,
-            review: null,
-            proposal: null,
-          };
-        }
-      }
-      attempts.push({
-        status: result.status,
-        reason: clean(result.reason),
-        attemptCount: Number(result.attemptCount || result.request?.metadata?.attemptCount || 0),
-        failure: result.failure || null,
+  const executionOptions = { retryFailures: true, repository, embeddingProvider, agentId: normalizedAgentId,
+    generator, usageLedgerPath, snapshotOptions, reviewVersion, preferencePolicy, firstStageBatchOptions };
+  for (let offset = 0; offset < requests.length;) {
+    const group = selectStateFirstStageGroup(repository, requests.slice(offset), generator);
+    offset += group.length;
+    const firstStageBatch = createStateFirstStageBatch({ ...firstStageBatchOptions, generator,
+      agentId: normalizedAgentId, usageLedgerPath, requestIds: group.map(request => request.id) });
+    let initial;
+    try {
+      initial = await withStateAnalysisExecutions(executionOptions, group.map(request => request.id), async guarded => {
+        try { return await processClaimedStateAnalysisRequest({ ...guarded, firstStageBatch }); }
+        finally { firstStageBatch.complete(guarded.requestId); }
       });
-    } while (result.status === "retry-pending");
-    results.push({
-      ...result,
-      automaticRetries: Math.max(0, attempts.length - 1),
-      attempts,
-    });
+    } finally { group.forEach(request => firstStageBatch.complete(request.id)); }
+    for (const [index, request] of group.entries()) {
+      const attempts = [];
+      let result = null;
+      let first = initial[index];
+      do {
+        try {
+          if (first) {
+            const outcome = first;
+            first = null;
+            if (outcome.status === 'rejected') throw outcome.reason;
+            result = outcome.value;
+          } else result = await processStateAnalysisRequest({ ...executionOptions, requestId: request.id });
+        } catch (error) {
+          assertEventSourceExecutionCurrent();
+          if (['EVENT_SOURCE_TASK_DEFERRED', 'EVENT_SOURCE_MATERIAL_INELIGIBLE'].includes(error.code)) {
+            result = { status: 'deferred', reason: error.message, request };
+            break;
+          }
+          const reason = clean(error?.message) || "state-analysis-request-failed";
+          // Failure accounting belongs to the claimed execution. This batch
+          // boundary only reports errors; it must not mutate a released request.
+          result = { status: 'retryable-failure', reason,
+            request: repository.getStateAnalysisRequest(normalizedAgentId, request.id),
+            evaluation: null, merged: null, review: null, proposal: null };
+        }
+        attempts.push({
+          status: result.status,
+          reason: clean(result.reason),
+          attemptCount: Number(result.attemptCount || result.request?.metadata?.attemptCount || 0),
+          failure: result.failure || null,
+        });
+      } while (result.status === "retry-pending");
+      results.push({
+        ...result,
+        automaticRetries: Math.max(0, attempts.length - 1),
+        attempts,
+      });
+      if (result.proposal) await onProposal?.(result.proposal);
+    }
   }
 
   const counts = Object.fromEntries([
@@ -759,11 +803,14 @@ export async function processPendingStateAnalysisRequests({
     "retryable-failure",
     "blocked",
     "already-resolved",
+    "deferred",
   ].map((status) => [status, results.filter((result) => result.status === status).length]));
   const unsuccessful = counts["retryable-failure"] + counts.blocked;
   return {
     status: results.length === 0
       ? "empty"
+      : counts.deferred === results.length
+        ? 'deferred'
       : unsuccessful > 0
         ? "partial-failure"
         : "completed",

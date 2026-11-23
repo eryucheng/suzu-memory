@@ -1,6 +1,7 @@
 export {
   buildStructureGenerationInput,
   MEMORY_STRUCTURE_OUTPUT_SCHEMA,
+  MEMORY_STRUCTURE_MEMBERSHIP_SCHEMA,
   MEMORY_STRUCTURE_SUMMARY_SCHEMA,
   parseStructureSummary,
   parseStructureGeneration,

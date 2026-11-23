@@ -1,13 +1,26 @@
 import { normalizedEntityName, entityNameKey, entityNameKeys } from './entity-identity.mjs';
-import { retirePendingMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
-import { stateAnalysisSemanticMemoryMatches, readStateAnalysisSemanticMemory, readReportedStateDraft } from "./reported-state-policy.mjs";
+import { assertRepositoryWriteCurrent } from './repository-execution.mjs';
+import { expectedStructureSummary, readStructureSummaryMaterial, structureSummaryMaterial } from './structure-provenance.mjs';
+import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES, retirePendingMemoryMaintenanceTasks } from './maintenance-tasks.mjs';
+import { stateAnalysisSemanticMemoryMatches, readStateAnalysisSemanticMemory, readReportedStateDraft,
+  reportedStateSourceFingerprint, reportedStateEvidenceMemoryFingerprint, invalidateReportedPreferenceEvidence, restoreReportedPreferenceEvidence,
+  appliedReportedStateMemory, appliedReportedPreferenceMemory, suspendedReportedPreferenceMemory, resolveReportedStateProposal,
+  REPORTED_STATE_REINFORCEMENT_PROVENANCE, withdrawableReportedStateMemory } from "./reported-state-policy.mjs";
+import { reconcileReportedStateEvidence } from './reported-state-evidence.mjs';
+import { reportedStateEvidenceAvailable } from './memory-input.mjs';
+import { appliedPreferenceStateMemory, invalidatePreferenceStateEvidence } from './preference-state-policy.mjs';
+import { materializePreferenceEvidenceMemory, preferenceEvidenceMayRestore } from './preference-evidence-memory.mjs';
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from './calendar-time.mjs';
 import { normalizedSearchDocument, removeSearchRows, memoryConceptLabels, conceptSearchText, withSearchTransaction } from './search-index.mjs';
 import { cachedEmbeddingRows } from './embedding-cache.mjs';
 import { eventContinuityFingerprint, invalidateEventContinuity } from './event-continuity-policy.mjs';
+import { enqueueStructureSummaryRefresh, finishOrganizationInputMutation } from './organization-invalidation.mjs';
+import { readOrganizationInput } from './organization-input.mjs';
+import { relationProposalOwnsEdge, MEMORY_EXPLANATORY_RELATIONS } from './relation-policy.mjs';
 import { guardSourceEpoch, advanceEventSourceEpoch } from './event-source-state.mjs';
-import { currentEventSourceExecution, executionEventSourceView } from './event-source-execution.mjs';
+import { currentEventSourceExecution, executionEventSourceView, assertEventSourceExecutionCurrent } from './event-source-execution.mjs';
+import { eventSourceInputEligible } from './event-source-contract.mjs';
 
 import { shiftedPowerLawRetention } from "./access-dynamics.mjs";
 
@@ -41,6 +54,13 @@ import { memoryRetrievalContextSourceHash } from "./retrieval-context.mjs";
 function clean(value) {
   return String(value ?? "").trim();
 }
+
+const currentReviewSource = `source.lifecycle = 'active' AND (
+  NOT EXISTS (SELECT 1 FROM memory_sources original WHERE original.source_id = source.id AND original.relation = 'verbatim')
+  OR EXISTS (SELECT 1 FROM memory_sources original JOIN memory_nodes utterance ON utterance.id = original.memory_id
+    WHERE original.source_id = source.id AND original.relation = 'verbatim'
+      AND utterance.status = 'active' AND utterance.content = source.content)
+)`;
 
 function nowIso() {
   return new Date().toISOString();
@@ -540,11 +560,14 @@ function normalizeStateAnalysisRun(row, memoryIds = [], sourceIds = []) {
 
 // Both observation getters and list filters resolve the same fixed semantic provenance.
 // Legacy family observations record the request on their analyzer runs instead of payload.
-function stateEvidenceWorldRows() {
+function stateEvidenceWorldRows({ availableOnly = false } = {}) {
+  const inferredWorld = `CASE WHEN observation.state_family='preference'
+    AND json_extract(observation.scope_json, '$.currentRepresentationLayer')='inferred'
+    THEN json_extract(observation.scope_json, '$.world') END`;
   return `SELECT observation.*,
-    COALESCE(semantic.reality, evidence.reality) AS evidence_world_reality,
-    COALESCE(semantic.world_id, evidence.world_id) AS evidence_world_id,
-    COALESCE(semantic.world_frame, evidence.world_frame) AS evidence_world_frame
+    COALESCE(json_extract(${inferredWorld}, '$.reality'), semantic.reality, evidence.reality) AS evidence_world_reality,
+    COALESCE(json_extract(${inferredWorld}, '$.worldId'), semantic.world_id, evidence.world_id) AS evidence_world_id,
+    COALESCE(json_extract(${inferredWorld}, '$.worldFrame'), semantic.world_frame, evidence.world_frame) AS evidence_world_frame
   FROM memory_state_evidence_observations observation
   JOIN memory_nodes evidence ON evidence.agent_id = observation.agent_id AND evidence.id = observation.memory_id
   LEFT JOIN memory_state_analysis_requests request
@@ -562,7 +585,8 @@ function stateEvidenceWorldRows() {
       WHERE member.agent_id = request.agent_id AND member.request_id = request.id AND member.memory_id = observation.memory_id)
   LEFT JOIN memory_nodes semantic
     ON semantic.agent_id = request.agent_id AND semantic.id = json_extract(request.metadata_json, '$.semanticMemoryId')
-    AND state_analysis_semantic_matches(semantic.agent_id, semantic.status, semantic.metadata_json, request.agent_id, request.id)`;
+    AND state_analysis_semantic_matches(semantic.agent_id, semantic.status, semantic.metadata_json, request.agent_id, request.id)
+  ${availableOnly ? "WHERE observation.lifecycle <> 'current' OR evidence.status <> 'deleted'" : ""}`;
 }
 
 function normalizeStateEvidenceObservation(row, sourceIds = [], analysisRunIds = []) {
@@ -824,6 +848,11 @@ export class MemoryRepository {
     this.timeZone = timeZone;
     // Restricted read adapters can wrap a connection whose functions are already registered.
     if (typeof database.function === 'function') {
+      database.function('memory_input_source_eligible', { deterministic: true },
+        (protocol, lifecycle, eventType, actorKey, metadata, scope) => Number(eventSourceInputEligible({
+          protocol_version: protocol, lifecycle, event_type: eventType, actor_key: actorKey,
+          metadata: parseJson(metadata, {}),
+        }, parseJson(scope, {}))));
       database.function('state_analysis_semantic_matches', { deterministic: true },
         (agentId, status, metadata, requestedAgentId, requestId) => Number(stateAnalysisSemanticMemoryMatches(
           { agent_id: agentId, status, metadata: parseJson(metadata, {}) }, { agentId: requestedAgentId, requestId },
@@ -834,7 +863,10 @@ export class MemoryRepository {
           { allowRealSpaces: true },
         )));
     }
-    this.sourceEpoch = guardSourceEpoch(database, () => currentEventSourceExecution()?.signal?.throwIfAborted());
+    this.sourceEpoch = guardSourceEpoch(database, () => {
+      currentEventSourceExecution()?.signal?.throwIfAborted();
+      assertRepositoryWriteCurrent(this);
+    });
     this.database = this.sourceEpoch.database;
     this.transactionDepth = 0;
   }
@@ -902,53 +934,121 @@ export class MemoryRepository {
       normalizedKind,
       normalizedExternalId,
     );
-    const createdAt = nowIso();
-    const contentHash = createHash("sha256").update(normalizedContent).digest("hex");
-    this.database.prepare(`
-      INSERT INTO source_records (
-        id, agent_id, source_kind, source_locator, external_id,
-        occurred_at, known_at, recorded_at, speaker, world_id, world_frame, content, content_hash,
-        metadata_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(agent_id, source_kind, external_id) DO UPDATE SET
-        source_locator = excluded.source_locator,
-        occurred_at = excluded.occurred_at,
-        known_at = excluded.known_at,
-        recorded_at = excluded.recorded_at,
-        speaker = excluded.speaker,
-        world_id = excluded.world_id,
-        world_frame = excluded.world_frame,
-        content = excluded.content,
-        content_hash = excluded.content_hash,
-        metadata_json = excluded.metadata_json
-    `).run(
-      sourceId,
-      normalizedAgentId,
-      normalizedKind,
-      clean(sourceLocator),
-      normalizedExternalId,
-      occurredAt || null,
-      knownAt || occurredAt || recordedAt,
-      recordedAt,
-      clean(speaker),
-      normalizedWorldId,
-      normalizedWorldFrame,
-      normalizedContent,
-      contentHash,
-      json(metadata, {}),
-      createdAt,
-    );
-    return this.getSourceByExternalId(
-      normalizedAgentId,
-      normalizedKind,
-      normalizedExternalId,
-    );
+    return this.transaction(() => {
+      const previous = this.getSourceByExternalId(normalizedAgentId, normalizedKind, normalizedExternalId);
+      const memoryIds = previous ? this.database.prepare('SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?')
+        .all(previous.id).map(row => row.memory_id) : [];
+      const organizationBefore = memoryIds.length ? readOrganizationInput(this, normalizedAgentId, memoryIds) : null;
+      const createdAt = nowIso();
+      const contentHash = createHash("sha256").update(normalizedContent).digest("hex");
+      this.database.prepare(`
+        INSERT INTO source_records (
+          id, agent_id, source_kind, source_locator, external_id,
+          occurred_at, known_at, recorded_at, speaker, world_id, world_frame, content, content_hash,
+          metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(agent_id, source_kind, external_id) DO UPDATE SET
+          source_locator = excluded.source_locator,
+          occurred_at = excluded.occurred_at,
+          known_at = excluded.known_at,
+          recorded_at = excluded.recorded_at,
+          speaker = excluded.speaker,
+          world_id = excluded.world_id,
+          world_frame = excluded.world_frame,
+          content = excluded.content,
+          content_hash = excluded.content_hash,
+          metadata_json = excluded.metadata_json
+      `).run(
+        sourceId,
+        normalizedAgentId,
+        normalizedKind,
+        clean(sourceLocator),
+        normalizedExternalId,
+        occurredAt || null,
+        knownAt || occurredAt || recordedAt,
+        recordedAt,
+        clean(speaker),
+        normalizedWorldId,
+        normalizedWorldFrame,
+        normalizedContent,
+        contentHash,
+        json(metadata, {}),
+        createdAt,
+      );
+      const source = this.getSourceByExternalId(
+        normalizedAgentId,
+        normalizedKind,
+        normalizedExternalId,
+      );
+      if (memoryIds.length && reportedStateSourceFingerprint(previous) !== reportedStateSourceFingerprint(source)) {
+        invalidateReportedPreferenceEvidence(this, { agentId: normalizedAgentId, memoryIds, sourceId: source.id });
+        this.invalidateSourceDerivatives(normalizedAgentId, [source.id], memoryIds);
+      }
+      if (organizationBefore) finishOrganizationInputMutation(this, { agentId: normalizedAgentId, before: organizationBefore, enqueue: true });
+      return source;
+    });
   }
 
   getSource(id) {
     return normalizeSource(
       this.database.prepare("SELECT * FROM source_records WHERE id = ?").get(id),
     );
+  }
+
+  isCurrentReviewSource(agentId, sourceId) {
+    return Boolean(this.database.prepare(`SELECT 1 FROM source_records source
+      WHERE source.agent_id = ? AND source.id = ? AND (${currentReviewSource})`).get(clean(agentId), clean(sourceId)));
+  }
+
+  /** Called in the source mutation's transaction. The ordinary memory may
+   * still have independent evidence after these particular sources change. */
+  invalidateSourceDerivatives(agentId, sourceIds, memoryIds) {
+    reconcileReportedStateEvidence(this, { agentId, sourceIds });
+    const continuities = new Set();
+    for (const id of memoryIds) {
+      const memory = this.getMemory(id);
+      if (memory?.kind === 'event') {
+        for (const affected of invalidateEventContinuity(this, { agentId, memoryId: id, sourceIds })) continuities.add(affected);
+      } else if (memory?.layer === 'provisional' && memory.metadata?.ingestionDecisionId && memory.status !== 'deleted') {
+        this.updateMemoryStatus(id, 'deleted');
+        retirePendingMemoryMaintenanceTasks(this, { agentId, memoryId: id });
+      }
+    }
+    for (const id of continuities) {
+      const memory = this.getMemory(id);
+      if (memory?.status === 'active') enqueueMemoryMaintenanceTasks({ repository: this, agentId,
+        batchId: `source-change:${memory.metadata.eventContinuityRevision}`, memoryIds: [id],
+        taskTypes: [MAINTENANCE_TASK_TYPES.eventContinuity] });
+    }
+    const requests = this.database.prepare(`SELECT DISTINCT request.id FROM memory_state_analysis_requests request
+      JOIN memory_state_analysis_request_sources link ON link.request_id = request.id AND link.agent_id = request.agent_id
+      JOIN source_records source ON source.id = link.source_id AND source.lifecycle <> 'active'
+      WHERE request.agent_id = ? AND request.status = 'pending' AND link.source_id IN (SELECT value FROM json_each(?))`)
+      .all(agentId, JSON.stringify(sourceIds));
+    for (const { id } of requests) this.resolveStateAnalysisRequest({ agentId, requestId: id, status: 'cancelled',
+      errorMessage: 'State analysis source changed.', metadata: { outcome: 'source-invalidated' } });
+  }
+
+  recoverInvalidatedSourceDerivatives(agentId) {
+    return this.transaction(() => {
+      const stale = this.database.prepare(`WITH invalid_sources AS (
+          SELECT id FROM source_records WHERE agent_id = ? AND lifecycle <> 'active'
+        )
+        SELECT ref.value AS sourceId, edge.from_memory_id AS memoryId FROM memory_edges edge
+        JOIN json_each(edge.metadata_json, '$.evidenceSourceIds') ref ON ref.value IN invalid_sources
+        WHERE edge.agent_id = ? AND edge.provenance IN ('event-continuity-v1', 'event-continuity-human-v1')
+        UNION
+        SELECT link.source_id, memory.id FROM memory_sources link JOIN memory_nodes memory ON memory.id = link.memory_id
+        WHERE memory.agent_id = ? AND memory.status <> 'deleted' AND memory.layer = 'provisional'
+          AND json_type(memory.metadata_json, '$.ingestionDecisionId') = 'text' AND link.source_id IN invalid_sources
+        UNION
+        SELECT link.source_id, NULL FROM memory_state_analysis_request_sources link
+        JOIN memory_state_analysis_requests request ON request.id = link.request_id AND request.agent_id = link.agent_id
+        WHERE request.agent_id = ? AND request.status = 'pending' AND link.source_id IN invalid_sources`)
+        .all(agentId, agentId, agentId, agentId);
+      if (stale.length) this.invalidateSourceDerivatives(agentId, cleanStringList(stale.map(item => item.sourceId)),
+        cleanStringList(stale.map(item => item.memoryId)));
+    });
   }
 
   getSourceByExternalId(agentId, sourceKind, externalId) {
@@ -1076,6 +1176,22 @@ export class MemoryRepository {
     return normalizeInputEvent(this.database.prepare(`
       SELECT * FROM memory_input_events WHERE agent_id = ? AND id = ?
     `).get(clean(agentId), clean(eventId)));
+  }
+
+  listEventSourceInputs(agentId, { owner, spaceId, commitSequence, offset = 0, limit = 100 } = {}) {
+    const id = clean(agentId), sourceOwner = clean(owner), space = clean(spaceId);
+    if (!id || !sourceOwner || !space || !Number.isSafeInteger(commitSequence) || commitSequence < 1
+      || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new Error('Event source inputs require an Agent, source location and bounded page.');
+    }
+    const where = `agent_id = ? AND json_extract(metadata_json, '$.eventSource.owner') = ?
+      AND json_extract(metadata_json, '$.eventSource.spaceId') = ?
+      AND json_extract(metadata_json, '$.eventSource.commitSequence') = ?`;
+    const parameters = [id, sourceOwner, space, commitSequence];
+    const items = this.database.prepare(`SELECT * FROM memory_input_events INDEXED BY memory_input_events_product_source WHERE ${where}
+      ORDER BY external_id LIMIT ? OFFSET ?`).all(...parameters, limit, offset).map(normalizeInputEvent);
+    const total = Number(this.database.prepare(`SELECT COUNT(*) AS count FROM memory_input_events WHERE ${where}`).get(...parameters).count);
+    return { items, total, offset, limit };
   }
 
   getInputEventByExternalId(agentId, externalId) {
@@ -1215,6 +1331,9 @@ export class MemoryRepository {
         WHERE source.agent_id = ?
           AND CAST(input_event.value AS TEXT) IN (${placeholders})
       `).all(normalizedAgentId, ...targetIds).map(normalizeSource);
+      const organizationMemoryIds = this.database.prepare(`SELECT DISTINCT memory_id AS id FROM memory_sources
+        WHERE source_id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(sourceRows.map(source => source.id))).map(row => row.id);
+      const organizationBefore = readOrganizationInput(this, normalizedAgentId, organizationMemoryIds);
       for (const source of sourceRows) {
         this.database.prepare(`
           UPDATE source_records
@@ -1265,6 +1384,10 @@ export class MemoryRepository {
           );
         }
       }
+      if (sourceRows.length) this.invalidateSourceDerivatives(normalizedAgentId, sourceRows.map(source => source.id), organizationMemoryIds);
+      finishOrganizationInputMutation(this, { agentId: normalizedAgentId, before: organizationBefore, enqueue: true });
+      const retryIds = cleanStringList(targetEvents.map(event => event.metadata?.suzuMemoryProcessing?.retryRequestedBy));
+      for (const id of retryIds) this.settleInputExtractionRetry(normalizedAgentId, id, timestamp);
       const revision = normalizeInputEventRevision(this.database.prepare(`
         SELECT * FROM memory_input_event_revisions WHERE agent_id = ? AND id = ?
       `).get(normalizedAgentId, revisionId));
@@ -1292,7 +1415,6 @@ export class MemoryRepository {
     sourceOrder = false,
     descending = false,
     beforeSourceEvent = null,
-    eligibleIds = null,
   } = {}) {
     const normalizedAgentId = clean(agentId);
     if (!normalizedAgentId) throw new Error("listInputEvents requires agentId.");
@@ -1306,11 +1428,13 @@ export class MemoryRepository {
     }
     const clauses = ["agent_id = ?"];
     const parameters = [normalizedAgentId];
-    const sourceSequence = "COALESCE(json_extract(metadata_json, '$.eventSource.observation.commitSequence'), json_extract(metadata_json, '$.eventSource.commitSequence'), 0)";
-    if (eligibleIds !== null) {
-      clauses.push('id IN (SELECT value FROM json_each(?))');
-      parameters.push(JSON.stringify([...eligibleIds]));
+    assertEventSourceExecutionCurrent(normalizedAgentId);
+    const sourceScope = currentEventSourceExecution()?.sourceScope;
+    if (sourceScope) {
+      clauses.push('memory_input_source_eligible(protocol_version, lifecycle, event_type, actor_key, metadata_json, ?)');
+      parameters.push(JSON.stringify(sourceScope));
     }
+    const sourceSequence = "COALESCE(json_extract(metadata_json, '$.eventSource.observation.commitSequence'), json_extract(metadata_json, '$.eventSource.commitSequence'), 0)";
     if (beforeSourceEvent !== null) {
       const source = beforeSourceEvent.metadata?.eventSource || {};
       if (!beforeSourceEvent.metadata?.eventSource) {
@@ -1539,18 +1663,19 @@ export class MemoryRepository {
       const candidateScope = scopedCandidateIds.length
         ? `AND id IN (${scopedCandidateIds.map(() => "?").join(", ")})`
         : "";
-      const sourceView = executionEventSourceView(this, normalizedAgentId);
+      assertEventSourceExecutionCurrent(normalizedAgentId);
+      const sourceScope = currentEventSourceExecution()?.sourceScope;
       const candidates = this.database.prepare(`
         SELECT * FROM memory_input_events
         WHERE agent_id = ? AND status = 'pending' AND lifecycle = 'active'
           ${candidateScope}
-          ${sourceView ? 'AND id IN (SELECT value FROM json_each(?))' : ''}
+          ${sourceScope ? 'AND memory_input_source_eligible(protocol_version, lifecycle, event_type, actor_key, metadata_json, ?)' : ''}
         ORDER BY occurred_at ASC, external_id ASC
         LIMIT ?
       `).all(
         normalizedAgentId,
         ...scopedCandidateIds,
-        ...(sourceView ? [JSON.stringify([...sourceView.inputIds])] : []),
+        ...(sourceScope ? [JSON.stringify(sourceScope)] : []),
         scopedCandidateIds.length ? scopedCandidateIds.length : 500,
       ).map(normalizeInputEvent);
       const events = [];
@@ -1973,6 +2098,12 @@ export class MemoryRepository {
               updated_at = ?
           WHERE agent_id = ? AND batch_id = ? AND status = 'processing'
         `).run(finishedAt, normalizedAgentId, normalizedBatchId);
+        const retryTasks = this.database.prepare(`SELECT DISTINCT
+          json_extract(metadata_json, '$.suzuMemoryProcessing.retryRequestedBy') AS id
+          FROM memory_input_events WHERE agent_id=? AND batch_id=?
+          AND json_type(metadata_json, '$.suzuMemoryProcessing.retryRequestedBy')='text'`)
+          .all(normalizedAgentId, normalizedBatchId);
+        for (const { id } of retryTasks) this.settleInputExtractionRetry(normalizedAgentId, id, finishedAt);
       } else {
         this.database.prepare(`
           UPDATE memory_input_events
@@ -1989,6 +2120,8 @@ export class MemoryRepository {
     agentId,
     eventIds = [],
     retryTaskId = "",
+    originalBatchId = "",
+    reviewedBy = "human",
     reason = "",
     retriedAt = nowIso(),
   } = {}) {
@@ -1996,7 +2129,7 @@ export class MemoryRepository {
     const normalizedEventIds = cleanStringList(eventIds);
     const normalizedTaskId = clean(retryTaskId);
     const timestamp = new Date(clean(retriedAt));
-    if (!normalizedAgentId || !normalizedEventIds.length || !normalizedTaskId
+    if (!normalizedAgentId || !normalizedEventIds.length || !normalizedTaskId || !clean(originalBatchId)
       || !Number.isFinite(timestamp.getTime())) {
       throw new Error("Requeueing archived input events requires Agent, event ids, review task, and valid time.");
     }
@@ -2007,14 +2140,11 @@ export class MemoryRepository {
         WHERE agent_id = ? AND id IN (${placeholders})
         ORDER BY occurred_at ASC, external_id ASC
       `).all(normalizedAgentId, ...normalizedEventIds).map(normalizeInputEvent);
-      if (events.length !== normalizedEventIds.length) {
-        throw new Error("Every retry input event must exist for this Agent.");
-      }
-      if (events.some((event) => event.lifecycle !== "active" || event.status !== "archived")) {
-        throw new Error("Only active archived input events can be retried from human review.");
-      }
       const retriedIso = timestamp.toISOString();
       for (const event of events) {
+        // A re-opened review keeps receipts from completed segments and leases
+        // of segments already running. Only the original archive is requeued.
+        if (event.lifecycle !== 'active' || event.status !== 'archived' || event.batch_id !== originalBatchId) continue;
         const metadata = event.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata)
           ? event.metadata
           : {};
@@ -2036,6 +2166,7 @@ export class MemoryRepository {
         humanRetries.push({
           taskId: normalizedTaskId,
           retriedAt: retriedIso,
+          reviewedBy: clean(reviewedBy) || 'human',
           reason: clean(reason),
         });
         this.database.prepare(`
@@ -2058,7 +2189,65 @@ export class MemoryRepository {
           event.id,
         );
       }
-      return normalizedEventIds.map((id) => this.getInputEvent(normalizedAgentId, id));
+      return this.settleInputExtractionRetry(normalizedAgentId, normalizedTaskId, retriedIso);
+    });
+  }
+
+  settleInputExtractionRetry(agentId, taskId, timestamp = nowIso()) {
+    const task = this.getMaintenanceTask(agentId, taskId);
+    if (task?.task_type !== 'long-term-extraction' || task.payload.extractionRepair) return { task, progress: null };
+    const ids = cleanStringList(task.payload.eventIds);
+    const rows = this.database.prepare(`SELECT event.id, event.lifecycle, event.status,
+      event.processing_disposition, event.batch_id, batch.status AS batchStatus, batch.output_json,
+      json_extract(event.metadata_json, '$.suzuMemoryProcessing.humanRetries[#-1]') AS retry
+      FROM memory_input_events event LEFT JOIN memory_input_batches batch ON batch.id=event.batch_id
+      WHERE event.agent_id=? AND event.id IN (SELECT value FROM json_each(?))`)
+      .all(agentId, JSON.stringify(ids));
+    const progress = { total: ids.length, completed: 0, withdrawn: ids.length - rows.length,
+      remainingEventIds: [], failureReviewTaskIds: [], quarantined: 0 };
+    const childReviews = new Set();
+    let reviewRequest;
+    for (const row of rows) {
+      if (row.lifecycle !== 'active') { progress.withdrawn++; continue; }
+      const retry = parseJson(row.retry, null);
+      if (retry?.taskId === taskId) reviewRequest ||= retry;
+      if (row.processing_disposition === 'quarantined') {
+        progress.quarantined++;
+        continue;
+      }
+      if (row.status !== 'archived' || row.batchStatus !== 'completed' || row.batch_id === task.payload.batchId) {
+        progress.remainingEventIds.push(row.id);
+        continue;
+      }
+      const output = parseJson(row.output_json, {});
+      if (output.retryWithdrawnEventIds?.includes(row.id)) progress.withdrawn++;
+      else if (!output.degraded) progress.completed++;
+      else if (output.failureReviewTaskId && output.failureReviewTaskId !== taskId) childReviews.add(output.failureReviewTaskId);
+      else progress.remainingEventIds.push(row.id);
+    }
+    progress.failureReviewTaskIds = [...childReviews];
+    if (task.status !== 'failed' || task.review_state !== 'pending' || progress.remainingEventIds.length
+      || progress.quarantined || !progress.total || (!reviewRequest && progress.withdrawn !== progress.total)) {
+      return { task, progress };
+    }
+    const complete = progress.completed > 0 && !childReviews.size;
+    const note = complete ? (reviewRequest?.reason || 'All remaining extraction sources were retried.')
+      : childReviews.size ? `Remaining extraction failures are recorded in: ${[...childReviews].join(', ')}.`
+        : 'Original extraction sources were withdrawn.';
+    return { progress, task: this.reviewMaintenanceTaskFailure({
+      agentId, taskId, action: complete ? 'accept' : 'dismiss',
+      reviewedBy: reviewRequest?.reviewedBy || 'human', note, reviewedAt: timestamp,
+    }) };
+  }
+
+  recoverInputExtractionRetries(agentId) {
+    return this.transaction(() => {
+      const tasks = this.database.prepare(`SELECT DISTINCT task.id FROM memory_input_events event
+        JOIN memory_maintenance_tasks task ON task.id=json_extract(event.metadata_json, '$.suzuMemoryProcessing.retryRequestedBy')
+          AND task.agent_id=event.agent_id
+        WHERE event.agent_id=? AND task.task_type='long-term-extraction'
+          AND task.status='failed' AND task.review_state='pending' AND event.lifecycle<>'active'`).all(agentId);
+      for (const { id } of tasks) this.settleInputExtractionRetry(agentId, id);
     });
   }
 
@@ -2331,12 +2520,18 @@ export class MemoryRepository {
         clauses.push("id IN (SELECT value FROM json_each(?))");
         parameters.push(JSON.stringify(cleanStringList(taskIds)));
       }
+      assertEventSourceExecutionCurrent(normalizedAgentId);
+      if (!this.database.prepare(`SELECT 1 FROM memory_maintenance_tasks
+        WHERE ${clauses.join(" AND ")} LIMIT 1`).get(...parameters)) {
+        return { workerId: normalizedWorkerId, leaseExpiresAt, tasks: [] };
+      }
       const sourceView = executionEventSourceView(this, normalizedAgentId);
       if (sourceView) {
         clauses.push(`json_array_length(payload_json, '$.memoryIds') > 0 AND NOT EXISTS (
           SELECT 1 FROM json_each(payload_json, '$.memoryIds') AS member
-          WHERE member.value NOT IN (SELECT value FROM json_each(?)))`);
-        parameters.push(JSON.stringify([...sourceView.memoryIds]));
+          WHERE member.value NOT IN (SELECT value FROM json_each(
+            CASE WHEN task_type = 'structure-summary' THEN ? ELSE ? END)))`);
+        parameters.push(JSON.stringify([...sourceView.summaryMemoryIds]), JSON.stringify([...sourceView.memoryIds]));
       }
       const candidates = this.database.prepare(`
         SELECT id FROM memory_maintenance_tasks
@@ -3105,15 +3300,18 @@ export class MemoryRepository {
   }
 
   unlinkMemoryContainer({ agentId, memoryId, containerId, relation }) {
-    return Number(this.database.prepare(`
-      DELETE FROM memory_edges
-      WHERE agent_id = ? AND from_memory_id = ? AND to_memory_id = ? AND relation = ?
-    `).run(
-      clean(agentId),
-      clean(memoryId),
-      clean(containerId),
-      clean(relation),
-    ).changes || 0);
+    const owner = clean(agentId), memberId = clean(memoryId), targetId = clean(containerId);
+    return this.transaction(() => {
+      const removed = Number(this.database.prepare(`DELETE FROM memory_edges
+        WHERE agent_id = ? AND from_memory_id = ? AND to_memory_id = ? AND relation = ?`)
+        .run(owner, memberId, targetId, clean(relation)).changes || 0);
+      const container = removed && this.getMemory(targetId);
+      if (container?.status === 'active' && ['episode', 'topic'].includes(container.kind)
+        && readStructureSummaryMaterial(this, container)?.memoryIds.includes(memberId)) {
+        enqueueStructureSummaryRefresh(this, owner, container);
+      }
+      return removed;
+    });
   }
 
   recordStructureProposal({
@@ -3257,7 +3455,8 @@ export class MemoryRepository {
     const normalizedResolution = clean(resolution);
     const proposal = this.getStructureProposal(normalizedAgentId, proposalId);
     if (!proposal) throw new Error("Structure proposal does not exist for this Agent.");
-    if (proposal.review_state !== "pending") {
+    const withdrawing = normalizedResolution === 'dismissed' && proposal.review_state === 'accepted' && proposal.result_memory_id;
+    if (proposal.review_state !== "pending" && !withdrawing) {
       throw new Error(`Structure proposal is already ${proposal.review_state}.`);
     }
     if (!["accepted", "dismissed"].includes(normalizedResolution)) {
@@ -3272,12 +3471,15 @@ export class MemoryRepository {
     } else if (normalizedMemoryId) {
       throw new Error("Dismissed structure proposal cannot reference a result memory.");
     }
+    const metadata = withdrawing ? { ...proposal.metadata, structureConfirmation: {
+      resolvedAt: proposal.resolved_at, resolvedBy: proposal.resolved_by, note: proposal.resolution_note,
+    } } : proposal.metadata;
     const resolvedAt = nowIso();
     const resolutionResult = this.database.prepare(`
       UPDATE memory_structure_proposals
       SET review_state = ?, result_memory_id = ?, resolution_note = ?, resolved_by = ?,
-          resolved_at = ?, updated_at = ?
-      WHERE agent_id = ? AND id = ? AND review_state = 'pending'
+          resolved_at = ?, updated_at = ?, metadata_json = ?
+      WHERE agent_id = ? AND id = ? AND review_state = ?
     `).run(
       normalizedResolution,
       normalizedMemoryId,
@@ -3285,8 +3487,10 @@ export class MemoryRepository {
       clean(resolvedBy) || "human",
       resolvedAt,
       resolvedAt,
+      json(metadata, {}),
       normalizedAgentId,
       proposal.id,
+      proposal.review_state,
     );
     if (Number(resolutionResult.changes || 0) !== 1) {
       throw new Error("Structure proposal changed while it was being resolved.");
@@ -3409,7 +3613,7 @@ export class MemoryRepository {
     if (
       !proposalId
       || !normalizedAgentId
-      || normalizedRelation !== "causes"
+      || !Object.hasOwn(MEMORY_EXPLANATORY_RELATIONS, normalizedRelation)
       || !normalizedFromMemoryId
       || !normalizedToMemoryId
       || normalizedFromMemoryId === normalizedToMemoryId
@@ -3550,6 +3754,22 @@ export class MemoryRepository {
     return rows.map((row) => this.getRelationProposal(normalizedAgentId, row.id));
   }
 
+  setPendingRelationProposalResult({ agentId, proposalId, resultEdgeId, resultEdgeUpdatedAt }) {
+    const proposal = this.getRelationProposal(agentId, proposalId);
+    const edge = this.getEdge(agentId, resultEdgeId);
+    if (!proposal || proposal.review_state !== 'pending' || proposal.result_edge_id
+      || !relationProposalOwnsEdge({ ...proposal, result_edge_id: resultEdgeId,
+        result_edge_updated_at: resultEdgeUpdatedAt }, edge)) {
+      throw new Error('Pending relation proposal requires its exact owned result edge.');
+    }
+    const result = this.database.prepare(`UPDATE memory_relation_proposals
+      SET result_edge_id = ?, result_edge_updated_at = ?, updated_at = ?
+      WHERE agent_id = ? AND id = ? AND review_state = 'pending' AND result_edge_id IS NULL`)
+      .run(edge.id, edge.updated_at, nowIso(), agentId, proposal.id);
+    if (Number(result.changes) !== 1) throw new Error('Relation proposal changed while applying its result.');
+    return this.getRelationProposal(agentId, proposal.id);
+  }
+
   resolveRelationProposal({
     agentId,
     proposalId,
@@ -3559,51 +3779,55 @@ export class MemoryRepository {
     resolvedBy = "human",
     note = "",
   }) {
-    const normalizedAgentId = clean(agentId);
-    const normalizedResolution = clean(resolution);
-    const proposal = this.getRelationProposal(normalizedAgentId, proposalId);
-    if (!proposal) throw new Error("Relation proposal does not exist for this Agent.");
-    if (proposal.review_state !== "pending") {
-      throw new Error(`Relation proposal is already ${proposal.review_state}.`);
-    }
-    if (!["accepted", "dismissed"].includes(normalizedResolution)) {
-      throw new Error(`Unknown relation proposal resolution: ${normalizedResolution || "(empty)"}.`);
-    }
-    const normalizedEdgeId = clean(resultEdgeId) || null;
-    const normalizedEdgeUpdatedAt = clean(resultEdgeUpdatedAt) || null;
-    if (normalizedResolution === "accepted") {
-      const edge = normalizedEdgeId ? this.getEdge(normalizedAgentId, normalizedEdgeId) : null;
-      if (!edge
-        || edge.from_memory_id !== proposal.from_memory_id
-        || edge.to_memory_id !== proposal.to_memory_id
-        || edge.relation !== proposal.relation
-        || edge.updated_at !== normalizedEdgeUpdatedAt) {
-        throw new Error("Accepted relation proposal requires the exact resulting edge version.");
+    return this.transaction(() => {
+      const normalizedAgentId = clean(agentId);
+      const normalizedResolution = clean(resolution);
+      const proposal = this.getRelationProposal(normalizedAgentId, proposalId);
+      if (!proposal) throw new Error("Relation proposal does not exist for this Agent.");
+      if (proposal.review_state !== "pending") {
+        throw new Error(`Relation proposal is already ${proposal.review_state}.`);
       }
-    } else if (normalizedEdgeId || normalizedEdgeUpdatedAt) {
-      throw new Error("Dismissed relation proposal cannot reference a result edge.");
-    }
-    const resolvedAt = nowIso();
-    const result = this.database.prepare(`
-      UPDATE memory_relation_proposals
-      SET review_state = ?, result_edge_id = ?, result_edge_updated_at = ?,
-          resolution_note = ?, resolved_by = ?, resolved_at = ?, updated_at = ?
-      WHERE agent_id = ? AND id = ? AND review_state = 'pending'
-    `).run(
-      normalizedResolution,
-      normalizedEdgeId,
-      normalizedEdgeUpdatedAt,
-      clean(note),
-      clean(resolvedBy) || "human",
-      resolvedAt,
-      resolvedAt,
-      normalizedAgentId,
-      proposal.id,
-    );
-    if (Number(result.changes || 0) !== 1) {
-      throw new Error("Relation proposal changed while it was being resolved.");
-    }
-    return this.getRelationProposal(normalizedAgentId, proposal.id);
+      if (!["accepted", "dismissed"].includes(normalizedResolution)) {
+        throw new Error(`Unknown relation proposal resolution: ${normalizedResolution || "(empty)"}.`);
+      }
+      const normalizedEdgeId = clean(resultEdgeId) || null;
+      const normalizedEdgeUpdatedAt = clean(resultEdgeUpdatedAt) || null;
+      if (normalizedResolution === "accepted") {
+        const edge = normalizedEdgeId ? this.getEdge(normalizedAgentId, normalizedEdgeId) : null;
+        if (!relationProposalOwnsEdge(proposal, edge) || edge.updated_at !== normalizedEdgeUpdatedAt) {
+          throw new Error("Accepted relation proposal requires the exact resulting edge version.");
+        }
+      } else if (normalizedEdgeId || normalizedEdgeUpdatedAt) {
+        throw new Error("Dismissed relation proposal cannot reference a result edge.");
+      }
+      if (normalizedResolution === 'dismissed') {
+        const edge = this.getEdge(normalizedAgentId, proposal.result_edge_id);
+        if (relationProposalOwnsEdge(proposal, edge)) this.database.prepare(
+          'DELETE FROM memory_edges WHERE agent_id = ? AND id = ? AND updated_at = ?')
+          .run(normalizedAgentId, edge.id, proposal.result_edge_updated_at);
+      }
+      const resolvedAt = nowIso();
+      const result = this.database.prepare(`
+        UPDATE memory_relation_proposals
+        SET review_state = ?, result_edge_id = ?, result_edge_updated_at = ?,
+            resolution_note = ?, resolved_by = ?, resolved_at = ?, updated_at = ?
+        WHERE agent_id = ? AND id = ? AND review_state = 'pending'
+      `).run(
+        normalizedResolution,
+        normalizedEdgeId,
+        normalizedEdgeUpdatedAt,
+        clean(note),
+        clean(resolvedBy) || "human",
+        resolvedAt,
+        resolvedAt,
+        normalizedAgentId,
+        proposal.id,
+      );
+      if (Number(result.changes || 0) !== 1) {
+        throw new Error("Relation proposal changed while it was being resolved.");
+      }
+      return this.getRelationProposal(normalizedAgentId, proposal.id);
+    });
   }
 
   revokeRelationProposal({
@@ -3612,30 +3836,30 @@ export class MemoryRepository {
     revokedBy = "human",
     note = "",
   }) {
-    const normalizedAgentId = clean(agentId);
-    const proposal = this.getRelationProposal(normalizedAgentId, proposalId);
-    if (!proposal) throw new Error("Relation proposal does not exist for this Agent.");
-    if (proposal.review_state !== "accepted") {
-      throw new Error(`Only an accepted relation proposal can be revoked; it is ${proposal.review_state}.`);
-    }
-    const edge = this.getEdge(normalizedAgentId, proposal.result_edge_id);
-    if (!edge || edge.updated_at !== proposal.result_edge_updated_at) {
-      throw new Error("Accepted relation edge has changed and cannot be revoked safely.");
-    }
-    const revokedAt = nowIso();
     return this.transaction(() => {
+      const normalizedAgentId = clean(agentId);
+      const proposal = this.getRelationProposal(normalizedAgentId, proposalId);
+      if (!proposal) throw new Error("Relation proposal does not exist for this Agent.");
+      if (!['pending', 'accepted'].includes(proposal.review_state)) {
+        throw new Error(`Only a live relation proposal can be revoked; it is ${proposal.review_state}.`);
+      }
+      const edge = this.getEdge(normalizedAgentId, proposal.result_edge_id);
+      if (!relationProposalOwnsEdge(proposal, edge)) {
+        throw new Error("Applied relation edge has changed and cannot be revoked safely.");
+      }
+      const revokedAt = nowIso();
       const deletion = this.database.prepare(`
         DELETE FROM memory_edges
         WHERE agent_id = ? AND id = ? AND updated_at = ?
       `).run(normalizedAgentId, edge.id, proposal.result_edge_updated_at);
       if (Number(deletion.changes || 0) !== 1) {
-        throw new Error("Accepted relation edge changed while it was being revoked.");
+        throw new Error("Applied relation edge changed while it was being revoked.");
       }
       const update = this.database.prepare(`
         UPDATE memory_relation_proposals
         SET review_state = 'revoked', revoked_by = ?, revocation_note = ?,
             revoked_at = ?, updated_at = ?
-        WHERE agent_id = ? AND id = ? AND review_state = 'accepted'
+        WHERE agent_id = ? AND id = ? AND review_state IN ('pending', 'accepted')
       `).run(
         clean(revokedBy) || "human",
         clean(note),
@@ -3952,6 +4176,9 @@ export class MemoryRepository {
       clauses.push(`status IN (${normalizedStatuses.map(() => "?").join(", ")})`);
       parameters.push(...normalizedStatuses);
     }
+    assertEventSourceExecutionCurrent(normalizedAgentId);
+    if (!this.database.prepare(`SELECT 1 FROM memory_state_analysis_requests
+      WHERE ${clauses.join(" AND ")} LIMIT 1`).get(...parameters)) return [];
     const sourceView = executionEventSourceView(this, normalizedAgentId);
     if (sourceView) {
       clauses.push(`EXISTS (SELECT 1 FROM memory_state_analysis_request_memories AS link
@@ -3981,6 +4208,66 @@ export class MemoryRepository {
       ORDER BY created_at ASC, candidate_index ASC LIMIT ?
     `).all(...parameters, maximum);
     return rows.map((row) => this.getStateAnalysisRequest(normalizedAgentId, row.id));
+  }
+
+  claimStateAnalysisRequest({ agentId, requestId, workerId = randomUUID(), leaseSeconds = 900, now = nowIso() } = {}) {
+    return this.claimStateAnalysisRequests({ agentId, requestIds: [requestId], workerId, leaseSeconds, now })?.[0] || null;
+  }
+
+  claimStateAnalysisRequests({ agentId, requestIds, workerId = randomUUID(), leaseSeconds = 900, now = nowIso() } = {}) {
+    const claimedAt = new Date(now);
+    if (!clean(agentId) || !Array.isArray(requestIds) || !requestIds.length
+      || requestIds.some(id => !clean(id)) || new Set(requestIds).size !== requestIds.length
+      || !clean(workerId) || !Number.isFinite(claimedAt.getTime())
+      || !Number.isFinite(leaseSeconds) || leaseSeconds <= 0) throw new Error('State analysis claim requires an Agent, request, worker and valid lease.');
+    return this.transaction(() => {
+      const requests = requestIds.map(id => this.getStateAnalysisRequest(agentId, id));
+      if (requests.some(request => !request || request.status !== 'pending')) return null;
+      const sourceView = executionEventSourceView(this, agentId);
+      if (sourceView && requests.some(request => request.memoryIds.some(id => !sourceView.memoryIds.has(id)))) return null;
+      // State identity matching depends on earlier requests becoming visible.
+      // One worker owns the whole ready group; other workers retain Agent order.
+      if (this.database.prepare(`SELECT 1 FROM memory_state_analysis_requests WHERE agent_id = ?
+        AND lease_owner <> '' AND lease_expires_at > ? LIMIT 1`).get(agentId, claimedAt.toISOString())) return null;
+      this.database.prepare(`UPDATE memory_state_analysis_requests SET lease_owner = '', lease_expires_at = NULL
+        WHERE agent_id = ? AND lease_owner <> '' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`)
+        .run(agentId, claimedAt.toISOString());
+      const expires = new Date(claimedAt.getTime() + leaseSeconds * 1000).toISOString();
+      const claim = this.database.prepare(`UPDATE memory_state_analysis_requests SET lease_owner = ?, lease_expires_at = ?
+        WHERE agent_id = ? AND id = ? AND status = 'pending'`);
+      for (const requestId of requestIds) claim.run(workerId, expires, agentId, requestId);
+      return requestIds.map(id => this.getStateAnalysisRequest(agentId, id));
+    });
+  }
+
+  saveStateAnalysisFirstStage({ agentId, requestId, workerId, checkpoint }) {
+    this.assertStateAnalysisRequestLease({ agentId, requestId, workerId });
+    const request = this.getStateAnalysisRequest(agentId, requestId);
+    if (request.status !== 'pending' || checkpoint?.version !== 1 || !clean(checkpoint.contractHash)) {
+      throw new Error('A first-stage checkpoint requires a pending, owned analysis and a versioned contract.');
+    }
+    this.database.prepare('UPDATE memory_state_analysis_requests SET metadata_json = ?, updated_at = ? WHERE agent_id = ? AND id = ?')
+      .run(canonicalJson({ ...request.metadata, firstStage: checkpoint }, {}), nowIso(), agentId, requestId);
+  }
+
+  assertStateAnalysisRequestLease({ agentId, requestId, workerId }) {
+    const request = this.database.prepare(`SELECT status, lease_owner FROM memory_state_analysis_requests
+      WHERE agent_id = ? AND id = ?`).get(agentId, requestId);
+    if (!request || request.status === 'cancelled' || request.lease_owner !== workerId) throw Object.assign(
+      new Error('State analysis request is no longer owned by this execution.'), { code: 'STATE_ANALYSIS_LEASE_LOST' });
+  }
+
+  releaseStateAnalysisRequest({ agentId, requestId, workerId }) {
+    return this.database.prepare(`UPDATE memory_state_analysis_requests SET lease_owner = '', lease_expires_at = NULL
+      WHERE agent_id = ? AND id = ? AND lease_owner = ?`).run(agentId, requestId, workerId).changes;
+  }
+
+  recoverStateAnalysisRequests(agentId, { force = false, recoveredAt = nowIso() } = {}) {
+    if (!clean(agentId) || !validTimestamp(recoveredAt)) throw new Error('State analysis recovery requires an Agent and valid time.');
+    const recovered = this.database.prepare(`UPDATE memory_state_analysis_requests SET lease_owner = '', lease_expires_at = NULL
+      WHERE agent_id = ? AND lease_owner <> '' AND (? = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?)`)
+      .run(agentId, Number(Boolean(force)), new Date(recoveredAt).toISOString()).changes;
+    return { recovered };
   }
 
   recordStateAnalysisRequestFailure({
@@ -4075,6 +4362,8 @@ export class MemoryRepository {
       if (same) return { ...current, wasUpdated: false };
       throw new Error("State analysis request is already resolved.");
     }
+    const completedMetadata = { ...current.metadata, ...metadata };
+    delete completedMetadata.firstStage;
     this.database.prepare(`
       UPDATE memory_state_analysis_requests
       SET status = ?, analysis_batch_id = ?, error_message = ?, metadata_json = ?, updated_at = ?
@@ -4083,7 +4372,7 @@ export class MemoryRepository {
       normalizedStatus,
       clean(analysisBatchId),
       clean(errorMessage),
-      canonicalJson({ ...current.metadata, ...metadata }, {}),
+      canonicalJson(completedMetadata, {}),
       new Date(timestamp).toISOString(),
       normalizedAgentId,
       normalizedRequestId,
@@ -4261,6 +4550,59 @@ export class MemoryRepository {
     return normalizeStateAnalysisRun(row, memoryIds, sourceIds);
   }
 
+  getInferredPreferenceTargets({ agentId, memoryIds = [], sourceIds = [] }) {
+    if (!memoryIds.length && !sourceIds.length) return [];
+    return this.database.prepare(`SELECT DISTINCT observation.subject_role AS subjectRole,
+      observation.subject_key AS subjectKey, observation.canonical_key AS canonicalKey
+      FROM memory_state_evidence_observations observation
+      WHERE observation.agent_id=? AND observation.state_family='preference'
+        AND json_extract(observation.scope_json, '$.currentRepresentationLayer')='inferred'
+        AND (observation.memory_id IN (SELECT value FROM json_each(?))
+          OR EXISTS (SELECT 1 FROM memory_state_observation_sources source
+            WHERE source.observation_id=observation.id AND source.agent_id=observation.agent_id
+              AND source.source_id IN (SELECT value FROM json_each(?))))`)
+      .all(agentId, JSON.stringify(memoryIds), JSON.stringify(sourceIds));
+  }
+
+  normalizePreferenceAnalysisSources(agentId) {
+    const observations = this.database.prepare(`SELECT id FROM memory_state_evidence_observations
+      WHERE agent_id=? AND state_family='preference' AND lifecycle='current'
+        AND json_extract(scope_json, '$.currentRepresentationLayer')='inferred'
+        AND json_type(scope_json, '$.world') IS NULL`).all(agentId);
+    for (const { id } of observations) {
+      const observation = this.getStateEvidenceObservation(agentId, id);
+      this.database.prepare(`UPDATE memory_state_evidence_observations
+        SET scope_json=json_set(scope_json, '$.world', json(?)) WHERE agent_id=? AND id=?`)
+        .run(JSON.stringify(observation.world), agentId, id);
+    }
+    const rows = this.database.prepare(`SELECT id, metadata_json FROM memory_state_analysis_runs
+      WHERE agent_id=? AND state_family='preference'
+        AND analyzer_role IN ('object-grounding','explicit-expression','behavior-conditions','sharing-affect','time-scope')`).all(agentId);
+    for (const row of rows) {
+      const metadata = parseJson(row.metadata_json, {});
+      const material = metadata.eventSourceMaterial;
+      if (!material) continue;
+      const run = this.getStateAnalysisRun(agentId, row.id);
+      if (canonicalJson([...run.memoryIds].sort(), []) === canonicalJson([...(material.memoryIds || [])].sort(), [])
+        && canonicalJson([...run.sourceIds].sort(), []) === canonicalJson([...(material.sourceIds || [])].sort(), [])) continue;
+      const sources = run.sourceIds.map(id => this.getSource(id));
+      const inputIds = [...new Set(sources.flatMap(source => source?.metadata?.inputEventIds || []))].sort();
+      const events = sources.flatMap(source => {
+        const sourceMetadata = source?.metadata || {};
+        const direct = sourceMetadata.eventMetadata?.eventSource || sourceMetadata.eventSource;
+        if (direct) return [direct];
+        return (sourceMetadata.inputEventIds || []).map(id => this.getInputEvent(agentId, id)?.metadata?.eventSource).filter(Boolean);
+      });
+      if (!events.length) continue;
+      const eventKeys = new Set(events.map(event => `${event.owner}:${event.eventId}`));
+      const ownMaterial = { ...material, memoryIds: [...run.memoryIds].sort(), sourceIds: [...run.sourceIds].sort(),
+        inputEventIds: inputIds, eventSources: (material.eventSources || []).filter(event => eventKeys.has(`${event.owner}:${event.eventId}`)) };
+      if (canonicalJson(ownMaterial, {}) === canonicalJson(material, {})) continue;
+      this.database.prepare('UPDATE memory_state_analysis_runs SET metadata_json=? WHERE agent_id=? AND id=?')
+        .run(canonicalJson({ ...metadata, eventSourceMaterial: ownMaterial }, {}), agentId, row.id);
+    }
+  }
+
   listStateAnalysisRuns(agentId, {
     stateFamily = "",
     analyzerRole = "",
@@ -4415,6 +4757,16 @@ export class MemoryRepository {
       }
     }
     const normalizedConfidence = unitInterval(confidence, "state evidence confidence");
+    let evidenceScope = scope;
+    if (normalizedFamily === 'preference' && scope.currentRepresentationLayer === 'inferred') {
+      const requestId = requestIds.size === 1 ? [...requestIds][0] : '';
+      const semantic = requestId ? this.getStateAnalysisRequestSemanticMemory(normalizedAgentId, requestId) : null;
+      const { world: _world, ...claimScope } = scope;
+      evidenceScope = claimScope;
+      scope = { ...claimScope, world: memoryWorldScope(semantic || memory) };
+    }
+    // World ownership is derived from the validated request. Persist it so
+    // retiring the request's comparison material cannot reassign old evidence.
     const hash = createHash("sha256").update(canonicalJson({
       agentId: normalizedAgentId,
       stateFamily: normalizedFamily,
@@ -4430,7 +4782,7 @@ export class MemoryRepository {
       qualification: normalizedQualification,
       confidence: normalizedConfidence,
       origin: normalizedOrigin,
-      scope,
+      scope: evidenceScope,
       payloadSchemaVersion: normalizedPayloadSchemaVersion,
       payload,
       excludedReason: normalizedExcludedReason,
@@ -4488,6 +4840,9 @@ export class MemoryRepository {
         if (Number(update.changes || 0) !== 1) {
           throw new Error("State evidence observation changed while being superseded.");
         }
+        if (normalizedFamily === 'preference') invalidatePreferenceStateEvidence(this, {
+          agentId: normalizedAgentId, observationIds: [previous.id],
+        });
       }
       this.database.prepare(`
         INSERT INTO memory_state_evidence_observations (
@@ -4627,7 +4982,7 @@ export class MemoryRepository {
       parameters.push(JSON.stringify([...sourceView.observationIds]));
     }
     const rows = this.database.prepare(`
-      SELECT id FROM (${stateEvidenceWorldRows()})
+      SELECT id FROM (${stateEvidenceWorldRows({ availableOnly: true })})
       WHERE ${clauses.join(" AND ")}
       ORDER BY observed_at DESC, created_at DESC, id DESC LIMIT ?
     `).all(...parameters, Math.min(1000, Math.max(1, Math.trunc(Number(limit) || 200))));
@@ -4650,6 +5005,9 @@ export class MemoryRepository {
     if (Number(result.changes || 0) !== 1) {
       throw new Error("State evidence observation changed while being withdrawn.");
     }
+    if (observation.state_family === 'preference') invalidatePreferenceStateEvidence(this, {
+      agentId: normalizedAgentId, observationIds: [observation.id],
+    });
     return this.getStateEvidenceObservation(normalizedAgentId, observation.id);
   }
 
@@ -4796,16 +5154,7 @@ export class MemoryRepository {
         }
         return {
           id: sourceId,
-          fingerprint: canonicalHash({
-            id: source.id,
-            agentId: source.agent_id,
-            sourceKind: source.source_kind,
-            externalId: source.external_id,
-            occurredAt: source.occurred_at,
-            knownAt: source.known_at,
-            speaker: source.speaker,
-            content: source.content,
-          }),
+          fingerprint: reportedStateSourceFingerprint(source),
         };
       });
       return {
@@ -4816,21 +5165,7 @@ export class MemoryRepository {
           observationId: observation.id,
           observationHash: clean(observation.observation_hash),
           memoryId,
-          memoryFingerprint: canonicalHash({
-            id: detail.memory.id,
-            title: detail.memory.title,
-            content: detail.memory.content,
-            subjectRole: detail.memory.subject_role,
-            subjectKey: detail.memory.subject_key,
-            knownAt: detail.memory.known_at,
-            eventStart: detail.memory.event_start,
-            roles: detail.roles.map((role) => ({
-              role: role.role,
-              actorRole: role.actor_role,
-              actorKey: role.actor_key,
-              isPrimary: role.is_primary,
-            })),
-          }),
+          memoryFingerprint: reportedStateEvidenceMemoryFingerprint(detail),
           sourceFingerprints,
         },
       };
@@ -4885,6 +5220,12 @@ export class MemoryRepository {
     `).get(proposalId);
     if (existingOwner && existingOwner.agent_id !== normalizedAgentId) {
       throw new Error("Reported state proposal id already belongs to another Agent.");
+    }
+
+    if (normalizedFamily === 'preference') {
+      const existing = this.database.prepare(`SELECT id FROM memory_reported_state_proposals
+        WHERE agent_id=? AND proposal_hash=?`).get(normalizedAgentId, proposalHash);
+      if (existing) return { ...this.getReportedStateProposal(normalizedAgentId, existing.id), wasInserted: false };
     }
 
     const ownPendingState = this.database.prepare(`SELECT memory.id
@@ -5037,7 +5378,8 @@ export class MemoryRepository {
     const normalizedResolution = clean(resolution);
     const proposal = this.getReportedStateProposal(normalizedAgentId, proposalId);
     if (!proposal) throw new Error("Reported state proposal does not exist for this Agent.");
-    if (proposal.review_state !== "pending") {
+    const withdrawing = normalizedResolution === 'dismissed' && withdrawableReportedStateMemory(this, proposal);
+    if (proposal.review_state !== "pending" && !(proposal.review_state === 'accepted' && withdrawing)) {
       throw new Error(`Reported state proposal is already ${proposal.review_state}.`);
     }
     if (!["accepted", "dismissed"].includes(normalizedResolution)) {
@@ -5069,7 +5411,8 @@ export class MemoryRepository {
       if (replacementActions.has(proposal.action) && memory.id === proposal.previousMemoryId) {
         throw new Error("This reported state action requires a new resulting state memory.");
       }
-      if (proposal.action === "add_scoped_exception") {
+      if (proposal.action === "add_scoped_exception"
+        && !(memory.id === proposal.resultMemoryId && (proposal.metadata?.reportedPreferenceApplication || proposal.metadata?.reportedStateApplication))) {
         const root = this.getMemory(proposal.previousMemoryId);
         const edge = root && this.findEdge({
           agentId: normalizedAgentId,
@@ -5089,26 +5432,30 @@ export class MemoryRepository {
     } else if (normalizedMemoryId) {
       throw new Error("Dismissed reported state proposal cannot reference a result memory.");
     }
-    const resolvedAt = nowIso();
-    const result = this.database.prepare(`
+    return this.transaction(() => {
+      const resolvedAt = nowIso();
+      const result = this.database.prepare(`
       UPDATE memory_reported_state_proposals
       SET review_state = ?, result_memory_id = ?, resolution_note = ?, resolved_by = ?,
           resolved_at = ?, updated_at = ?
-      WHERE agent_id = ? AND id = ? AND review_state = 'pending'
-    `).run(
-      normalizedResolution,
-      normalizedMemoryId,
-      clean(note),
-      clean(resolvedBy) || "human",
-      resolvedAt,
-      resolvedAt,
-      normalizedAgentId,
-      proposal.id,
-    );
-    if (Number(result.changes || 0) !== 1) {
-      throw new Error("Reported state proposal changed while it was being resolved.");
-    }
-    return this.getReportedStateProposal(normalizedAgentId, proposal.id);
+      WHERE agent_id = ? AND id = ? AND review_state = ? AND result_memory_id IS ?
+      `).run(
+        normalizedResolution,
+        normalizedMemoryId,
+        clean(note),
+        clean(resolvedBy) || "human",
+        resolvedAt,
+        resolvedAt,
+        normalizedAgentId,
+        proposal.id,
+        proposal.review_state,
+        proposal.result_memory_id,
+      );
+      if (Number(result.changes || 0) !== 1) {
+        throw new Error("Reported state proposal changed while it was being resolved.");
+      }
+      return this.getReportedStateProposal(normalizedAgentId, proposal.id);
+    });
   }
 
   dismissReportedStateProposal({
@@ -5117,13 +5464,7 @@ export class MemoryRepository {
     resolvedBy = "human",
     note = "",
   } = {}) {
-    return this.resolveReportedStateProposalRecord({
-      agentId,
-      proposalId,
-      resolution: "dismissed",
-      resolvedBy,
-      note,
-    });
+    return resolveReportedStateProposal(this, { agentId, proposalId, action: 'dismiss', resolvedBy, note }).proposal;
   }
 
   recordPreferenceStateProposal({
@@ -5410,7 +5751,8 @@ export class MemoryRepository {
     const normalizedResolution = clean(resolution);
     const proposal = this.getPreferenceStateProposal(normalizedAgentId, proposalId);
     if (!proposal) throw new Error("Preference state proposal does not exist for this Agent.");
-    if (proposal.review_state !== "pending") {
+    const withdrawing = normalizedResolution === 'dismissed' && appliedPreferenceStateMemory(this, proposal);
+    if (proposal.review_state !== "pending" && !(proposal.review_state === 'accepted' && withdrawing)) {
       throw new Error(`Preference state proposal is already ${proposal.review_state}.`);
     }
     if (!["accepted", "dismissed"].includes(normalizedResolution)) {
@@ -5429,7 +5771,7 @@ export class MemoryRepository {
         || clean(memory.metadata?.preferenceStateLevel) !== proposal.proposed_level) {
         throw new Error("Accepted preference state proposal requires its exact resulting state memory.");
       }
-      if (["challenge", "reinforce"].includes(proposal.transition)
+      if (["challenge", "reinforce"].includes(proposal.transition) && !proposal.metadata?.accumulatedPreference
         && memory.id !== proposal.previousMemoryId) {
         throw new Error("Accepted preference challenge or reinforcement must remain attached to the reviewed current state.");
       }
@@ -5441,7 +5783,7 @@ export class MemoryRepository {
       UPDATE memory_preference_state_proposals
       SET review_state = ?, result_memory_id = ?, resolution_note = ?, resolved_by = ?,
           resolved_at = ?, updated_at = ?
-      WHERE agent_id = ? AND id = ? AND review_state = 'pending'
+      WHERE agent_id = ? AND id = ? AND review_state = ?
     `).run(
       normalizedResolution,
       normalizedMemoryId,
@@ -5451,6 +5793,7 @@ export class MemoryRepository {
       resolvedAt,
       normalizedAgentId,
       proposal.id,
+      proposal.review_state,
     );
     if (Number(result.changes || 0) !== 1) {
       throw new Error("Preference state proposal changed while it was being resolved.");
@@ -5993,6 +6336,13 @@ export class MemoryRepository {
     }
     const timestamp = inspectedAt.toISOString();
     this.recoverExpiredConsolidationRuns(normalizedAgentId, { now: timestamp });
+    assertEventSourceExecutionCurrent(normalizedAgentId);
+    const claimable = `agent_id = ? AND attempt_count < max_attempts AND (
+      (status = 'planned' AND available_at <= ?)
+      OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))`;
+    const parameters = [normalizedAgentId, timestamp, timestamp];
+    if (!this.database.prepare(`SELECT 1 FROM memory_consolidation_runs
+      WHERE ${claimable} LIMIT 1`).get(...parameters)) return [];
     const sourceView = executionEventSourceView(this, normalizedAgentId);
     const sourceFilter = sourceView ? `AND NOT EXISTS (
       SELECT 1 FROM json_each(trigger_ids_json) AS member
@@ -6001,17 +6351,12 @@ export class MemoryRepository {
       WHERE member.value NOT IN (SELECT value FROM json_each(?)))` : '';
     return this.database.prepare(`
       SELECT * FROM memory_consolidation_runs
-      WHERE agent_id = ? AND attempt_count < max_attempts AND (
-        (status = 'planned' AND available_at <= ?)
-        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-      )
+      WHERE ${claimable}
       ${sourceFilter}
       ORDER BY created_at ASC, id ASC
       LIMIT ?
     `).all(
-      normalizedAgentId,
-      timestamp,
-      timestamp,
+      ...parameters,
       ...(sourceView ? [JSON.stringify([...sourceView.memoryIds]), JSON.stringify([...sourceView.memoryIds])] : []),
       Math.min(500, Math.max(1, Math.trunc(Number(limit) || 100))),
     ).map(normalizeConsolidationRun);
@@ -6199,7 +6544,7 @@ export class MemoryRepository {
     if (normalizedStatus === "completed" && !structureIds.length && !relationIds.length) {
       throw new Error("Completed consolidation run requires at least one proposal.");
     }
-    if (["no_proposals", "cancelled"].includes(normalizedStatus)
+    if (normalizedStatus === "no_proposals"
       && (structureIds.length || relationIds.length)) {
       throw new Error(`${normalizedStatus} consolidation run cannot reference proposals.`);
     }
@@ -6620,41 +6965,45 @@ export class MemoryRepository {
     const selected = memoryIds == null ? null : JSON.stringify([...new Set(memoryIds.map(clean).filter(Boolean))]);
     const selection = selected == null ? '' : ' AND memory.id IN (SELECT value FROM json_each(?))';
     return this.database.prepare(`
+      WITH eligible AS (
+        SELECT memory.* FROM memory_nodes AS memory
+        WHERE memory.agent_id = ? AND memory.layer = 'provisional' AND memory.status <> 'deleted'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_sources link JOIN source_records source ON source.id = link.source_id
+            WHERE link.memory_id = memory.id AND NOT (${currentReviewSource})
+          )
+      )
       SELECT memory.*,
              decision.id AS provisional_decision_id,
              decision.reason_codes_json AS provisional_reason_codes_json,
              decision.created_at AS provisional_created_at
       FROM memory_ingestion_decisions AS decision
-      JOIN memory_nodes AS memory
+      JOIN eligible AS memory
         ON memory.id = decision.provisional_memory_id
        AND memory.agent_id = decision.agent_id
       WHERE decision.agent_id = ?
         AND decision.decision = 'review'
         AND decision.review_state = 'pending'
-        AND memory.layer = 'provisional'
-        AND memory.status <> 'deleted'
         ${selection}
       UNION ALL
       SELECT memory.*, proposal.id AS provisional_decision_id,
              '[]' AS provisional_reason_codes_json, proposal.created_at AS provisional_created_at
       FROM memory_reported_state_proposals proposal
-      JOIN memory_nodes memory ON memory.agent_id = proposal.agent_id
+      JOIN eligible memory ON memory.agent_id = proposal.agent_id
         AND json_extract(memory.metadata_json, '$.reportedStateProposalId') = proposal.id
       WHERE proposal.agent_id = ? AND proposal.review_state = 'pending'
-        AND memory.layer = 'provisional' AND memory.status <> 'deleted'
         ${selection}
       UNION ALL
       SELECT memory.*, proposal.id AS provisional_decision_id,
              '[]' AS provisional_reason_codes_json, proposal.created_at AS provisional_created_at
       FROM memory_preference_state_proposals proposal
-      JOIN memory_nodes memory ON memory.agent_id = proposal.agent_id
+      JOIN eligible memory ON memory.agent_id = proposal.agent_id
         AND json_extract(memory.metadata_json, '$.preferenceProposalId') = proposal.id
       WHERE proposal.agent_id = ? AND proposal.review_state = 'pending'
-        AND memory.layer = 'provisional' AND memory.status <> 'deleted'
         ${selection}
       ORDER BY provisional_created_at DESC, provisional_decision_id ASC
       LIMIT ?
-    `).all(...Array.from({ length: 3 }, () => selected == null ? [normalizedAgentId] : [normalizedAgentId, selected]).flat(), maximum).map((row) => ({
+    `).all(normalizedAgentId, ...Array.from({ length: 3 }, () => selected == null ? [normalizedAgentId] : [normalizedAgentId, selected]).flat(), maximum).map((row) => ({
       ...normalizeNode(row),
       provisionalDecisionId: clean(row.provisional_decision_id),
       provisionalReasonCodes: parseJson(row.provisional_reason_codes_json, []),
@@ -9786,7 +10135,9 @@ export class MemoryRepository {
   }
 
   listMemorySources(memoryId) {
-    return this.database.prepare(`
+    // Follow supplementary evidence at read time so the state's own source
+    // links describe how its original claim was established.
+    const rows = this.database.prepare(`
         SELECT source.*, link.relation, link.authority,
                link.source_trust, link.evidence_strength,
                link.provenance AS evidence_provenance,
@@ -9794,9 +10145,29 @@ export class MemoryRepository {
                link.updated_at AS evidence_updated_at
         FROM memory_sources AS link
         JOIN source_records AS source ON source.id = link.source_id
-        WHERE link.memory_id = ?
-        ORDER BY source.occurred_at ASC, source.recorded_at ASC
-      `).all(memoryId).map(normalizeEvidenceSource);
+         WHERE link.memory_id = ? AND ${reportedStateEvidenceAvailable('link')}
+        UNION ALL
+        SELECT source.*, 'reported_state_reinforce', link.authority, link.source_trust, edge.confidence,
+               edge.provenance, edge.metadata_json, edge.updated_at
+        FROM memory_nodes AS state
+        JOIN memory_edges AS edge
+          ON edge.agent_id = state.agent_id AND edge.from_memory_id = state.id AND edge.relation = 'supported_by'
+          AND edge.provenance = ?
+        JOIN memory_nodes AS evidence ON evidence.id = edge.to_memory_id AND evidence.status <> 'deleted'
+        JOIN json_each(edge.metadata_json, '$.evidenceSourceIds') AS ref
+        JOIN source_records AS source ON source.id = ref.value AND source.lifecycle = 'active'
+        JOIN memory_sources AS link ON link.rowid = (
+          SELECT rowid FROM memory_sources WHERE memory_id = evidence.id AND source_id = source.id ORDER BY relation LIMIT 1
+        )
+        WHERE state.id = ? AND state.representation_layer = 'reported' AND state.status <> 'deleted'
+          AND NOT EXISTS (SELECT 1 FROM memory_sources WHERE memory_id = state.id AND source_id = source.id)
+        ORDER BY occurred_at ASC, recorded_at ASC
+      `).all(memoryId, REPORTED_STATE_REINFORCEMENT_PROVENANCE, memoryId);
+    const scope = currentEventSourceExecution()?.sourceScope;
+    const allowed = scope && rows.some(row => row.evidence_provenance === REPORTED_STATE_REINFORCEMENT_PROVENANCE)
+      ? executionEventSourceView(this, scope.agentId).sourceIds : null;
+    return rows.filter(row => !allowed || row.evidence_provenance !== REPORTED_STATE_REINFORCEMENT_PROVENANCE
+      || allowed.has(row.id)).map(normalizeEvidenceSource);
   }
 
   getMemoryDetail(agentId, memoryId) {
@@ -9865,6 +10236,8 @@ export class MemoryRepository {
     const before = this.getMemory(memoryId);
     if (!before || before.agent_id !== clean(agentId)) throw new Error("没有找到要编辑的记忆。");
     const content = Object.hasOwn(patch, "content") ? String(patch.content ?? "") : before.content;
+    const title = Object.hasOwn(patch, 'title') ? clean(patch.title) : before.title;
+    const changesSummary = ['episode', 'topic'].includes(before.kind) && (title !== before.title || content !== before.content);
     if (!content.trim()) throw new Error("记忆正文不能为空。");
     const eventDate = Object.hasOwn(patch, "eventDate")
       ? clean(patch.eventDate) || null
@@ -9873,6 +10246,7 @@ export class MemoryRepository {
       throw new Error("事件日期必须为空或 YYYY-MM-DD。");
     }
     const continuityFingerprint = eventContinuityFingerprint(this, agentId, memoryId);
+    const organizationBefore = readOrganizationInput(this, agentId, [memoryId]);
     let invalidatedMemoryIds = [];
     let after;
     this.transaction(() => {
@@ -9881,7 +10255,7 @@ export class MemoryRepository {
         agentId: before.agent_id,
         kind: clean(patch.kind) || before.kind,
         layer: clean(patch.layer) || before.layer,
-        title: Object.hasOwn(patch, "title") ? patch.title : before.title,
+        title,
         content,
         subjectRole: clean(patch.subjectRole) || before.subject_role,
         subjectKey: Object.hasOwn(patch, "subjectKey") ? patch.subjectKey : before.subject_key,
@@ -9916,9 +10290,25 @@ export class MemoryRepository {
         metadata: {
           ...before.metadata,
           manuallyEdited: true,
+          ...(changesSummary ? { structureSummaryRevision: expectedStructureSummary(before).revision + 1 } : {}),
         },
       });
       this.database.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memoryId);
+      if (before.content !== after.content || before.title !== after.title || before.known_at !== after.known_at
+        || before.event_start !== after.event_start || before.event_date !== after.event_date
+        || before.subject_role !== after.subject_role || before.subject_key !== after.subject_key) {
+        invalidatePreferenceStateEvidence(this, { agentId, memoryIds: [memoryId] });
+        const observations = this.database.prepare(`SELECT id FROM memory_state_evidence_observations
+          WHERE agent_id=? AND memory_id=? AND state_family='preference' AND lifecycle='current'
+            AND json_extract(scope_json, '$.currentRepresentationLayer')='inferred'`).all(agentId, memoryId);
+        for (const { id } of observations) this.withdrawStateEvidenceObservation({ agentId, observationId: id });
+      }
+      if (before.kind === 'utterance' && (before.content !== after.content || before.title !== after.title
+        || before.subject_role !== after.subject_role || before.subject_key !== after.subject_key
+        || before.known_at !== after.known_at || before.event_start !== after.event_start)) {
+        invalidateReportedPreferenceEvidence(this, { agentId, memoryIds: [memoryId], evidenceOnly: true });
+        reconcileReportedStateEvidence(this, { agentId, memoryIds: [memoryId] });
+      }
       if ((before.kind === 'event' || after.kind === 'event') && continuityFingerprint !== eventContinuityFingerprint(this, agentId, memoryId)) {
         invalidatedMemoryIds = invalidateEventContinuity(this, { agentId, memoryId });
         after = this.getMemory(memoryId);
@@ -9928,6 +10318,8 @@ export class MemoryRepository {
         WHERE agent_id = ? AND provenance = 'association-builder-v1'
           AND (from_memory_id = ? OR to_memory_id = ?)
       `).run(agentId, memoryId, memoryId);
+      finishOrganizationInputMutation(this, { agentId, before: organizationBefore });
+      after = this.getMemory(memoryId);
       this.recordMutation({
         agentId,
         memoryId,
@@ -9941,19 +10333,34 @@ export class MemoryRepository {
     return { ...after, eventContinuityInvalidatedMemoryIds: invalidatedMemoryIds };
   }
 
-  updateStructureSummary({ agentId, memoryId, title, content, proposalId = '', actor = 'memory-structurer', reason = '' }) {
+  updateStructureSummary({ agentId, memoryId, title, content, proposalId = '', sourceMemoryIds,
+    actor = 'memory-structurer', reason = '' }) {
     const before = this.getMemory(memoryId);
     if (!before || before.agent_id !== clean(agentId) || !['episode', 'topic'].includes(before.kind)
       || before.status !== 'active' || !clean(content)) throw new Error('Structure summary requires an active container and nonempty content.');
     const metadata = { ...before.metadata };
-      metadata.structureSummaryHash = createHash('sha256').update(JSON.stringify([clean(title), clean(content)])).digest('hex');
+    metadata.structureSummaryHash = createHash('sha256').update(JSON.stringify([clean(title), clean(content)])).digest('hex');
+    metadata.structureSummaryRevision = expectedStructureSummary(before).revision + 1;
+    // The proposal owns its old rationale and input versions. A refreshed node
+    // retains only the provenance of the summary it actually exposes.
+    delete metadata.organizationInput;
+    delete metadata.structureSummaryBefore;
+    delete metadata.structureProposalRationale;
+    const members = sourceMemoryIds === undefined ? this.listContainerMembers({ agentId, containerId: memoryId,
+      containerKind: before.kind, relation: before.kind === 'topic' ? 'supports_topic' : 'part_of_episode',
+      statuses: ['active', 'superseded', 'disputed', 'archived'] }).map(member => member.id) : sourceMemoryIds;
+    if (members) metadata.structureSummaryMaterial = structureSummaryMaterial(clean(title), clean(content), members,
+      readOrganizationInput(this, before.agent_id, members));
+    else delete metadata.structureSummaryMaterial;
     if (proposalId) metadata.structureSummaryProposalId = proposalId;
     else delete metadata.structureSummaryProposalId;
     return this.transaction(() => {
+      const organizationBefore = readOrganizationInput(this, before.agent_id, [before.id]);
       this.database.prepare(`UPDATE memory_nodes SET title = ?, content = ?, metadata_json = ?, updated_at = ?
         WHERE agent_id = ? AND id = ?`).run(clean(title), clean(content), json(metadata, {}), nowIso(), before.agent_id, before.id);
       this.database.prepare('DELETE FROM memory_embeddings WHERE memory_id = ?').run(before.id);
       this.syncSearch(before.id);
+      finishOrganizationInputMutation(this, { agentId: before.agent_id, before: organizationBefore });
       const after = this.getMemory(before.id);
       this.recordMutation({ agentId: before.agent_id, memoryId: before.id, action: 'edit', actor, reason, before, after });
       return after;
@@ -10009,24 +10416,50 @@ export class MemoryRepository {
     const before = this.getMemory(memoryId);
     if (!before || before.agent_id !== clean(agentId)) throw new Error("没有找到要修改的记忆。");
     const targetStatus = deleted ? "deleted" : "active";
+    if (before.metadata?.reportedStateSuspendedStatus) {
+      if (!deleted) throw new Error('Restore the original evidence to recover this reported state.');
+      if (before.status === targetStatus) {
+        const { reportedStateSuspendedStatus, ...metadata } = before.metadata;
+        return this.updateMemoryMetadata({ agentId, memoryId, metadata, actor, reason });
+      }
+    }
     if (before.status === targetStatus) return before;
+    if (!deleted && !preferenceEvidenceMayRestore(this, before)) {
+      throw new Error("Preference evidence requires its original current observation and sources before it can be restored.");
+    }
+    if (!deleted && before.state_family === 'preference' && before.metadata?.reportedStateProposalId) {
+      const proposal = this.getReportedStateProposal(agentId, before.metadata.reportedStateProposalId);
+      if (suspendedReportedPreferenceMemory(this, proposal)?.id === before.id) {
+        throw new Error('This reported preference can be recovered by restoring its original evidence.');
+      }
+    }
+    const organizationBefore = readOrganizationInput(this, agentId, [memoryId]);
     let invalidatedMemoryIds = [];
     let after;
     this.transaction(() => {
       after = this.updateMemoryStatus(memoryId, targetStatus);
+      finishOrganizationInputMutation(this, { agentId, before: organizationBefore });
+      after = this.getMemory(memoryId);
       if (before.kind === 'event') {
         invalidatedMemoryIds = invalidateEventContinuity(this, { agentId, memoryId,
           reason: deleted ? '事件已删除，原关联判断失效。' : '事件已恢复，需要重新判断关联。' });
         after = this.getMemory(memoryId);
       }
       if (deleted) {
+        invalidateReportedPreferenceEvidence(this, { agentId, memoryIds: [memoryId], reversible: before.kind === 'utterance' });
+        invalidatePreferenceStateEvidence(this, { agentId, memoryIds: [memoryId] });
         retirePendingMemoryMaintenanceTasks(this, { agentId, memoryId });
         this.database.prepare(`
           DELETE FROM memory_edges
           WHERE agent_id = ? AND provenance = 'association-builder-v1'
             AND (from_memory_id = ? OR to_memory_id = ?)
         `).run(agentId, memoryId, memoryId);
+      } else if (before.kind === 'utterance') {
+        restoreReportedPreferenceEvidence(this, { agentId, memoryId });
+        const observations = this.listStateEvidenceObservations(agentId, { stateFamily: 'preference', memoryId, limit: 1000 });
+        for (const observation of observations) materializePreferenceEvidenceMemory(this, observation);
       }
+      if (before.kind === 'utterance') reconcileReportedStateEvidence(this, { agentId, memoryIds: [memoryId] });
       this.recordMutation({
         agentId,
         memoryId,
@@ -10890,6 +11323,7 @@ export class MemoryRepository {
                 IN ('create', 'supersede', 'pause', 'resume', 'narrow_scope'))
             OR EXISTS (SELECT 1 FROM memory_reported_state_proposals proposal
               WHERE proposal.agent_id = memory_nodes.agent_id AND proposal.review_state = 'pending'
+                AND json_type(proposal.metadata_json, '$.reportedPreferenceApplication') IS NULL
                 AND proposal.id = json_extract(memory_nodes.metadata_json, '$.reportedStateTransitionId'))
           ))` : ""} ${includeHistorical ? "OR (status = 'superseded' AND layer <> 'provisional')" : ""})
       ORDER BY CASE WHEN status = 'active' OR layer = 'provisional' THEN 0 ELSE 1 END,
@@ -11161,25 +11595,35 @@ export class MemoryRepository {
     return this.getMemory(normalizedMemoryId);
   }
 
-  restoreReportedStateTransition({ agentId, proposalId, memoryId, before, applied, actor = "human", reason = "" }) {
+  restoreReportedStateTransition({ agentId, proposalId, memoryId, before, applied, reapply = false, preserveSuspension = false,
+    actor = "human", reason = "" }) {
     const memory = this.getMemory(memoryId);
-    if (!memory || memory.agent_id !== clean(agentId) || memory.status === "deleted") return null;
+    if (!memory || memory.agent_id !== clean(agentId)) return null;
+    const suspendedStatus = preserveSuspension && memory.status === 'deleted' && memory.metadata?.reportedStateSuspendedStatus;
+    if (memory.status === 'deleted' && !suspendedStatus) return null;
+    const after = { ...applied, transitionId: proposalId };
+    const [expected, target] = reapply ? [before, after] : [after, before];
+    const statusOf = snapshot => snapshot.layer === 'provisional' && snapshot.status === 'archived'
+      && memory.layer !== 'provisional' ? 'active' : snapshot.status;
     // A later transition or manual edit owns the state now; never overwrite it.
-    if (memory.metadata?.reportedStateTransitionId !== proposalId
-      || ["status", "state_phase", "temporal_state", "valid_to"].some(key => memory[key] !== applied[key])) return null;
-    const current = this.getCurrentCanonicalMemory({
+    if ((memory.metadata?.reportedStateTransitionId || '') !== expected.transitionId || (suspendedStatus || memory.status) !== statusOf(expected)
+      || ["state_phase", "temporal_state", "valid_to"].some(key => memory[key] !== expected[key])) return null;
+    const current = !suspendedStatus && this.getCurrentCanonicalMemory({
       ...memoryWorldScope(memory), agentId, subjectRole: memory.subject_role,
       subjectKey: memory.subject_key, canonicalKey: memory.canonical_key,
-      representationLayer: "reported", stateFamily: memory.state_family, stateScopeKey: memory.state_scope_key,
+      representationLayer: memory.representation_layer, stateFamily: memory.state_family, stateScopeKey: memory.state_scope_key,
       includePending: true, excludeMemoryId: memory.id });
-    if (current) return null;
+    // Pending comparison can also return the historical row already closed by
+    // this predecessor. That row does not occupy another current slot.
+    if (current && !(current.status === 'superseded' && current.metadata?.reportedStateTransitionId
+      && current.metadata.reportedStateTransitionId === memory.metadata?.reportedStateProposalId)) return null;
     const metadata = { ...memory.metadata };
     delete metadata.reportedStateTransitionId;
-    if (before.transitionId) metadata.reportedStateTransitionId = before.transitionId;
-    const status = before.layer === "provisional" && memory.layer !== "provisional" ? "active" : before.status;
+    if (target.transitionId) metadata.reportedStateTransitionId = target.transitionId;
+    if (suspendedStatus) metadata.reportedStateSuspendedStatus = statusOf(target);
     this.database.prepare(`UPDATE memory_nodes
       SET status = ?, state_phase = ?, temporal_state = ?, valid_to = ?, metadata_json = ?, updated_at = ?
-      WHERE agent_id = ? AND id = ?`).run(status, before.state_phase, before.temporal_state, before.valid_to,
+      WHERE agent_id = ? AND id = ?`).run(suspendedStatus ? 'deleted' : statusOf(target), target.state_phase, target.temporal_state, target.valid_to,
         json(metadata, {}), nowIso(), clean(agentId), memory.id);
     this.syncSearch(memory.id);
     const restored = this.getMemory(memory.id);
@@ -11487,7 +11931,7 @@ export class MemoryRepository {
     confidence = 1,
     provenance = "",
     metadata = {},
-  }) {
+  }, { preserveOtherProvenance = false } = {}) {
     const normalizedAgentId = clean(agentId);
     const normalizedFromMemoryId = clean(fromMemoryId);
     const normalizedToMemoryId = clean(toMemoryId);
@@ -11530,7 +11974,9 @@ export class MemoryRepository {
         confidence = excluded.confidence,
         provenance = excluded.provenance,
         metadata_json = excluded.metadata_json,
-        updated_at = excluded.updated_at
+        updated_at = CASE WHEN excluded.updated_at > memory_edges.updated_at THEN excluded.updated_at
+          ELSE strftime('%Y-%m-%dT%H:%M:%fZ', memory_edges.updated_at, '+0.001 seconds') END
+      ${preserveOtherProvenance ? "WHERE memory_edges.provenance = excluded.provenance" : ""}
     `).run(
       edgeId,
       normalizedAgentId,

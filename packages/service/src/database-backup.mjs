@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { databaseInfo, inputEventContentHash, MemoryRepository, openMemoryDatabase } from "@suzu-memory/core";
+import { databaseInfo, inputEventContentHash, MemoryRepository, openMemoryDatabase, sqliteFilePath } from "@suzu-memory/core";
 
 const BACKUP_FORMAT = "suzu-memory-sqlite-backup-v1";
 
@@ -169,7 +169,7 @@ export function createDatabaseBackup({
   try {
     const repository = new MemoryRepository(database);
     database.exec("PRAGMA wal_checkpoint(FULL)");
-    database.exec(`VACUUM INTO ${sqlString(temporaryPath)}`);
+    database.exec(`VACUUM INTO ${sqlString(sqliteFilePath(temporaryPath))}`);
     repository.sourceEpoch.assert();
   } finally {
     closeDatabase(database);
@@ -211,7 +211,7 @@ function snapshotDatabaseReadOnly(sourcePath, destinationPath) {
     // VACUUM INTO reads the source's current WAL state while writing only the
     // staged destination. This is safer than copying a live .db file and it
     // never mutates the file the user selected.
-    sourceDatabase.exec(`VACUUM INTO ${sqlString(destinationPath)}`);
+    sourceDatabase.exec(`VACUUM INTO ${sqlString(sqliteFilePath(destinationPath))}`);
   } finally {
     closeDatabase(sourceDatabase);
   }

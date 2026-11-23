@@ -93,7 +93,7 @@ test('memory quality diagnostics retain counts without classifying quarantine, r
   });
   assert.deepEqual(diagnostics, { quarantinedMessages: 1, archiveOnlyBatches: 1, failedMaintenancePasses: 1,
     unresolvedExtractionCandidates: 2, incompleteExtractionBatches: 1,
-    pendingWork: 2, failedWork: 3, missingInputEvents: 1, infrastructureFailures: [] });
+    pendingWork: 2, failedWork: 3, missingInputEvents: 1, infrastructureFailures: [], blockingInputFailures: [] });
   assert.equal(summarizeMemoryPreparation([{ memoryDiagnostics: diagnostics }, { memoryDiagnostics: diagnostics }]).quarantinedMessages, 2);
 });
 

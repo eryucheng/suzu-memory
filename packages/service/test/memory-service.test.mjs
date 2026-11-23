@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from 'node:sqlite';
+import { runImmediateMemoryMaintenance } from '@suzu-memory/maintenance';
 
 import {
   MemoryRepository,
@@ -14,6 +15,8 @@ import {
   memoryRetrievalContextSourceHash,
   openMemoryDatabase,
   proposeMemoryStructure,
+  proposeMemoryRelation,
+  validateStructureMembership,
 } from "@suzu-memory/core";
 
 import {
@@ -24,6 +27,148 @@ import {
 function temporaryDirectory() {
   return createTestDirectory(path.join(os.tmpdir(), "suzu-memory-service-"));
 }
+
+test('structure confirmation only records review and the confirmed contribution remains withdrawable', async () => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'structure-withdrawal-owner' };
+  const service = closeAfterTests(createMemoryService(options));
+  const agentId = service.agentId;
+  const candidate = { agentId, kind: 'topic', title: 'Studio visits', content: 'Two visits to the pottery studio.', memberIds: ['a', 'b'] };
+  const { original, savedDuplicate } = service.withRepository(repository => {
+    for (const [id, content] of [['a', 'The first visit to the pottery studio.'], ['b', 'A return visit to the pottery studio.'],
+      ['manual-member', 'A piece was accepted for the museum display.']]) {
+      repository.upsertMemory({ agentId, id, kind: 'event', layer: 'episodic', content });
+    }
+    const original = proposeMemoryStructure(repository, candidate);
+    const savedDuplicate = repository.recordStructureProposal({ ...candidate, id: 'saved-duplicate', proposalHash: 'earlier-plan',
+      content: 'Another summary from the same members.', metadata: { organizationInput: original.metadata.organizationInput } });
+    return { original, savedDuplicate };
+  });
+  const topicId = original.result_memory_id;
+  const embeddingTasks = () => service.withRepository(repository => repository.listMaintenanceTasks(agentId, { taskTypes: ['memory-embedding'] })
+    .filter(task => task.payload.memoryIds.includes(topicId)).map(task => task.id));
+  const queued = embeddingTasks();
+  const confirmed = service.resolveHighLevelProposal('structure', original.id, { action: 'accept', actor: 'confirmed-by' });
+  assert.equal(confirmed.resolution.memory.id, topicId);
+  assert.deepEqual(embeddingTasks(), queued, 'Confirmation must not schedule the already-applied result again.');
+  assert.equal(service.getReviewConsoleProposal('structure', original.id).permissions.canRevoke, true);
+
+  const manualContent = 'The studio and the museum arranged a display.';
+  service.editMemory(topicId, { content: manualContent });
+  service.withRepository(repository => repository.linkMemoryToTopic({ agentId, topicId, memoryId: 'manual-member', provenance: 'human' }));
+  const withdrawn = service.resolveHighLevelProposal('structure', original.id, { action: 'dismiss', actor: 'withdrawn-by' });
+  assert.equal(withdrawn.resolution.proposal.review_state, 'dismissed');
+  assert.equal(withdrawn.resolution.proposal.metadata.structureConfirmation.resolvedBy, 'confirmed-by');
+  const reopened = closeAfterTests(createMemoryService(options));
+  assert.equal(reopened.initialize().status, 'ready');
+  assert.equal(reopened.getMemory(topicId).memory.content, manualContent);
+  const recalled = await reopened.search('studio museum display', { anchors: [topicId], persistTrace: false });
+  assert.ok(recalled.graph.selectedMemoryIds.includes(topicId));
+  reopened.withRepository(repository => {
+    const recovered = repository.getStructureProposal(agentId, savedDuplicate.id);
+    assert.equal(recovered.review_state, 'dismissed');
+    assert.equal(recovered.result_memory_id, null);
+    assert.deepEqual(repository.listTopicMembers({ agentId, topicId }).map(memory => memory.id), ['manual-member']);
+    const repeated = { ...candidate, memberIds: ['b', 'a'], title: 'Pottery studio visits', content: 'A pair of studio visits.' };
+    assert.equal(proposeMemoryStructure(repository, repeated).id, original.id);
+    assert.throws(() => validateStructureMembership(repository, repeated), { code: 'MEMORY_STRUCTURE_WITHDRAWN' });
+    repository.editMemoryManually({ agentId, memoryId: 'a', patch: { content: 'The first visit included a new ceramics exhibition.' } });
+    assert.notEqual(proposeMemoryStructure(repository, repeated).id, original.id, 'A new version of the underlying evidence can be evaluated.');
+  });
+});
+
+test('organization service reruns both phases for changed evidence, including restore, and reuses unchanged results', async () => {
+  const service = closeAfterTests(createMemoryService({ dataRoot: temporaryDirectory(), agentId: 'organization-owner' }));
+  const agentId = service.agentId;
+  const originals = { closed: 'The museum was closed.', cancelled: 'Lin cancelled the visit.' };
+  const source = { agentId, sourceKind: 'conversation', externalId: 'visit', recordedAt: '2026-10-01T00:00:00Z',
+    content: 'Because the museum was closed, Lin cancelled the visit.' };
+  service.withRepository(repository => {
+    const evidence = repository.upsertSource(source);
+    for (const [id, content] of Object.entries(originals)) {
+      repository.upsertMemory({ agentId, id, kind: 'event', layer: 'episodic', content, subjectRole: 'user', subjectKey: 'Lin' });
+      repository.linkSource(id, evidence.id);
+    }
+    runImmediateMemoryMaintenance({ repository, agentId, batchId: 'first-pass', memoryIds: Object.keys(originals),
+      followUpTaskTypes: ['structure-proposal'], planConsolidation: false });
+  });
+  const calls = [];
+  const generator = async request => { calls.push(request); return { output: { proposals: [] } }; };
+  const run = () => service.runSemanticMaintenance({ processInputEvents: false, generator: null, structureGenerator: generator,
+    retrievalContextGenerator: null, minimumStructureMemories: 2, maximumTasks: 20 });
+  const bothPhases = async () => {
+    const start = calls.length;
+    await run();
+    assert.deepEqual(calls.slice(start).map(request => request.schemaName).sort(),
+      ['memory-relation-proposals-v2', 'memory-structure-proposals-v2']);
+  };
+  await bothPhases();
+  await run();
+  assert.equal(calls.length, 2);
+  for (const id of Object.keys(originals)) service.editMemory(id, { importance: 0.9 });
+  await run();
+  assert.equal(calls.length, 2, 'Score-only edits must not regenerate organization.');
+  for (const id of Object.keys(originals)) service.editMemory(id, { content: `Correction: ${id} happened for another reason.` });
+  await bothPhases();
+  for (const [id, content] of Object.entries(originals)) service.editMemory(id, { content });
+  await bothPhases();
+  for (const id of Object.keys(originals)) service.deleteMemory(id);
+  for (const id of Object.keys(originals)) service.restoreMemory(id);
+  await bothPhases();
+  service.withRepository(repository => repository.upsertSource({ ...source, content: 'Correction: the visit was cancelled because of rain.' }));
+  await bothPhases();
+  assert.match(calls.at(-1).input, /because of rain/);
+  service.withRepository(repository => repository.upsertSource(source));
+  await bothPhases();
+  const count = calls.length;
+  service.withRepository(repository => repository.upsertSource(source));
+  await run();
+  assert.equal(calls.length, count, 'An identical source write must not trigger another generation.');
+  const plans = service.withRepository(repository => repository.listConsolidationRuns(agentId));
+  assert.equal(plans.filter(plan => plan.status === 'no_proposals').length, 6);
+});
+
+test('service applies causal maintenance without review and recovers an unapplied result before normal recall', async () => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'causal-owner' };
+  const service = closeAfterTests(createMemoryService(options));
+  const agentId = service.agentId;
+  const source = service.withRepository(repository => {
+    const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: 'closure',
+      content: 'Because the access gate failed, the museum visit was cancelled.' });
+    for (const [id, content] of [['cause', 'The access gate failed.'], ['effect', 'The museum visit was cancelled.']]) {
+      repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+      repository.linkSource(id, source.id);
+    }
+    runImmediateMemoryMaintenance({ repository, agentId, batchId: 'causal', memoryIds: ['cause', 'effect'],
+      followUpTaskTypes: ['structure-proposal'], planConsolidation: false });
+    return source;
+  });
+  const generator = async request => ({ output: { proposals: request.schemaName === 'memory-relation-proposals-v2'
+    ? [{ relation: 'causes', fromMemoryId: 'cause', toMemoryId: 'effect', evidenceSourceIds: [source.id],
+      confidence: 1, rationale: source.content }] : [] } });
+  await service.runSemanticMaintenance({ processInputEvents: false, generator: null, structureGenerator: generator,
+    retrievalContextGenerator: null, minimumStructureMemories: 2, maximumTasks: 20 });
+  const proposal = service.withRepository(repository => repository.listRelationProposals(agentId)[0]);
+  assert.equal(proposal.review_state, 'pending');
+  assert.ok(proposal.result_edge_id);
+  const recalled = await service.search('museum visit cancelled', { persistTrace: false, reactivate: false });
+  assert.ok(recalled.graph.selectedMemoryIds.includes('cause'));
+  const detail = service.getReviewConsoleProposal('relation', proposal.id);
+  assert.equal(detail.applied, true);
+  service.withRepository((_repository, database) => database.prepare('DELETE FROM memory_edges WHERE id = ?').run(proposal.result_edge_id));
+  const reader = closeAfterTests(createMemoryService({ ...options, readOnly: true }));
+  assert.equal(reader.initialize().pendingRelationMaterialization, null);
+  assert.equal(reader.getHighLevelProposal('relation', proposal.id).proposal.result_edge_id, null);
+  const restarted = closeAfterTests(createMemoryService(options));
+  assert.equal(restarted.initialize().pendingRelationMaterialization.materialized, 1);
+  assert.equal(restarted.getHighLevelProposal('relation', proposal.id).proposal.review_state, 'pending');
+  restarted.resolveHighLevelProposal('relation', proposal.id, { action: 'dismiss' });
+  assert.equal(restarted.getReviewConsoleProposal('relation', proposal.id).applied, false);
+  const duplicate = restarted.withRepository(repository => proposeMemoryRelation(repository, { agentId, relation: 'causes',
+    fromMemoryId: 'cause', toMemoryId: 'effect', evidenceSourceIds: [source.id], rationale: 'Repeated result.' }));
+  assert.equal(duplicate.review_state, 'dismissed');
+  const after = await restarted.search('museum visit cancelled', { persistTrace: false, reactivate: false });
+  assert.ok(!after.graph.selectedMemoryIds.includes('cause'));
+});
 
 function seedMemory(service) {
   const database = closeAfterTests(openMemoryDatabase(service.paths.databasePath));
@@ -487,10 +632,7 @@ test("service uses pending structural nodes immediately and confirms them after 
   });
   assert.equal(accepted.resolution.status, "accepted");
   assert.equal(accepted.resolution.memory.kind, "episode");
-  assert.deepEqual(
-    accepted.maintenance.queued.map((task) => task.taskType).sort(),
-    ["memory-embedding"],
-  );
+  assert.deepEqual(accepted.maintenance.queued, []);
   const recalled = await service.search("还记得科技馆和之后的晚饭吗", {
     persistTrace: false,
   });
@@ -963,18 +1105,104 @@ test("service retries a degraded long-term extraction from retained raw events a
   assert.equal(service.listMemories({ statuses: [], kinds: ["event"] }).total, 1);
 });
 
+for (const withdrawLast of [false, true]) test(`whole-batch extraction retry settles its split inputs across restart, withdraw=${withdrawLast}`, async t => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'split-whole-extraction' };
+  t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
+  const service = closeAfterTests(createMemoryService(options));
+  const messages = ['这周去取书。', '明早给小周打电话。', '等收到通知再约时间。', '收到书单了。', '今天先把资料收好。']
+    .slice(0, withdrawLast ? 2 : 5);
+  const maximum = withdrawLast ? 1 : 2;
+  service.appendEvents(messages.map((text, index) => ({ ...inputEvent(`split-retry-${index}`), content: { text } })));
+  const original = await service.processPendingEvents({ generator: async () => {
+    throw Object.assign(new Error('provider temporarily unavailable'), {
+      code: 'MEMORY_PROVIDER_TRANSPORT_EXHAUSTED', transportAttempts: 3,
+    });
+  } });
+  const retryId = original.generationDiagnostics.failureReviewTaskId;
+  const successful = [];
+  const generator = async ({ input }) => {
+    const lines = input.split('\n').filter(line => /^\[M\d{4}\]/u.test(line));
+    if (lines.length > maximum) throw Object.assign(new Error('truncated extraction'), { code: 'MAX_TOKENS' });
+    for (const line of lines) successful.push(messages.find(message => line.includes(message)));
+    return { output: extractionModelFixture({ memories: [] }), usage: {} };
+  };
+  const part = await service.retryLongTermExtractionFailure(retryId, { generator, actor: 'human:test' });
+  assert.equal(part.status, 'retry-partial');
+  assert.equal(part.reviewTask.review_state, 'pending');
+  assert.equal(part.progress.completed, maximum);
+  assert.equal(part.progress.remainingEventIds.length, messages.length - maximum);
+  if (withdrawLast) {
+    const [remaining] = service.listInputEvents({ statuses: ['pending'] }).items;
+    service.reviseEvent(remaining.external_id, { action: 'retract' });
+    assert.equal(service.getReviewConsoleProposal('maintenance-failure', retryId).proposal.review_state, 'accepted');
+  }
+  await service.close();
+
+  const reopened = closeAfterTests(createMemoryService(options));
+  await reopened.runSemanticMaintenance({ generator, structureGenerator: null, maximumInputBatches: 5,
+    chunkPolicy: { maximumCoreCharacters: 12_000, flush: false } });
+  assert.equal(reopened.listInputEvents({ statuses: ['pending'] }).total, 0);
+  assert.deepEqual(successful, withdrawLast ? messages.slice(0, maximum) : messages,
+    'Each remaining input is extracted successfully once, including across the reopen.');
+  const review = reopened.getReviewConsoleProposal('maintenance-failure', retryId).proposal;
+  assert.equal(review.review_state, 'accepted');
+  assert.equal(review.reviewed_by, 'human:test');
+});
+
+for (const during of [false, true]) test(`whole-batch retry preserves source deletion and edits, during=${during}`, async t => {
+  const options = { dataRoot: temporaryDirectory(), agentId: 'retry-original-evidence' };
+  t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
+  const service = closeAfterTests(createMemoryService(options));
+  const texts = ['今天先学了基础规则。', '下午去图书馆取书。', '上午在书店拿到了小说书单。'];
+  service.appendEvents(texts.map((text, index) => ({ ...inputEvent(`retry-source-${index}`), content: { text } })));
+  const original = await service.processPendingEvents({ generator: async () => {
+    throw Object.assign(new Error('provider unavailable'), {
+      code: 'MEMORY_PROVIDER_TRANSPORT_EXHAUSTED', transportAttempts: 3,
+    });
+  } });
+  const utterances = service.listMemories({ kinds: ['utterance'] }).items;
+  const [deleted, edited, kept] = texts.map(text => utterances.find(item => item.content === text));
+  const edit = { content: '更正一下，下午没有去图书馆。' };
+  const mutate = () => {
+    service.deleteMemory(deleted.id);
+    service.editMemory(edited.id, edit);
+  };
+  if (!during) mutate();
+  const requests = [];
+  const retried = await service.retryLongTermExtractionFailure(original.generationDiagnostics.failureReviewTaskId, {
+    generator: async request => {
+      requests.push(request);
+      if (during && requests.length === 1) mutate();
+      const keptCandidate = { ...generatedEventCandidate(), title: '拿到小说书单', content: texts[2],
+        sourceRefs: [during ? 'M0003' : 'M0001'] };
+      const staleCandidate = { ...generatedEventCandidate(), title: '学了规则', content: texts[0],
+        sourceRefs: ['M0001'], confidence: -1 };
+      return { output: extractionModelFixture({ memories: during ? [keptCandidate, staleCandidate] : [keptCandidate] }), usage: {} };
+    },
+  });
+  assert.equal(requests.length, 1, 'Discard stale material before any follow-up generation.');
+  if (!during) assert.ok(texts.slice(0, 2).every(text => !requests[0].input.includes(text)));
+  assert.equal(retried.status, 'retried');
+  assert.equal(retried.result.memoriesStored, 1);
+  assert.equal(retried.progress.withdrawn, 2);
+  assert.equal(service.getMemory(deleted.id).memory.status, 'deleted');
+  assert.equal(service.getMemory(edited.id).memory.content, edit.content);
+  assert.deepEqual(service.getMemory(kept.id).memory, kept);
+});
+
 test('service persists unresolved repair candidates and retries only the remaining candidates', async t => {
   const options = { dataRoot: temporaryDirectory(), agentId: 'partial-extraction-repair',
     defaults: { memoryOwner: 'Companion', userName: 'User' } };
   t.after(() => fs.rmSync(options.dataRoot, { recursive: true, force: true }));
   const service = closeAfterTests(createMemoryService(options));
-  service.appendEvent(inputEvent('repair-persistence'));
+  service.appendEvent({ ...inputEvent('repair-persistence'), content: { text:
+    'User and Companion completed the design and confirmed the input format. In Paris they agreed on the event boundary and separately confirmed the scope. They also completed the review.' } });
   const first = { ...generatedEventCandidate(), title: 'First repaired event', content: 'User and Companion completed the design.' };
-  const second = { ...generatedEventCandidate(), title: 'Second repaired event', content: 'User and Companion agreed on the event boundary.' };
+  const second = { ...generatedEventCandidate(), title: 'Second repaired event', content: 'User and Companion agreed on the event boundary in Paris.' };
   const third = { ...generatedEventCandidate(), title: 'Third repaired event', content: 'User and Companion completed the review.' };
   const firstDetail = { ...first, title: 'First independent detail', content: 'User and Companion separately confirmed the input format.' };
   const secondDetail = { ...second, title: 'Second independent detail', content: 'User and Companion separately confirmed the scope.' };
-  const invalid = memory => ({ ...memory, eventDate: 'last week' });
+  const invalid = memory => ({ ...memory, confidence: -1 });
   let calls = 0;
   const processed = await service.processPendingEvents({ now: '2026-08-04T03:05:00.000Z',
     generator: async request => {
@@ -986,36 +1214,63 @@ test('service persists unresolved repair candidates and retries only the remaini
         return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [first, firstDetail] }] }) };
       }
       assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
-      return { output: { results: [] } };
+      if (calls === 3) {
+        const output = extractionModelFixture({ entities: [{ ref: 'E1', kind: 'place', name: 'Paris', aliases: [] }],
+          results: [{ candidateIndex: 1, status: 'repaired', memories: [second, invalid(secondDetail)] }] });
+        for (const memory of output.results[0].memories) memory.entityRefs = ['E1'];
+        return { output };
+      }
+      assert.deepEqual(candidates[0].draft.memories.map(memory => memory.title), [secondDetail.title]);
+      throw new Error('Transport unavailable after a partially repaired split.');
     } });
   assert.equal(calls, 4);
   assert.equal(processed.generationDiagnostics.degraded, true);
   assert.equal(processed.generationDiagnostics.unresolvedCandidateCount, 2);
   assert.ok(processed.generationDiagnostics.failureReviewTaskId);
-  assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 2);
+  const stored = service.listMemories({ statuses: [], kinds: ['event'] }).items;
+  assert.deepEqual(new Set(stored.map(memory => memory.title)), new Set([first.title, firstDetail.title, second.title]));
+  const secondId = stored.find(memory => memory.title === second.title).id;
   const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
   assert.deepEqual(review.proposal.payload.extractionRepair.candidates.map(item => item.index), [1, 2]);
+  const saved = review.proposal.payload.extractionRepair.candidates[0];
+  const original = service.getMemory(review.proposal.payload.memoryIds[0]);
+  assert.deepEqual(saved.draft.memories.map(memory => memory.title), [secondDetail.title]);
+  assert.equal(saved.draft.entities, undefined);
+  assert.deepEqual(review.proposal.payload.extractionRepair.entities.map(entity => entity.ref), ['E1']);
+  assert.match(saved.reason, /confidence/);
+  assert.match(review.proposal.payload.extractionRepair.requestFailures[0].reason, /Transport unavailable/u);
   const batch = service.listInputBatches()[0];
   assert.equal(batch.output.degraded, true);
   assert.equal(batch.output.unresolvedCandidateCount, 2);
+  await service.close();
   const resumed = closeAfterTests(createMemoryService(options));
   let retryCalls = 0;
   const partial = await resumed.retryLongTermExtractionFailure(review.id, { now: '2026-08-04T03:10:00.000Z',
     generator: async request => {
       retryCalls++;
       assert.equal(request.schemaName, 'long-term-memory-extraction-repair-v5');
-      const candidates = JSON.parse(request.input).candidates;
+      const { candidates, entities } = JSON.parse(request.input);
       if (retryCalls > 1) {
         assert.deepEqual(candidates.map(item => item.candidateIndex), [2]);
         return { output: { results: [] } };
       }
       assert.deepEqual(candidates.map(item => item.candidateIndex), [1, 2]);
-      assert.equal(candidates[0].candidate.title, second.title);
-      return { output: extractionModelFixture({ results: [{ candidateIndex: 1, status: 'repaired', memories: [second, secondDetail] }] }) };
+      assert.deepEqual(candidates[0].draft, saved.draft);
+      assert.match(candidates[0].validationError, /confidence/);
+      assert.doesNotMatch(request.input, /Transport unavailable/u);
+      assert.match(candidates[1].responseFeedback, /omitted this candidateIndex/u);
+      const memories = candidates[0].draft.memories;
+      assert.deepEqual(memories[0].entityRefs, ['E1']);
+      assert.deepEqual(entities.map(entity => entity.ref), ['E1']);
+      memories[0].confidence = secondDetail.confidence;
+      // The persisted declaration can be reused without repeating it in the model response.
+      return { output: { results: [{ candidateIndex: 1, status: 'repaired', memories }] } };
     } });
   assert.equal(retryCalls, 3);
   assert.equal(partial.status, 'retry-degraded');
+  assert.equal(partial.result.messagesArchived, 0);
   assert.deepEqual(partial.reviewTask.payload.extractionRepair.candidates.map(item => item.index), [2]);
+  assert.deepEqual(partial.reviewTask.payload.extractionRepair.entities.map(entity => entity.ref), ['E1']);
   assert.equal(resumed.listHighLevelProposals({ types: ['maintenance-failure'] }).items.length, 1);
   const retried = await resumed.retryLongTermExtractionFailure(partial.reviewTask.id, { now: '2026-08-04T03:15:00.000Z',
     generator: async request => {
@@ -1023,6 +1278,11 @@ test('service persists unresolved repair candidates and retries only the remaini
       return { output: extractionModelFixture({ results: [{ candidateIndex: 2, status: 'repaired', memories: [third] }] }) };
     } });
   assert.equal(retried.status, 'retried');
+  assert.equal(retried.result.messagesArchived, 0);
+  const reused = resumed.getMemory(original.memory.id);
+  assert.equal(reused.memory.recorded_at, original.memory.recorded_at);
+  assert.equal(reused.sources[0].recorded_at, original.sources[0].recorded_at);
+  assert.equal(resumed.getMemory(retried.result.candidateResults[0].memoryId).sources[0].id, original.sources[0].id);
   assert.equal(retried.reviewTask.review_state, 'accepted');
   assert.equal(service.listInputBatches().length, 1);
   assert.equal(service.listInputEvents({ statuses: ['archived'] }).total, 1);
@@ -1033,6 +1293,13 @@ test('service persists unresolved repair candidates and retries only the remaini
   const decisions = resumed.withRepository(repository => repository.listIngestionDecisions(options.agentId,
     { batchId: batch.id, limit: 10 }), { readOnly: true });
   assert.deepEqual(decisions.map(item => item.candidate_index).sort((a, b) => a - b), [0, 1, 2, 3, 4]);
+  const location = resumed.withRepository(repository => {
+    const memory = repository.listMemories(options.agentId, { kinds: ['event'], statuses: [], limit: 20 }).items
+      .find(memory => memory.title === second.title);
+    assert.equal(memory.id, secondId);
+    return repository.listMemoryEntities(memory.id).find(entity => entity.kind === 'place');
+  }, { readOnly: true });
+  assert.equal(location.canonical_name, 'Paris');
 });
 
 test('concurrent split repairs append once and preserve earlier valid records', async t => {
@@ -1079,18 +1346,48 @@ for (const timing of ['before', 'during']) test('candidate repair cannot restore
     defaults: { memoryOwner: 'Companion', userName: 'User' } }));
   service.appendEvent(inputEvent('withdrawn-source'));
   await service.processPendingEvents({ generator: async request => ({ output: extractionModelFixture(request.schemaName === 'long-term-memory-extraction-v4'
-    ? { memories: [{ ...generatedEventCandidate(), eventDate: 'invalid' }] } : { results: [] }) }) });
+    ? { memories: [{ ...generatedEventCandidate(), confidence: -1 }] } : { results: [] }) }) });
   const review = service.listHighLevelProposals({ types: ['maintenance-failure'] }).items[0];
   const retract = () => service.reviseEvent('withdrawn-source', { action: 'retract', reason: 'Source withdrawn.' });
   if (timing === 'before') retract();
   let calls = 0;
-  await assert.rejects(service.retryLongTermExtractionFailure(review.id, { generator: async () => {
+  const retried = await service.retryLongTermExtractionFailure(review.id, { generator: async () => {
     calls++;
     if (timing === 'during') retract();
     return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [generatedEventCandidate()] }] }) };
-  } }), /Only active archived/);
+  } });
+  assert.equal(retried.status, 'source-invalidated');
+  assert.equal(retried.reviewTask.review_state, 'dismissed');
   assert.equal(calls, timing === 'before' ? 0 : 1);
   assert.equal(service.listMemories({ statuses: [], kinds: ['event'] }).total, 0);
+});
+
+test('candidate retry archives remaining evidence after other sources in the window change', async t => {
+  const dataRoot = temporaryDirectory();
+  t.after(() => fs.rmSync(dataRoot, { recursive: true, force: true }));
+  const service = closeAfterTests(createMemoryService({ dataRoot, agentId: 'independent-repair-sources',
+    defaults: { memoryOwner: 'Companion', userName: 'User' } }));
+  const texts = ['I completed the kiln inspection.', 'I paid for a pottery class.', 'This is unrelated background.'];
+  texts.forEach((text, index) => service.appendEvent({ ...inputEvent(`repair-${index}`),
+    occurredAt: `2026-08-04T03:0${index}:00.000Z`, content: { text } }));
+  const rows = texts.slice(0, 2).map((content, index) => ({ ...generatedEventCandidate(), title: content, content,
+    eventDate: '', eventStart: '', sourceRefs: [`M000${index + 1}`] }));
+  const first = await service.processPendingEvents({ generator: async request => ({ output: extractionModelFixture(
+    request.schemaName === 'long-term-memory-extraction-v4' ? { memories: rows.map(row => ({ ...row, confidence: -1 })) }
+      : { results: [] }) }) });
+  const reviewId = first.generationDiagnostics.failureReviewTaskId;
+  assert.ok(reviewId);
+  service.reviseEvent('repair-2', { action: 'retract' });
+  const withdrawn = service.listMemories({ kinds: ['utterance'] }).items.find(memory => memory.content === texts[1]);
+  service.deleteMemory(withdrawn.id);
+  const retried = await service.retryLongTermExtractionFailure(reviewId, { generator: async request => {
+    const input = JSON.parse(request.input);
+    assert.deepEqual(input.candidates.map(item => item.candidateIndex), [0]);
+    assert.deepEqual(input.sourceMessages.map(item => item.text), [texts[0]]);
+    return { output: extractionModelFixture({ results: [{ candidateIndex: 0, status: 'repaired', memories: [rows[0]] }] }) };
+  } });
+  assert.equal(retried.status, 'retried');
+  assert.deepEqual(service.listMemories({ kinds: ['event'] }).items.map(memory => memory.content), [texts[0]]);
 });
 
 test("service carries configured identities from input through archive into entity-seeded recall", async () => {
@@ -1259,9 +1556,10 @@ test("a recoverable semantic failure does not prevent the embedding lane from ru
   assert.equal(result.embedding.report.added, 1);
 });
 
-test("service creates verified backups and restores them with an automatic safety snapshot", () => {
+for (const depth of ['normal', 'deep']) test(`service creates verified backups and restores them with an automatic safety snapshot: ${depth}`, () => {
+  const root = temporaryDirectory();
   const service = closeAfterTests(createMemoryService({
-    dataRoot: temporaryDirectory(),
+    dataRoot: depth === 'deep' ? path.join(root, 'nested-' + 'x'.repeat(150), 'child-' + 'y'.repeat(80)) : root,
     agentId: "agent-test",
   }));
   service.initialize();

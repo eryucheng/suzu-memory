@@ -55,6 +55,7 @@ export function retirePendingMemoryMaintenanceTasks(repository, { agentId, memor
       result_json = ?, error_message = ''
     WHERE agent_id = ? AND status = 'pending'
       AND task_type IN ('memory-embedding', 'retrieval-context', 'structure-proposal', 'structure-summary', 'event-continuity')
+      AND json_type(result_json, '$.structureBatch') IS NULL
       AND json_array_length(payload_json, '$.memoryIds') = 1
       AND json_extract(payload_json, '$.memoryIds[0]') = ?
   `).run(new Date().toISOString(), new Date().toISOString(),

@@ -1,7 +1,10 @@
 import { memoryWorldScope, commonMemoryWorld } from './ontology.mjs';
 import { enqueueMemoryMaintenanceTasks, MAINTENANCE_TASK_TYPES } from './maintenance-tasks.mjs';
 import { createHash } from "node:crypto";
-import { readStateAnalysisSemanticMemory } from './reported-state-policy.mjs';
+import { readStateAnalysisSemanticMemory, recordStateClosure } from './reported-state-policy.mjs';
+import { syncMemoryRelationshipMemberships } from './relationship-structure.mjs';
+import { updateAssociationGraph } from './association-graph.mjs';
+import { invalidatePreferenceEvidenceMemories } from './preference-evidence-memory.mjs';
 
 import {
   NON_STATE_SCOPE_KEY,
@@ -39,6 +42,14 @@ const SUPPORT_SIGNALS = new Set([
   "voluntary_acceptance",
 ]);
 const OPPOSITION_SIGNALS = new Set(["explicit_rejection", "counter_behavior"]);
+
+export class PreferenceStateValidationError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = 'PreferenceStateValidationError';
+    this.code = 'MEMORY_PREFERENCE_STATE_VALIDATION_FAILED';
+  }
+}
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -108,11 +119,11 @@ function directionForEvidence(item) {
   return "neutral";
 }
 
-function preferenceEvidenceSnapshot(detail, { memoryId, sourceIds }) {
-  if (!detail?.memory) throw new Error(`Preference proposal evidence ${memoryId} is unavailable.`);
+export function preferenceEvidenceSnapshot(detail, { memoryId, sourceIds }) {
+  if (!detail?.memory) throw new PreferenceStateValidationError(`Preference proposal evidence ${memoryId} is unavailable.`);
   const sources = new Map(detail.sources.map((source) => [source.id, source]));
   if (sourceIds.some((sourceId) => !sources.has(sourceId))) {
-    throw new Error(`Preference proposal evidence ${memoryId} references an unrelated source.`);
+    throw new PreferenceStateValidationError(`Preference proposal evidence ${memoryId} references an unrelated source.`);
   }
   const memory = detail.memory;
   return canonicalHash({
@@ -160,26 +171,43 @@ function preferenceEvidenceSnapshot(detail, { memoryId, sourceIds }) {
   });
 }
 
-function normalizeEvidence(repository, { agentId, subjectRole, subjectKey, evidence }) {
+function normalizeEvidence(repository, { agentId, subjectRole, subjectKey, canonicalKey, evidence, observationHashes }) {
   const seen = new Set();
   return (Array.isArray(evidence) ? evidence : []).map((item, index) => {
     const memoryId = clean(item?.memoryId ?? item?.memory_id);
     const memory = repository.getMemory(memoryId);
     if (!memoryId || !memory || memory.agent_id !== agentId || memory.status === "deleted") {
-      throw new Error(`Preference proposal evidence ${index} must exist for the same Agent.`);
-    }
-    if (memory.subject_role !== subjectRole || memory.subject_key !== subjectKey) {
-      throw new Error(`Preference proposal evidence ${memoryId} belongs to a different subject.`);
+      throw new PreferenceStateValidationError(`Preference proposal evidence ${index} must exist for the same Agent.`);
     }
     if (seen.has(memoryId)) {
-      throw new Error(`Preference proposal evidence repeats memoryId: ${memoryId}`);
+      throw new PreferenceStateValidationError(`Preference proposal evidence repeats memoryId: ${memoryId}`);
     }
     seen.add(memoryId);
     const evidenceGroupId = clean(item?.evidenceGroupId ?? item?.evidence_group_id);
     const signal = clean(item?.signal);
     const sourceIds = cleanStringList(item?.sourceIds ?? item?.source_ids).sort();
     if (!evidenceGroupId || !signal || !sourceIds.length) {
-      throw new Error(`Preference proposal evidence ${memoryId} requires a group, signal, and direct sources.`);
+      throw new PreferenceStateValidationError(`Preference proposal evidence ${memoryId} requires a group, signal, and direct sources.`);
+    }
+    const direction = directionForEvidence(item);
+    const confidence = bounded(item?.confidence, 0.5);
+    if (memory.subject_role !== subjectRole || memory.subject_key !== subjectKey) {
+      // Raw speech retains its speaker. A qualified observation can establish
+      // a different holder for the accumulated behavior and its exact sources.
+      const observationId = clean(item?.observationId);
+      const expectedHash = observationHashes?.get(observationId);
+      const observation = expectedHash ? repository.getStateEvidenceObservation(agentId, observationId) : null;
+      if (memory.status !== "active" || !observation || observation.observation_hash !== expectedHash
+        || observation.lifecycle !== "current" || observation.qualification !== "qualified"
+        || observation.state_family !== "preference" || observation.scope?.currentRepresentationLayer !== "inferred"
+        || observation.subject_role !== subjectRole || observation.subject_key !== subjectKey
+        || observation.canonical_key !== canonicalKey || observation.memory_id !== memoryId
+        || signal.startsWith("explicit_") || observation.signal !== signal
+        || observation.effective_direction !== direction || observation.confidence !== confidence
+        || observation.sourceIds.length !== sourceIds.length
+        || observation.sourceIds.some(sourceId => !sourceIds.includes(sourceId))) {
+        throw new PreferenceStateValidationError(`Preference proposal evidence ${memoryId} belongs to a different subject.`);
+      }
     }
     const evidenceSnapshotHash = preferenceEvidenceSnapshot(repository.getMemoryDetail(agentId, memoryId), {
       memoryId,
@@ -190,8 +218,8 @@ function normalizeEvidence(repository, { agentId, subjectRole, subjectKey, evide
       evidenceGroupId,
       contextId: clean(item?.contextId ?? item?.context_id),
       signal,
-      direction: directionForEvidence(item),
-      confidence: bounded(item?.confidence, 0.5),
+      direction,
+      confidence,
       sourceIds,
       evidenceSnapshotHash,
       knownAt: memory.known_at || memory.event_start || memory.recorded_at,
@@ -202,6 +230,7 @@ function normalizeEvidence(repository, { agentId, subjectRole, subjectKey, evide
 
 function transitionFor({ currentLevel, proposedLevel, previewStatus, evidenceReviewMode, scopeChange }) {
   if (!currentLevel) return "create";
+  if (proposedLevel === "no_conclusion" && evidenceReviewMode === "full_canonical") return "downgrade";
   if (CHALLENGE_PREVIEWS.has(previewStatus)) return "challenge";
   if (previewStatus === "behavioral-opposition" && evidenceReviewMode !== "full_canonical") {
     return "challenge";
@@ -284,21 +313,21 @@ function validateStateEvidence({ proposedLevel, transition, evidence }) {
   const opposition = evidence.filter((item) => item.direction === "opposition");
   if (transition === "challenge") {
     if (!opposition.length) {
-      throw new Error("A preference challenge requires opposition evidence.");
+      throw new PreferenceStateValidationError("A preference challenge requires opposition evidence.");
     }
     return;
   }
   if (["direct_preference"].includes(proposedLevel)
     && !support.some((item) => item.signal === "explicit_preference")) {
-    throw new Error("A direct preference proposal requires explicit preference evidence.");
+    throw new PreferenceStateValidationError("A direct preference proposal requires explicit preference evidence.");
   }
   if (proposedLevel === "explicit_rejection"
     && !opposition.some((item) => item.signal === "explicit_rejection")) {
-    throw new Error("An explicit rejection proposal requires explicit rejection evidence.");
+    throw new PreferenceStateValidationError("An explicit rejection proposal requires explicit rejection evidence.");
   }
   if (["situational_tolerance", "selection_tendency", "stable_preference"].includes(proposedLevel)
     && !support.length) {
-    throw new Error("A positive preference state proposal requires supporting evidence.");
+    throw new PreferenceStateValidationError("A positive preference state proposal requires supporting evidence.");
   }
 }
 
@@ -323,19 +352,25 @@ export function proposePreferenceState(repository, input = {}) {
     || !["bounded", "full_canonical"].includes(evidenceReviewMode)
     || representationLayer !== expectedRepresentationLayer
     || !isValidStateScopeKey(stateScopeKey) || stateScopeKey === NON_STATE_SCOPE_KEY) {
-    throw new Error("Preference state proposal target is incomplete.");
+    throw new PreferenceStateValidationError("Preference state proposal target is incomplete.");
   }
   if (representationLayer === "established") {
     throw new Error("Established preference requires the dedicated cross-layer promotion policy.");
   }
+  const metadata = object(input.metadata);
+  const observationHashes = representationLayer === "inferred" && evidenceReviewMode === "full_canonical"
+    && metadata.accumulatedPreference === true && Array.isArray(metadata.observationHashes)
+    ? new Map(metadata.observationHashes.map(item => [item?.id, item?.hash])) : null;
   const evidence = normalizeEvidence(repository, {
     agentId,
     subjectRole,
     subjectKey,
+    canonicalKey,
     evidence: input.evidence,
+    observationHashes,
   });
-  if (!evidence.length) throw new Error("Preference state proposal requires evidence.");
-  const world = preferenceProposalWorld(repository, { agent_id: agentId, subject_role: subjectRole, subject_key: subjectKey, canonical_key: canonicalKey, metadata: object(input.metadata), evidence });
+  if (!evidence.length) throw new PreferenceStateValidationError("Preference state proposal requires evidence.");
+  const world = preferenceProposalWorld(repository, { agent_id: agentId, subject_role: subjectRole, subject_key: subjectKey, canonical_key: canonicalKey, metadata, evidence });
   const current = repository.getCurrentCanonicalMemory({
     ...world,
     agentId,
@@ -348,7 +383,7 @@ export function proposePreferenceState(repository, input = {}) {
   });
   const requestedPreviousMemoryId = clean(input.previousMemoryId);
   if (requestedPreviousMemoryId && requestedPreviousMemoryId !== current?.id) {
-    throw new Error("Preference state proposal does not target the current canonical state.");
+    throw new PreferenceStateValidationError("Preference state proposal does not target the current canonical state.");
   }
   const currentLevel = inferredLevel(current);
   const transition = transitionFor({
@@ -366,18 +401,18 @@ export function proposePreferenceState(repository, input = {}) {
   }
   if (["challenge", "reinforce", "promote", "downgrade", "narrow_scope", "replace_explicit"]
     .includes(transition) && !current) {
-    throw new Error(`Preference transition ${transition} requires a current state.`);
+    throw new PreferenceStateValidationError(`Preference transition ${transition} requires a current state.`);
   }
   if (["downgrade", "narrow_scope"].includes(transition)
     && evidenceReviewMode !== "full_canonical") {
-    throw new Error("Preference downgrade requires a full canonical evidence review.");
+    throw new PreferenceStateValidationError("Preference downgrade requires a full canonical evidence review.");
   }
   validateStateEvidence({ proposedLevel, transition, evidence });
   const timestamps = evidence.map((item) => item.knownAt);
   const knownAt = latestTimestamp([input.knownAt, ...timestamps]);
   const validFrom = latestTimestamp([input.validFrom, knownAt], knownAt);
   if (current?.valid_from && validFrom < current.valid_from) {
-    throw new Error("Preference proposal cannot predate the current state validity.");
+    throw new PreferenceStateValidationError("Preference proposal cannot predate the current state validity.");
   }
   const proposedKind = stateKind(proposedLevel);
   const scope = object(input.scope);
@@ -421,7 +456,7 @@ export function proposePreferenceState(repository, input = {}) {
     rationale: clean(input.rationale),
     provenance: clean(input.provenance) || "preference-state-proposal-v1",
     evidence,
-    metadata: object(input.metadata),
+    metadata,
     createdAt: clean(input.createdAt) || new Date().toISOString(),
   };
   const hash = proposalHash(candidate);
@@ -429,10 +464,10 @@ export function proposePreferenceState(repository, input = {}) {
     .update(`${agentId}\u001f${hash}`)
     .digest("hex")
     .slice(0, 24)}`;
-  return repository.recordPreferenceStateProposal({
-    ...candidate,
-    id,
-    proposalHash: hash,
+  return repository.transaction(() => {
+    const saved = repository.recordPreferenceStateProposal({ ...candidate, id, proposalHash: hash });
+    const result = applyPreferenceState(repository, saved, { recompute: true });
+    return { ...result.proposal, wasInserted: saved.wasInserted };
   });
 }
 
@@ -448,15 +483,15 @@ function preferenceProposalWorld(repository, proposal) {
     const observations = observationIds.map(id => repository.getStateEvidenceObservation(proposal.agent_id, id));
     if (observations.some(item => !item || item.state_family !== 'preference' || item.subject_role !== proposal.subject_role
       || item.subject_key !== proposal.subject_key || item.canonical_key !== proposal.canonical_key)) {
-      throw new Error('Preference proposal observation escaped its fixed target.');
+      throw new PreferenceStateValidationError('Preference proposal observation escaped its fixed target.');
     }
     const world = commonMemoryWorld(observations.map(item => item.world));
-    if (!world) throw new Error('Preference proposal observations cross incompatible worlds.');
+    if (!world) throw new PreferenceStateValidationError('Preference proposal observations cross incompatible worlds.');
     return world;
   }
   const memories = proposal.evidence.map(item => repository.getMemory(item.memoryId));
   const world = commonMemoryWorld(memories, semantic);
-  if (!world) throw new Error('Preference proposal evidence crosses incompatible worlds.');
+  if (!world) throw new PreferenceStateValidationError('Preference proposal evidence crosses incompatible worlds.');
   return world;
 }
 
@@ -472,7 +507,7 @@ function currentStateForProposal(repository, proposal) {
     stateScopeKey: proposal.state_scope_key,
   });
   if ((current?.id || "") !== (proposal.previousMemoryId || "")) {
-    throw new Error("Preference state changed after proposal creation; review it again.");
+    throw new PreferenceStateValidationError("Preference state changed after proposal creation; review it again.");
   }
   return current;
 }
@@ -531,8 +566,9 @@ function validateCanonicalReviewSnapshot(repository, proposal) {
   }
 }
 
-function attachEvidence(repository, proposal, targetMemory, { pending = false } = {}) {
-  const provenance = pending ? "pending-preference-state-proposal-v1" : "accepted-preference-state-proposal-v1";
+function attachEvidence(repository, proposal, targetMemory) {
+  const provenance = 'preference-state-proposal-v1';
+  const attachedSources = repository.listMemorySources(targetMemory.id);
   const entityIds = new Set();
   for (const item of proposal.evidence) {
     const evidenceDetail = repository.getMemoryDetail(proposal.agent_id, item.memoryId);
@@ -549,6 +585,9 @@ function attachEvidence(repository, proposal, targetMemory, { pending = false } 
     const sources = new Map((evidenceDetail?.sources || []).map((source) => [source.id, source]));
     for (const sourceId of item.sourceIds) {
       const source = sources.get(sourceId);
+      const existing = attachedSources.find(link => link.id === sourceId
+        && link.relation === `preference_${item.direction}`);
+      if (existing && existing.evidenceMetadata?.preferenceProposalId !== proposal.id) continue;
       repository.linkSource(targetMemory.id, sourceId, `preference_${item.direction}`, {
         authority: clean(source?.authority) || "model_inference",
         sourceTrust: bounded(source?.source_trust, 0.5),
@@ -562,6 +601,9 @@ function attachEvidence(repository, proposal, targetMemory, { pending = false } 
         },
       });
     }
+    const existingEdge = repository.findEdge({ agentId: proposal.agent_id, fromMemoryId: targetMemory.id,
+      toMemoryId: item.memoryId, relation });
+    if (existingEdge && existingEdge.metadata?.preferenceProposalId !== proposal.id) continue;
     repository.upsertEdge({
       agentId: proposal.agent_id,
       fromMemoryId: targetMemory.id,
@@ -582,221 +624,220 @@ function attachEvidence(repository, proposal, targetMemory, { pending = false } 
   repository.linkMemoryEntities({ memoryId: targetMemory.id, entityIds: [...entityIds] });
 }
 
+
 function provisionalPreferenceId(proposal) {
-  return `pending-preference-${canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24)}`;
+  return 'pending-preference-' + canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24);
+}
+
+function preferenceVersion(memory) {
+  return canonicalHash([memory.id, memory.title, memory.content, memory.layer, memory.kind,
+    memory.subject_role, memory.subject_key, memory.canonical_key, memory.state_scope_key,
+    memory.representation_layer, memoryWorldScope(memory), memory.valid_from,
+    memory.metadata?.preferenceStateLevel, memory.metadata?.observationHashes]);
+}
+
+export function appliedPreferenceStateMemory(repository, proposal, { includeDeleted = false } = {}) {
+  if (!proposal?.resultMemoryId || proposal.review_state === 'dismissed') return null;
+  const memory = repository.getMemory(proposal.resultMemoryId);
+  if (!memory || memory.agent_id !== proposal.agent_id || (!includeDeleted && memory.status === 'deleted')) return null;
+  const application = proposal.metadata?.preferenceApplication;
+  if (application?.version) return !memory.metadata?.manuallyEdited
+    && application.version === preferenceVersion(memory) ? memory : null;
+  if (application) return memory;
+  return memory.metadata?.preferenceProposalId === proposal.id && memory.title === proposal.title
+    && memory.content === proposal.content && !memory.metadata?.manuallyEdited ? memory : null;
+}
+
+function preserveLegacyPreferenceApplication(repository, proposal, memory) {
+  if (!proposal || proposal.review_state !== 'accepted' || proposal.metadata?.preferenceApplication
+    || appliedPreferenceStateMemory(repository, proposal)?.id !== memory.id) return;
+  let transition = null;
+  const previous = proposal.previousMemoryId ? repository.getMemory(proposal.previousMemoryId) : null;
+  const edge = previous && repository.findEdge({ agentId: proposal.agent_id, fromMemoryId: memory.id,
+    toMemoryId: previous.id, relation: 'supersedes' });
+  const earlier = previous?.metadata?.preferenceProposalId
+    ? repository.getPreferenceStateProposal(proposal.agent_id, previous.metadata.preferenceProposalId) : null;
+  if (previous?.status === 'superseded' && previous.valid_to === memory.valid_from
+    && !previous.metadata?.reportedStateTransitionId && edge?.metadata?.preferenceProposalId === proposal.id
+    && earlier?.review_state === 'accepted' && appliedPreferenceStateMemory(repository, earlier)?.id === previous.id) {
+    preserveLegacyPreferenceApplication(repository, earlier, previous);
+    const fields = { layer: previous.layer, status: previous.status, state_phase: previous.state_phase,
+      temporal_state: previous.temporal_state, valid_to: previous.valid_to };
+    transition = { memoryId: previous.id,
+      before: { ...fields, status: 'active', temporal_state: 'current', valid_to: null, transitionId: '' },
+      applied: fields };
+    repository.updateMemoryMetadata({ agentId: proposal.agent_id, memoryId: previous.id,
+      metadata: { ...previous.metadata, reportedStateTransitionId: proposal.id },
+      reason: 'Recover the owner of the recorded legacy preference closure.' });
+  }
+  repository.database.prepare(`UPDATE memory_preference_state_proposals
+    SET metadata_json=json_set(metadata_json, '$.preferenceApplication', json(?)) WHERE agent_id=? AND id=?`)
+    .run(JSON.stringify({ version: preferenceVersion(memory), ...(transition ? { transition } : {}) }),
+      proposal.agent_id, proposal.id);
+}
+
+function applyPreferenceState(repository, proposal, { recompute = false } = {}) {
+  if (proposal.review_state === 'dismissed') return { status: 'skipped', proposal, memory: null };
+  const applied = appliedPreferenceStateMemory(repository, proposal);
+  const reapply = recompute && proposal.metadata?.preferenceApplication?.invalidated
+    || proposal.metadata?.accumulatedPreference && applied?.status === 'superseded'
+    && !repository.getCurrentCanonicalMemory({ ...memoryWorldScope(applied), agentId: proposal.agent_id,
+      subjectRole: proposal.subject_role, subjectKey: proposal.subject_key, canonicalKey: proposal.canonical_key,
+      stateFamily: 'preference', representationLayer: proposal.representation_layer, stateScopeKey: proposal.state_scope_key });
+  if (proposal.metadata?.preferenceApplication && !reapply) return { status: 'existing', proposal, memory: applied };
+  if (proposal.review_state !== 'pending' && !reapply) return { status: 'existing', proposal, memory: applied };
+  const current = currentStateForProposal(repository, proposal);
+  validateCanonicalReviewSnapshot(repository, proposal);
+  for (const expected of proposal.metadata?.observationHashes || []) {
+    const observation = repository.getStateEvidenceObservation(proposal.agent_id, expected.id);
+    if (!observation || observation.lifecycle !== 'current' || observation.observation_hash !== expected.hash) {
+      throw new PreferenceStateValidationError('Preference evidence changed after accumulation; recompute it.');
+    }
+  }
+  const createsVersion = proposal.metadata?.accumulatedPreference || !['challenge', 'reinforce'].includes(proposal.transition);
+  if (current && createsVersion && repository.listCurrentScopedExceptions({ agentId: proposal.agent_id, rootMemoryId: current.id }).length) {
+    throw new PreferenceStateValidationError('Preference root state has active scoped exceptions; reconcile their evidence before replacing it.');
+  }
+  let memory = current;
+  let transition = null;
+  if (createsVersion) {
+    const preview = repository.getMemory(provisionalPreferenceId(proposal));
+    if (preview?.status === 'deleted' && !reapply) return { status: 'skipped', proposal, memory: null };
+    const memoryId = applied?.id || preview?.id || 'preference-state-' + canonicalHash([proposal.agent_id, proposal.id]).slice(0, 24);
+    memory = repository.upsertMemory({
+      id: memoryId, agentId: proposal.agent_id, kind: proposal.proposed_kind, layer: 'semantic', status: 'active',
+      title: proposal.title, content: proposal.content, subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
+      canonicalKey: proposal.canonical_key, ...preferenceProposalWorld(repository, proposal),
+      evidenceMode: DIRECT_LEVELS.has(proposal.proposed_level) ? 'explicit' : 'inferred',
+      representationLayer: proposal.representation_layer, stateFamily: 'preference', stateScopeKey: proposal.state_scope_key,
+      statePhase: 'active', temporalState: 'current', revisionAction: current ? 'update' : 'add',
+      knownAt: proposal.known_at, validFrom: proposal.valid_from,
+      confidence: proposal.proposed_kind === 'derived_hypothesis' ? Math.min(0.65, proposal.confidence) : proposal.confidence,
+      importance: 0.6,
+      actorRoles: [{ role: 'preference_holder', actorRole: proposal.subject_role, actorKey: proposal.subject_key,
+        isPrimary: true, confidence: proposal.confidence, provenance: 'preference-state-proposal-v1' }],
+      metadata: { ...proposal.metadata, preferenceStateLevel: proposal.proposed_level,
+        preferenceScope: proposal.scope, preferenceScopeLabel: proposal.scope_label, preferenceProposalId: proposal.id,
+        preferencePolicyVersion: proposal.policy_version, preferencePreviewStatus: proposal.preview_status,
+        preferenceTransition: proposal.transition, preferenceMetrics: proposal.metrics },
+    });
+    if (current) {
+      const previousProposal = current.metadata?.preferenceProposalId
+        ? repository.getPreferenceStateProposal(proposal.agent_id, current.metadata.preferenceProposalId) : null;
+      preserveLegacyPreferenceApplication(repository, previousProposal, current);
+      transition = recordStateClosure(repository, proposal, current, () => repository.closeCurrentMemoryState({
+        agentId: proposal.agent_id, memoryId: current.id, validTo: proposal.valid_from,
+      }));
+      repository.upsertEdge({ agentId: proposal.agent_id, fromMemoryId: memory.id, toMemoryId: current.id,
+        relation: 'supersedes', direction: 'directed', weight: 1, confidence: proposal.confidence,
+        provenance: 'preference-state-proposal-v1', metadata: { preferenceProposalId: proposal.id, transition: proposal.transition } });
+    }
+  }
+  attachEvidence(repository, proposal, memory);
+  const application = { ...(createsVersion ? { version: preferenceVersion(memory) } : {}),
+    ...(transition ? { transition } : {}) };
+  repository.database.prepare(
+    "UPDATE memory_preference_state_proposals SET result_memory_id=?, metadata_json=json_set(metadata_json, '$.preferenceApplication', json(?)), updated_at=? WHERE agent_id=? AND id=? AND review_state IN ('pending','accepted')"
+  ).run(memory.id, JSON.stringify(application), new Date().toISOString(), proposal.agent_id, proposal.id);
+  if (createsVersion) {
+    const maintenance = { repository, agentId: proposal.agent_id, memoryIds: [memory.id] };
+    syncMemoryRelationshipMemberships(maintenance);
+    updateAssociationGraph(maintenance);
+    enqueueMemoryMaintenanceTasks({ ...maintenance, batchId: 'preference-state:' + proposal.id,
+      taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding, MAINTENANCE_TASK_TYPES.structureProposal] });
+  }
+  return { status: proposal.transition === 'challenge' ? 'challenge-accepted'
+    : proposal.transition === 'reinforce' ? 'reinforced' : proposal.transition,
+    proposal: repository.getPreferenceStateProposal(proposal.agent_id, proposal.id), memory: repository.getMemory(memory.id), previous: current };
 }
 
 export function materializePreferenceStateProposal(repository, { agentId, proposalId } = {}) {
   const proposal = repository.getPreferenceStateProposal(clean(agentId), proposalId);
-  if (!proposal) throw new Error("Preference state proposal does not exist for this Agent.");
-  if (proposal.representation_layer !== "inferred") throw new Error("Pending preference materialization requires an inferred proposal.");
-  if (proposal.review_state !== "pending") return { status: "skipped", proposal, memory: null };
-  const existing = repository.getMemory(provisionalPreferenceId(proposal));
-  if (existing) return { status: "existing", proposal, memory: existing };
+  if (!proposal) throw new Error('Preference state proposal does not exist for this Agent.');
+  if (proposal.representation_layer !== 'inferred') throw new Error('Preference materialization requires an inferred proposal.');
   return repository.transaction(() => {
-    const world = preferenceProposalWorld(repository, proposal);
-    const memory = repository.upsertMemory({
-      id: provisionalPreferenceId(proposal), agentId: proposal.agent_id,
-      kind: proposal.proposed_kind, layer: "provisional", status: "archived",
-      title: proposal.title, content: proposal.content,
-      subjectRole: proposal.subject_role, subjectKey: proposal.subject_key,
-      canonicalKey: proposal.canonical_key, ...world, evidenceMode: "inferred",
-      representationLayer: "inferred", stateFamily: "preference", stateScopeKey: proposal.state_scope_key,
-      statePhase: "active", temporalState: "current", knownAt: proposal.known_at,
-      validFrom: proposal.valid_from, confidence: Math.min(0.65, proposal.confidence), importance: 0.6,
-      actorRoles: [{ role: "preference_holder", actorRole: proposal.subject_role, actorKey: proposal.subject_key,
-        isPrimary: true, confidence: proposal.confidence, provenance: "pending-preference-state-proposal-v1" }],
-      metadata: { provisional: true, reviewState: "pending", epistemicStatus: "inferred_preference",
-        preferenceProposalId: proposal.id, preferenceStateLevel: proposal.proposed_level,
-        preferenceMetrics: proposal.metrics, preferencePolicyVersion: proposal.policy_version },
-    });
-    attachEvidence(repository, proposal, memory, { pending: true });
-    enqueueMemoryMaintenanceTasks({ repository, agentId: proposal.agent_id,
-      batchId: 'pending-reported-state:' + memory.id, memoryIds: [memory.id],
-      taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding] });
-    return { status: "created", proposal, memory };
+    const result = applyPreferenceState(repository, proposal);
+    return { ...result, status: ['existing', 'skipped'].includes(result.status) ? result.status : 'created' };
   });
 }
 
-function removeProvisionalPreference(repository, proposal, actor) {
-  const memory = repository.getMemory(provisionalPreferenceId(proposal));
-  if (memory && memory.status !== "deleted") repository.setMemoryDeleted({ agentId: proposal.agent_id,
-    memoryId: memory.id, actor, reason: "Preference state proposal resolved." });
+function undoPreferenceState(repository, proposal, memory, erasing) {
+  if (!memory) return null;
+  repository.database.prepare("DELETE FROM memory_edges WHERE agent_id=? AND from_memory_id=? AND json_extract(metadata_json, '$.preferenceProposalId')=?")
+    .run(proposal.agent_id, memory.id, proposal.id);
+  repository.database.prepare("DELETE FROM memory_sources WHERE memory_id=? AND json_extract(metadata_json, '$.preferenceProposalId')=?")
+    .run(memory.id, proposal.id);
+  const application = proposal.metadata?.preferenceApplication;
+  const ownsVersion = application?.version || memory.metadata?.preferenceProposalId === proposal.id;
+  if (ownsVersion) repository.setMemoryDeleted({ agentId: proposal.agent_id, memoryId: memory.id,
+    actor: 'preference-review', reason: 'Preference state withdrawn.' });
+  let owner = proposal;
+  let change = application?.transition;
+  while (change) {
+    const previous = repository.getMemory(change.memoryId);
+    if (!previous) return null;
+    if (previous.status !== 'deleted' && !erasing?.has(previous.id)) return repository.restoreReportedStateTransition({
+      agentId: proposal.agent_id, proposalId: owner.id, ...change, actor: 'preference-review', reason: 'Restore the surviving preference version.',
+    });
+    owner = repository.getPreferenceStateProposal(proposal.agent_id, previous.metadata?.preferenceProposalId);
+    change = owner?.metadata?.preferenceApplication?.transition;
+  }
+  return null;
 }
 
-export function resolvePreferenceStateProposal(repository, {
-  agentId,
-  proposalId,
-  action,
-  resolvedBy = "human",
-  note = "",
-} = {}) {
-  if (!repository) throw new Error("Resolving a preference state proposal requires a repository.");
-  const normalizedAgentId = clean(agentId);
-  const normalizedAction = clean(action);
-  const proposal = repository.getPreferenceStateProposal(normalizedAgentId, proposalId);
-  if (!proposal) throw new Error("Preference state proposal does not exist for this Agent.");
-  if (proposal.review_state !== "pending") {
-    throw new Error(`Preference state proposal is already ${proposal.review_state}.`);
+export function invalidatePreferenceStateEvidence(repository, { agentId, memoryIds = [], observationIds = [], proposalIds = [] }) {
+  if (!memoryIds.length && !observationIds.length && !proposalIds.length) return;
+  invalidatePreferenceEvidenceMemories(repository, { agentId, memoryIds, observationIds });
+  const affected = repository.database.prepare(`SELECT proposal.id FROM memory_preference_state_proposals proposal
+    WHERE proposal.agent_id=? AND proposal.review_state IN ('pending','accepted') AND proposal.result_memory_id IS NOT NULL
+      AND (EXISTS (SELECT 1 FROM memory_preference_proposal_evidence evidence WHERE evidence.proposal_id=proposal.id
+        AND evidence.memory_id IN (SELECT value FROM json_each(?)))
+      OR EXISTS (SELECT 1 FROM json_each(proposal.metadata_json, '$.observationHashes') ref
+        WHERE json_extract(ref.value, '$.id') IN (SELECT value FROM json_each(?)))
+      OR EXISTS (SELECT 1 FROM json_each(proposal.metadata_json, '$.canonicalReview.observationSnapshots') ref
+        WHERE json_extract(ref.value, '$.id') IN (SELECT value FROM json_each(?)))
+      OR proposal.id IN (SELECT value FROM json_each(?)))
+    ORDER BY proposal.created_at DESC, proposal.id DESC`)
+    .all(agentId, JSON.stringify(memoryIds), JSON.stringify(observationIds), JSON.stringify(observationIds), JSON.stringify(proposalIds))
+    .map(({ id }) => repository.getPreferenceStateProposal(agentId, id));
+  const erasing = new Set(affected.filter(proposal => proposal.metadata?.preferenceApplication?.version
+    || repository.getMemory(proposal.resultMemoryId)?.metadata?.preferenceProposalId === proposal.id).map(proposal => proposal.resultMemoryId));
+  for (const proposal of affected) {
+    const memory = appliedPreferenceStateMemory(repository, proposal);
+    repository.database.prepare(`UPDATE memory_preference_state_proposals SET result_memory_id=NULL,
+      metadata_json=json_set(metadata_json, '$.preferenceApplication.invalidated', json('true')), updated_at=?
+      WHERE agent_id=? AND id=?`).run(new Date().toISOString(), agentId, proposal.id);
+    undoPreferenceState(repository, proposal, memory, erasing);
   }
-  if (!["accept", "dismiss"].includes(normalizedAction)) {
-    throw new Error(`Unknown preference state proposal action: ${normalizedAction || "(empty)"}.`);
-  }
-  if (normalizedAction === "dismiss") {
-    return repository.transaction(() => {
-      removeProvisionalPreference(repository, proposal, resolvedBy);
-      return {
-        status: "dismissed",
-        proposal: repository.resolvePreferenceStateProposal({
-          agentId: normalizedAgentId,
-          proposalId: proposal.id,
-          resolution: "dismissed",
-          resolvedBy,
-          note,
-        }),
-        memory: null,
-        previous: proposal.previousMemoryId
-          ? repository.getMemory(proposal.previousMemoryId)
-          : null,
-      };
-    });
-  }
+}
 
+export function resolvePreferenceStateProposal(repository, { agentId, proposalId, action, resolvedBy = 'human', note = '' } = {}) {
+  if (!repository) throw new Error('Resolving a preference state proposal requires a repository.');
+  if (!['accept', 'dismiss'].includes(action)) throw new Error('Unknown preference state proposal action.');
   return repository.transaction(() => {
-    const current = currentStateForProposal(repository, proposal);
-    validateCanonicalReviewSnapshot(repository, proposal);
-    for (const expected of proposal.metadata?.observationHashes || []) {
-      const observation = repository.getStateEvidenceObservation(normalizedAgentId, expected.id);
-      if (!observation || observation.lifecycle !== "current" || observation.observation_hash !== expected.hash) {
-        throw new Error("Preference evidence changed after accumulation; review it again.");
-      }
+    let proposal = repository.getPreferenceStateProposal(clean(agentId), proposalId);
+    if (!proposal) throw new Error('Preference state proposal does not exist for this Agent.');
+    const applied = appliedPreferenceStateMemory(repository, proposal);
+    if (proposal.review_state !== 'pending' && !(action === 'dismiss' && proposal.review_state === 'accepted' && applied)) {
+      throw new Error('Preference state proposal is already ' + proposal.review_state + '.');
     }
-    removeProvisionalPreference(repository, proposal, resolvedBy);
-    if (current && !["challenge", "reinforce"].includes(proposal.transition)
-      && repository.listCurrentScopedExceptions({
-        agentId: normalizedAgentId,
-        rootMemoryId: current.id,
-      }).length) {
-      throw new Error("Preference root state has active scoped exceptions; reattach them before replacing it.");
-    }
-    if (proposal.transition === "challenge") {
-      attachEvidence(repository, proposal, current);
-      return {
-        status: "challenge-accepted",
-        proposal: repository.resolvePreferenceStateProposal({
-          agentId: normalizedAgentId,
-          proposalId: proposal.id,
-          resolution: "accepted",
-          resultMemoryId: current.id,
-          resolvedBy,
-          note,
-        }),
-        memory: current,
-        previous: current,
-      };
-    }
-    if (proposal.transition === "reinforce") {
-      attachEvidence(repository, proposal, current);
-      return {
-        status: "reinforced",
-        proposal: repository.resolvePreferenceStateProposal({
-          agentId: normalizedAgentId,
-          proposalId: proposal.id,
-          resolution: "accepted",
-          resultMemoryId: current.id,
-          resolvedBy,
-          note,
-        }),
-        memory: current,
-        previous: current,
-      };
-    }
-
-    const memoryId = `preference-state-${createHash("sha256")
-      .update(`${normalizedAgentId}\u001f${proposal.id}`)
-      .digest("hex")
-      .slice(0, 24)}`;
-    const memory = repository.upsertMemory({
-      id: memoryId,
-      agentId: normalizedAgentId,
-      kind: proposal.proposed_kind,
-      layer: "semantic",
-      title: proposal.title,
-      content: proposal.content,
-      subjectRole: proposal.subject_role,
-      subjectKey: proposal.subject_key,
-      canonicalKey: proposal.canonical_key,
-      ...preferenceProposalWorld(repository, proposal),
-      evidenceMode: DIRECT_LEVELS.has(proposal.proposed_level) ? "explicit" : "inferred",
-      representationLayer: proposal.representation_layer,
-      stateFamily: "preference",
-      stateScopeKey: proposal.state_scope_key,
-      statePhase: "active",
-      temporalState: "current",
-      revisionAction: current ? "update" : "add",
-      knownAt: proposal.known_at,
-      validFrom: proposal.valid_from,
-      status: "active",
-      confidence: proposal.proposed_kind === "derived_hypothesis"
-        ? Math.min(0.65, proposal.confidence)
-        : proposal.confidence,
-      importance: 0.6,
-      actorRoles: [{
-        role: "preference_holder",
-        actorRole: proposal.subject_role,
-        actorKey: proposal.subject_key,
-        isPrimary: true,
-        confidence: proposal.confidence,
-        provenance: "accepted-preference-state-proposal-v1",
-        metadata: { preferenceProposalId: proposal.id },
-      }],
-      metadata: {
-        ...proposal.metadata,
-        preferenceStateLevel: proposal.proposed_level,
-        preferenceScope: proposal.scope,
-        preferenceScopeLabel: proposal.scope_label,
-        preferenceProposalId: proposal.id,
-        preferencePolicyVersion: proposal.policy_version,
-        preferencePreviewStatus: proposal.preview_status,
-        preferenceTransition: proposal.transition,
-        preferenceMetrics: proposal.metrics,
-      },
-    });
-    attachEvidence(repository, proposal, memory);
-    if (current) {
-      repository.closeCurrentMemoryState({
-        agentId: normalizedAgentId,
-        memoryId: current.id,
-        validTo: proposal.valid_from,
+    if (action === 'dismiss') {
+      const resolved = repository.resolvePreferenceStateProposal({ agentId, proposalId, resolution: 'dismissed', resolvedBy, note });
+      const restored = undoPreferenceState(repository, proposal, applied);
+      const preview = repository.getMemory(provisionalPreferenceId(proposal));
+      if (preview && preview.id !== applied?.id && preview.status !== 'deleted') repository.setMemoryDeleted({
+        agentId, memoryId: preview.id, actor: resolvedBy, reason: 'Preference state withdrawn.',
       });
-      repository.upsertEdge({
-        agentId: normalizedAgentId,
-        fromMemoryId: memory.id,
-        toMemoryId: current.id,
-        relation: "supersedes",
-        direction: "directed",
-        weight: 1,
-        confidence: proposal.confidence,
-        provenance: "accepted-preference-state-proposal-v1",
-        metadata: {
-          preferenceProposalId: proposal.id,
-          transition: proposal.transition,
-        },
-      });
+      return { status: 'dismissed', proposal: resolved, memory: null, restored,
+        previous: proposal.previousMemoryId ? repository.getMemory(proposal.previousMemoryId) : null };
     }
-    return {
-      status: proposal.transition,
-      proposal: repository.resolvePreferenceStateProposal({
-        agentId: normalizedAgentId,
-        proposalId: proposal.id,
-        resolution: "accepted",
-        resultMemoryId: memory.id,
-        resolvedBy,
-        note,
-      }),
-      memory: repository.getMemory(memory.id),
-      previous: current ? repository.getMemory(current.id) : null,
-    };
+    const result = applied ? { memory: applied } : applyPreferenceState(repository, proposal);
+    if (!result.memory) throw new Error('Preference state has no valid result to confirm.');
+    proposal = repository.resolvePreferenceStateProposal({ agentId, proposalId, resolution: 'accepted',
+      resultMemoryId: result.memory.id, resolvedBy, note });
+    return { status: proposal.transition === 'challenge' ? 'challenge-accepted'
+      : proposal.transition === 'reinforce' ? 'reinforced' : proposal.transition,
+      proposal, memory: result.memory, previous: proposal.previousMemoryId ? repository.getMemory(proposal.previousMemoryId) : null };
   });
 }
 

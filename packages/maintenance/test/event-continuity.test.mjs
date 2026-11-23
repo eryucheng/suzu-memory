@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MemoryRepository, openMemoryDatabase, resolveEventContinuityReview, withEventSourceExecution } from '@suzu-memory/core';
+import { MemoryRepository, openMemoryDatabase, rebuildAssociationGraph, resolveEventContinuityReview, withEventSourceExecution } from '@suzu-memory/core';
 import { prepareEventContinuity, applyEventContinuity } from '@suzu-memory/analysis';
 import { createOpenAiCompatibleStructuredGenerator } from '@suzu-memory/providers';
 import { MemoryService, assertMemoryTaskRequest, validateMemoryTaskOutput } from '@suzu-memory/service';
@@ -31,10 +31,11 @@ function fixture(t) {
     validateMemoryTaskOutput(request, output);
     return { output, model: 'test' };
   };
-  function seed(id, { agentId = 'owner', worldId = 'room-a', reality = 'real', worldFrame = 'physical', queue = true } = {}) {
+  function seed(id, { agentId = 'owner', worldId = 'room-a', reality = 'real', worldFrame = 'physical', queue = true,
+    eventDate = null, content = `${id}：我和小明整理同一份书单。` } = {}) {
     const memory = repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic',
-      title: '整理书单', content: `${id}：我和小明整理同一份书单。`, subjectRole: 'agent', subjectKey: agentId,
-      canonicalKey: 'unreliable-model-key', reality, worldId, worldFrame,
+      title: '整理书单', content, subjectRole: 'agent', subjectKey: agentId,
+      canonicalKey: 'unreliable-model-key', reality, worldId, worldFrame, eventDate,
       knownAt: `2026-09-${String(Number(id.replace(/\D/g, '')) || 1).padStart(2, '0')}T08:00:00.000Z` });
     const source = repository.upsertSource({ agentId, sourceKind: 'conversation', externalId: id, content: memory.content });
     repository.linkSource(memory.id, source.id);
@@ -68,6 +69,31 @@ test('event progress shares identity across spaces, preserves records and reuses
   assert.equal(f.embeddings.length, 2);
 });
 
+test('automatic graph refresh preserves evidence-backed event continuity', async t => {
+  const f = fixture(t), agentId = 'owner';
+  const target = f.seed('event-1', { eventDate: '2026-09-02', content: '小林在冰桶旁找回了唐粟的钥匙。' });
+  await f.run();
+  const origin = f.seed('event-2', { eventDate: '2026-09-01', content: '小林回忆那串钥匙前一晚就落在冰桶旁。' });
+  f.setDecision(({ memory, candidates: [previous] }) => ({ memoryId: memory.id, resolution: 'matched',
+    candidateId: previous.id, relation: 'same_thread', memorySourceIds: [memory.sources[0].id],
+    candidateSourceIds: [previous.sources[0].id], rationale: '两条原话指向同一回钥匙遗落。' }));
+  assert.deepEqual((await f.run()).failed, []);
+
+  const pair = { agentId, fromMemoryId: origin.id, toMemoryId: target.id, relation: 'same_thread' };
+  const confirmed = f.repository.findEdge(pair);
+  assert.equal(confirmed.provenance, 'event-continuity-v1');
+  assert.equal(confirmed.metadata.evidenceSourceIds.length, 2);
+
+  const refresh = await runEmbeddingMaintenance({ repository: f.repository, agentId, embeddingProvider: f.embeddingProvider });
+  assert.equal(refresh.status, 'completed');
+  assert.deepEqual(f.repository.findEdge(pair), confirmed);
+  rebuildAssociationGraph({ repository: f.repository, agentId });
+  assert.deepEqual(f.repository.findEdge(pair), confirmed);
+
+  const edited = f.repository.editMemoryManually({ agentId, memoryId: target.id, patch: { title: '唐粟的钥匙在冰桶旁找到' } });
+  assert.ok(edited.eventContinuityInvalidatedMemoryIds.includes(origin.id));
+});
+
 for (const resolution of ['new', 'ambiguous']) test(`similar events remain independent when ${resolution}`, async t => {
   const f = fixture(t);
   f.seed('event-1'); await f.run();
@@ -88,7 +114,7 @@ test('event candidates exclude other owners and incompatible fictional worlds', 
   assert.equal(f.calls.length, 0);
 });
 
-for (const fault of ['changed-source', 'coverage']) test(`stale evidence and incomplete coverage cannot partially apply: ${fault}`, async t => {
+for (const fault of ['changed-source', 'coverage']) test(`stale evidence and an unusable response leave decisions unapplied: ${fault}`, async t => {
   const f = fixture(t);
   f.seed('event-1'); await f.run();
   const next = f.seed('event-2');
@@ -104,6 +130,11 @@ for (const fault of ['changed-source', 'coverage']) test(`stale evidence and inc
   assert.equal(f.repository.getMemory(next.id).canonical_key, next.canonical_key);
   assert.equal(f.repository.getMemory(next.id).metadata.eventContinuity, undefined);
   assert.equal(f.database.prepare("SELECT COUNT(*) AS n FROM memory_edges WHERE provenance = 'event-continuity-v1'").get().n, 0);
+  if (fault === 'coverage') {
+    assert.equal(JSON.parse(result.failed[0].failure_history_json).at(-1).details.errorCode, 'MEMORY_EVENT_CONTINUITY_COVERAGE');
+    await f.run();
+    assert.equal(f.calls.length, 1);
+  }
 });
 
 test('one batch resolves a chain in storage order and uses one matching call', async t => {
@@ -209,34 +240,41 @@ test('the service forwards its configured request limit without requiring a prov
   assert.equal(judged.length, ids.length - 1);
 });
 
-for (const fault of ['missing', 'duplicate', 'unexpected']) test(`coverage diagnostics record ${fault} decisions without partially applying them`, async t => {
+for (const fault of ['missing', 'duplicate', 'unexpected']) test(`keeps valid decisions when the initial response has ${fault} entries`, async t => {
   const f = fixture(t);
   f.seed('event-1'); await f.run();
-  f.seed('event-2', { queue: false }); f.seed('event-3', { queue: false });
-  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ['event-2', 'event-3'] });
-  let calls = 0;
+  const memoryIds = ['event-2', 'event-3', 'event-4', 'event-5'];
+  for (const id of memoryIds) f.seed(id, { queue: false });
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds });
+  const prior = f.repository.getMemory('event-1').metadata.eventContinuity;
+  const defectiveId = memoryIds.at(-1);
+  const calls = [];
   const generator = async request => {
-    calls++;
-    const matches = JSON.parse(request.input).events.map(({ memoryId }) => ({ memoryId, resolution: 'new', candidateId: '',
-      relation: '', memorySourceIds: [], candidateSourceIds: [], rationale: '独立事件。' }));
-    if (fault === 'missing') matches.pop();
-    if (fault === 'duplicate') matches[1] = matches[0];
-    if (fault === 'unexpected') matches.push({ ...matches[0], memoryId: 'unrequested-event' });
+    const input = JSON.parse(request.input);
+    calls.push(input);
+    const memories = new Map(input.memories.map(memory => [memory.id, memory]));
+    const matches = input.events.map(({ memoryId }) => matched(memories.get(memoryId), memories.get('event-1')));
+    if (!input.validationErrors) {
+      if (fault === 'missing') matches.pop();
+      if (fault !== 'missing') matches.push({ memoryId: fault === 'duplicate' ? defectiveId : 'event-1',
+        resolution: 'new', candidateId: '', relation: '', memorySourceIds: [], candidateSourceIds: [], rationale: '这是一件独立事件。' });
+    }
     return { output: { matches } };
   };
-  const result = await runEventContinuityMaintenance({ repository: f.repository, agentId: 'owner', generator, embeddingProvider: f.embeddingProvider });
-  assert.equal(result.failed.length, 1);
-  const failure = JSON.parse(result.failed[0].failure_history_json).at(-1).details;
-  assert.equal(failure.errorCode, 'MEMORY_EVENT_CONTINUITY_COVERAGE');
-  assert.equal(failure.providerDiagnostics.expectedCount, 2);
-  assert.deepEqual(failure.providerDiagnostics.missingMemoryIds, fault === 'unexpected' ? [] : ['event-3']);
-  assert.deepEqual(failure.providerDiagnostics.duplicateMemoryIds, fault === 'duplicate' ? ['event-2'] : []);
-  assert.deepEqual(failure.providerDiagnostics.unexpectedMemoryIds, fault === 'unexpected' ? ['unrequested-event'] : []);
-  for (const id of ['event-2', 'event-3']) assert.equal(f.repository.getMemory(id).metadata.eventContinuity, undefined);
-  assert.equal(result.failed[0].status, 'failed');
-  assert.equal(result.failed[0].review_state, 'pending');
-  await runEventContinuityMaintenance({ repository: f.repository, agentId: 'owner', generator, embeddingProvider: f.embeddingProvider });
-  assert.equal(calls, 1, 'Deterministic coverage errors never repeat the entire model input.');
+  const result = await f.run({ generator });
+  assert.deepEqual(result.failed, []);
+  const part = result.completed[0].result.eventContinuityProgress.parts[0].result;
+  assert.deepEqual(part.coverage.initial, { expectedCount: 4, returnedCount: fault === 'missing' ? 3 : 5,
+    missingMemoryIds: fault === 'missing' ? [defectiveId] : [], duplicateMemoryIds: fault === 'duplicate' ? [defectiveId] : [],
+    unexpectedMemoryIds: fault === 'unexpected' ? ['event-1'] : [] });
+  assert.equal(calls.length, fault === 'unexpected' ? 1 : 2);
+  if (fault !== 'unexpected') {
+    assert.deepEqual(calls[1].events.map(event => event.memoryId), [defectiveId]);
+    assert.equal(calls[1].events[0].allowNew, true);
+    assert.deepEqual(calls[1].validationErrors, [{ memoryId: defectiveId, problems: [`${fault}-decision`] }]);
+  }
+  for (const id of memoryIds) assert.equal(f.repository.getMemory(id).metadata.eventContinuity.targetMemoryId, 'event-1');
+  assert.deepEqual(f.repository.getMemory('event-1').metadata.eventContinuity, prior);
 });
 
 test('a late-arriving account can reference an already stored event with a later knowledge date', async t => {
@@ -300,18 +338,71 @@ test('event input overflow partitions complete events and reuses already prepare
   assert.equal(f.calls.length, 2);
 });
 
+for (const fits of [true, false]) test(`complete event batches use the provider request budget (fits=${fits})`, async t => {
+  const f = fixture(t), ids = [1, 2, 3].map(i => `event-${i}-${'a'.repeat(512)}`);
+  f.seed(ids[0], { content: '小明与我约定整理书单。' }); await f.run();
+  for (const id of ids.slice(1)) f.seed(id, { queue: false, content: '我和小明继续整理此前约定的同一份书单。' });
+  f.generator.measureRequest = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: () => { throw new Error('Only request serialization is used here.'); },
+  }).measureRequest;
+  const prepared = await prepareEventContinuity({ repository: f.repository, agentId: 'owner', memoryIds: ids.slice(1),
+    generator: f.generator, embeddingProvider: f.embeddingProvider });
+  const limit = f.generator.measureRequest(prepared.request) - Number(!fits);
+  assert.ok(prepared.request.input.length + prepared.request.systemPrompt.length + JSON.stringify(prepared.request.schema).length > limit);
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ids.slice(1) });
+  const result = await f.run({ maximumRequestCharacters: limit });
+  assert.equal(result.failed.length, 0);
+  assert.equal(f.calls.length, fits ? 1 : 2);
+  const judged = [];
+  for (const request of f.calls) {
+    assert.ok(f.generator.measureRequest(request) <= limit);
+    const input = JSON.parse(request.input);
+    judged.push(...input.events.map(event => event.memoryId));
+    for (const memory of input.memories) {
+      const detail = f.repository.getMemoryDetail('owner', memory.id);
+      assert.equal(memory.content, detail.memory.content);
+      assert.deepEqual(memory.sources.map(s => [s.id, s.content]), detail.sources.map(s => [s.id, s.content]));
+    }
+    if (fits) for (const event of input.events) {
+      assert.deepEqual(new Set(event.candidateIds), new Set(ids.filter(id => id !== event.memoryId)));
+    }
+  }
+  assert.deepEqual(judged, ids.slice(1));
+  assert.equal(new Set(ids.map(id => f.repository.getMemory(id).canonical_key)).size, 1);
+  await f.run({ maximumRequestCharacters: limit });
+  assert.equal(f.calls.length, fits ? 1 : 2);
+});
+
 test('an indivisible event request retains evidence and stops before provider invocation', async t => {
   const f = fixture(t);
   f.seed('event-1'); await f.run();
-  const next = f.seed('event-2');
-  f.generator.assertRequestBudget = () => { throw Object.assign(new Error('complete material too large'), { code: 'MEMORY_STATE_ANALYSIS_INPUT_TOO_LARGE' }); };
-  const result = await f.run();
+  const next = f.seed('event-2', { content: '书单记录含有 "引号" 和 \\ 路径。'.repeat(30) });
+  let calls = 0;
+  const generator = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async (_url, { body }) => {
+      calls++;
+      const payload = JSON.parse(body), input = JSON.parse(payload.messages[1].content);
+      const byId = new Map(input.memories.map(memory => [memory.id, memory]));
+      return Response.json({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ type: 'function',
+        function: { name: payload.tools[0].function.name, arguments: JSON.stringify({ matches: input.events.map(event =>
+          matched(byId.get(event.memoryId), byId.get(event.candidateIds[0]))) }) } }] } }] });
+    },
+  });
+  const prepared = await prepareEventContinuity({ repository: f.repository, agentId: 'owner', memoryIds: [next.id],
+    generator, embeddingProvider: f.embeddingProvider });
+  const limit = generator.measureRequest(prepared.request) - 1;
+  assert.ok(prepared.request.input.length + prepared.request.systemPrompt.length + JSON.stringify(prepared.request.schema).length < limit,
+    'The unescaped internal request fits, but the complete provider payload exceeds the budget.');
+  const result = await f.run({ generator, maximumRequestCharacters: limit });
   assert.equal(result.failed.length, 1);
   assert.equal(result.failed[0].status, 'failed');
   assert.equal(result.failed[0].review_state, 'pending');
-  assert.equal(f.calls.length, 0);
+  assert.equal(calls, 0);
   assert.equal(f.repository.getMemory(next.id).content, next.content);
-  assert.equal((await f.run()).failed.length, 0);
+  assert.equal((await f.run({ generator, maximumRequestCharacters: limit })).failed.length, 0);
+  assert.equal(calls, 0);
 });
 
 function matched(memory, candidate) {
@@ -321,15 +412,16 @@ function matched(memory, candidate) {
 
 test('event matching and citation repair exchange local references and store canonical evidence', async t => {
   const f = fixture(t);
-  const historical = f.seed('event-1');
+  const historical = f.seed(`event-1-${'a'.repeat(512)}`, { content: '小明提出一起整理书单。' });
   await f.run();
-  const incoming = f.seed('event-2');
+  const incoming = f.seed(`event-2-${'b'.repeat(512)}`, { content: '我和小明已完成之前约定的书单。' });
   const evidence = [historical, incoming].map(memory => f.repository.getMemoryDetail('owner', memory.id).sources[0]);
-  let calls = 0;
+  let calls = 0, limit;
   const generator = createOpenAiCompatibleStructuredGenerator({
-    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture' },
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool' },
     fetchImpl: async (_url, { body }) => {
-      const { messages } = JSON.parse(body);
+      assert.ok(body.length <= limit, 'Both the initial call and the citation repair fit the real serialized request budget.');
+      const { messages, tools } = JSON.parse(body);
       const input = JSON.parse(messages[1].content);
       const memory = input.memories.find(row => row.content === incoming.content);
       const candidate = input.memories.find(row => row.content === historical.content);
@@ -348,15 +440,62 @@ test('event matching and citation repair exchange local references and store can
         assert.equal(previous.candidateId, candidate.id);
         assert.deepEqual(previous.candidateSourceIds, match.memorySourceIds);
       }
-      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ matches: [match] }) } }] });
+      return Response.json({ choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ type: 'function',
+        function: { name: tools[0].function.name, arguments: JSON.stringify({ matches: [match] }) } }] } }] });
     },
   });
-  const result = await f.run({ generator });
+  const prepared = await prepareEventContinuity({ repository: f.repository, agentId: 'owner', memoryIds: [incoming.id],
+    generator, embeddingProvider: f.embeddingProvider });
+  limit = generator.measureRequest(prepared.request) + 1000;
+  assert.ok(prepared.request.input.length + prepared.request.systemPrompt.length + JSON.stringify(prepared.request.schema).length > limit,
+    'Canonical IDs exceed the budget even though the complete compact request fits.');
+  const result = await f.run({ generator, maximumRequestCharacters: limit });
   assert.equal(result.failed.length, 0);
   assert.equal(calls, 2);
   const decision = f.repository.getMemory(incoming.id).metadata.eventContinuity;
   assert.equal(decision.targetMemoryId, historical.id);
   assert.deepEqual(new Set(decision.evidenceSourceIds), new Set(evidence.map(source => source.id)));
+  assert.equal(f.repository.getMemory(incoming.id).content, incoming.content);
+  await f.run({ generator, maximumRequestCharacters: limit });
+  assert.equal(calls, 2, 'A completed batch does not repeat matching or repair.');
+});
+
+test('event defaults and candidate pools preserve complete mixed-space evidence on matching and repair wires', async t => {
+  const f = fixture(t);
+  const ids = [];
+  for (let i = 1; i <= 16; i++) ids.push(f.seed(`event-${i}`, { queue: false, worldId: i === 16 ? 'different-room' : 'room-a',
+    worldFrame: i === 16 ? 'relational' : 'physical' }).id);
+  runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ids });
+  let current, calls = 0;
+  const native = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'fixture', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: async (_url, { body }) => {
+      const payload = JSON.parse(body), wire = JSON.parse(payload.messages[1].content);
+      const { memoryDefaults = {}, candidatePools, ...material } = wire;
+      material.memories = wire.memories.map(memory => ({ ...memoryDefaults, ...memory }));
+      material.events = wire.events.map(({ candidatePool, ...event }) => ({ ...event,
+        candidateIds: candidatePools ? candidatePools[candidatePool].filter(id => id !== event.memoryId) : event.candidateIds }));
+      const canonical = JSON.parse(current.input), restored = current.decodeOutput(material);
+      const normalize = value => ({ ...value, events: value.events.map(event => ({ ...event, candidateIds: [...event.candidateIds].sort() })) });
+      assert.deepEqual(normalize(restored), normalize(canonical), 'Packing preserves every field, full body and allowed candidate.');
+      assert.ok(wire.memoryDefaults);
+      if (++calls === 1) {
+        assert.ok(wire.candidatePools);
+        assert.equal(wire.memories.find(memory => memory.worldId === 'different-room').worldFrame, 'relational');
+      } else assert.ok(canonical.validationErrors && canonical.events.every(event => Object.hasOwn(event, 'allowNew')));
+      const byId = new Map(material.memories.map(memory => [memory.id, memory]));
+      const matches = material.events.map(event => matched(byId.get(event.memoryId), byId.get(event.candidateIds[0])));
+      if (calls === 1) matches[0].candidateSourceIds = matches[0].memorySourceIds;
+      return Response.json({ choices: [{ message: { tool_calls: [{ function: {
+        name: payload.tools[0].function.name, arguments: JSON.stringify({ matches }),
+      } }] } }] });
+    },
+  });
+  const generator = Object.assign(request => { current = request; return native(request); }, { measureRequest: native.measureRequest });
+  const result = await f.run({ generator });
+  assert.equal(result.failed.length, 0, result.failed.map(task => task.error_message).join('\n'));
+  assert.equal(calls, 2);
+  assert.ok(f.repository.getMemory('event-2').metadata.eventContinuity);
 });
 
 for (const outcome of ['corrected', 'invalid', 'new', 'ambiguous']) test(`citation repair isolates one invalid decision and keeps four valid decisions: ${outcome}`, async t => {
@@ -427,7 +566,7 @@ test('an unavailable candidate can only be repaired using the original allowed c
   assert.equal(f.repository.getMemory('event-2').metadata.eventContinuity.targetMemoryId, 'event-1');
 });
 
-test('a repair batch keeps its corrected decision when another repair still has invalid evidence', async t => {
+test('a repair batch keeps its corrected decision when a sibling repair is missing', async t => {
   const f = fixture(t);
   for (let i = 1; i <= 4; i++) f.seed(`event-${i}`, { queue: false });
   runImmediateMemoryMaintenance({ repository: f.repository, agentId: 'owner', memoryIds: ['event-1', 'event-2', 'event-3', 'event-4'] });
@@ -440,7 +579,12 @@ test('a repair batch keeps its corrected decision when another repair still has 
     return memory.id === 'event-3' || (memory.id === 'event-2' && !input.validationErrors)
       ? { ...match, candidateSourceIds: ['wrong-source'] } : match;
   });
-  assert.equal((await f.run()).failed.length, 0);
+  const generator = async request => {
+    const response = await f.generator(request);
+    if (JSON.parse(request.input).validationErrors) response.output.matches.pop();
+    return response;
+  };
+  assert.equal((await f.run({ generator })).failed.length, 0);
   assert.equal(f.calls.length, 2);
   for (const id of ['event-2', 'event-4']) assert.equal(f.repository.getMemory(id).metadata.eventContinuity.resolution, 'matched');
   assert.equal(f.repository.getMemory('event-3').metadata.eventContinuity.resolution, 'ambiguous');
@@ -518,13 +662,19 @@ for (const failure of ['budget', 'transport', 'schema', 'coverage', 'swapped-end
   assert.equal(providerCalls, failure === 'budget' ? 1 : 2);
 });
 
-test('the configured character budget also bounds repair before another model call', async t => {
+for (const measured of [false, true]) test(`the configured character budget also bounds repair before another model call (measured=${measured})`, async t => {
   const f = fixture(t);
-  f.seed('event-1'); await f.run(); f.seed('event-2');
+  f.seed('event-1'); await f.run();
+  f.seed('event-2', { content: '书单记录含有 "引号" 和 \\ 路径。'.repeat(30) });
+  if (measured) f.generator.measureRequest = createOpenAiCompatibleStructuredGenerator({
+    connection: { baseUrl: 'https://provider.test', apiKey: 'test-key', model: 'fixture', structuredOutputMode: 'strict-tool' },
+    fetchImpl: () => { throw new Error('Only request serialization is used here.'); },
+  }).measureRequest;
   f.setDecision(({ memory, candidates }) => ({ ...matched(memory, candidates[0]), candidateSourceIds: ['wrong-source'] }));
   const prepared = await prepareEventContinuity({ repository: f.repository, agentId: 'owner', memoryIds: ['event-2'],
     generator: f.generator, embeddingProvider: f.embeddingProvider });
-  prepared.maximumRequestCharacters = prepared.request.input.length + prepared.request.systemPrompt.length + JSON.stringify(prepared.request.schema).length;
+  prepared.maximumRequestCharacters = measured ? f.generator.measureRequest(prepared.request)
+    : prepared.request.input.length + prepared.request.systemPrompt.length + JSON.stringify(prepared.request.schema).length;
   const result = await applyEventContinuity({ repository: f.repository, agentId: 'owner', prepared, generator: f.generator });
   assert.equal(f.calls.length, 1);
   assert.deepEqual(result.repair, { requested: 1, repaired: 0, sentToReview: 1 });

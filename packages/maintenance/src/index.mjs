@@ -1,6 +1,7 @@
 import { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES, memoryMaintenanceTaskPayload as taskPayload, enqueueMemoryMaintenanceTasks } from '@suzu-memory/core';
-export { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES } from '@suzu-memory/core';
-import { assertEventSourceExecutionCurrent } from '@suzu-memory/core';
+export { MAINTENANCE_LANES, MAINTENANCE_TASK_TYPES, runImmediateMemoryMaintenance,
+  assessReportedStateAutoAcceptance, autoAcceptReportedStateProposals } from '@suzu-memory/core';
+import { assertEventSourceExecutionCurrent, assertOrganizationInputCurrent } from '@suzu-memory/core';
 import { randomUUID } from "node:crypto";
 import { claimAccumulatedStructureTasks, inspectAccumulatedStructureTasks, deferSmallConsolidationRuns,
   DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
@@ -8,11 +9,8 @@ export { DEFAULT_MINIMUM_STRUCTURE_MEMORIES } from "./structure-batching.mjs";
 
 import { processPendingStateAnalysisRequests, prepareEventContinuity, applyEventContinuity } from "@suzu-memory/analysis";
 import {
-  DIRECT_INGESTION_MEMORY_KINDS,
-  resolveReportedStateProposal,
-  isRepeatedReportedStateTransition,
   materializePendingReportedStateProposals,
-  syncMemoryRelationshipMemberships,
+  runImmediateMemoryMaintenance,
   updateAssociationGraph,
 } from "@suzu-memory/core";
 import {
@@ -47,317 +45,6 @@ function boundedInteger(value, fallback, minimum, maximum, label) {
     throw new Error(`${label} must be an integer between ${minimum} and ${maximum}.`);
   }
   return parsed;
-}
-
-
-
-
-
-/**
- * Runs only deterministic work for newly stored memories. It never scans old
- * data and never invokes an external model. Expensive follow-up work is merely
- * recorded in the persistent maintenance queue.
- */
-export function runImmediateMemoryMaintenance({
-  repository,
-  agentId,
-  batchId = "",
-  memoryIds = [],
-  embeddingMemoryIds = memoryIds,
-  followUpTaskTypes = [MAINTENANCE_TASK_TYPES.memoryEmbedding, MAINTENANCE_TASK_TYPES.structureProposal, MAINTENANCE_TASK_TYPES.eventContinuity],
-  planConsolidation = true,
-  requiredFollowUpEnqueue = false,
-} = {}) {
-  if (!repository) throw new Error("Immediate memory maintenance requires a repository.");
-  const normalizedAgentId = clean(agentId);
-  const normalizedMemoryIds = uniqueStrings(memoryIds).sort();
-  const normalizedEmbeddingMemoryIds = uniqueStrings(embeddingMemoryIds).sort();
-  const normalizedFollowUpTaskTypes = uniqueStrings(followUpTaskTypes);
-  if (!normalizedAgentId) throw new Error("Immediate memory maintenance requires agentId.");
-  if (normalizedFollowUpTaskTypes.some((taskType) => (
-    !Object.values(MAINTENANCE_TASK_TYPES).includes(taskType)
-  ))) {
-    throw new Error("Immediate memory maintenance received an unknown follow-up task type.");
-  }
-  if (!normalizedMemoryIds.length && !normalizedEmbeddingMemoryIds.length) {
-    return {
-      status: "skipped",
-      reason: "no-new-memories",
-      relationshipMemberships: { status: "skipped", linked: 0 },
-      associations: { status: "skipped", memories: 0 },
-      consolidationPlan: null,
-      queued: [],
-      warnings: [],
-    };
-  }
-
-  const warnings = [];
-  const provisionalMemoryIdSet = new Set(normalizedMemoryIds.filter((memoryId) => (
-    repository.getMemory(memoryId)?.layer === "provisional"
-  )));
-  const formalMemoryIds = normalizedMemoryIds.filter((memoryId) => (
-    !provisionalMemoryIdSet.has(memoryId)
-  ));
-  let relationshipMemberships = { status: "skipped", linked: 0 };
-  let associations = { status: "skipped", memories: 0 };
-  let consolidationPlan = null;
-  const queued = [];
-  try {
-    relationshipMemberships = formalMemoryIds.length
-      ? syncMemoryRelationshipMemberships({
-        repository,
-        agentId: normalizedAgentId,
-        memoryIds: formalMemoryIds,
-      })
-      : relationshipMemberships;
-  } catch (error) {
-    assertEventSourceExecutionCurrent();
-    warnings.push(`Relationship membership sync failed: ${error.message}`);
-  }
-  try {
-    associations = formalMemoryIds.length ? updateAssociationGraph({
-      repository,
-      agentId: normalizedAgentId,
-      memoryIds: formalMemoryIds,
-    }) : associations;
-  } catch (error) {
-    assertEventSourceExecutionCurrent();
-    warnings.push(`Association update failed: ${error.message}`);
-  }
-  if (planConsolidation && formalMemoryIds.length) {
-    const eligibleIds = formalMemoryIds.filter(id => DIRECT_INGESTION_MEMORY_KINDS.includes(repository.getMemory(id)?.kind));
-    consolidationPlan = { status: "accumulating", memoryIds: eligibleIds };
-    if (eligibleIds.length && !normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.structureProposal)) {
-      normalizedFollowUpTaskTypes.push(MAINTENANCE_TASK_TYPES.structureProposal);
-    }
-  }
-  try {
-    if (normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.memoryEmbedding)) {
-      if (normalizedEmbeddingMemoryIds.length) {
-        queued.push(...enqueueMemoryMaintenanceTasks({
-          repository,
-          agentId: normalizedAgentId,
-          payload: taskPayload({
-            repository,
-            agentId: normalizedAgentId,
-            batchId,
-            memoryIds: normalizedEmbeddingMemoryIds,
-          }),
-          taskTypes: [MAINTENANCE_TASK_TYPES.memoryEmbedding],
-        }));
-      }
-    }
-    const eventIds = formalMemoryIds.filter(id => {
-      const memory = repository.getMemory(id);
-      return memory?.kind === 'event' && memory.status === 'active' && !memory.metadata?.eventContinuity;
-    });
-    if (eventIds.length && normalizedFollowUpTaskTypes.includes(MAINTENANCE_TASK_TYPES.eventContinuity)) queued.push(...enqueueMemoryMaintenanceTasks({ repository, agentId: normalizedAgentId,
-      payload: taskPayload({ repository, agentId: normalizedAgentId, batchId, memoryIds: eventIds }),
-      taskTypes: [MAINTENANCE_TASK_TYPES.eventContinuity] }));
-    const semanticTaskTypes = normalizedFollowUpTaskTypes.filter((taskType) => (
-      taskType !== MAINTENANCE_TASK_TYPES.memoryEmbedding && taskType !== MAINTENANCE_TASK_TYPES.eventContinuity
-    ));
-    if (formalMemoryIds.length && semanticTaskTypes.length) {
-      queued.push(...enqueueMemoryMaintenanceTasks({
-        repository,
-        agentId: normalizedAgentId,
-        payload: taskPayload({
-          repository,
-          agentId: normalizedAgentId,
-          batchId,
-          memoryIds: formalMemoryIds,
-        }),
-        taskTypes: semanticTaskTypes,
-      }));
-    }
-  } catch (error) {
-    assertEventSourceExecutionCurrent();
-    if (requiredFollowUpEnqueue) throw error;
-    warnings.push(`Follow-up maintenance enqueue failed: ${error.message}`);
-  }
-  return {
-    status: warnings.length ? "completed-with-warnings" : "completed",
-    relationshipMemberships,
-    associations,
-    consolidationPlan,
-    queued: queued.map((task) => ({
-      id: task.id,
-      lane: task.lane,
-      taskType: task.task_type,
-      status: task.status,
-      wasInserted: task.wasInserted,
-    })),
-    warnings,
-  };
-}
-
-const SAFE_AUTOMATIC_REPORTED_STATE_ACTIONS = new Set(["create", "reinforce"]);
-
-function isDirectSelfReport(observation) {
-  const payload = observation?.payload || {};
-  switch (clean(observation?.state_family)) {
-    case "preference":
-      return payload.explicitExpression?.directness === "explicit_self_statement";
-    case "identity":
-      return payload.subject?.attribution === "explicit_self_report";
-    case "belief":
-      return payload.holder?.attribution === "explicit_self_statement";
-    case "value":
-      return payload.holder?.attribution === "explicit_self_statement"
-        && ["explicit_principle", "reasoned_priority"].includes(payload.basis?.evidenceType);
-    case "goal":
-      return payload.holder?.attribution === "explicit_self_statement";
-    case "capability":
-      return payload.holder?.attribution === "explicit_self_statement"
-        && payload.performance?.evidenceType === "self_report";
-    case "self_concept":
-      return ["explicit_self_definition", "explicit_self_reflection"]
-        .includes(payload.holder?.attribution);
-    case "condition":
-    case "habit":
-      return payload.evidenceBasis === "explicit_self_report";
-    case "disposition":
-      return payload.evidenceType === "explicit_self_description";
-    case "relationship":
-      return payload.perspective?.attribution === "explicit_self_statement";
-    case "affective_association":
-      return payload.experiencer?.attribution === "explicit_self_report";
-    default:
-      return false;
-  }
-}
-
-/**
- * Deterministic gate for the only high-level proposal class that may be
- * accepted without a human: a new or reinforcing state explicitly stated by
- * the same person. It does not use content keywords or model confidence alone.
- */
-export function assessReportedStateAutoAcceptance({
-  repository,
-  agentId,
-  proposalId,
-} = {}) {
-  if (!repository) throw new Error("Reported-state auto-accept assessment requires a repository.");
-  const normalizedAgentId = clean(agentId);
-  const proposal = repository.getReportedStateProposal(normalizedAgentId, proposalId);
-  if (!proposal) return { eligible: false, reason: "proposal-not-found", proposal: null };
-  if (proposal.review_state !== "pending") {
-    return { eligible: false, reason: `proposal-${proposal.review_state}`, proposal };
-  }
-  if (!SAFE_AUTOMATIC_REPORTED_STATE_ACTIONS.has(proposal.action) && !isRepeatedReportedStateTransition(repository, proposal)) {
-    return { eligible: false, reason: "state-transition-requires-review", proposal };
-  }
-  if (!["user", "agent", "other"].includes(proposal.subject_role)) {
-    return { eligible: false, reason: "subject-is-not-an-individual", proposal };
-  }
-  const requestId = clean(proposal.metadata?.stateAnalysisRequestId);
-  const request = requestId
-    ? repository.getStateAnalysisRequest(normalizedAgentId, requestId)
-    : null;
-  if (!request
-    || request.evidence_mode !== "explicit"
-    || request.representation_layer !== "reported"
-    || request.subject_role !== proposal.subject_role
-    || request.subject_key !== proposal.subject_key
-    || request.canonical_key !== proposal.canonical_key) {
-    return { eligible: false, reason: "request-boundary-mismatch", proposal };
-  }
-  const observation = repository.getStateEvidenceObservation(
-    normalizedAgentId,
-    proposal.selectedObservationId,
-  );
-  if (!observation
-    || observation.lifecycle !== "current"
-    || observation.qualification !== "qualified"
-    || observation.subject_role !== proposal.subject_role
-    || observation.subject_key !== proposal.subject_key
-    || observation.canonical_key !== proposal.canonical_key
-    || clean(observation.scope?.currentRepresentationLayer) !== "reported"
-    || !isDirectSelfReport(observation)) {
-    return { eligible: false, reason: "selected-evidence-is-not-direct-self-report", proposal };
-  }
-  const memoryId = clean(observation.memory_id || observation.memoryId);
-  const detail = repository.getMemoryDetail(normalizedAgentId, memoryId);
-  const isOwnUtterance = detail?.roles.some((role) => (
-    role.role === "speaker"
-    && role.actor_role === proposal.subject_role
-    && role.actor_key === proposal.subject_key
-    && Boolean(role.is_primary)
-  ));
-  if (!isOwnUtterance
-    || !request.memoryIds.includes(memoryId)
-    || observation.sourceIds.some((sourceId) => !request.sourceIds.includes(sourceId))) {
-    return { eligible: false, reason: "speaker-or-source-boundary-mismatch", proposal };
-  }
-  return {
-    eligible: true,
-    reason: "explicit-self-report",
-    proposal,
-    request,
-    observation,
-  };
-}
-
-export function autoAcceptReportedStateProposals({
-  repository,
-  agentId,
-  proposalIds = [],
-} = {}) {
-  if (!repository) throw new Error("Reported-state auto-acceptance requires a repository.");
-  const normalizedAgentId = clean(agentId);
-  if (!normalizedAgentId) throw new Error("Reported-state auto-acceptance requires agentId.");
-  const accepted = [];
-  const deferred = [];
-  for (const proposalId of uniqueStrings(proposalIds)) {
-    const assessment = assessReportedStateAutoAcceptance({
-      repository,
-      agentId: normalizedAgentId,
-      proposalId,
-    });
-    if (!assessment.eligible) {
-      deferred.push({ proposalId, reason: assessment.reason });
-      continue;
-    }
-    try {
-      const resolution = resolveReportedStateProposal(repository, {
-        agentId: normalizedAgentId,
-        proposalId,
-        action: "accept",
-        resolvedBy: "system:auto-explicit-self-report-v1",
-        note: "Accepted by deterministic explicit self-report policy v1.",
-      });
-      const memoryIds = uniqueStrings([
-        resolution.memory?.id,
-        resolution.previous?.id,
-      ]);
-      accepted.push({
-        proposalId,
-        resolution,
-        maintenance: runImmediateMemoryMaintenance({
-          repository,
-          agentId: normalizedAgentId,
-          batchId: `auto-reported-state:${proposalId}`,
-          memoryIds,
-          followUpTaskTypes: [
-            MAINTENANCE_TASK_TYPES.memoryEmbedding,
-          ],
-          planConsolidation: true,
-        }),
-      });
-    } catch (error) {
-    assertEventSourceExecutionCurrent();
-      deferred.push({
-        proposalId,
-        reason: "acceptance-revalidation-failed",
-        error: error.message,
-      });
-    }
-  }
-  return {
-    status: accepted.length ? "completed" : "no-eligible-proposals",
-    accepted,
-    deferred,
-  };
 }
 
 function taskMemoryIds(tasks) {
@@ -397,6 +84,7 @@ function structureTaskResult(report) {
       .filter(Boolean),
     duplicateIds: (report?.duplicates || []).map((item) => clean(item.id)).filter(Boolean),
     rejected: Array.isArray(report?.rejected) ? report.rejected.length : 0,
+    rejections: Array.isArray(report?.rejected) ? report.rejected : [],
     warnings: Array.isArray(report?.warnings) ? report.warnings.map(clean).filter(Boolean) : [],
   };
 }
@@ -605,11 +293,28 @@ async function processRetrievalContextTasks({
 
 async function processStructureTasks({ repository, agentId, tasks, batch,
   workerId, generator, usageLedgerPath }) {
+  // A persisted old part keeps its original contract. New capable providers
+  // transfer the batch directly to the one durable organization owner.
+  const planned = batch.organizationMode === 'unified-v1'
+    || (generator.supportsPlannedOrganization === true && !batch.parts.some(part => part.result));
   const checkpoint = () => repository.transaction(() => {
     for (const task of tasks) repository.checkpointMaintenanceTask({ agentId, taskId: task.id, workerId,
       result: { structureBatch: batch } });
   });
   try {
+    assertOrganizationInputCurrent(repository, agentId, batch.organizationInput);
+    if (planned) {
+      const completed = repository.transaction(() => {
+        const runId = batch.organizationRunId || (batch.memoryIds.length ? planMemoryConsolidation({ repository, agentId,
+          triggerMemoryIds: batch.memoryIds, organizeNewMemories: true,
+          metadata: { accumulatedStructureBatchId: batch.id } }).id : '');
+        const transferred = { ...batch, organizationRunId: runId, organizationMode: 'unified-v1' };
+        return tasks.map(task => repository.finishMaintenanceTask({ agentId, taskId: task.id, workerId,
+          result: { status: 'completed', structureBatch: transferred, processedMemoryVersions: batch.memoryVersions,
+            consolidationRunId: runId } }));
+      });
+      return { reports: [{ status: 'planned', runId: completed[0]?.result.consolidationRunId || '' }], completed, failed: [] };
+    }
     await runBudgetedMemoryParts({ parts: batch.parts, checkpoint,
       prepare: part => prepareStructureGeneration({ repository, agentId, batchId: part.id,
         memoryIds: part.memoryIds, generator }),
@@ -625,6 +330,7 @@ async function processStructureTasks({ repository, agentId, tasks, batch,
         return { ...structureTaskResult(report), queued: queued.queued, maintenanceWarnings: queued.warnings };
       },
     });
+    assertOrganizationInputCurrent(repository, agentId, batch.organizationInput);
     const finishedIds = uniqueStrings(batch.parts.filter(part => part.status === "completed").flatMap(part => part.memoryIds));
     if (!batch.consolidationPlanned) {
       const consolidationPlan = finishedIds.length ? planMemoryConsolidation({
@@ -725,7 +431,7 @@ export async function runSemanticTaskMaintenance({
         assertEventSourceExecutionCurrent();
         failed.push(repository.failMaintenanceTask({ agentId: normalizedAgentId, taskId: task.id, workerId,
           errorMessage: error.message, errorDetails: { stage: 'structure-summary', errorCode: error.code || '' },
-          retry: !['MEMORY_STRUCTURE_INPUT_TOO_LARGE', 'MAX_TOKENS'].includes(error.code) }));
+          retry: error.category !== 'invalid-candidate' && !['MEMORY_STRUCTURE_INPUT_TOO_LARGE', 'MAX_TOKENS'].includes(error.code) }));
       }
     }
     results.summaries = { completed, failed };
@@ -871,15 +577,18 @@ export async function runSemanticMemoryMaintenance({
       usageLedgerPath,
     })
     : { status: "disabled", reason: "generation-provider-not-configured", selected: 0 };
+  const applications = new Map();
+  for (const { automaticApplication } of stateAnalysis.results || []) {
+    if (automaticApplication && !applications.has(automaticApplication.proposalId)) {
+      applications.set(automaticApplication.proposalId, automaticApplication);
+    }
+  }
+  const accepted = [...applications.values()].filter(application => application.resolution);
+  const deferred = [...applications.values()].filter(application => !application.resolution);
+  // Preserve the existing diagnostics field. Formal application keeps review pending.
   const automaticStateAcceptance = stateAnalysis.status === "disabled"
     ? { status: "disabled", reason: stateAnalysis.reason, accepted: [], deferred: [] }
-    : autoAcceptReportedStateProposals({
-      repository,
-      agentId: normalizedAgentId,
-      proposalIds: (stateAnalysis.results || [])
-        .map((result) => clean(result.proposal?.id))
-        .filter(Boolean),
-    });
+    : { status: accepted.length ? "completed" : "no-eligible-proposals", accepted, deferred };
   const pendingStateMaterialization = materializePendingReportedStateProposals(repository, {
     agentId: normalizedAgentId,
   });

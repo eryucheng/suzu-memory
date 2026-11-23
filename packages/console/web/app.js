@@ -223,15 +223,16 @@ function renderDetail(detail) {
   const status = detail.reviewState;
   const pending = detail.permissions?.canAccept || detail.permissions?.canDismiss;
   const humanFallback = ["ingestion", "maintenance-failure"].includes(detail.type);
+  const applied = detail.applied === true;
   $("#review-detail").innerHTML = `<div class="detail-head"><div class="title-line"><div><h2>${escapeHtml(detail.title)}</h2><p>${escapeHtml(TYPE_LABELS[detail.type] || detail.type)} · ${escapeHtml(detail.action || "create")} · ${escapeHtml(formatTime(detail.createdAt))}</p></div><span class="badge ${escapeHtml(status)}">${escapeHtml(STATE_LABELS[status] || status)}</span></div></div><div class="detail-body">
-    <section class="detail-section"><div class="section-title"><h3>${humanFallback ? "人工判断" : "准备写入"}</h3>${humanFallback ? "" : `<span class="badge">置信度 ${(Number(detail.confidence || 0) * 100).toFixed(0)}%</span>`}</div>${writePreviewCard(detail.writePreview || {})}</section>
+    <section class="detail-section"><div class="section-title"><h3>${humanFallback ? "人工判断" : applied ? "已生效内容" : "候选内容"}</h3>${humanFallback ? "" : `<span class="badge">置信度 ${(Number(detail.confidence || 0) * 100).toFixed(0)}%</span>`}</div>${applied && status === 'pending' ? '<p>当前结果已自动生效，可按需复核或撤回。</p>' : ''}${writePreviewCard(detail.writePreview || {})}</section>
     ${detail.currentState ? `<section class="detail-section"><div class="section-title"><h3>状态变化</h3></div><div class="impact-card">${memoryCard(detail.currentState)}<div class="impact-arrow">${escapeHtml(detail.action || "变更")} ↓</div>${writePreviewCard(detail.writePreview || {})}</div></section>` : ""}
     ${endpointsSection(detail.endpoints)}
     ${membersSection(detail.members)}
     ${maintenanceFailureSection(detail.maintenanceFailure)}
     <section class="detail-section"><div class="section-title"><h3>直接证据</h3><span class="badge">${detail.evidence?.length || 0}</span></div>${evidenceCards(detail.evidence)}</section>
     <details class="json-details"><summary>查看完整审计记录</summary><pre>${escapeHtml(JSON.stringify(detail.proposal, null, 2))}</pre></details>
-    ${(pending || detail.permissions?.canRevoke) ? `<div class="decision-box"><textarea id="decision-reason" placeholder="可选：记录本次判断理由"></textarea><div class="decision-actions">${detail.permissions?.canDismiss ? `<button class="button danger proposal-action" data-action="dismiss">${humanFallback ? "保留基础记忆并结束" : "驳回"}</button>` : ""}${detail.permissions?.canAccept ? `<button class="button primary proposal-action" data-action="accept">${humanFallback ? "人工通过并写入" : "接受并写入"}</button>` : ""}${detail.permissions?.canRevoke ? "<button class=\"button danger proposal-action\" data-action=\"revoke\">撤销关系</button>" : ""}</div></div>` : ""}
+    ${(pending || detail.permissions?.canRevoke) ? `<div class="decision-box"><textarea id="decision-reason" placeholder="可选：记录本次判断理由"></textarea><div class="decision-actions">${detail.permissions?.canDismiss ? `<button class="button danger proposal-action" data-action="dismiss">${humanFallback ? "保留基础记忆并结束" : applied ? "撤回" : "驳回"}</button>` : ""}${detail.permissions?.canAccept ? `<button class="button primary proposal-action" data-action="accept">${humanFallback ? "人工通过并写入" : applied ? "确认复核" : "接受并写入"}</button>` : ""}${detail.permissions?.canRevoke ? `<button class="button danger proposal-action" data-action="revoke">${detail.type === "reported-state" ? "撤回本次结果" : "撤销关系"}</button>` : ""}</div></div>` : ""}
   </div>`;
 }
 
@@ -295,7 +296,7 @@ async function resolveSelected(action) {
   if (!selected) return;
   const reason = $("#decision-reason")?.value || "";
   const endpoint = action === "revoke"
-    ? `/v1/high-level-proposals/relation/${encodeURIComponent(selected.id)}/revoke`
+    ? `/v1/high-level-proposals/${encodeURIComponent(selected.type)}/${encodeURIComponent(selected.id)}/revoke`
     : `/v1/high-level-proposals/${encodeURIComponent(selected.type)}/${encodeURIComponent(selected.id)}/resolve`;
   const buttons = $$(".proposal-action");
   buttons.forEach((button) => { button.disabled = true; });
@@ -314,10 +315,10 @@ async function resolveSelected(action) {
       return;
     }
     toast(action === "accept"
-      ? humanFallback ? "人工审核候选已直接写入" : "候选已接受并进入正式记忆"
+      ? humanFallback ? "人工审核候选已直接写入" : selected.applied ? "已确认复核" : "候选已接受并进入正式记忆"
       : action === "dismiss"
-        ? humanFallback ? "已保留基础记忆并结束该升级项" : "候选已驳回"
-        : "关系已安全撤销");
+        ? humanFallback ? "已保留基础记忆并结束该升级项" : selected.applied ? "已撤回" : "候选已驳回"
+        : selected.type === "reported-state" ? "已撤回本次结果" : "关系已安全撤销");
     const current = state.selected === selection;
     if (current) state.selected = null;
     await loadOverview({ refreshDetail: current });

@@ -1,9 +1,11 @@
 import { EVENT_SOURCE_MIGRATION } from './schema-event-sources.mjs';
 import { backfillSearchRows, backfillConceptSearchRows } from './search-index.mjs';
 import { memoryWorldsCompatible } from './ontology.mjs';
-import { entityNameKeys } from './entity-identity.mjs';
+import { entityLabelKey, entityLabelOccurs, entityNameKeys } from './entity-identity.mjs';
+import { restoreEventContinuityEdges } from './event-continuity-policy.mjs';
+import { MemoryRepository } from './repository.mjs';
 import { structureKnownAt } from './structure-policy.mjs';
-export const SCHEMA_VERSION = 51;
+export const SCHEMA_VERSION = 55;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -2449,6 +2451,66 @@ export const MIGRATIONS = Object.freeze([
       database.exec(`CREATE TRIGGER retrieval_revision_concept_names AFTER UPDATE OF canonical_name,aliases_json ON entities
         WHEN NEW.kind='concept' AND (OLD.canonical_name<>NEW.canonical_name OR OLD.aliases_json<>NEW.aliases_json)
         BEGIN UPDATE memory_meta SET value=lower(hex(randomblob(16))) WHERE key='retrieval-revision'; END;`);
+    },
+  },
+  {
+    version: 52, name: 'state-analysis-request-leases',
+    sql: `ALTER TABLE memory_state_analysis_requests ADD COLUMN lease_owner TEXT NOT NULL DEFAULT '';
+      ALTER TABLE memory_state_analysis_requests ADD COLUMN lease_expires_at TEXT;
+      CREATE INDEX memory_state_analysis_request_leases ON memory_state_analysis_requests
+        (agent_id, lease_expires_at) WHERE lease_owner <> '';`,
+  },
+  {
+    version: 53, name: 'explanatory-relation-types', foreignKeysOff: true,
+    apply(database) {
+      const table = database.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='memory_relation_proposals'").get().sql;
+      const objects = database.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='memory_relation_proposals' AND type IN ('index','trigger') AND sql IS NOT NULL").all();
+      const expanded = table.replace("relation IN ('causes')", "relation IN ('causes', 'reason_for', 'condition_for')");
+      if (expanded === table) throw new Error('Explanatory relation migration requires the previous relation contract.');
+      database.exec(expanded.replace('memory_relation_proposals', 'memory_relation_proposals_next'));
+      database.exec(`INSERT INTO memory_relation_proposals_next SELECT * FROM memory_relation_proposals;
+        DROP TABLE memory_relation_proposals;
+        ALTER TABLE memory_relation_proposals_next RENAME TO memory_relation_proposals;`);
+      for (const object of objects) database.exec(object.sql);
+    },
+  },
+  {
+    version: 54, name: 'utterance-entity-links-with-source-mentions',
+    apply(database) {
+      // Expand each recorded decision, then follow the indexed source and entity links.
+      const links = database.prepare(`
+        SELECT DISTINCT utterance.id AS memory_id, utterance.content, entity.id AS entity_id,
+          entity.kind, entity.canonical_name, entity.aliases_json
+        FROM memory_ingestion_decisions AS decision
+        CROSS JOIN json_each(decision.source_ids_json) AS ref
+        CROSS JOIN memory_sources AS evidence ON evidence.source_id = ref.value
+          AND evidence.relation = 'verbatim' AND evidence.provenance = 'suzu-memory-extraction-v1'
+        CROSS JOIN memory_nodes AS utterance ON utterance.id = evidence.memory_id
+          AND utterance.agent_id = decision.agent_id AND utterance.kind = 'utterance'
+        CROSS JOIN json_each(decision.candidate_json, '$.entityIds') AS candidate_entity
+        CROSS JOIN memory_entities AS link ON link.memory_id = utterance.id
+          AND link.entity_id = candidate_entity.value AND link.role = 'about'
+        CROSS JOIN entities AS entity ON entity.id = link.entity_id AND entity.agent_id = decision.agent_id
+      `).all();
+      const remove = database.prepare("DELETE FROM memory_entities WHERE memory_id = ? AND entity_id = ? AND role = 'about'");
+      const refresh = new Set();
+      for (const link of links) {
+        const text = entityLabelKey(link.content);
+        const names = [link.canonical_name, ...JSON.parse(link.aliases_json)];
+        if (names.some(name => entityLabelOccurs(text, entityLabelKey(name)))) continue;
+        remove.run(link.memory_id, link.entity_id);
+        if (link.kind === 'concept') refresh.add(link.memory_id);
+      }
+      if (refresh.size && database.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'memory_fts'").get()) {
+        const repository = new MemoryRepository(database);
+        for (const memoryId of refresh) repository.syncSearchEntry(memoryId);
+      }
+    },
+  },
+  {
+    version: 55, name: 'restore-event-continuity-evidence-edges',
+    apply(database) {
+      restoreEventContinuityEdges(new MemoryRepository(database));
     },
   },
 ]);

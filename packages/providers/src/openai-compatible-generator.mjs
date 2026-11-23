@@ -5,6 +5,7 @@ import {
 } from "./openai-compatible-url.mjs";
 
 export const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 32_768;
+const RESULT_TOOL_NAME = "return_result";
 
 function clean(value) {
   return String(value ?? "").trim();
@@ -100,21 +101,25 @@ function intersectToolSchemas(base, refinement) {
 function strictToolSchema(schema) {
   if (!schema || typeof schema !== "object") return schema;
   if (Array.isArray(schema.type) && schema.type.some(type => type === 'object' || type === 'array')) {
-    const { type: types, ...base } = schema;
-    return { anyOf: types.flatMap(type => {
+    const { type: types, description, ...base } = schema;
+    return { ...(description === undefined ? {} : { description }), anyOf: types.flatMap(type => {
       const branch = strictToolSchema({ ...base, type });
       return branch.anyOf && Object.keys(branch).length === 1 ? branch.anyOf : [branch];
     }) };
   }
   if (schema.anyOf && (schema.type || schema.properties)) {
-    const { anyOf, ...base } = schema;
+    const { anyOf, description, ...base } = schema;
     const branches = anyOf.map(branch => intersectToolSchemas(base, branch)).filter(branch => branch !== false);
     if (!branches.length) throw new Error("严格结构化工具的 Schema 条件没有可满足的分支。");
-    return { anyOf: branches.map(strictToolSchema) };
+    return { ...(description === undefined ? {} : { description }), anyOf: branches.map(strictToolSchema) };
   }
   const result = { ...schema };
+  if (result.type === 'null') {
+    // The container keywords do not apply to a null value.
+    for (const keyword of ['items', 'minItems', 'maxItems', 'properties', 'required', 'additionalProperties']) delete result[keyword];
+  }
   for (const key of ["properties", "$defs", "definitions"]) {
-    if (schema[key]) result[key] = Object.fromEntries(Object.entries(schema[key])
+    if (result[key]) result[key] = Object.fromEntries(Object.entries(result[key])
       .map(([name, child]) => [name, strictToolSchema(child)]));
   }
   if (schema.type === 'object' && schema.properties) {
@@ -126,7 +131,7 @@ function strictToolSchema(schema) {
     ]));
     result.required = Object.keys(schema.properties);
   }
-  if (schema.items) result.items = strictToolSchema(schema.items);
+  if (result.items) result.items = strictToolSchema(result.items);
   if (schema.anyOf) result.anyOf = schema.anyOf.map(strictToolSchema);
   return result;
 }
@@ -145,20 +150,23 @@ function parseJsonContent(value) {
       throw new Error("顶层必须是 JSON 对象");
     }
     return parsed;
-  } catch (error) {
-    throw new Error(`记忆处理 API 返回的不是有效 JSON：${error.message}`);
+  } catch (cause) {
+    const error = new Error(`记忆处理 API 返回的不是有效 JSON：${cause.message}`, { cause });
+    error.code = "MEMORY_PROVIDER_INVALID_STRUCTURED_OUTPUT";
+    Object.defineProperty(error, "rawOutput", { value });
+    throw error;
   }
 }
 
-function completionContent(payload, outputMode, schemaName) {
+function completionContent(payload, outputMode) {
   if (outputMode === "strict-tool") {
     const calls = payload?.choices?.[0]?.message?.tool_calls;
     const selected = Array.isArray(calls)
-      ? calls.find((call) => clean(call?.function?.name) === schemaName)
+      ? calls.find((call) => clean(call?.function?.name) === RESULT_TOOL_NAME)
       : null;
     const argumentsText = selected?.function?.arguments;
     if (typeof argumentsText !== "string" && !argumentsText) {
-      throw new Error(`记忆处理 API 没有调用要求的严格结构化工具 ${schemaName}。`);
+      throw new Error(`记忆处理 API 没有返回严格结构化工具 ${RESULT_TOOL_NAME} 的参数。`);
     }
     return argumentsText;
   }
@@ -170,11 +178,11 @@ function completionContent(payload, outputMode, schemaName) {
   return content;
 }
 
-function anthropicToolContent(payload, schemaName) {
+function anthropicToolContent(payload) {
   const blocks = Array.isArray(payload?.content) ? payload.content : [];
-  const selected = blocks.find((block) => clean(block?.type).toLowerCase() === "tool_use" && clean(block?.name) === schemaName);
+  const selected = blocks.find((block) => clean(block?.type).toLowerCase() === "tool_use" && clean(block?.name) === RESULT_TOOL_NAME);
   if (!selected || !Object.hasOwn(selected, "input")) {
-    throw new Error(`记忆处理 API 没有调用要求的结构化工具 ${schemaName}。`);
+    throw new Error(`记忆处理 API 没有返回结构化工具 ${RESULT_TOOL_NAME} 的参数。`);
   }
   return selected.input;
 }
@@ -287,11 +295,10 @@ export function createOpenAiCompatibleStructuredGenerator({
     schemaName = "memory-analysis-v1",
   } = {}) => {
     const schema = modelSchema ?? canonicalSchema;
-    const selectedSchemaName = jsonName(schemaName);
-    const schemaText = JSON.stringify(schema);
-    const outputInstruction = outputMode === "strict-tool" || outputMode === "anthropic-tool"
-      ? `必须调用 ${selectedSchemaName}，并让参数严格符合它的 JSON Schema。不要输出解释。`
-      : `只输出一个 JSON 对象，不要输出 Markdown 或解释。输出必须符合这个 JSON Schema：\n${schemaText}`;
+    const normalizedSchemaName = jsonName(schemaName);
+    const outputInstruction = anthropicCompatible || outputMode === "strict-tool"
+      ? "按提供的 JSON Schema 返回结果。"
+      : `只输出一个 JSON 对象，不要输出 Markdown 或解释。输出必须符合这个 JSON Schema：\n${JSON.stringify(schema)}`;
     const extraBody = connection.extraBody && typeof connection.extraBody === "object" && !Array.isArray(connection.extraBody)
       ? connection.extraBody
       : {};
@@ -304,11 +311,11 @@ export function createOpenAiCompatibleStructuredGenerator({
         messages: [{ role: "user", content: String(modelInput ?? input ?? "") }],
         temperature: 0,
         tools: [{
-          name: selectedSchemaName,
+          name: RESULT_TOOL_NAME,
           description: "Return the validated structured memory result.",
           input_schema: schema,
         }],
-        tool_choice: { type: "tool", name: selectedSchemaName },
+        tool_choice: { type: "tool", name: RESULT_TOOL_NAME },
       }
       : {
         ...extraBody,
@@ -326,7 +333,7 @@ export function createOpenAiCompatibleStructuredGenerator({
           tools: [{
             type: "function",
             function: {
-              name: selectedSchemaName,
+              name: RESULT_TOOL_NAME,
               description: "Return the validated structured memory result.",
               strict: true,
               parameters: strictToolSchema(schema),
@@ -334,20 +341,20 @@ export function createOpenAiCompatibleStructuredGenerator({
           }],
           tool_choice: {
             type: "function",
-            function: { name: selectedSchemaName },
+            function: { name: RESULT_TOOL_NAME },
           },
         } : {
           response_format: { type: "json_object" },
         }),
       };
-    return { payload, selectedSchemaName };
+    return { payload, normalizedSchemaName };
   };
   const generate = async function generate({ signal, decodeOutput, ...request } = {}) {
     const signals = [signal, getSignal?.()].filter(Boolean);
     const operationSignal = signals.length ? AbortSignal.any(signals) : undefined;
     operationSignal?.throwIfAborted();
     const started = Date.now();
-    const { payload, selectedSchemaName } = buildPayload(request);
+    const { payload, normalizedSchemaName } = buildPayload(request);
     for (let attempt = 1; attempt <= maximumTransportAttempts; attempt += 1) {
       operationSignal?.throwIfAborted();
       const controller = new AbortController();
@@ -462,7 +469,7 @@ export function createOpenAiCompatibleStructuredGenerator({
         metadata: {
           provider: clean(connection.name || connection.provider || connection.type) || "OpenAI Compatible",
           responseFormat: outputMode,
-          schemaName: selectedSchemaName,
+          schemaName: normalizedSchemaName,
           transportAttempts: attempt,
         },
       };
@@ -474,8 +481,8 @@ export function createOpenAiCompatibleStructuredGenerator({
           throw error;
         }
         const output = parseJsonContent(anthropicCompatible
-          ? anthropicToolContent(envelope, selectedSchemaName)
-          : completionContent(envelope, outputMode, selectedSchemaName));
+          ? anthropicToolContent(envelope)
+          : completionContent(envelope, outputMode));
         return { ...responseInfo, output: typeof decodeOutput === 'function' ? decodeOutput(output) : output };
       } catch (error) {
         Object.assign(error, responseInfo);
@@ -486,6 +493,7 @@ export function createOpenAiCompatibleStructuredGenerator({
   };
   generate.supportsCombinedStateAnalysis = true;
   generate.supportsCombinedConsolidation = true;
+  generate.supportsPlannedOrganization = true;
   generate.measureRequest = request => JSON.stringify(buildPayload(request).payload).length;
   return generate;
 }

@@ -294,7 +294,7 @@ test("evaluates three audited free-time choices without writing memory", async (
   database.close();
 });
 
-test("turns an evaluated selection tendency into a pending state proposal without writing memory", async () => {
+test("applies an evaluated selection tendency while its audit remains pending", async () => {
   const { database, repository } = fixture();
   const evaluation = await evaluatePreferenceEvidenceTarget({
     repository,
@@ -314,7 +314,6 @@ test("turns an evaluated selection tendency into a pending state proposal withou
     }),
   });
   assert.equal(evaluation.preview.status, "selection-tendency");
-  const beforeNodes = Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count);
   const persisted = proposePreferenceStateFromEvaluation(repository, {
     agentId: "agent-test",
     evaluation,
@@ -325,7 +324,7 @@ test("turns an evaluated selection tendency into a pending state proposal withou
   assert.equal(persisted.proposal.proposed_level, "selection_tendency");
   assert.equal(persisted.proposal.transition, "create");
   assert.equal(persisted.proposal.evidence.length, 2);
-  assert.equal(Number(database.prepare("SELECT COUNT(*) AS count FROM memory_nodes").get().count), beforeNodes);
+  assert.equal(repository.getMemory(persisted.proposal.resultMemoryId).status, 'active');
   database.close();
 });
 

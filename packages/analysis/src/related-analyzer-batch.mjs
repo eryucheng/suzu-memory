@@ -3,8 +3,9 @@ import path from "node:path";
 import { analysisSystemPrompt, analysisSourceMaterial } from "./source-material.mjs";
 import { isStateAnalysisBudgetError, stateAnalysisBudgetError } from "./request-budget.mjs";
 import { analysisCountLimit, analysisSchemaForCount } from './analysis-output.mjs';
-import { mergeEventSourceMaterials, assertEventSourceExecutionCurrent, withModelReferences } from '@suzu-memory/core';
+import { mergeEventSourceMaterials, assertEventSourceExecutionCurrent } from '@suzu-memory/core';
 import { stateMatchAnalysisSchema } from './state-memory-candidates.mjs';
+import { stateModelRequest } from './state-model-input.mjs';
 import { createHash } from 'node:crypto';
 import { appendUsageEvent } from '@suzu-memory/usage-ledger';
 
@@ -12,16 +13,36 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
-const analysisReferenceFields = new Set(['id', 'memoryId', 'sourceIds', 'episodeIds', 'candidateId', 'canonicalKey']);
-
-function withAnalysisReferences(request, material, renderInput) {
-  return withModelReferences(request, { material, fields: analysisReferenceFields, renderInput });
-}
-
 function providerRequest(request, snapshot = request.analysisSnapshot) {
   const { analysisSnapshot, renderAnalysisInput, ...provided } = request;
   if (!renderAnalysisInput) return provided;
-  return withAnalysisReferences({ ...provided, input: renderAnalysisInput(snapshot) }, snapshot, renderAnalysisInput);
+  return stateModelRequest({ ...provided, input: renderAnalysisInput(snapshot) }, snapshot);
+}
+
+function matchingRequest(request) {
+  const includePreferenceSupport = request.analysisSnapshot.stateCandidates.some(candidate => candidate.preferenceClaim);
+  const isPreference = request.stateAnalysisFamily === 'preference';
+  return {
+    ...request,
+    schemaName: 'memory-state-match-analysis-v1',
+    stateMatchAnalysisTask: { schemaName: request.schemaName, schema: request.schema,
+      combinedAnalyzerKeys: request.combinedAnalyzerKeys, ...(includePreferenceSupport ? { includePreferenceSupport } : {}) },
+    schema: stateMatchAnalysisSchema(request.schema, { includePreferenceSupport }),
+    systemPrompt: analysisSystemPrompt([
+      '先判断 semanticMemory 是否描述 stateCandidates 中同一事项或状态对象的后续证据，将判断写入 stateMatch。',
+      'matched 必须引用候选 id；new 表示独立的新事项；ambiguous 表示现有材料无法确定。new 和 ambiguous 的 candidateId 为空字符串。',
+      isPreference
+        ? '依据原话核对偏好的持有者、对象和适用范围。有明确对应的已有场合偏好时选择该条。增加新场合的例外或更新一般偏好时选择一般偏好。'
+        : '人物、日期、对象和具体约定需要相互吻合；语义相似、同名、同一个话题都不足以证明是同一事项。改期本身不表示新事项。',
+      'stateCandidates 仅供匹配；evidenceOnly 标记尚未形成状态的已有证据。',
+      ...(isPreference ? [] : ['身份字段不同、关系对象或方向不同、关系维度不同均是不同状态；婚恋状态与对某个人的关系观点分开。']),
+      ...(includePreferenceSupport ? [
+        '对含 preferenceClaim 的选中候选，逐条用 memories 引用的原话核对偏好、好恶方向和适用范围。supportingMemoryIds 仅列出确认同一偏好及原有范围的 memoryId，允许同义表达。范围有变、仅部分重合、指向不清或缺少直接依据时不列入。没有符合的证据时填空数组。',
+        'analysis 字段分别完成下述专职分析。',
+      ] : ['analysis 字段分别完成下述专职分析，stateMatch 仅判断是否为同一事项。']),
+      request.systemPrompt,
+    ].join('\n\n'), request.analysisSnapshot),
+  };
 }
 
 function sameSnapshot(calls) {
@@ -54,11 +75,11 @@ function combinedSchema(calls) {
 
 function combinedPrompt(calls, snapshot) {
   const sections = calls.map((call) => [
-    `## results.${call.key} (${call.request.analyzerRole})`,
+    `## 专科 ${call.key} (${call.request.analyzerRole})`,
     clean(call.request.systemPrompt),
   ].join("\n"));
   return analysisSystemPrompt([
-    "分别完成以下专职分析，将结果写入 results.<key>。各职责独立依据同一快照判断，一个职责的推断不能替另一个职责补齐证据。",
+    "分别完成以下专职分析，按输出 Schema 返回每个专科的判断。各职责独立依据同一快照判断，一个职责的推断不能替另一个职责补齐证据。",
     ...sections,
   ].join("\n\n"), snapshot);
 }
@@ -86,6 +107,7 @@ function analyzerGeneration(generation, calls, index) {
         combinedAnalyzerKeys: calls.map(item => item.key),
       } : {}),
       usageRecordedByAnalyzerKey: calls[0].key,
+      usageWarnings: index === 0 ? generation.metadata?.usageWarnings || [] : [],
     },
   };
 }
@@ -96,9 +118,6 @@ function splitGeneration(generation, calls) {
     throw new Error("Combined state analysis did not return a results object.");
   }
   return calls.map((call, index) => {
-    if (!Object.hasOwn(results, call.key)) {
-      throw new Error(`Combined state analysis omitted results.${call.key}.`);
-    }
     return {
       ...analyzerGeneration(generation, calls, index),
       output: results[call.key],
@@ -136,7 +155,7 @@ function noCurrentStateGeneration(request, snapshot = request.analysisSnapshot) 
     .filter(Boolean);
   return {
     output: { analyses },
-    usage: {},
+    usage: null,
     model: "local-deterministic-rule",
     requestId: "",
     durationMs: 0,
@@ -173,19 +192,20 @@ function combinedRequest(calls, snapshot, stateFamily, phase) {
 
 // Only split independent analyzer roles. Every role retains the same complete
 // evidence, target, current state and source material.
-function planCalls(generator, calls, stateFamily, phase) {
+function planCalls(generator, calls, stateFamily, phase, stateContext) {
   const snapshot = calls.length > 1 ? sameSnapshot(calls) : null;
   if (calls.length > 1 && (!snapshot || generator.supportsCombinedStateAnalysis !== true)) {
-    return calls.flatMap(call => planCalls(generator, [call], stateFamily, phase));
+    return calls.flatMap(call => planCalls(generator, [call], stateFamily, phase, stateContext));
   }
   const request = calls.length === 1 ? calls[0].request : combinedRequest(calls, snapshot, stateFamily, phase);
   try {
-    generator.assertRequestBudget?.(providerRequest(request));
+    const matching = phase === 'evidence' && stateContext && !stateContext.resolved;
+    generator.assertRequestBudget?.(providerRequest(matching ? matchingRequest(request) : request));
     return [{ calls, request }];
   } catch (error) {
     if (!isStateAnalysisBudgetError(error) || calls.length === 1) throw error;
     const middle = Math.ceil(calls.length / 2);
-    return [calls.slice(0, middle), calls.slice(middle)].flatMap(group => planCalls(generator, group, stateFamily, phase));
+    return [calls.slice(0, middle), calls.slice(middle)].flatMap(group => planCalls(generator, group, stateFamily, phase, stateContext));
   }
 }
 
@@ -196,6 +216,8 @@ export function createRelatedAnalyzerBatch({
   onBudgetExceeded = () => {},
   onGenerationError = () => {},
   stateContext = null,
+  analysisExecution = null,
+  firstStageBatch = null,
 } = {}) {
   if (!definitions || typeof definitions !== "object") {
     throw new Error("Related analyzer batching requires analyzer definitions.");
@@ -206,10 +228,13 @@ export function createRelatedAnalyzerBatch({
   const decorate = (input) => ({
     ...input,
     stateAnalysisRequestId: request.id,
+    stateAnalysisFamily: request.stateFamily,
     stateAnalysisProcessorVersion: request.processorVersion,
     stateAnalysisAttempt: request.attempt || 1,
   });
   const pending = [];
+  const completions = new Map();
+  let firstEvidence = true;
   let scheduled = false;
   function rejectCalls(calls, error, generation = null) {
     onGenerationError(error);
@@ -247,7 +272,7 @@ export function createRelatedAnalyzerBatch({
             groups.get(key).calls.push(call);
           }
           // Finish all budget checks before starting any provider work.
-          const plans = [...groups.values()].flatMap(group => planCalls(generator, group.calls, group.family, group.phase));
+          const plans = [...groups.values()].flatMap(group => planCalls(generator, group.calls, group.family, group.phase, stateContext));
           let stateResolutionError = null;
           for (const plan of plans) {
             if (stateResolutionError && stateContext && !stateContext.resolved
@@ -257,31 +282,29 @@ export function createRelatedAnalyzerBatch({
             }
             let generation = null;
             try {
+              assertEventSourceExecutionCurrent();
               const snapshot = stateContext?.resolved
                 ? stateContext.refresh(plan.request.analysisSnapshot) : plan.request.analysisSnapshot;
-              let actualRequest = providerRequest(plan.request, snapshot);
+              // Matching can follow a historical candidate to a newer current
+              // state. Track the actual comparison input before provider work.
+              analysisExecution?.track([snapshot.currentState?.id, snapshot.relationshipComparison?.memoryId,
+                ...(snapshot.comparisonMemories || []).map(memory => memory.memoryId)]);
               const resolveIdentity = stateContext && !stateContext.resolved;
-              if (resolveIdentity) actualRequest = {
-                ...actualRequest,
-                schemaName: 'memory-state-match-analysis-v1',
-                stateMatchAnalysisTask: { schemaName: plan.request.schemaName, schema: plan.request.schema,
-                  combinedAnalyzerKeys: plan.request.combinedAnalyzerKeys },
-                schema: stateMatchAnalysisSchema(plan.request.schema),
-                systemPrompt: [
-                  '先判断 semanticMemory 是否描述 stateCandidates 中同一事项或状态对象的后续证据，将判断写入 stateMatch。',
-                  'matched 必须引用候选 id；new 表示独立的新事项；ambiguous 表示现有材料无法确定。new 和 ambiguous 的 candidateId 为空字符串。',
-                  '人物、日期、对象和具体约定需要相互吻合；语义相似、同名、同一个话题都不足以证明是同一事项。改期本身不表示新事项。',
-                  'stateCandidates 仅供匹配；evidenceOnly 标记尚未形成状态的已有证据。',
-                  '身份字段不同、关系对象或方向不同、关系维度不同均是不同状态；婚恋状态与对某个人的关系观点分开。',
-                  'analysis 字段分别完成下述专职分析，stateMatch 仅判断是否为同一事项。',
-                  actualRequest.systemPrompt,
-                ].join('\n\n'),
-              };
+              const actualRequest = providerRequest(resolveIdentity ? matchingRequest(plan.request) : plan.request, snapshot);
               generator.assertRequestBudget?.(actualRequest);
+              const firstStage = firstEvidence && plan.calls.every(call => phaseFor(call.definition) === 'evidence');
+              if (firstStage) firstEvidence = false;
+              const checkpoint = firstStage && firstStageBatch ? analysisExecution?.firstStage(actualRequest, snapshot) : null;
               const deterministic = !resolveIdentity && plan.calls.length === 1
                 && plan.calls[0].definition.role === 'current-relation' && generator.supportsCombinedStateAnalysis === true
                 ? noCurrentStateGeneration(actualRequest, snapshot) : null;
-              generation = deterministic || await generator(actualRequest);
+              if (checkpoint?.generation) {
+                firstStageBatch.complete(request.id);
+                generation = checkpoint.generation;
+              } else generation = deterministic || (firstStage && firstStageBatch
+                ? await firstStageBatch.generate(request.id, actualRequest, snapshot, analysisExecution.assertCurrent)
+                : await generator(actualRequest));
+              const firstGeneration = generation;
               if (resolveIdentity) {
                 stateContext.resolve(generation?.output?.stateMatch);
                 generation = { ...generation, output: generation.output.analysis };
@@ -290,9 +313,24 @@ export function createRelatedAnalyzerBatch({
                 analysisInputHash: createHash('sha256').update(actualRequest.input).digest('hex'),
                 analysisSchemaName: actualRequest.schemaName, stateAnalysisRequestId: request.id } };
               const outputs = plan.calls.length === 1 ? [generation] : splitGeneration(generation, plan.calls);
+              const completed = checkpoint ? plan.calls.map(call => {
+                const item = { result: Promise.withResolvers(), saved: Promise.withResolvers() };
+                completions.set(call.key, item);
+                return item;
+              }) : [];
               plan.calls.forEach((call, index) => call.resolve(outputs[index]));
+              if (completed.length) {
+                try {
+                  const invocations = await Promise.all(completed.map(item => item.result.promise));
+                  if (!checkpoint.generation && invocations.every(item => !['failed', 'rejected'].includes(item.status)
+                    && !item.rejected.length && !item.retryMemoryIds.length)) checkpoint.save(firstGeneration);
+                  completed.forEach(item => item.saved.resolve());
+                } catch (error) {
+                  completed.forEach(item => item.saved.reject(error));
+                  throw error;
+                } finally { plan.calls.forEach(call => completions.delete(call.key)); }
+              }
             } catch (error) {
-              assertEventSourceExecutionCurrent();
               if (stateContext && !stateContext.resolved) stateResolutionError = error;
               rejectCalls(plan.calls, error, generation || error);
             }
@@ -306,7 +344,12 @@ export function createRelatedAnalyzerBatch({
 
   return Object.fromEntries(Object.entries(definitions).map(([key, definition]) => [
     key,
-    (input) => enqueue(key, definition, input),
+    Object.assign(input => enqueue(key, definition, input), { onAnalysisResult: invocation => {
+      const completion = completions.get(key);
+      if (!completion) return;
+      completion.result.resolve(invocation);
+      return completion.saved.promise;
+    } }),
   ]));
 }
 
@@ -350,7 +393,7 @@ function bindAnalysisContext(item, definition, snapshot) {
   return bound;
 }
 
-export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, promptDirectory, maximumAnalyses,
+async function analyzeEvidence({ definition, generator, snapshot, promptDirectory, maximumAnalyses,
   previousRuns = [], buildInput, prepareInputSnapshot = value => value, parseGeneration, enforceBoundary, analysisKey = definition.role }) {
   const systemPrompt = analysisSystemPrompt(fs.readFileSync(
     path.join(path.resolve(promptDirectory), definition.promptFile), 'utf8').replace(/^\uFEFF/u, '').trim(), snapshot);
@@ -374,19 +417,20 @@ export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, 
   const sourceSnapshot = replay.snapshot || snapshot;
   let generation = null;
   try {
+    assertEventSourceExecutionCurrent();
     const limit = analysisCountLimit(maximumAnalyses);
     if (snapshot.memories.length > limit) {
       throw stateAnalysisBudgetError(`Complete analysis requires ${snapshot.memories.length} judgments; maximumAnalyses is ${limit}.`);
     }
     const sourceMaterial = analysisSourceMaterial(sourceSnapshot);
     const requestSnapshot = inputSnapshot(sourceSnapshot);
-    generation = replay.snapshot ? await generator(withAnalysisReferences({
+    generation = replay.snapshot ? await generator(stateModelRequest({
       input: renderInput(requestSnapshot), systemPrompt,
       analysisSnapshot: requestSnapshot, renderAnalysisInput: renderInput,
       schema: schemaForSnapshot(requestSnapshot), schemaName: definition.schemaName,
       stateFamily: definition.stateFamily, analyzerRole: definition.role,
       ...(sourceMaterial ? { sourceMaterial } : {}),
-    }, requestSnapshot, renderInput)) : { output: { analyses: [] }, model: 'local-analysis-replay', usage: null };
+    }, requestSnapshot)) : { output: { analyses: [] }, model: 'local-analysis-replay', usage: null };
     const rejected = [];
     // Retain valid siblings even when a provider duplicates an entry. Accepted
     // results are bounded by the distinct supplied memory IDs below.
@@ -422,12 +466,17 @@ export async function invokeEvidenceAnalyzer({ definition, generator, snapshot, 
       retryMemoryIds, analyses, rejected,
       status: analyses.length ? 'completed' : rejected.length ? 'rejected' : 'abstained', error: '' };
   } catch (error) {
-    assertEventSourceExecutionCurrent();
     generation ||= error;
     return { definition, input, generation, contractHash, reusedRunId: replay.runId, analysisRequestId: replay.analysisRequestId || "",
       retryMemoryIds: sourceSnapshot.memories.map(memory => memory.id),
       analyses: replay.analyses, rejected: [], status: 'failed', error: error.message };
   }
+}
+
+export async function invokeEvidenceAnalyzer(options) {
+  const invocation = await analyzeEvidence(options);
+  await options.generator?.onAnalysisResult?.(invocation);
+  return invocation;
 }
 
 export function analyzerRunMetadata(invocation) {
@@ -449,11 +498,10 @@ export async function recordAnalyzerInvocations({ repository, agentId, batchId, 
   const runs = {}, analyses = {}, rejected = {}, warnings = [];
   const materials = new Map();
   for (const [key, invocation] of invocations) {
-    const currentSnapshot = typeof snapshot === 'function' ? snapshot(key) : snapshot;
     const family = stateFamily || invocation.definition.stateFamily;
     const generation = invocation.generation;
-    if (!materials.has(currentSnapshot)) materials.set(currentSnapshot, analysisSourceMaterial(currentSnapshot));
-    if (clean(usageLedgerPath) && generation?.model && generation?.usage) {
+    warnings.push(...(generation?.metadata?.usageWarnings || []));
+    if (!generation?.metadata?.stateBatchUsageRecorded && clean(usageLedgerPath) && generation?.model && generation?.usage) {
       try {
         await appendUsageEvent(path.resolve(usageLedgerPath), {
           agentId: clean(agentId), provider: generation.metadata?.provider || '', model: generation.model,
@@ -463,10 +511,20 @@ export async function recordAnalyzerInvocations({ repository, agentId, batchId, 
           metadata: { batchId, durationMs: Number(generation.durationMs || 0), ...generation.metadata },
         });
       } catch (error) {
-        assertEventSourceExecutionCurrent();
         warnings.push('费用流水写入失败：' + error.message);
       }
     }
+  }
+  // All completed provider work is billable, including an answer whose lease
+  // or evidence became obsolete. Account for every receipt before guarded writes.
+  assertEventSourceExecutionCurrent();
+  for (const [key, invocation] of invocations) {
+    const currentSnapshot = typeof snapshot === 'function' ? snapshot(key) : snapshot;
+    const family = stateFamily || invocation.definition.stateFamily;
+    const generation = invocation.generation;
+    if (!materials.has(currentSnapshot)) materials.set(currentSnapshot, analysisSourceMaterial(currentSnapshot, {
+      includeComparisons: family !== 'preference' || phaseFor(invocation.definition) !== 'evidence',
+    }));
     runs[key] = repository.recordStateAnalysisRun({ sourceMaterial: materials.get(currentSnapshot),
       agentId: clean(agentId), batchId, stateFamily: family, analyzerRole: invocation.definition.role,
       subjectRole: currentSnapshot.target.subjectRole, subjectKey: currentSnapshot.target.subjectKey,

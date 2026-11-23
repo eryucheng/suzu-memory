@@ -101,4 +101,12 @@ export function eventSourceEligible(source, scope) {
     && (!source.observation || source.observation.commitSequence <= scope.eventUpperBound)
     && !scope.clears.some(clear => clear.spaceId === source.spaceId && source.commitSequence <= clear.throughSequence);
 }
+/** Eligibility for one stored input; shared by indexed input reads and provenance views. */
+export function eventSourceInputEligible(input, scope) {
+  return input.protocol_version === 2 && input.lifecycle === 'active' && !input.metadata?.eventSourceErased
+    && input.metadata?.eventSource?.eventType === input.event_type
+    && input.metadata?.eventSource?.sender?.id === input.actor_key
+    && eventSourceEligible(input.metadata?.eventSource, scope);
+}
+
 export const eventSourceOf = row => row?.metadata?.eventSource;

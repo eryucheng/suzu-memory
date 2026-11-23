@@ -270,7 +270,7 @@ export function assessMemoryCandidate(candidate) {
   }
   if (
     candidate.kind === "reflection"
-    && !["agent", "shared"].includes(candidate.subjectRole)
+    && !MEMORY_KIND_DEFINITIONS.reflection.subjectRoles.includes(candidate.subjectRole)
   ) {
     reasons.push("reflection-must-belong-to-agent-or-shared");
   }
@@ -605,6 +605,11 @@ export function resolveMemoryIngestionReview(repository, {
     },
   };
   return repository.transaction(() => {
+    const provisional = decision.provisional_memory_id && repository.getMemory(decision.provisional_memory_id);
+    const checkedSources = [...new Set(evidenceLinks.map(link => link.sourceId).filter(Boolean))];
+    if (provisional?.status === 'deleted' || checkedSources.some(id => !repository.isCurrentReviewSource(normalizedAgentId, id))) {
+      return { status: 'needs-correction', decision, memory: null, reasons: ['review-source-unavailable'], candidate: reviewedCandidate };
+    }
     const result = applyMemoryCandidate(repository, reviewedCandidate, {
       agentId: normalizedAgentId,
       recordedAt,

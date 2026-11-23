@@ -108,7 +108,8 @@ test('incremental checkpoints retain extracted memory and send each core source 
   const report = await runMemoryBenchmark({ dataset, config: nativeConfig, outputDirectory: output,
     fetchImpl: async (_url, init) => {
       const request = JSON.parse(init.body), tool = request.tools?.[0]?.function;
-      assert.equal(tool?.name || request.response_format?.json_schema?.name, 'long-term-memory-extraction-v4');
+      assert.equal(tool?.name, 'return_result');
+      assert.ok(tool.parameters.properties.memories, 'The request carries the extraction schema.');
       const sources = [...request.messages.at(-1).content.matchAll(/^\[M\d+\] (.+)$/gmu)].map(match => match[1]);
       assert.ok(sources.length, request.messages.at(-1).content.slice(0, 1600));
       extracted.push(...sources);

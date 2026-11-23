@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readReportedStateDraft, executionEventSourceView, assertEventSourceExecutionCurrent, ROOT_STATE_SCOPE_KEY, memoryWorldsCompatible, modelCalendarFields } from '@suzu-memory/core';
 import { syncMemoryEmbeddings, prepareMemoryEmbeddingDocument } from '@suzu-memory/embedding-indexer';
 import { lexicalScore } from '@suzu-memory/retriever';
+import { readReportedPreferenceClaim } from './reported-preference-review.mjs';
 
 export const STATE_MEMORY_MATCH_SCHEMA = Object.freeze({
   type: 'object', additionalProperties: false, required: ['resolution', 'candidateId', 'rationale'],
@@ -12,9 +13,15 @@ export const STATE_MEMORY_MATCH_SCHEMA = Object.freeze({
   },
 });
 
-export function stateMatchAnalysisSchema(analysisSchema) {
+export function stateMatchAnalysisSchema(analysisSchema, { includePreferenceSupport = false } = {}) {
+  const stateMatch = includePreferenceSupport ? {
+    ...STATE_MEMORY_MATCH_SCHEMA,
+    properties: { ...STATE_MEMORY_MATCH_SCHEMA.properties,
+      supportingMemoryIds: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
+    },
+  } : STATE_MEMORY_MATCH_SCHEMA;
   return { type: 'object', additionalProperties: false, required: ['stateMatch', 'analysis'],
-    properties: { stateMatch: STATE_MEMORY_MATCH_SCHEMA, analysis: analysisSchema } };
+    properties: { stateMatch, analysis: analysisSchema } };
 }
 
 function similarity(left, right) {
@@ -62,7 +69,6 @@ function candidateView(repository, memory) {
     temporalState: memory.temporal_state, statePhase: memory.state_phase,
     ...modelCalendarFields(memory, ['knownAt', 'validFrom', 'validTo', 'eventDate', 'eventStart'], detail.sources),
     worldFrame: memory.world_frame,
-    reviewState: memory.layer === 'provisional' ? 'pending' : 'accepted',
     evidenceOnly: memory.metadata?.stateAnalysisDraft === true,
     roles: detail.roles.map(role => ({ role: role.role, actorRole: role.actor_role, actorKey: role.actor_key })),
     sourceIds: detail.sources.map(source => source.id),
@@ -78,22 +84,25 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     embeddingProvider, memoryIds: [draft.id], ledgerPath: usageLedgerPath, continueOnError: false }) : null;
   assertEventSourceExecutionCurrent();
   const sourceView = executionEventSourceView(repository, request.agent_id);
+  const reportedPreference = request.state_family === 'preference' && request.representation_layer === 'reported';
+  const candidateIds = repository.database.prepare(`SELECT id FROM memory_nodes
+    WHERE agent_id = ? AND subject_role = ? AND subject_key = ? AND state_family = ?
+      AND representation_layer = ? AND status <> 'deleted' AND reality = ? AND id <> ?
+    ORDER BY recorded_at DESC, id`).all(request.agent_id, request.subject_role, request.subject_key,
+      request.state_family, request.representation_layer, draft.reality, draft.id).map(({ id }) => id);
   const embeddings = new Map((useEmbeddings
-    ? repository.listEmbeddings(request.agent_id, embeddingProvider.model, { includeArchived: true }) : [])
+    ? repository.listEmbeddings(request.agent_id, embeddingProvider.model, {
+      includeArchived: true, memoryIds: [draft.id, ...candidateIds],
+    }) : [])
     .map(row => [row.memory_id, row]));
   const vector = embeddings.get(draft.id)?.vector;
   if (useEmbeddings && !vector) throw new Error('State analysis semantic memory has no embedding.');
   const pending = new Set(repository.listPendingProvisionalMemories(request.agent_id, { limit: 5000 }).map(item => item.id));
-  const ids = repository.database.prepare(`SELECT id FROM memory_nodes
-    WHERE agent_id = ? AND subject_role = ? AND subject_key = ? AND state_family = ?
-      AND representation_layer = ? AND status <> 'deleted' AND reality = ?
-    ORDER BY recorded_at DESC, id`).all(request.agent_id, request.subject_role, request.subject_key,
-      request.state_family, request.representation_layer, draft.reality);
   const ranked = [];
-  for (const { id } of ids) {
-    if (id === draft.id) continue;
+  for (const id of candidateIds) {
     const memory = repository.getMemory(id);
-    if (memory.state_scope_key !== ROOT_STATE_SCOPE_KEY) continue;
+    if (memory.state_scope_key !== ROOT_STATE_SCOPE_KEY
+      && !(reportedPreference && memory.status === 'active' && memory.state_scope_key.startsWith('scope:'))) continue;
     if (!memoryWorldsCompatible(draft, memory, { allowRealSpaces: true })) continue;
     if (sourceView && !sourceView.allows(memory)) continue;
     const earlierRequest = memory.metadata?.stateAnalysisDraft
@@ -115,9 +124,13 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     ...[...ranked].sort((a, b) => b.lexical - a.lexical || b.score - a.score).slice(0, 2),
     ...ranked.slice(0, 2),
   ].map(item => [item.memory.id, item])).values()];
-  const candidates = selected.map(({ memory, earlierRequest, targetSpec }) => ({ ...candidateView(repository, memory),
-    ...(targetSpec ? { targetSpec: Object.fromEntries(Object.entries(targetSpec).filter(([key]) => !key.endsWith('EntityId'))) } : {}),
-    canonicalKey: earlierRequest?.canonical_key || memory.canonical_key }));
+  const candidates = selected.map(({ memory, earlierRequest, targetSpec }) => {
+    const preferenceClaim = reportedPreference ? readReportedPreferenceClaim(memory) : null;
+    return { ...candidateView(repository, memory),
+      ...(targetSpec ? { targetSpec: Object.fromEntries(Object.entries(targetSpec).filter(([key]) => !key.endsWith('EntityId'))) } : {}),
+      ...(preferenceClaim ? { preferenceClaim } : {}),
+      canonicalKey: earlierRequest?.canonical_key || memory.canonical_key };
+  });
   const validityById = new Map(selected.map(({ memory }) => [memory.id, memory.valid_to]));
   // A persisted binding belongs to this request across retries. Only a successful
   // match moves it to another existing state; preparing candidates never rebinds it.
@@ -125,7 +138,7 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
     : `state-${createHash('sha256').update(request.id).digest('hex').slice(0, 24)}`;
   const snapshots = [];
   const context = {
-    draft, report, candidates, selected: null, ambiguous: false,
+    draft, report, candidates, selected: null, ambiguous: false, preferenceSupport: null, stateScopeKey: ROOT_STATE_SCOPE_KEY,
     resolved: false,
     attach(snapshot) {
       snapshots.push(snapshot);
@@ -148,12 +161,22 @@ export async function prepareStateMemoryCandidates({ repository, request, embedd
           || memory.title !== selected.title || memory.state_phase !== selected.statePhase
           || memory.valid_to !== validityById.get(selected.id)
           || (sourceView && !sourceView.allows(memory))) throw new Error('State identity candidate changed during analysis.');
+        context.stateScopeKey = memory.state_scope_key;
+      }
+      if (selected?.preferenceClaim) {
+        context.preferenceSupport = {
+          stateId: selected.id,
+          claim: selected.preferenceClaim,
+          requestId: request.id,
+          memoryIds: Array.isArray(match.supportingMemoryIds)
+            ? new Set(match.supportingMemoryIds.filter(id => request.memoryIds.includes(id))) : null,
+        };
       }
       context.selected = selected;
       if (selected && !selected.evidenceOnly) {
         const latest = repository.getCurrentCanonicalMemory({ ...memoryWorldScope(draft), agentId: request.agent_id,
           subjectRole: request.subject_role, subjectKey: request.subject_key, canonicalKey: selected.canonicalKey,
-          representationLayer: request.representation_layer, stateFamily: request.state_family,
+          representationLayer: request.representation_layer, stateFamily: request.state_family, stateScopeKey: context.stateScopeKey,
           includePending: true, includeHistorical: true });
         if (latest && !memoryWorldsCompatible(draft, latest, { allowRealSpaces: true })) {
           throw new Error('Canonical state identity crosses incompatible worlds.');

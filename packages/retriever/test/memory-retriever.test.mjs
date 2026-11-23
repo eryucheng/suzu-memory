@@ -10,6 +10,40 @@ import { closeRetrievalWorkers, collectBm25SeedScores, lexicalScore, lexicalTerm
 import { fuseCandidateLanes, DEFAULT_RETRIEVAL_OPTIONS } from "../src/retriever.mjs";
 import { renderRecallOutput, joinBoundedSections, formatPrimary } from '../src/context-renderer.mjs';
 
+for (const relation of ['reason_for', 'condition_for']) test(`recall carries scoped ${relation} without requiring its other endpoint in the response`, async t => {
+  const { databasePath, database, repository } = temporaryDatabase();
+  const agentId = 'agent-test', scope = '两个月的夜班安排期间';
+  const rationale = '林说夜班后需要白天补觉，因此暂时无法安排练车。';
+  const input = { agentId, sourceKind: 'conversation', externalId: 'night-shift',
+    content: '林说：这两个月排夜班，白天要补觉，所以先暂停驾驶课程，等排班调整后再考虑。' };
+  const source = repository.upsertSource(input);
+  for (const [id, content] of [['shift', '林这两个月排夜班。'], ['pause', '林暂停驾驶课程。']]) {
+    repository.upsertMemory({ id, agentId, kind: 'event', layer: 'episodic', content });
+    repository.linkSource(id, source.id);
+  }
+  const proposal = proposeMemoryRelation(repository, { agentId, relation, fromMemoryId: 'shift', toMemoryId: 'pause',
+    scope, rationale, evidenceSourceIds: [source.id], weight: 1, confidence: 1 });
+  const original = repository.getMemory('pause');
+  database.close();
+  const search = extra => retrieveMemories({ databasePath, agentId, query: '驾驶课程',
+    options: { execution: 'inline', maximumContextMemories: 1, ...extra } });
+  const first = await search();
+  assert.deepEqual(first.records.map(record => record.memoryId), ['pause']);
+  assert.ok(first.context.includes(scope)); assert.ok(first.context.includes(rationale));
+  assert.equal(first.graph.relations[0].relation, relation);
+  assert.deepEqual(first.graph.relations[0].evidenceSourceIds, [source.id]);
+  const excluded = await search({ excludedMemoryIds: ['shift'] });
+  assert.equal(excluded.records[0].textVersion, first.records[0].textVersion);
+  const writable = closeAfterTests(openMemoryDatabase(databasePath)), reopened = new MemoryRepository(writable);
+  assert.deepEqual(reopened.getMemory('pause'), original, 'Reading a condition does not change the decision.');
+  assert.equal(reopened.getRelationProposal(agentId, proposal.id).review_state, 'pending');
+  reopened.upsertSource({ ...input, content: '林纠正：暂停学车的原因另有其事。' });
+  writable.close();
+  const after = await search();
+  assert.deepEqual(after.graph.relations, []);
+  assert.ok(!after.context.includes(rationale));
+});
+
 test('default recall keeps long original statements and returns factual metadata without boilerplate', () => {
   assert.equal(DEFAULT_RETRIEVAL_OPTIONS.maximumContextChars, 24_000);
   for (const language of ['zh','en']) {
@@ -2332,7 +2366,7 @@ test("falls back to lexical retrieval and retains charged embedding failures", a
   assert.equal(events.reduce((sum, event) => sum + event.usage.prompt_tokens, 0), 34);
 });
 
-test("keeps causes edges inert during ordinary recall", async () => {
+test("keeps unvalidated causal edges without an owning proposal inert during recall", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   seedMuseumMemory(repository);
   repository.upsertMemory({
@@ -2373,7 +2407,7 @@ test("keeps causes edges inert during ordinary recall", async () => {
   assert.deepEqual(after.graph.selectedMemoryIds, before.graph.selectedMemoryIds);
 });
 
-test("suppresses weak causes behind a reviewed high-fanout effect", async () => {
+test("recalls unreviewed causal results, confirms without rewriting and withdraws them without reviving on restart", async () => {
   const { databasePath, database, repository } = temporaryDatabase();
   const source = repository.upsertSource({
     agentId: "agent-test",
@@ -2397,6 +2431,7 @@ test("suppresses weak causes behind a reviewed high-fanout effect", async () => 
       0.05,
     ]),
   ];
+  const proposals = [];
   for (const [id, content, weight] of causes) {
     repository.upsertMemory({
       id,
@@ -2414,14 +2449,10 @@ test("suppresses weak causes behind a reviewed high-fanout effect", async () => 
       evidenceSourceIds: [source.id],
       weight,
       confidence: 1,
-      rationale: "用于验证审核后因果边的扇出预算。",
+      rationale: "原话支持的因果结果自动生效，并遵守扇出预算。",
     });
-    resolveMemoryRelationProposal(repository, {
-      agentId: "agent-test",
-      proposalId: proposal.id,
-      action: "accept",
-      resolvedBy: "human:test",
-    });
+    assert.equal(proposal.review_state, 'pending');
+    proposals.push(proposal);
   }
   database.close();
   const result = await retrieveMemories({
@@ -2434,6 +2465,19 @@ test("suppresses weak causes behind a reviewed high-fanout effect", async () => 
     "fanout-strong-cause",
   ]);
   assert.doesNotMatch(result.context, /弱相关原因/u);
+  const writable = closeAfterTests(openMemoryDatabase(databasePath));
+  const reopened = new MemoryRepository(writable);
+  const proposal = proposals[0], originalEdge = reopened.getEdge('agent-test', proposal.result_edge_id);
+  const confirmed = resolveMemoryRelationProposal(reopened, { agentId: 'agent-test', proposalId: proposal.id, action: 'accept' });
+  assert.deepEqual(confirmed.edge, originalEdge);
+  reopened.revokeRelationProposal({ agentId: 'agent-test', proposalId: proposal.id });
+  const repeated = proposeMemoryRelation(reopened, { agentId: 'agent-test', relation: 'causes',
+    fromMemoryId: proposal.from_memory_id, toMemoryId: proposal.to_memory_id,
+    evidenceSourceIds: [source.id], weight: 1, confidence: 1, rationale: '重复分析也不能复活已撤回关系。' });
+  assert.equal(repeated.review_state, 'revoked');
+  writable.close();
+  const after = await retrieveMemories({ databasePath, agentId: 'agent-test', query: '为什么目标任务最终停止' });
+  assert.ok(!after.graph.selectedMemoryIds.includes('fanout-strong-cause'));
 });
 
 for (const content of ['用户以前喜欢解谜游戏。', 'The user used to like puzzle games.']) {

@@ -162,7 +162,7 @@ test("generation gates distinguish single-memory structure, source-backed relati
   const calls = [];
   const generator = async request => {
     calls.push(request.schemaName);
-    return { output: request.schemaName === "memory-consolidation-combined-v1"
+    return { output: request.schemaName === "memory-consolidation-combined-v2"
       ? { structure: { proposals: [] }, relations: { proposals: [] } } : { proposals: [] } };
   };
   generator.supportsCombinedConsolidation = true;
@@ -177,6 +177,10 @@ test("generation gates distinguish single-memory structure, source-backed relati
   assert.equal(calls.length, 0);
   await proposeRelationsForBatch({ ...args, generator });
   assert.equal(calls.length, 1);
+  const noPairs = await proposeRelationsForBatch({ ...args, generator, snapshotOptions: {
+    relationContext: { anchorMemoryIds: [args.memoryIds[0]], candidateMemoryIds: [], includeAnchorPairs: false },
+  } });
+  assert.equal(noPairs.reason, 'no-selected-relation-pairs'); assert.equal(calls.length, 1);
   const empty = planMemoryConsolidation({ ...args, triggerMemoryIds: [args.memoryIds[0]] });
   await runMemoryConsolidation({ ...args, runId: empty.id, structureGenerator: generator, relationGenerator: generator });
   assert.equal(calls.length, 1);
@@ -185,5 +189,5 @@ test("generation gates distinguish single-memory structure, source-backed relati
   const related = planMemoryConsolidation({ ...args, triggerMemoryIds: [args.memoryIds[0]] });
   assert.deepEqual(related.candidateIds, [args.memoryIds[1]]);
   await runMemoryConsolidation({ ...args, runId: related.id, structureGenerator: generator, relationGenerator: generator });
-  assert.deepEqual(calls, ["memory-relation-proposals-v1", "memory-consolidation-combined-v1"]);
+  assert.deepEqual(calls, ["memory-relation-proposals-v2", "memory-consolidation-combined-v2"]);
 });

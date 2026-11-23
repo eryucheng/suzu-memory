@@ -2,7 +2,7 @@ import {
   PREFERENCE_EVIDENCE_ENUMS,
   PREFERENCE_EVIDENCE_SIGNALS,
 } from "./preference-contract.mjs";
-import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone } from '@suzu-memory/core';
+import { DEFAULT_MEMORY_TIME_ZONE, dateKeyInTimeZone, PreferenceStateValidationError } from '@suzu-memory/core';
 
 const SCORED_SIGNALS = Object.freeze([
   "active_choice",
@@ -333,13 +333,13 @@ export function simulatePreferenceFormation({
     throw new Error("preference preview requires an identified holder and canonicalKey.");
   }
   const normalizedPolicy = normalizePolicy(policy);
-  const normalizedEvidence = normalizeEvidence(
-    evidence,
-    normalizedSubjectRole,
-    normalizedSubjectKey,
-    normalizedPolicy.minimumConfidence,
-    timeZone,
-  );
+  let normalizedEvidence;
+  try {
+    normalizedEvidence = normalizeEvidence(evidence, normalizedSubjectRole, normalizedSubjectKey,
+      normalizedPolicy.minimumConfidence, timeZone);
+  } catch (error) {
+    throw new PreferenceStateValidationError(error.message, { cause: error });
+  }
   const explicitSupport = normalizedEvidence.some((item) => (
     item.signal === "explicit_preference" && !item.ignoredReason
   ));

@@ -1,4 +1,4 @@
-import { isStructuredStateMemory as structuredStateNode } from '@suzu-memory/core';
+import { isStructuredStateMemory as structuredStateNode, readReportedStateDraft, MEMORY_EXPLANATORY_RELATIONS } from '@suzu-memory/core';
 import { createHash } from 'node:crypto';
 import { memoryCalendarDate } from './temporal-ranking.mjs';
 const clean = value => String(value ?? '').trim();
@@ -95,6 +95,7 @@ function stateEvidenceNature(node) {
 
 function sourceEvidenceNature(node, options) {
   if (!node || node.kind === "utterance") return "";
+  if (node.metadata?.preferenceEvidence?.kind === "single_behavior") return "单次行为";
   const authorities = new Set(
     options.sourceAuthoritiesByMemoryId?.get(node.id) || [],
   );
@@ -112,7 +113,10 @@ function sourceEvidenceNature(node, options) {
 }
 
 function formatStatement(node, options, maximum) {
-  const content = boundedText(node.content, maximum);
+  const goal = node.state_family === 'goal' && node.metadata?.sourceTimeKnown !== false ? readReportedStateDraft(node).goalClaim : null;
+  const text = goal?.deadlineDate && goal.timeReference && !String(node.content).includes(goal.deadlineDate)
+    ? `${node.content}\n${goal.timeReference}` : node.content;
+  const content = boundedText(text, maximum);
   const name = clean(options.actorNames?.get(node.subject_key));
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
   const namesSubject = name && new RegExp(`(?<![\\p{Script=Latin}\\p{N}_])${escapedName}(?![\\p{Script=Latin}\\p{N}_])`, 'u').test(content);
@@ -204,7 +208,7 @@ export function fitRecallRecords(sections, maximum) {
   return { text, records, requiredTextChars: required, sectionTruncationApplied: required > text.length };
 }
 
-export function renderRecallOutput({ nodes }, options) {
+export function renderRecallOutput({ nodes, relations = [] }, options) {
   const maximum = Math.max(1, Math.trunc(Number(options.maximumContextChars) || 1));
   if (!nodes.length) return { text: '', context: '', records: [], outputBudget: {
     maximumContextChars: maximum, requiredTextChars: 0, finalTextChars: 0, sectionTruncationApplied: false } };
@@ -212,8 +216,10 @@ export function renderRecallOutput({ nodes }, options) {
   const prefix = intro ? intro + '\n\n' : '';
   const available = Math.max(0, maximum - prefix.length);
   const sections = nodes.map(node => {
-    const body = formatPrimary(node, [], { ...options,
-      maximumContextChars: Number.MAX_SAFE_INTEGER, maximumMessageChars: Number.MAX_SAFE_INTEGER });
+    const explanations = relations.filter(relation => relation.toMemoryId === node.id).map(relation =>
+      `${MEMORY_EXPLANATORY_RELATIONS[relation.relation]}${relation.scope ? `（${relation.scope}）` : ''}：${relation.rationale}`);
+    const body = [formatPrimary(node, [], { ...options,
+      maximumContextChars: Number.MAX_SAFE_INTEGER, maximumMessageChars: Number.MAX_SAFE_INTEGER }), ...explanations].join('\n');
     const textVersion = createHash('sha256').update(body).digest('hex');
     const position = options.recordOffsets?.[node.id];
     const requestedOffset = position?.textVersion === textVersion ? position.offset : 0;

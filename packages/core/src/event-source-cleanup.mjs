@@ -1,7 +1,10 @@
 import { entityNameKey, entityNameKeys } from './entity-identity.mjs';
+import { readStructureDependencies } from './structure-provenance.mjs';
 import { eventSourceError } from './event-source-contract.mjs';
 import { removeSearchRows } from './search-index.mjs';
 import { getEventSourceCleanup, advanceEventSourceCleanup, advanceEventSourceEpoch } from './event-source-state.mjs';
+import { invalidateReportedPreferenceEvidence } from './reported-state-policy.mjs';
+import { reconcileReportedStateEvidence } from './reported-state-evidence.mjs';
 
 const quote = value => `"${value.replaceAll('"', '""')}"`;
 const parse = (value, fallback = {}) => { try { return JSON.parse(value); } catch { return fallback; } };
@@ -87,21 +90,25 @@ export function cleanEventSourceDatabase(repository, { agentId, id }) {
     const sourceRows = database.prepare('SELECT * FROM source_records WHERE agent_id=?').all(agentId);
     const erasedSources = sourceRows.filter(row => references(parse(row.metadata_json).inputEventIds, inputIds));
     const sourceIds = new Set(erasedSources.map(row => row.id));
+    repository.normalizePreferenceAnalysisSources(agentId);
+    const preferenceTargets = repository.getInferredPreferenceTargets({ agentId, sourceIds: [...sourceIds] });
     const nodes = database.prepare('SELECT * FROM memory_nodes WHERE agent_id=?').all(agentId);
     const links = database.prepare('SELECT link.* FROM memory_sources link JOIN memory_nodes node ON node.id=link.memory_id WHERE node.agent_id=?').all(agentId);
     const memoryIds = new Set(links.filter(link => sourceIds.has(link.source_id)).map(link => link.memory_id));
     for (const node of nodes) if (references(parse(node.metadata_json).inputEventIds, inputIds)) memoryIds.add(node.id);
+    invalidateReportedPreferenceEvidence(repository, { agentId, memoryIds: [...memoryIds], erasing: memoryIds });
+    reconcileReportedStateEvidence(repository, { agentId, sourceIds: [...sourceIds], erasing: memoryIds });
     // Source-less topic/episode material is derived from its members. A mixed
     // container cannot retain an unverifiable old summary; its clean members
     // keep their own source records and remain eligible to the same RAG.
-    const edges = database.prepare('SELECT * FROM memory_edges WHERE agent_id=?').all(agentId);
+    const structures = readStructureDependencies(repository, agentId);
+    const edges = database.prepare("SELECT * FROM memory_edges WHERE agent_id=? AND relation='followed_by'").all(agentId);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const node of nodes) {
-        if (memoryIds.has(node.id) || !['topic', 'episode'].includes(node.kind) || links.some(link => link.memory_id === node.id)) continue;
-        if (edges.some(edge => edge.from_memory_id === node.id && memoryIds.has(edge.to_memory_id)
-          || edge.to_memory_id === node.id && memoryIds.has(edge.from_memory_id))) { memoryIds.add(node.id); changed = true; }
+      for (const [id, structure] of structures) {
+        if (memoryIds.has(id)) continue;
+        if (structure.erasureDependencyIds.some(member => memoryIds.has(member))) { memoryIds.add(id); changed = true; }
       }
     }
     const dependentIds = new Map([
@@ -152,7 +159,8 @@ export function cleanEventSourceDatabase(repository, { agentId, id }) {
       if (!changed) break;
     }
     database.exec('PRAGMA defer_foreign_keys = ON');
-    const counts = { inputs: erasedInputs.length, sources: erasedSources.length, memories: memoryIds.size, auxiliary: {} };
+    const counts = { inputs: erasedInputs.length, sources: erasedSources.length, memories: memoryIds.size,
+      pendingPreferenceTargets: preferenceTargets, auxiliary: {} };
     const entities = new Set(database.prepare(`SELECT link.* FROM memory_entities link JOIN memory_nodes node
       ON node.id=link.memory_id WHERE node.agent_id=?`).all(agentId).filter(row => memoryIds.has(row.memory_id)).map(row => row.entity_id));
     // An unaffected input in the same interrupted batch must be claimable again.

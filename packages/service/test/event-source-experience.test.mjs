@@ -2,6 +2,7 @@ import { createTestDirectory, closeAfterTests } from '../../../test/support/suit
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createMemoryService, inspectDatabaseBackup } from '../src/index.mjs';
 import { openMemoryDatabase } from '@suzu-memory/core';
@@ -30,6 +31,43 @@ test('experience consumption advances independently of global sequence and admit
   assert.equal(progress.consumedThroughExperienceSequence,2);assert.equal(progress.consumedThroughSequence,0);
   assert.deepEqual(memory.listInputEvents().items.map(row => row.metadata.eventSource.eventId).sort(),['direct-new','group-old']);
   assert.throws(() => memory.appendEventSources({ scope: next,events: [event('future',3,2000)] }),{ code: 'EVENT_SOURCE_FUTURE' });
+});
+
+test('experience recall reads only inputs within the fixed experience range', async t => {
+  const memory = fixture();
+  memory.appendEventSources({ scope: scope(3, 2000), events: [
+    { ...event('before-clear', 1, 1000), content: { text: '清空前修过天文钟摆。' } },
+    { ...event('group-old', 2, 10, { eventId: 'observed-now', commitSequence: 2000 }),
+      content: { text: '群里提到天文钟摆需要校准。' } },
+    { ...event('later-experience', 3, 1500), content: { text: '后来换掉了天文钟摆。' } },
+  ] });
+  const archive = await memory.processPendingEvents({ generator: async () => ({ output: { memories: [] } }) });
+  assert.equal(archive.eventsProcessed, 3);
+
+  const inputsRead = [];
+  const prepare = DatabaseSync.prototype.prepare;
+  t.mock.method(DatabaseSync.prototype, 'prepare', function (sql) {
+    const statement = prepare.call(this, sql);
+    if (!/\bFROM\s+memory_input_events\b/u.test(sql)) return statement;
+    return new Proxy(statement, { get(target, key) {
+      if (key === 'all') return (...params) => {
+        const rows = target.all(...params);
+        inputsRead.push(...rows.map(row => row.id));
+        return rows;
+      };
+      const value = target[key];
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  });
+  const recall = globalUpper => memory.search('天文钟摆', {
+    sourceScope: scope(2, globalUpper, 1), persistTrace: false, options: { execution: 'inline' },
+  });
+  assert.equal((await recall(1999)).status, 'no-match');
+  const result = await recall(2000);
+  assert.equal(result.status, 'ready');
+  assert.deepEqual(result.records.flatMap(row => row.eventSources.map(source => source.eventId)), ['group-old']);
+  assert.equal(inputsRead.length, 2, 'Each recall reads only the input at experience position 2.');
+  assert.equal(inputsRead[0], inputsRead[1]);
 });
 
 test('experience clear persists the fence, preserves later input, and scrubs managed backups by the owning experience cutoff',async () => {
